@@ -221,6 +221,31 @@ CREATE TABLE IF NOT EXISTS backtest_results (
 );
 """
 
+_SIGNAL_RUNS_DDL = """\
+CREATE TABLE IF NOT EXISTS signal_runs (
+    id                  VARCHAR PRIMARY KEY,
+    strategy_id         VARCHAR NOT NULL,
+    strategy_version    INTEGER,
+    target_date         DATE NOT NULL,
+    universe_group_id   VARCHAR,
+    result_level        VARCHAR DEFAULT 'exploratory',
+    dependency_snapshot JSON,
+    signal_count        INTEGER,
+    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+_SIGNAL_DETAILS_DDL = """\
+CREATE TABLE IF NOT EXISTS signal_details (
+    run_id          VARCHAR NOT NULL,
+    ticker          VARCHAR NOT NULL,
+    signal          INTEGER,
+    target_weight   DOUBLE,
+    strength        DOUBLE,
+    PRIMARY KEY (run_id, ticker)
+);
+"""
+
 
 def get_connection() -> duckdb.DuckDBPyConnection:
     """Return the singleton DuckDB connection (thread-safe init)."""
@@ -256,6 +281,8 @@ def init_db() -> None:
         ("models", _MODELS_DDL),
         ("strategies", _STRATEGIES_DDL),
         ("backtest_results", _BACKTEST_RESULTS_DDL),
+        ("signal_runs", _SIGNAL_RUNS_DDL),
+        ("signal_details", _SIGNAL_DETAILS_DDL),
     ):
         conn.execute(ddl)
         log.info("db.init", table=name)

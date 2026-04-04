@@ -510,3 +510,95 @@ export async function deleteBacktest(backtestId: string) {
   const { data } = await client.delete(`/strategies/backtests/${backtestId}`);
   return data;
 }
+
+// ---- Signal Types ----
+
+export interface SignalDetail {
+  ticker: string;
+  signal: number;  // 1=buy, -1=sell, 0=hold
+  target_weight: number;
+  strength: number;
+}
+
+export interface SignalRun {
+  id: string;
+  strategy_id: string;
+  strategy_version: number;
+  target_date: string;
+  universe_group_id: string;
+  result_level: string;  // exploratory / formal
+  dependency_snapshot: Record<string, unknown> | null;
+  signal_count: number;
+  created_at: string;
+  signals?: SignalDetail[];
+  warnings?: string[];
+}
+
+// ---- Signal API ----
+
+export async function generateSignals(body: {
+  strategy_id: string;
+  target_date: string;
+  universe_group_id: string;
+}): Promise<{ task_id: string }> {
+  const { data } = await client.post<{ task_id: string }>("/signals/generate", body);
+  return data;
+}
+
+export async function listSignalRuns(strategyId?: string): Promise<SignalRun[]> {
+  const { data } = await client.get<SignalRun[]>("/signals", {
+    params: { strategy_id: strategyId || undefined },
+  });
+  return data;
+}
+
+export async function getSignalRun(runId: string): Promise<SignalRun> {
+  const { data } = await client.get<SignalRun>(`/signals/${runId}`);
+  return data;
+}
+
+export async function exportSignals(runId: string, format: "csv" | "json"): Promise<void> {
+  const response = await client.get(`/signals/${runId}/export`, {
+    params: { format },
+    responseType: "blob",
+  });
+  const blob = new Blob([response.data as BlobPart]);
+  const disposition = response.headers["content-disposition"] as string | undefined;
+  let filename = `signals_${runId}.${format}`;
+  if (disposition) {
+    const match = disposition.match(/filename="?([^"]+)"?/);
+    if (match) filename = match[1];
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// ---- System Info Types ----
+
+export interface SystemInfo {
+  version: string;
+  python_version: string;
+  db_path: string;
+  data_dir: string;
+  models_dir: string;
+  factors_dir: string;
+  strategies_dir: string;
+  data_provider: string;
+  server_host: string;
+  server_port: number;
+  market_calendar: string;
+  config: Record<string, unknown>;
+}
+
+// ---- System API ----
+
+export async function getSystemInfo(): Promise<SystemInfo> {
+  const { data } = await client.get<SystemInfo>("/system/info");
+  return data;
+}
