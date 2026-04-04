@@ -159,6 +159,68 @@ CREATE TABLE IF NOT EXISTS factor_eval_results (
 );
 """
 
+_FEATURE_SETS_DDL = """\
+CREATE TABLE IF NOT EXISTS feature_sets (
+    id              VARCHAR PRIMARY KEY,
+    name            VARCHAR UNIQUE NOT NULL,
+    description     TEXT,
+    factor_refs     JSON NOT NULL,
+    preprocessing   JSON NOT NULL,
+    status          VARCHAR DEFAULT 'draft',
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+_MODELS_DDL = """\
+CREATE TABLE IF NOT EXISTS models (
+    id              VARCHAR PRIMARY KEY,
+    name            VARCHAR NOT NULL,
+    feature_set_id  VARCHAR NOT NULL,
+    label_id        VARCHAR NOT NULL,
+    model_type      VARCHAR NOT NULL DEFAULT 'lightgbm',
+    model_params    JSON,
+    train_config    JSON,
+    eval_metrics    JSON,
+    status          VARCHAR DEFAULT 'draft',
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+_STRATEGIES_DDL = """\
+CREATE TABLE IF NOT EXISTS strategies (
+    id              VARCHAR PRIMARY KEY,
+    name            VARCHAR NOT NULL,
+    version         INTEGER NOT NULL DEFAULT 1,
+    description     TEXT,
+    source_code     TEXT NOT NULL,
+    required_factors JSON,
+    required_models  JSON,
+    position_sizing VARCHAR DEFAULT 'equal_weight',
+    status          VARCHAR DEFAULT 'draft',
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(name, version)
+);
+"""
+
+_BACKTEST_RESULTS_DDL = """\
+CREATE TABLE IF NOT EXISTS backtest_results (
+    id              VARCHAR PRIMARY KEY,
+    strategy_id     VARCHAR NOT NULL,
+    config          JSON NOT NULL,
+    summary         JSON NOT NULL,
+    nav_series      JSON,
+    benchmark_nav   JSON,
+    drawdown_series JSON,
+    monthly_returns JSON,
+    trade_count     INTEGER,
+    result_level    VARCHAR DEFAULT 'exploratory',
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 
 def get_connection() -> duckdb.DuckDBPyConnection:
     """Return the singleton DuckDB connection (thread-safe init)."""
@@ -190,6 +252,10 @@ def init_db() -> None:
         ("factors", _FACTORS_DDL),
         ("factor_values_cache", _FACTOR_VALUES_CACHE_DDL),
         ("factor_eval_results", _FACTOR_EVAL_RESULTS_DDL),
+        ("feature_sets", _FEATURE_SETS_DDL),
+        ("models", _MODELS_DDL),
+        ("strategies", _STRATEGIES_DDL),
+        ("backtest_results", _BACKTEST_RESULTS_DDL),
     ):
         conn.execute(ddl)
         log.info("db.init", table=name)

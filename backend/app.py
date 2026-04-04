@@ -15,6 +15,9 @@ from backend.api.groups import router as groups_router
 from backend.api.tasks import router as tasks_router
 from backend.api.labels import router as labels_router
 from backend.api.factors import router as factors_router
+from backend.api.features import router as features_router
+from backend.api.models import router as models_router
+from backend.api.strategies import router as strategies_router
 from backend.config import settings
 from backend.db import close_db, init_db
 from backend.logger import get_logger, setup_logging
@@ -79,6 +82,9 @@ app.include_router(groups_router)
 app.include_router(tasks_router)
 app.include_router(labels_router)
 app.include_router(factors_router)
+app.include_router(features_router)
+app.include_router(models_router)
+app.include_router(strategies_router)
 
 # Serve frontend build if it exists
 if _FRONTEND_DIST.is_dir():

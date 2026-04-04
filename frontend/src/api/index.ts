@@ -301,3 +301,212 @@ export async function getTaskStatus(taskId: string): Promise<TaskStatus> {
   const { data } = await client.get<TaskStatus>(`/tasks/${taskId}`);
   return data;
 }
+
+// ---- Feature Set Types ----
+
+export interface FeatureSet {
+  id: string;
+  name: string;
+  description: string | null;
+  factor_refs: Array<{ factor_id: string; factor_name: string; version: number }>;
+  preprocessing: Record<string, string> | null;
+  status: string;
+  created_at: string;
+}
+
+export interface CorrelationMatrix {
+  factor_names: string[];
+  matrix: number[][];
+}
+
+// ---- Feature Set API ----
+
+export async function listFeatureSets(): Promise<FeatureSet[]> {
+  const { data } = await client.get<FeatureSet[]>("/feature-sets");
+  return data;
+}
+
+export async function getFeatureSet(fsId: string): Promise<FeatureSet> {
+  const { data } = await client.get<FeatureSet>(`/feature-sets/${fsId}`);
+  return data;
+}
+
+export async function createFeatureSet(params: {
+  name: string;
+  description?: string;
+  factor_refs: Array<{ factor_id: string; factor_name: string; version: number }>;
+  preprocessing?: Record<string, string>;
+}): Promise<FeatureSet> {
+  const { data } = await client.post<FeatureSet>("/feature-sets", params);
+  return data;
+}
+
+export async function deleteFeatureSet(fsId: string) {
+  const { data } = await client.delete(`/feature-sets/${fsId}`);
+  return data;
+}
+
+export async function getCorrelationMatrix(
+  fsId: string,
+  body: { universe_group_id: string; start_date: string; end_date: string },
+): Promise<CorrelationMatrix> {
+  const { data } = await client.post<CorrelationMatrix>(`/feature-sets/${fsId}/correlation`, body);
+  return data;
+}
+
+// ---- Model Types ----
+
+export interface Model {
+  id: string;
+  name: string;
+  feature_set_id: string;
+  label_id: string;
+  model_type: string;
+  model_params: Record<string, unknown> | null;
+  train_config: Record<string, unknown> | null;
+  eval_metrics: Record<string, unknown> | null;
+  status: string;
+  created_at: string;
+}
+
+// ---- Model API ----
+
+export async function trainModel(params: {
+  name: string;
+  feature_set_id: string;
+  label_id: string;
+  model_type?: string;
+  model_params?: Record<string, unknown>;
+  train_config?: Record<string, unknown>;
+  universe_group_id: string;
+}): Promise<{ task_id: string }> {
+  const { data } = await client.post<{ task_id: string }>("/models/train", params);
+  return data;
+}
+
+export async function listModels(): Promise<Model[]> {
+  const { data } = await client.get<Model[]>("/models");
+  return data;
+}
+
+export async function getModel(modelId: string): Promise<Model> {
+  const { data } = await client.get<Model>(`/models/${modelId}`);
+  return data;
+}
+
+export async function deleteModel(modelId: string) {
+  const { data } = await client.delete(`/models/${modelId}`);
+  return data;
+}
+
+// ---- Strategy Types ----
+
+export interface Strategy {
+  id: string;
+  name: string;
+  version: number;
+  description: string | null;
+  source_code: string;
+  required_factors: string[] | null;
+  required_models: string[] | null;
+  position_sizing: string;
+  status: string;
+  created_at: string;
+}
+
+export interface StrategyTemplate {
+  name: string;
+  source_code?: string;
+}
+
+export interface BacktestResultSummary {
+  id: string;
+  strategy_id: string;
+  config: Record<string, unknown> | null;
+  summary: Record<string, number> | null;
+  result_level: string | null;
+  trade_count: number | null;
+  created_at: string;
+}
+
+export interface BacktestResultDetail extends BacktestResultSummary {
+  nav_series: Array<{ date: string; value: number }> | null;
+  benchmark_nav: Array<{ date: string; value: number }> | null;
+  drawdown_series: Array<{ date: string; value: number }> | null;
+  monthly_returns: Record<string, Record<string, number>> | null;
+}
+
+// ---- Strategy API ----
+
+export async function createStrategy(params: {
+  name: string;
+  source_code: string;
+  description?: string;
+  position_sizing?: string;
+}): Promise<Strategy> {
+  const { data } = await client.post<Strategy>("/strategies", params);
+  return data;
+}
+
+export async function listStrategies(): Promise<Strategy[]> {
+  const { data } = await client.get<Strategy[]>("/strategies");
+  return data;
+}
+
+export async function getStrategy(strategyId: string): Promise<Strategy> {
+  const { data } = await client.get<Strategy>(`/strategies/${strategyId}`);
+  return data;
+}
+
+export async function updateStrategy(
+  strategyId: string,
+  params: {
+    source_code?: string;
+    description?: string;
+    position_sizing?: string;
+    status?: string;
+  },
+): Promise<Strategy> {
+  const { data } = await client.put<Strategy>(`/strategies/${strategyId}`, params);
+  return data;
+}
+
+export async function deleteStrategy(strategyId: string) {
+  const { data } = await client.delete(`/strategies/${strategyId}`);
+  return data;
+}
+
+export async function listStrategyTemplates(): Promise<StrategyTemplate[]> {
+  const { data } = await client.get<StrategyTemplate[]>("/strategies/templates");
+  return data;
+}
+
+export async function getStrategyTemplate(name: string): Promise<StrategyTemplate> {
+  const { data } = await client.get<StrategyTemplate>(`/strategies/templates/${name}`);
+  return data;
+}
+
+export async function runBacktest(
+  strategyId: string,
+  body: { config: Record<string, unknown>; universe_group_id: string },
+): Promise<{ task_id: string }> {
+  const { data } = await client.post<{ task_id: string }>(`/strategies/${strategyId}/backtest`, body);
+  return data;
+}
+
+export async function listBacktests(strategyId?: string): Promise<BacktestResultSummary[]> {
+  const { data } = await client.get<BacktestResultSummary[]>("/strategies/backtests", {
+    params: { strategy_id: strategyId || undefined },
+  });
+  return data;
+}
+
+export async function getBacktest(backtestId: string): Promise<BacktestResultDetail> {
+  const { data } = await client.get<BacktestResultDetail>(`/strategies/backtests/${backtestId}`);
+  return data;
+}
+
+export async function deleteBacktest(backtestId: string) {
+  const { data } = await client.delete(`/strategies/backtests/${backtestId}`);
+  return data;
+}
