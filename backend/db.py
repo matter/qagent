@@ -104,6 +104,61 @@ CREATE TABLE IF NOT EXISTS data_update_log (
 );
 """
 
+_LABEL_DEFINITIONS_DDL = """\
+CREATE TABLE IF NOT EXISTS label_definitions (
+    id          VARCHAR PRIMARY KEY,
+    name        VARCHAR UNIQUE NOT NULL,
+    description TEXT,
+    target_type VARCHAR NOT NULL,
+    horizon     INTEGER NOT NULL,
+    benchmark   VARCHAR,
+    status      VARCHAR DEFAULT 'draft',
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+_FACTORS_DDL = """\
+CREATE TABLE IF NOT EXISTS factors (
+    id          VARCHAR PRIMARY KEY,
+    name        VARCHAR NOT NULL,
+    version     INTEGER NOT NULL DEFAULT 1,
+    description TEXT,
+    category    VARCHAR DEFAULT 'custom',
+    source_code TEXT NOT NULL,
+    params      JSON,
+    status      VARCHAR DEFAULT 'draft',
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(name, version)
+);
+"""
+
+_FACTOR_VALUES_CACHE_DDL = """\
+CREATE TABLE IF NOT EXISTS factor_values_cache (
+    factor_id   VARCHAR NOT NULL,
+    ticker      VARCHAR NOT NULL,
+    date        DATE NOT NULL,
+    value       DOUBLE,
+    PRIMARY KEY (factor_id, ticker, date)
+);
+"""
+
+_FACTOR_EVAL_RESULTS_DDL = """\
+CREATE TABLE IF NOT EXISTS factor_eval_results (
+    id                  VARCHAR PRIMARY KEY,
+    factor_id           VARCHAR NOT NULL,
+    label_id            VARCHAR NOT NULL,
+    universe_group_id   VARCHAR,
+    start_date          DATE,
+    end_date            DATE,
+    summary             JSON,
+    ic_series           JSON,
+    group_returns       JSON,
+    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 
 def get_connection() -> duckdb.DuckDBPyConnection:
     """Return the singleton DuckDB connection (thread-safe init)."""
@@ -131,6 +186,10 @@ def init_db() -> None:
         ("data_update_log", _DATA_UPDATE_LOG_DDL),
         ("stock_groups", _STOCK_GROUPS_DDL),
         ("stock_group_members", _STOCK_GROUP_MEMBERS_DDL),
+        ("label_definitions", _LABEL_DEFINITIONS_DDL),
+        ("factors", _FACTORS_DDL),
+        ("factor_values_cache", _FACTOR_VALUES_CACHE_DDL),
+        ("factor_eval_results", _FACTOR_EVAL_RESULTS_DDL),
     ):
         conn.execute(ddl)
         log.info("db.init", table=name)
