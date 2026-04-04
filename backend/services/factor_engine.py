@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime
+from datetime import date as date_type, datetime
 
 import numpy as np
 import pandas as pd
@@ -268,16 +268,20 @@ class FactorEngine:
         # Load OHLCV data for all tickers in this batch.
         # We request extra history before start_date for warm-up periods.
         # Many indicators (e.g. 200-day MA) need ~250 bars of warm-up.
+        from datetime import timedelta
+        sd = start_date if isinstance(start_date, date_type) else date_type.fromisoformat(str(start_date))
+        ed = end_date if isinstance(end_date, date_type) else date_type.fromisoformat(str(end_date))
+        warm_start = sd - timedelta(days=400)
         warm_up_query = f"""
             SELECT ticker, date, open, high, low, close, volume
             FROM daily_bars
             WHERE ticker IN ({','.join(f"'{t}'" for t in tickers)})
-              AND date >= (SELECT MIN(date) FROM daily_bars WHERE date >= ? - INTERVAL '400 DAY')
+              AND date >= ?
               AND date <= ?
             ORDER BY ticker, date
         """
         try:
-            all_bars = conn.execute(warm_up_query, [start_date, end_date]).fetchdf()
+            all_bars = conn.execute(warm_up_query, [warm_start, ed]).fetchdf()
         except Exception as exc:
             log.error("factor_engine.compute.query_failed", error=str(exc))
             return pd.DataFrame()

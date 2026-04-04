@@ -248,18 +248,20 @@ CREATE TABLE IF NOT EXISTS signal_details (
 
 
 def get_connection() -> duckdb.DuckDBPyConnection:
-    """Return the singleton DuckDB connection (thread-safe init)."""
+    """Return a thread-local cursor from the singleton DuckDB connection.
+
+    DuckDB connections are not thread-safe for concurrent operations.
+    Each thread must use its own cursor via connection.cursor().
+    """
     global _connection
-    if _connection is not None:
-        return _connection
-    with _lock:
-        if _connection is not None:
-            return _connection
-        db_path = settings.db_path
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        log.info("db.connect", path=str(db_path))
-        _connection = duckdb.connect(str(db_path))
-        return _connection
+    if _connection is None:
+        with _lock:
+            if _connection is None:
+                db_path = settings.db_path
+                db_path.parent.mkdir(parents=True, exist_ok=True)
+                log.info("db.connect", path=str(db_path))
+                _connection = duckdb.connect(str(db_path))
+    return _connection.cursor()
 
 
 def init_db() -> None:
