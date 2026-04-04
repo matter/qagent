@@ -57,13 +57,30 @@ curl http://127.0.0.1:8000/api/health
 
 ### 3. 任务框架
 
+> 注意：DuckDB 是单进程数据库。验收时后端必须处于运行状态，通过 API 验证；不要用独立 Python 脚本直接连接数据库文件，否则会因锁冲突报错。
+
 ```bash
-# 查看 DuckDB 中 task_runs 表是否存在
+# 通过 API 验证任务框架（后端需运行中）
+# 触发一次数据更新（会创建任务记录）
+curl -X POST http://127.0.0.1:8000/api/data/update \
+  -H "Content-Type: application/json" -d '{"mode": "incremental"}'
+
+# 查看任务进度（包含 task_id、status 等字段，证明 task_runs 表工作正常）
+curl -s http://127.0.0.1:8000/api/data/update/progress | python3 -m json.tool
+```
+
+预期返回包含 `task_id`、`status`（running/completed/failed）等字段。
+
+如果需要直接检查数据库表结构，**先停止后端**再执行：
+
+```bash
+bash scripts/stop.sh
 uv run python -c "
 from backend.db import get_connection, init_db
 init_db()
 conn = get_connection()
 print(conn.execute('DESCRIBE task_runs').fetchall())
+conn.close()
 "
 ```
 

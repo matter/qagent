@@ -67,6 +67,14 @@ async def trigger_update(body: UpdateRequest) -> dict:
     executor = _get_executor()
     svc = _get_service()
 
+    # Reject if a data_update task is already running
+    running_id = executor.has_running_task("data_update")
+    if running_id:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Data update already running (task_id={running_id}). Cancel it first via POST /api/tasks/{running_id}/cancel",
+        )
+
     task_id = executor.submit(
         task_type="data_update",
         fn=svc.update_data,

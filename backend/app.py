@@ -12,9 +12,11 @@ from fastapi.staticfiles import StaticFiles
 from backend.api.health import router as health_router
 from backend.api.data import router as data_router
 from backend.api.groups import router as groups_router
+from backend.api.tasks import router as tasks_router
 from backend.config import settings
 from backend.db import close_db, init_db
 from backend.logger import get_logger, setup_logging
+from backend.tasks.store import TaskStore
 
 log = get_logger(__name__)
 
@@ -39,6 +41,9 @@ async def lifespan(app: FastAPI):
 
     init_db()
 
+    # Mark any tasks left running/queued from a previous server run as failed
+    TaskStore().mark_stale_running()
+
     yield
 
     # --- shutdown ---
@@ -61,6 +66,7 @@ app.add_middleware(
 app.include_router(health_router)
 app.include_router(data_router)
 app.include_router(groups_router)
+app.include_router(tasks_router)
 
 # Serve frontend build if it exists
 if _FRONTEND_DIST.is_dir():

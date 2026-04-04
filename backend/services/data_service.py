@@ -392,8 +392,8 @@ class DataService:
                 if last < end_date:
                     result[t] = last + timedelta(days=1)
             else:
-                # New ticker: fetch last 30 days for incremental
-                result[t] = end_date - timedelta(days=30)
+                # New ticker with no local data: fetch full history
+                result[t] = date(end_date.year - _FULL_HISTORY_YEARS, 1, 1)
 
         return result
 

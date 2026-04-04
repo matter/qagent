@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
 
 from backend.db import get_connection
 from backend.logger import get_logger
@@ -13,17 +16,19 @@ log = get_logger(__name__)
 _BUILTIN_ALL_MARKET = "all_market"
 _BUILTIN_ALL_MARKET_NAME = "全市场"
 
+# Built-in index groups: id -> (name, description, filter_expr or None, tickers_fetcher)
+_BUILTIN_INDEX_GROUPS = {
+    "sp500": ("标普500", "S&P 500 成分股", "sp500"),
+    "nasdaq100": ("纳斯达克100", "NASDAQ 100 成分股", "nasdaq100"),
+    "russell3000": ("罗素3000", "Russell 3000 成分股", "russell3000"),
+}
+
 # Safe columns that filter expressions may reference.
 _ALLOWED_FILTER_COLUMNS = {"ticker", "name", "exchange", "sector", "status"}
 
 
 def _validate_filter_expr(expr: str) -> str:
-    """Basic validation for filter expressions used as SQL WHERE clauses.
-
-    Only allows references to known columns in the stocks table and basic
-    comparison / logical operators.  This is *not* a full sandbox but prevents
-    the most obvious injection vectors.
-    """
+    """Basic validation for filter expressions used as SQL WHERE clauses."""
     if not expr or not expr.strip():
         raise ValueError("filter_expr must not be empty")
 
@@ -37,6 +42,65 @@ def _validate_filter_expr(expr: str) -> str:
     return expr.strip()
 
 
+def _fetch_index_tickers(index_id: str) -> list[str]:
+    """Fetch latest index constituents from Wikipedia. Returns ticker list."""
+    try:
+        if index_id == "sp500":
+            url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+            tables = pd.read_html(url)
+            df = tables[0]
+            tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()
+        elif index_id == "nasdaq100":
+            url = "https://en.wikipedia.org/wiki/Nasdaq-100"
+            tables = pd.read_html(url)
+            # Find the table with a "Ticker" or "Symbol" column
+            df = None
+            for t in tables:
+                cols = [c.lower() for c in t.columns]
+                if "ticker" in cols:
+                    df = t
+                    col = t.columns[[c.lower() for c in t.columns].index("ticker")]
+                    break
+                if "symbol" in cols:
+                    df = t
+                    col = t.columns[[c.lower() for c in t.columns].index("symbol")]
+                    break
+            if df is None:
+                log.warning("group.index_fetch.no_table", index=index_id)
+                return []
+            tickers = df[col].str.replace(".", "-", regex=False).tolist()
+        elif index_id == "russell3000":
+            # Russell 3000 is not on Wikipedia in a clean table.
+            # Use the iShares Russell 3000 ETF holdings page as proxy.
+            # Fallback: return empty and log, user can manually populate.
+            try:
+                url = "https://en.wikipedia.org/wiki/Russell_3000_Index"
+                tables = pd.read_html(url)
+                # Try to find a constituents table
+                for t in tables:
+                    cols = [c.lower() for c in t.columns]
+                    if "ticker" in cols or "symbol" in cols:
+                        col_name = "ticker" if "ticker" in cols else "symbol"
+                        col = t.columns[[c.lower() for c in t.columns].index(col_name)]
+                        return t[col].str.replace(".", "-", regex=False).tolist()
+            except Exception:
+                pass
+            # Russell 3000 is ~3000 stocks; approximate with all active NYSE+NASDAQ stocks
+            log.info("group.russell3000.using_filter", msg="Using all active stocks as Russell 3000 proxy")
+            return []  # Will be created as filter group instead
+        else:
+            return []
+
+        # Clean up tickers
+        tickers = [t.strip() for t in tickers if isinstance(t, str) and t.strip()]
+        log.info("group.index_fetch.done", index=index_id, count=len(tickers))
+        return tickers
+
+    except Exception as e:
+        log.warning("group.index_fetch.failed", index=index_id, error=str(e))
+        return []
+
+
 class GroupService:
     """CRUD operations for stock groups."""
 
@@ -47,6 +111,8 @@ class GroupService:
     def ensure_builtins(self) -> None:
         """Create built-in groups if they do not exist."""
         conn = get_connection()
+
+        # --- "全市场" group ---
         row = conn.execute(
             "SELECT id FROM stock_groups WHERE id = ?",
             [_BUILTIN_ALL_MARKET],
@@ -64,6 +130,42 @@ class GroupService:
                 ],
             )
             log.info("group.builtin_created", name=_BUILTIN_ALL_MARKET_NAME)
+
+        # --- Index constituent groups (S&P 500, NASDAQ 100, Russell 3000) ---
+        for group_id, (name, desc, fetch_key) in _BUILTIN_INDEX_GROUPS.items():
+            existing = conn.execute(
+                "SELECT id FROM stock_groups WHERE id = ?", [group_id]
+            ).fetchone()
+            if existing is not None:
+                continue
+
+            tickers = _fetch_index_tickers(fetch_key)
+
+            if fetch_key == "russell3000" and not tickers:
+                # Fallback: use filter for all active NYSE+NASDAQ stocks
+                conn.execute(
+                    """INSERT INTO stock_groups (id, name, description, group_type, filter_expr)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    [group_id, name, desc + "（近似：全部活跃 NYSE+NASDAQ 股票）",
+                     "builtin", "exchange IN ('NYSE', 'NASDAQ') AND status = 'active'"],
+                )
+                self._evaluate_filter(group_id, "exchange IN ('NYSE', 'NASDAQ') AND status = 'active'")
+            elif tickers:
+                conn.execute(
+                    """INSERT INTO stock_groups (id, name, description, group_type, filter_expr)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    [group_id, name, desc, "builtin", None],
+                )
+                self._set_members(group_id, tickers)
+            else:
+                # Fetch failed, create empty group that can be refreshed later
+                conn.execute(
+                    """INSERT INTO stock_groups (id, name, description, group_type, filter_expr)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    [group_id, name, desc + "（成分股获取失败，请手动刷新）", "builtin", None],
+                )
+
+            log.info("group.builtin_created", name=name, tickers=len(tickers) if tickers else 0)
 
     def create_group(
         self,

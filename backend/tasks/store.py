@@ -78,6 +78,30 @@ class TaskStore:
         )
         log.debug("task.updated", task_id=task_id, status=status.value)
 
+    def mark_stale_running(self) -> int:
+        """Mark any 'queued' or 'running' tasks as 'failed' (stale from previous run).
+
+        Returns the number of rows affected.
+        """
+        conn = get_connection()
+        result = conn.execute(
+            """UPDATE task_runs
+               SET status = 'failed',
+                   completed_at = CURRENT_TIMESTAMP,
+                   error_message = 'Marked as failed: server restarted while task was in progress'
+               WHERE status IN ('queued', 'running')"""
+        )
+        count = result.fetchone()[0] if result.description else 0
+        # DuckDB doesn't return affected rows easily; query instead
+        count = conn.execute(
+            """SELECT COUNT(*) FROM task_runs
+               WHERE error_message = 'Marked as failed: server restarted while task was in progress'
+                 AND completed_at > CURRENT_TIMESTAMP - INTERVAL 5 SECOND"""
+        ).fetchone()[0]
+        if count > 0:
+            log.info("task.stale_cleaned", count=count)
+        return count
+
     # ------------------------------------------------------------------
     # Read
     # ------------------------------------------------------------------

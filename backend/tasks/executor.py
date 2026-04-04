@@ -83,6 +83,39 @@ class TaskExecutor:
     def get_task(self, task_id: str) -> TaskRecord | None:
         return self._store.get(task_id)
 
+    def cancel(self, task_id: str) -> bool:
+        """Cancel a queued or running task. Returns True if cancelled."""
+        record = self._store.get(task_id)
+        if record is None:
+            return False
+        if record.status not in (TaskStatus.QUEUED, TaskStatus.RUNNING):
+            return False
+
+        future = self._futures.get(task_id)
+        if future is not None:
+            future.cancel()
+
+        self._store.update_status(
+            task_id,
+            TaskStatus.FAILED,
+            completed_at=datetime.utcnow(),
+            error_message="Cancelled by user",
+        )
+        log.info("task.cancelled", task_id=task_id)
+        return True
+
+    def has_running_task(self, task_type: str) -> str | None:
+        """Return task_id if there's a running/queued task of this type, else None."""
+        tasks = self._store.list_tasks(task_type=task_type, limit=1)
+        for t in tasks:
+            if t.status in (TaskStatus.QUEUED, TaskStatus.RUNNING):
+                return t.id
+        return None
+
+    def mark_stale(self) -> None:
+        """Mark stale tasks from previous server run as failed."""
+        self._store.mark_stale_running()
+
     def shutdown(self, wait: bool = True) -> None:
         self._pool.shutdown(wait=wait)
 

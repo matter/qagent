@@ -19,7 +19,7 @@ from backend.providers.base import DataProvider
 
 log = get_logger(__name__)
 
-_BATCH_SIZE = 500
+_BATCH_SIZE = 200
 _BASE_DELAY = 2.0
 _JITTER_RANGE = (0.5, 1.5)
 _BACKOFF_BASE = 5.0
@@ -230,7 +230,7 @@ class YFinanceProvider(DataProvider):
                     auto_adjust=False,
                     progress=False,
                     group_by="ticker",
-                    threads=True,
+                    threads=False,
                 )
 
                 if raw.empty:
