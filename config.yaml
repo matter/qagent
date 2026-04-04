@@ -1,0 +1,19 @@
+data:
+  provider: yfinance
+  db_path: ./data/qagent.duckdb
+  models_dir: ./data/models
+  factors_dir: ./data/factors
+  strategies_dir: ./data/strategies
+
+server:
+  host: 127.0.0.1
+  port: 8000
+
+backtest:
+  default_initial_capital: 1000000
+  default_commission_rate: 0.001
+  default_slippage_rate: 0.001
+  default_benchmark: SPY
+
+market:
+  calendar: NYSE

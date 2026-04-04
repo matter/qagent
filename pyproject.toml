@@ -1,0 +1,25 @@
+[project]
+name = "qagent"
+version = "0.1.0"
+description = "Quantitative research and backtesting system"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "duckdb>=1.2.0",
+    "pyyaml>=6.0",
+    "structlog>=25.0.0",
+    "pandas>=2.2.0",
+    "exchange-calendars>=4.5.0",
+    "httpx>=0.28.1",
+    "yfinance>=0.2.40",
+    "requests>=2.31.0",
+    "requests-cache>=1.2.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
