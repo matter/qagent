@@ -13,6 +13,8 @@ from backend.api.health import router as health_router
 from backend.api.data import router as data_router
 from backend.api.groups import router as groups_router
 from backend.api.tasks import router as tasks_router
+from backend.api.labels import router as labels_router
+from backend.api.factors import router as factors_router
 from backend.config import settings
 from backend.db import close_db, init_db
 from backend.logger import get_logger, setup_logging
@@ -44,6 +46,14 @@ async def lifespan(app: FastAPI):
     # Mark any tasks left running/queued from a previous server run as failed
     TaskStore().mark_stale_running()
 
+    # Seed preset label definitions
+    from backend.services.label_service import LabelService
+    LabelService().ensure_presets()
+
+    # Register built-in factor templates
+    from backend.services.factor_service import FactorService
+    FactorService().ensure_builtin_templates()
+
     yield
 
     # --- shutdown ---
@@ -67,6 +77,8 @@ app.include_router(health_router)
 app.include_router(data_router)
 app.include_router(groups_router)
 app.include_router(tasks_router)
+app.include_router(labels_router)
+app.include_router(factors_router)
 
 # Serve frontend build if it exists
 if _FRONTEND_DIST.is_dir():

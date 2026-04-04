@@ -136,3 +136,168 @@ export async function refreshGroup(groupId: string): Promise<StockGroup> {
   const { data } = await client.post<StockGroup>(`/groups/${groupId}/refresh`);
   return data;
 }
+
+// ---- Factor Types ----
+
+export interface Factor {
+  id: string;
+  name: string;
+  version: number;
+  description: string | null;
+  category: string;
+  source_code: string;
+  params: Record<string, unknown> | null;
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FactorTemplate {
+  name: string;
+  source_code?: string;
+}
+
+export interface LabelDefinition {
+  id: string;
+  name: string;
+  description: string | null;
+  target_type: string;
+  horizon: number;
+  benchmark: string | null;
+  status: string;
+}
+
+export interface FactorEvalSummary {
+  ic_mean: number;
+  ic_std: number;
+  ir: number;
+  ic_win_rate: number;
+  long_short_annual_return: number;
+  turnover: number;
+  coverage: number;
+}
+
+export interface FactorEvalRecord {
+  id: string;
+  factor_id: string;
+  label_id: string;
+  universe_group_id: string;
+  start_date: string | null;
+  end_date: string | null;
+  summary: FactorEvalSummary;
+  created_at: string | null;
+}
+
+export interface FactorEvalDetail extends FactorEvalRecord {
+  ic_series: Array<{ date: string; ic: number | null }>;
+  group_returns: {
+    dates: string[];
+    groups: Record<string, number[]>;
+  };
+}
+
+export interface TaskStatus {
+  task_id: string;
+  task_type: string;
+  status: string;
+  params: Record<string, unknown> | null;
+  result: Record<string, unknown> | null;
+  error: string | null;
+  created_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+// ---- Factor API ----
+
+export async function listFactors(category?: string, status?: string): Promise<Factor[]> {
+  const { data } = await client.get<Factor[]>("/factors", {
+    params: { category: category || undefined, status: status || undefined },
+  });
+  return data;
+}
+
+export async function getFactor(factorId: string): Promise<Factor> {
+  const { data } = await client.get<Factor>(`/factors/${factorId}`);
+  return data;
+}
+
+export async function createFactor(params: {
+  name: string;
+  source_code: string;
+  description?: string;
+  category?: string;
+  params?: Record<string, unknown>;
+}): Promise<Factor> {
+  const { data } = await client.post<Factor>("/factors", params);
+  return data;
+}
+
+export async function updateFactor(
+  factorId: string,
+  params: {
+    source_code?: string;
+    description?: string;
+    category?: string;
+    params?: Record<string, unknown>;
+    status?: string;
+  },
+): Promise<Factor> {
+  const { data } = await client.put<Factor>(`/factors/${factorId}`, params);
+  return data;
+}
+
+export async function deleteFactor(factorId: string) {
+  const { data } = await client.delete(`/factors/${factorId}`);
+  return data;
+}
+
+export async function listTemplates(): Promise<FactorTemplate[]> {
+  const { data } = await client.get<FactorTemplate[]>("/factors/templates");
+  return data;
+}
+
+export async function getTemplate(name: string): Promise<FactorTemplate> {
+  const { data } = await client.get<FactorTemplate>(`/factors/templates/${name}`);
+  return data;
+}
+
+export async function computeFactor(
+  factorId: string,
+  body: { universe_group_id: string; start_date: string; end_date: string },
+): Promise<{ task_id: string }> {
+  const { data } = await client.post<{ task_id: string }>(`/factors/${factorId}/compute`, body);
+  return data;
+}
+
+export async function evaluateFactor(
+  factorId: string,
+  body: { label_id: string; universe_group_id: string; start_date: string; end_date: string },
+): Promise<{ task_id: string }> {
+  const { data } = await client.post<{ task_id: string }>(`/factors/${factorId}/evaluate`, body);
+  return data;
+}
+
+export async function listEvaluations(factorId: string): Promise<FactorEvalRecord[]> {
+  const { data } = await client.get<FactorEvalRecord[]>(`/factors/${factorId}/evaluations`);
+  return data;
+}
+
+export async function getEvaluation(evalId: string): Promise<FactorEvalDetail> {
+  const { data } = await client.get<FactorEvalDetail>(`/factors/evaluations/${evalId}`);
+  return data;
+}
+
+// ---- Label API ----
+
+export async function listLabels(): Promise<LabelDefinition[]> {
+  const { data } = await client.get<LabelDefinition[]>("/labels");
+  return data;
+}
+
+// ---- Task API ----
+
+export async function getTaskStatus(taskId: string): Promise<TaskStatus> {
+  const { data } = await client.get<TaskStatus>(`/tasks/${taskId}`);
+  return data;
+}
