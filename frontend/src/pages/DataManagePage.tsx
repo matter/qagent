@@ -17,6 +17,9 @@ import {
   Popconfirm,
   Descriptions,
   Spin,
+  Progress,
+  Alert,
+  Collapse,
 } from "antd";
 import {
   ReloadOutlined,
@@ -25,6 +28,7 @@ import {
   DeleteOutlined,
   CloudDownloadOutlined,
   SyncOutlined,
+  ExclamationCircleOutlined,
 } from "@ant-design/icons";
 import {
   getDataStatus,
@@ -35,6 +39,7 @@ import {
   updateGroup,
   deleteGroup,
   getGroup,
+  refreshIndexGroups,
 } from "../api";
 import type { DataStatus, UpdateProgress, StockGroup } from "../api";
 
@@ -116,28 +121,69 @@ function DataStatusSection() {
 
 // ---- Data Update Section ----
 
+function formatElapsed(startedAt: string): string {
+  const start = new Date(startedAt).getTime();
+  const now = Date.now();
+  const diff = Math.max(0, Math.floor((now - start) / 1000));
+  const m = Math.floor(diff / 60);
+  const s = diff % 60;
+  return m > 0 ? `${m}分${s}秒` : `${s}秒`;
+}
+
 function DataUpdateSection() {
+  const [status, setStatus] = useState<DataStatus | null>(null);
   const [progress, setProgress] = useState<UpdateProgress | null>(null);
   const [triggering, setTriggering] = useState(false);
+  const [elapsed, setElapsed] = useState("");
   const pollTimer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
+  const elapsedTimer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
   const [messageApi, contextHolder] = message.useMessage();
 
   const isRunning = progress?.status === "running" || progress?.status === "queued";
+
+  // Fetch data status for confirmation dialog
+  const fetchStatus = useCallback(async () => {
+    try {
+      const data = await getDataStatus();
+      setStatus(data);
+    } catch {
+      /* noop */
+    }
+  }, []);
+
+  const startElapsedTimer = useCallback((startedAt: string) => {
+    if (elapsedTimer.current) clearInterval(elapsedTimer.current);
+    setElapsed(formatElapsed(startedAt));
+    elapsedTimer.current = setInterval(() => {
+      setElapsed(formatElapsed(startedAt));
+    }, 1000);
+  }, []);
+
+  const stopElapsedTimer = useCallback(() => {
+    if (elapsedTimer.current) {
+      clearInterval(elapsedTimer.current);
+      elapsedTimer.current = undefined;
+    }
+  }, []);
 
   const pollProgress = useCallback(async () => {
     try {
       const data = await getUpdateProgress();
       setProgress(data);
+      if (data.status === "running" && data.started_at) {
+        startElapsedTimer(data.started_at);
+      }
       if (data.status !== "running" && data.status !== "queued") {
         if (pollTimer.current) {
           clearInterval(pollTimer.current);
           pollTimer.current = undefined;
         }
+        stopElapsedTimer();
       }
     } catch {
       /* noop */
     }
-  }, []);
+  }, [startElapsedTimer, stopElapsedTimer]);
 
   const startPoll = useCallback(() => {
     if (pollTimer.current) clearInterval(pollTimer.current);
@@ -145,11 +191,44 @@ function DataUpdateSection() {
   }, [pollProgress]);
 
   useEffect(() => {
+    fetchStatus();
     pollProgress();
     return () => {
       if (pollTimer.current) clearInterval(pollTimer.current);
+      stopElapsedTimer();
     };
-  }, [pollProgress]);
+  }, [fetchStatus, pollProgress, stopElapsedTimer]);
+
+  const confirmAndUpdate = (mode: "incremental" | "full") => {
+    const lastUpdate = status?.last_update?.completed_at ?? "从未更新";
+    const stockCount = status?.stock_count ?? "未知";
+    const desc =
+      mode === "incremental"
+        ? "将更新至最新交易日的数据"
+        : "将重新拉取全部历史数据（约30-60分钟）";
+
+    Modal.confirm({
+      title: "确认数据更新",
+      icon: <ExclamationCircleOutlined />,
+      content: (
+        <Space direction="vertical" style={{ width: "100%", marginTop: 8 }}>
+          <Descriptions size="small" column={1} bordered>
+            <Descriptions.Item label="最近更新">{lastUpdate}</Descriptions.Item>
+            <Descriptions.Item label="股票总数">{stockCount}</Descriptions.Item>
+            <Descriptions.Item label="更新模式">
+              <Tag color={mode === "incremental" ? "blue" : "orange"}>
+                {mode === "incremental" ? "增量更新" : "全量更新"}
+              </Tag>
+            </Descriptions.Item>
+          </Descriptions>
+          <Text type="secondary">{desc}</Text>
+        </Space>
+      ),
+      okText: "确认更新",
+      cancelText: "取消",
+      onOk: () => handleUpdate(mode),
+    });
+  };
 
   const handleUpdate = async (mode: "incremental" | "full") => {
     setTriggering(true);
@@ -166,6 +245,26 @@ function DataUpdateSection() {
     }
   };
 
+  // Determine progress percent for visual bar
+  const progressPercent = !progress
+    ? 0
+    : progress.status === "completed"
+      ? 100
+      : progress.status === "failed"
+        ? 100
+        : progress.status === "running"
+          ? 50
+          : 0;
+
+  const progressStatus =
+    progress?.status === "completed"
+      ? "success"
+      : progress?.status === "failed"
+        ? "exception"
+        : progress?.status === "running"
+          ? "active"
+          : "normal";
+
   return (
     <Card title="数据更新">
       {contextHolder}
@@ -176,7 +275,7 @@ function DataUpdateSection() {
             icon={<SyncOutlined spin={isRunning} />}
             loading={triggering}
             disabled={isRunning}
-            onClick={() => handleUpdate("incremental")}
+            onClick={() => confirmAndUpdate("incremental")}
           >
             增量更新
           </Button>
@@ -184,45 +283,68 @@ function DataUpdateSection() {
             icon={<CloudDownloadOutlined />}
             loading={triggering}
             disabled={isRunning}
-            onClick={() => handleUpdate("full")}
+            onClick={() => confirmAndUpdate("full")}
           >
             全量更新
           </Button>
-          {isRunning && (
-            <Text type="warning">
-              <SyncOutlined spin /> 更新进行中...
-            </Text>
-          )}
         </Space>
+
+        {isRunning && (
+          <div>
+            <Space style={{ marginBottom: 8 }}>
+              <SyncOutlined spin />
+              <Text strong>更新进行中...</Text>
+              {elapsed && <Text type="secondary">已运行 {elapsed}</Text>}
+            </Space>
+            <Progress percent={progressPercent} status={progressStatus} />
+          </div>
+        )}
+
         {progress && progress.status !== "no_updates" && (
-          <Descriptions size="small" column={3} bordered>
-            <Descriptions.Item label="状态">
-              <Tag
-                color={
-                  progress.status === "completed"
-                    ? "green"
-                    : progress.status === "failed"
-                      ? "red"
-                      : progress.status === "running"
-                        ? "blue"
-                        : "default"
-                }
-              >
-                {progress.status}
-              </Tag>
-            </Descriptions.Item>
-            <Descriptions.Item label="开始时间">
-              {progress.started_at ?? "-"}
-            </Descriptions.Item>
-            <Descriptions.Item label="完成时间">
-              {progress.completed_at ?? "-"}
-            </Descriptions.Item>
-            {progress.error && (
-              <Descriptions.Item label="错误" span={3}>
-                <Text type="danger">{progress.error}</Text>
-              </Descriptions.Item>
-            )}
-          </Descriptions>
+          <Collapse
+            size="small"
+            items={[
+              {
+                key: "log",
+                label: "查看日志",
+                children: (
+                  <Descriptions size="small" column={3} bordered>
+                    <Descriptions.Item label="状态">
+                      <Tag
+                        color={
+                          progress.status === "completed"
+                            ? "green"
+                            : progress.status === "failed"
+                              ? "red"
+                              : progress.status === "running"
+                                ? "blue"
+                                : "default"
+                        }
+                      >
+                        {progress.status}
+                      </Tag>
+                    </Descriptions.Item>
+                    <Descriptions.Item label="开始时间">
+                      {progress.started_at ?? "-"}
+                    </Descriptions.Item>
+                    <Descriptions.Item label="完成时间">
+                      {progress.completed_at ?? "-"}
+                    </Descriptions.Item>
+                    {progress.message && (
+                      <Descriptions.Item label="消息" span={3}>
+                        <Text>{progress.message}</Text>
+                      </Descriptions.Item>
+                    )}
+                    {progress.error && (
+                      <Descriptions.Item label="错误" span={3}>
+                        <Text type="danger">{progress.error}</Text>
+                      </Descriptions.Item>
+                    )}
+                  </Descriptions>
+                ),
+              },
+            ]}
+          />
         )}
       </Space>
     </Card>
@@ -246,6 +368,7 @@ function StockGroupsSection() {
   const [editingGroup, setEditingGroup] = useState<StockGroup | null>(null);
   const [detailGroup, setDetailGroup] = useState<StockGroup | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
+  const [refreshingIndices, setRefreshingIndices] = useState(false);
   const [form] = Form.useForm<GroupFormValues>();
   const [submitting, setSubmitting] = useState(false);
   const [messageApi, contextHolder] = message.useMessage();
@@ -351,6 +474,19 @@ function StockGroupsSection() {
     }
   };
 
+  const handleRefreshIndices = async () => {
+    setRefreshingIndices(true);
+    try {
+      await refreshIndexGroups();
+      messageApi.success("指数成分刷新成功");
+      fetchGroups();
+    } catch {
+      messageApi.error("指数成分刷新失败");
+    } finally {
+      setRefreshingIndices(false);
+    }
+  };
+
   const groupType = Form.useWatch("group_type", form);
 
   const columns = [
@@ -417,6 +553,14 @@ function StockGroupsSection() {
         title="股票分组"
         extra={
           <Space>
+            <Button
+              icon={<SyncOutlined spin={refreshingIndices} />}
+              size="small"
+              loading={refreshingIndices}
+              onClick={handleRefreshIndices}
+            >
+              刷新指数成分
+            </Button>
             <Button icon={<ReloadOutlined />} size="small" onClick={fetchGroups}>
               刷新
             </Button>
@@ -468,13 +612,34 @@ function StockGroupsSection() {
             </Form.Item>
           )}
           {(groupType === "filter" || editingGroup?.group_type === "filter") && (
-            <Form.Item
-              name="filter_expr"
-              label="筛选条件"
-              help="SQL WHERE 子句，例如: sector = 'Technology'"
-            >
-              <TextArea rows={2} placeholder="sector = 'Technology'" />
-            </Form.Item>
+            <>
+              <Form.Item
+                name="filter_expr"
+                label="筛选条件"
+                help="SQL WHERE 子句，例如: sector = 'Technology'"
+              >
+                <TextArea rows={2} placeholder="sector = 'Technology'" />
+              </Form.Item>
+              <Alert
+                type="info"
+                showIcon
+                message="筛选条件说明"
+                description={
+                  <div>
+                    <Text type="secondary">可用字段: ticker, name, exchange, sector, status</Text>
+                    <br />
+                    <Text type="secondary">示例:</Text>
+                    <ul style={{ margin: "4px 0", paddingLeft: 20 }}>
+                      <li><Text code>exchange = 'NYSE'</Text> — NYSE 上市股票</li>
+                      <li><Text code>exchange IN ('NYSE', 'NASDAQ')</Text> — 主要交易所</li>
+                      <li><Text code>sector = 'Technology'</Text> — 科技行业</li>
+                      <li><Text code>status = 'active'</Text> — 活跃状态</li>
+                    </ul>
+                  </div>
+                }
+                style={{ marginBottom: 16 }}
+              />
+            </>
           )}
         </Form>
       </Modal>

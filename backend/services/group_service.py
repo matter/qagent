@@ -325,6 +325,57 @@ class GroupService:
         log.info("group.filter_refreshed", id=group_id)
         return self.get_group(group_id)
 
+    def refresh_index_groups(self) -> list[dict]:
+        """Re-fetch S&P 500, NASDAQ 100, and Russell 3000 constituents from Wikipedia.
+
+        For each built-in index group, re-downloads the ticker list and updates
+        the group membership.  If the fetch fails for a particular index, its
+        membership is left unchanged.
+
+        Returns:
+            List of updated group dicts.
+        """
+        conn = get_connection()
+        results: list[dict] = []
+
+        for group_id, (name, desc, fetch_key) in _BUILTIN_INDEX_GROUPS.items():
+            # Ensure the group row exists
+            existing = conn.execute(
+                "SELECT id FROM stock_groups WHERE id = ?", [group_id]
+            ).fetchone()
+            if existing is None:
+                # Create a placeholder row so we can populate it
+                conn.execute(
+                    """INSERT INTO stock_groups (id, name, description, group_type, filter_expr)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    [group_id, name, desc, "builtin", None],
+                )
+
+            if fetch_key == "russell3000":
+                # Russell 3000: use filter as documented
+                filter_expr = "exchange IN ('NYSE', 'NASDAQ') AND status = 'active'"
+                conn.execute(
+                    "UPDATE stock_groups SET filter_expr = ?, description = ?, updated_at = ? WHERE id = ?",
+                    [filter_expr, desc, datetime.utcnow(), group_id],
+                )
+                self._evaluate_filter(group_id, filter_expr)
+                log.info("group.index_refresh.done", index=group_id, method="filter")
+            else:
+                tickers = _fetch_index_tickers(fetch_key)
+                if tickers:
+                    self._set_members(group_id, tickers)
+                    conn.execute(
+                        "UPDATE stock_groups SET description = ?, updated_at = ? WHERE id = ?",
+                        [desc, datetime.utcnow(), group_id],
+                    )
+                    log.info("group.index_refresh.done", index=group_id, count=len(tickers))
+                else:
+                    log.warning("group.index_refresh.fetch_failed", index=group_id)
+
+            results.append(self.get_group(group_id))
+
+        return results
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

@@ -50,6 +50,17 @@ class UpdateGroupRequest(BaseModel):
 # ------------------------------------------------------------------
 
 
+@router.post("/groups/refresh-indices")
+async def refresh_index_groups() -> list[dict]:
+    """Re-fetch S&P 500, NASDAQ 100, and Russell 3000 constituents."""
+    svc = _get_service()
+    try:
+        return svc.refresh_index_groups()
+    except Exception as e:
+        log.error("api.groups.refresh_indices_error", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to refresh index groups: {e}")
+
+
 @router.post("/groups")
 async def create_group(body: CreateGroupRequest) -> dict:
     """Create a new stock group."""

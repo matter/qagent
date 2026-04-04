@@ -28,6 +28,37 @@ _DEFAULT_PREPROCESSING = {
     "neutralize": None,
 }
 
+# Map frontend shorthand values to internal canonical values.
+_PREPROCESSING_ALIASES = {
+    "missing": {
+        "ffill": "forward_fill",
+        "forward_fill": "forward_fill",
+        "cross_sectional_mean": "cross_sectional_mean",
+        "median": "cross_sectional_mean",
+        "drop": "drop",
+        "zero": "drop",  # closest available
+    },
+    "outlier": {
+        "winsorize": "winsorize",
+        "clip": "winsorize",
+        "mad": "mad",
+        "zscore": "mad",
+        "none": None,
+    },
+    "normalize": {
+        "zscore": "zscore",
+        "minmax": "zscore",  # closest available
+        "rank": "rank",
+        "none": None,
+    },
+    "neutralize": {
+        "industry": None,   # not yet implemented; accept silently
+        "market": None,
+        "both": None,
+        "none": None,
+    },
+}
+
 
 class FeatureService:
     """CRUD and computation for feature sets (collections of factors with preprocessing)."""
@@ -409,12 +440,27 @@ class FeatureService:
 
     @staticmethod
     def _validate_preprocessing(preprocessing: dict | None) -> dict:
-        """Validate and fill defaults for preprocessing config."""
+        """Validate and fill defaults for preprocessing config.
+
+        Accepts both canonical values and frontend shorthand aliases.
+        """
         if preprocessing is None:
             return dict(_DEFAULT_PREPROCESSING)
 
         result = dict(_DEFAULT_PREPROCESSING)
         result.update(preprocessing)
+
+        # Resolve aliases for each key
+        for key in ("missing", "outlier", "normalize", "neutralize"):
+            val = result.get(key)
+            if val is None:
+                continue
+            alias_map = _PREPROCESSING_ALIASES.get(key, {})
+            if isinstance(val, str):
+                canonical = alias_map.get(val.lower())
+                if canonical is not None or val.lower() in alias_map:
+                    result[key] = alias_map.get(val.lower())
+                # else leave as-is for validation below
 
         missing = result.get("missing")
         if missing not in _VALID_MISSING:

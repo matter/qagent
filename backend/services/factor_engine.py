@@ -11,6 +11,7 @@ import pandas as pd
 from backend.db import get_connection
 from backend.factors.loader import load_factor_from_code
 from backend.logger import get_logger
+from backend.services.calendar_service import snap_to_trading_day
 from backend.services.factor_service import FactorService
 
 log = get_logger(__name__)
@@ -51,6 +52,19 @@ class FactorEngine:
             DataFrame with DatetimeIndex rows, ticker columns, factor values.
         """
         if not universe_tickers:
+            return pd.DataFrame()
+
+        # Snap user-provided dates to nearest trading days
+        from datetime import date as _date
+        _start = _date.fromisoformat(start_date)
+        _end = _date.fromisoformat(end_date)
+        _start = snap_to_trading_day(_start, direction="forward")
+        _end = snap_to_trading_day(_end, direction="backward")
+        start_date = str(_start)
+        end_date = str(_end)
+
+        if _start > _end:
+            log.warning("factor_engine.compute.invalid_range", start=start_date, end=end_date)
             return pd.DataFrame()
 
         # 1. Load factor definition and compile
@@ -253,12 +267,12 @@ class FactorEngine:
 
         # Load OHLCV data for all tickers in this batch.
         # We request extra history before start_date for warm-up periods.
-        # Most indicators need ~60 bars of warm-up at most.
+        # Many indicators (e.g. 200-day MA) need ~250 bars of warm-up.
         warm_up_query = f"""
             SELECT ticker, date, open, high, low, close, volume
             FROM daily_bars
             WHERE ticker IN ({','.join(f"'{t}'" for t in tickers)})
-              AND date >= (SELECT MIN(date) FROM daily_bars WHERE date >= ? - INTERVAL '120 DAY')
+              AND date >= (SELECT MIN(date) FROM daily_bars WHERE date >= ? - INTERVAL '400 DAY')
               AND date <= ?
             ORDER BY ticker, date
         """

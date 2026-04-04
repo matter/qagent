@@ -58,3 +58,22 @@ def get_latest_trading_day() -> date:
     today = pd.Timestamp(date.today())
     ts = cal.date_to_session(today, direction="previous")
     return ts.date()
+
+
+def snap_to_trading_day(dt: date, direction: str = "backward") -> date:
+    """Find the nearest trading day on or before/after the given date.
+
+    Args:
+        dt: The date to snap.
+        direction: 'backward' snaps to the nearest trading day on or before *dt*.
+                   'forward' snaps to the nearest trading day on or after *dt*.
+
+    Returns:
+        The snapped trading day as a ``date``.
+    """
+    cal = _calendar()
+    ts = pd.Timestamp(dt)
+    if cal.is_session(ts):
+        return dt
+    cal_dir = "previous" if direction == "backward" else "next"
+    return cal.date_to_session(ts, direction=cal_dir).date()

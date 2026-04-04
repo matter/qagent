@@ -18,6 +18,7 @@ from backend.db import get_connection
 from backend.logger import get_logger
 from backend.models.base import ModelBase
 from backend.models.lightgbm_model import LightGBMModel
+from backend.services.calendar_service import snap_to_trading_day
 from backend.services.feature_service import FeatureService
 from backend.services.group_service import GroupService
 from backend.services.label_service import LabelService
@@ -79,6 +80,11 @@ class ModelService:
 
         train_config = train_config or {}
         model_params = model_params or {}
+
+        # ---- Normalize train_config from frontend nested format ----
+        # Frontend sends: { train_period: {start, end}, valid_period: ..., test_period: ... }
+        # Backend expects: { train_start, train_end, valid_start, valid_end, test_start, test_end }
+        train_config = self._normalize_train_config(train_config)
 
         # ---- 1. Resolve tickers ----
         if universe_group_id:
@@ -415,6 +421,47 @@ class ModelService:
         # Drop rows with any NaN
         X = X.dropna()
         return X
+
+    @staticmethod
+    def _normalize_train_config(train_config: dict) -> dict:
+        """Normalize train_config from various frontend formats to flat keys.
+
+        Handles the nested format from the frontend:
+            { train_period: {start, end}, valid_period: {start, end}, test_period: {start, end} }
+        And converts it to the flat format the backend expects:
+            { train_start, train_end, valid_start, valid_end, test_start, test_end }
+        Also snaps all date values to the nearest valid trading day.
+        """
+        result = dict(train_config)
+
+        # Map nested period format to flat keys
+        for period_key, (start_key, end_key) in {
+            "train_period": ("train_start", "train_end"),
+            "valid_period": ("valid_start", "valid_end"),
+            "test_period": ("test_start", "test_end"),
+        }.items():
+            if period_key in result:
+                period = result.pop(period_key)
+                if isinstance(period, dict):
+                    if "start" in period and start_key not in result:
+                        result[start_key] = period["start"]
+                    if "end" in period and end_key not in result:
+                        result[end_key] = period["end"]
+
+        # Snap all date values to nearest trading days
+        from datetime import date as _date
+        date_keys_forward = {"train_start", "valid_start", "test_start"}
+        date_keys_backward = {"train_end", "valid_end", "test_end"}
+        for key in date_keys_forward | date_keys_backward:
+            if key in result and result[key]:
+                try:
+                    dt = _date.fromisoformat(str(result[key]))
+                    direction = "forward" if key in date_keys_forward else "backward"
+                    result[key] = str(snap_to_trading_day(dt, direction=direction))
+                except (ValueError, TypeError):
+                    pass  # leave as-is, will fail downstream with a clear error
+
+        return result
 
     @staticmethod
     def _split_by_dates(

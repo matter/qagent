@@ -18,6 +18,7 @@ import pandas as pd
 
 from backend.db import get_connection
 from backend.logger import get_logger
+from backend.services.calendar_service import snap_to_trading_day
 
 log = get_logger(__name__)
 
@@ -43,6 +44,9 @@ class BacktestConfig:
             self.start_date = date.fromisoformat(self.start_date)
         if isinstance(self.end_date, str):
             self.end_date = date.fromisoformat(self.end_date)
+        # Snap to valid trading days so weekends/holidays don't cause empty ranges
+        self.start_date = snap_to_trading_day(self.start_date, direction="forward")
+        self.end_date = snap_to_trading_day(self.end_date, direction="backward")
 
     def to_dict(self) -> dict:
         return {

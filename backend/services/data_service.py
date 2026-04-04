@@ -14,7 +14,7 @@ from backend.db import get_connection
 from backend.logger import get_logger
 from backend.providers.base import DataProvider
 from backend.providers.yfinance_provider import YFinanceProvider
-from backend.services.calendar_service import get_latest_trading_day, get_trading_days
+from backend.services.calendar_service import get_latest_trading_day, get_trading_days, snap_to_trading_day
 
 log = get_logger(__name__)
 
@@ -54,6 +54,30 @@ class DataService:
         started_at = datetime.utcnow()
         conn = get_connection()
 
+        # --- For incremental mode, check if data is already up to date ---
+        if mode == "incremental":
+            latest_completed = get_latest_trading_day()
+            max_bar_row = conn.execute(
+                "SELECT MAX(date) FROM daily_bars"
+            ).fetchone()
+            if max_bar_row and max_bar_row[0]:
+                max_bar_date = max_bar_row[0]
+                if isinstance(max_bar_date, str):
+                    max_bar_date = date.fromisoformat(max_bar_date)
+                elif hasattr(max_bar_date, "date") and callable(max_bar_date.date):
+                    max_bar_date = max_bar_date.date()
+                if max_bar_date >= latest_completed:
+                    log.info("data.update.already_up_to_date", max_date=str(max_bar_date))
+                    return {
+                        "run_id": run_id,
+                        "mode": mode,
+                        "total": 0,
+                        "success": 0,
+                        "failed": 0,
+                        "duration_seconds": 0.0,
+                        "message": "Data is already up to date",
+                    }
+
         # Log the start
         conn.execute(
             """INSERT INTO data_update_log
@@ -64,11 +88,15 @@ class DataService:
         )
 
         try:
-            # --- Step 1: Update stock list ---
+            # --- Step 1: Update stock list (skip if updated within 24 hours) ---
             log.info("data.update.stock_list")
-            stock_df = self._provider.get_stock_list()
-            self._upsert_stocks(stock_df)
-            tickers = stock_df["ticker"].tolist()
+            if mode == "incremental" and self._stock_list_is_fresh(conn):
+                log.info("data.update.stock_list.cached", msg="Stock list updated within 24h, skipping")
+                tickers = [r[0] for r in conn.execute("SELECT ticker FROM stocks").fetchall()]
+            else:
+                stock_df = self._provider.get_stock_list()
+                self._upsert_stocks(stock_df)
+                tickers = stock_df["ticker"].tolist()
 
             # --- Step 2: Determine date ranges ---
             end_date = get_latest_trading_day()
@@ -396,6 +424,20 @@ class DataService:
                 result[t] = date(end_date.year - _FULL_HISTORY_YEARS, 1, 1)
 
         return result
+
+    @staticmethod
+    def _stock_list_is_fresh(conn) -> bool:
+        """Return True if the stocks table was updated within the last 24 hours."""
+        row = conn.execute(
+            "SELECT MAX(updated_at) FROM stocks"
+        ).fetchone()
+        if row and row[0]:
+            last_updated = row[0]
+            if isinstance(last_updated, str):
+                last_updated = datetime.fromisoformat(last_updated)
+            if (datetime.utcnow() - last_updated) < timedelta(hours=24):
+                return True
+        return False
 
     def _load_progress(self) -> dict | None:
         """Load resume progress from disk."""

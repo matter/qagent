@@ -80,7 +80,28 @@ class FactorEvalService:
             factor_id, tickers, start_date, end_date
         )
         if factor_df.empty:
-            raise ValueError("Factor computation produced no data")
+            tickers_with_data = 0
+            log.warning(
+                "factor_eval.no_factor_data",
+                factor_id=factor_id,
+                universe_size=len(tickers),
+                tickers_with_data=tickers_with_data,
+                start=start_date,
+                end=end_date,
+            )
+            raise ValueError(
+                f"Factor computation produced no data. "
+                f"Universe had {len(tickers)} tickers, date range {start_date} to {end_date}. "
+                f"Check that daily_bars has data for this period."
+            )
+        else:
+            tickers_with_data = factor_df.notna().any().sum()
+            log.info(
+                "factor_eval.factor_data",
+                universe_size=len(tickers),
+                tickers_with_data=int(tickers_with_data),
+                dates=len(factor_df),
+            )
 
         factor_def = self._factor_service.get_factor(factor_id)
 
@@ -89,7 +110,10 @@ class FactorEvalService:
             label_id, tickers, start_date, end_date
         )
         if label_long.empty:
-            raise ValueError("Label computation produced no data")
+            raise ValueError(
+                f"Label computation produced no data. "
+                f"Universe had {len(tickers)} tickers, date range {start_date} to {end_date}."
+            )
 
         label_def = self._label_service.get_label(label_id)
 
@@ -103,7 +127,9 @@ class FactorEvalService:
 
         if len(common_dates) == 0 or len(common_tickers) == 0:
             raise ValueError(
-                "No overlapping dates/tickers between factor and label data"
+                f"No overlapping dates/tickers between factor and label data. "
+                f"Factor dates: {len(factor_df.index)}, label dates: {len(label_df.index)}, "
+                f"factor tickers: {len(factor_df.columns)}, label tickers: {len(label_df.columns)}."
             )
 
         factor_aligned = factor_df.loc[common_dates, common_tickers].sort_index()
@@ -113,6 +139,7 @@ class FactorEvalService:
             "factor_eval.aligned",
             dates=len(common_dates),
             tickers=len(common_tickers),
+            universe_total=len(tickers),
         )
 
         # --- 5. Calculate metrics ---

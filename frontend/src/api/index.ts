@@ -137,6 +137,11 @@ export async function refreshGroup(groupId: string): Promise<StockGroup> {
   return data;
 }
 
+export async function refreshIndexGroups() {
+  const { data } = await client.post('/groups/refresh-indices');
+  return data;
+}
+
 // ---- Factor Types ----
 
 export interface Factor {
