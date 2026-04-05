@@ -216,6 +216,7 @@ CREATE TABLE IF NOT EXISTS backtest_results (
     drawdown_series JSON,
     monthly_returns JSON,
     trade_count     INTEGER,
+    trades          JSON,
     result_level    VARCHAR DEFAULT 'exploratory',
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

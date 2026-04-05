@@ -439,6 +439,35 @@ export interface BacktestResultDetail extends BacktestResultSummary {
   benchmark_nav: Array<{ date: string; value: number }> | null;
   drawdown_series: Array<{ date: string; value: number }> | null;
   monthly_returns: Record<string, Record<string, number>> | null;
+  trades: TradeRecord[] | null;
+  stock_pnl: StockPnL[] | null;
+}
+
+export interface TradeRecord {
+  date: string;
+  ticker: string;
+  action: "buy" | "sell";
+  shares: number;
+  price: number;
+  cost: number;
+}
+
+export interface StockPnL {
+  ticker: string;
+  buy_count: number;
+  sell_count: number;
+  total_buy_value: number;
+  total_sell_value: number;
+  realized_pnl: number;
+  pnl_pct: number;
+  win_count: number;
+  loss_count: number;
+}
+
+export interface StockChartData {
+  ticker: string;
+  daily_bars: Array<{ date: string; open: number; high: number; low: number; close: number; volume: number }>;
+  trades: Array<{ date: string; action: string; shares: number; price: number; cost: number }>;
 }
 
 // ---- Strategy API ----
@@ -513,6 +542,11 @@ export async function getBacktest(backtestId: string): Promise<BacktestResultDet
 
 export async function deleteBacktest(backtestId: string) {
   const { data } = await client.delete(`/strategies/backtests/${backtestId}`);
+  return data;
+}
+
+export async function getBacktestStockChart(backtestId: string, ticker: string): Promise<StockChartData> {
+  const { data } = await client.get<StockChartData>(`/strategies/backtests/${backtestId}/stock/${ticker}`);
   return data;
 }
 

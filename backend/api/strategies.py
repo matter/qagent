@@ -147,6 +147,16 @@ async def delete_backtest(backtest_id: str) -> dict:
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.get("/strategies/backtests/{backtest_id}/stock/{ticker}")
+async def get_backtest_stock_chart(backtest_id: str, ticker: str) -> dict:
+    """Get daily bars and trade markers for a single stock within a backtest."""
+    svc = _get_backtest_service()
+    try:
+        return svc.get_stock_chart_data(backtest_id, ticker)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 @router.post("/strategies/backtests/compare")
 async def compare_backtests(body: CompareBacktestsRequest) -> dict:
     """Compare multiple backtest results."""

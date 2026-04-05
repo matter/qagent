@@ -292,7 +292,8 @@ class BacktestService:
         row = conn.execute(
             """SELECT id, strategy_id, config, summary,
                       nav_series, benchmark_nav, drawdown_series,
-                      monthly_returns, trade_count, result_level, created_at
+                      monthly_returns, trade_count, result_level, created_at,
+                      trades
                FROM backtest_results
                WHERE id = ?""",
             [backtest_id],
@@ -300,6 +301,8 @@ class BacktestService:
 
         if row is None:
             raise ValueError(f"Backtest {backtest_id} not found")
+
+        trades = _parse_json(row[11]) if row[11] else []
 
         return {
             "id": row[0],
@@ -313,6 +316,8 @@ class BacktestService:
             "trade_count": row[8],
             "result_level": row[9],
             "created_at": str(row[10]) if row[10] else None,
+            "trades": trades,
+            "stock_pnl": _compute_stock_pnl(trades if isinstance(trades, list) else []),
         }
 
     def delete_backtest(self, backtest_id: str) -> None:
@@ -326,6 +331,66 @@ class BacktestService:
 
         conn.execute("DELETE FROM backtest_results WHERE id = ?", [backtest_id])
         log.info("backtest_service.deleted", backtest_id=backtest_id)
+
+    def get_stock_chart_data(self, backtest_id: str, ticker: str) -> dict:
+        """Return daily bars and trade markers for a single stock within a backtest.
+
+        Used to render a K-line chart with buy/sell markers.
+        """
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT config, trades FROM backtest_results WHERE id = ?",
+            [backtest_id],
+        ).fetchone()
+
+        if row is None:
+            raise ValueError(f"Backtest {backtest_id} not found")
+
+        config = _parse_json(row[0])
+        all_trades = _parse_json(row[1]) if row[1] else []
+
+        start_date = config.get("start_date", "2020-01-01")
+        end_date = config.get("end_date", "2024-12-31")
+
+        # Fetch daily bars for this ticker in the backtest range
+        bars = conn.execute(
+            """SELECT date, open, high, low, close, volume
+               FROM daily_bars
+               WHERE ticker = ? AND date >= ? AND date <= ?
+               ORDER BY date""",
+            [ticker, start_date, end_date],
+        ).fetchall()
+
+        daily_bars = [
+            {
+                "date": str(r[0]),
+                "open": r[1],
+                "high": r[2],
+                "low": r[3],
+                "close": r[4],
+                "volume": r[5],
+            }
+            for r in bars
+        ]
+
+        # Filter trades for this ticker
+        ticker_trades = [
+            {
+                "date": t["date"],
+                "action": t["action"],
+                "shares": t["shares"],
+                "price": t["price"],
+                "cost": t.get("cost", 0),
+            }
+            for t in all_trades
+            if isinstance(t, dict) and t.get("ticker") == ticker
+        ]
+
+        return {
+            "ticker": ticker,
+            "daily_bars": daily_bars,
+            "trades": ticker_trades,
+        }
 
     def compare_strategies(self, backtest_ids: list[str]) -> dict:
         """Compare multiple backtest results.
@@ -533,12 +598,15 @@ class BacktestService:
             "values": result.drawdown,
         }
 
+        # Cap trades at 10000 to avoid huge JSON blobs
+        trades_to_save = result.trades[:10000] if len(result.trades) > 10000 else result.trades
+
         conn.execute(
             """INSERT INTO backtest_results
                (id, strategy_id, config, summary,
                 nav_series, benchmark_nav, drawdown_series,
-                monthly_returns, trade_count, result_level, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                monthly_returns, trade_count, trades, result_level, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 bt_id,
                 strategy_id,
@@ -549,6 +617,7 @@ class BacktestService:
                 json.dumps(drawdown_data, default=str),
                 json.dumps(result.monthly_returns, default=str),
                 result.total_trades,
+                json.dumps(trades_to_save, default=str),
                 result_level,
                 now,
             ],
@@ -569,6 +638,78 @@ def _parse_json(raw) -> dict | list:
         except (json.JSONDecodeError, TypeError):
             return {}
     return raw if raw else {}
+
+
+def _compute_stock_pnl(trades: list[dict]) -> list[dict]:
+    """Compute per-stock P&L statistics from a trade log.
+
+    Groups trades by ticker and computes realized P&L using FIFO matching
+    of buy/sell pairs.
+
+    Returns a list sorted by realized_pnl descending.
+    """
+    if not trades:
+        return []
+
+    from collections import defaultdict
+    from datetime import date as _date, datetime as _dt
+
+    # Group trades by ticker
+    by_ticker: dict[str, list[dict]] = defaultdict(list)
+    for t in trades:
+        by_ticker[t["ticker"]].append(t)
+
+    results: list[dict] = []
+
+    for ticker, ticker_trades in by_ticker.items():
+        buy_count = 0
+        sell_count = 0
+        total_buy_value = 0.0
+        total_sell_value = 0.0
+        win_count = 0
+        loss_count = 0
+        realized_pnl = 0.0
+
+        # FIFO queue for open buy positions
+        open_buys: list[dict] = []
+
+        for trade in ticker_trades:
+            value = trade["shares"] * trade["price"]
+            if trade["action"] == "buy":
+                buy_count += 1
+                total_buy_value += value
+                open_buys.append(trade)
+            elif trade["action"] == "sell":
+                sell_count += 1
+                total_sell_value += value
+                # Match against earliest open buy (FIFO)
+                if open_buys:
+                    buy_trade = open_buys.pop(0)
+                    pnl = (trade["price"] - buy_trade["price"]) * trade["shares"]
+                    pnl -= trade.get("cost", 0) + buy_trade.get("cost", 0)
+                    realized_pnl += pnl
+                    if pnl > 0:
+                        win_count += 1
+                    else:
+                        loss_count += 1
+
+        pnl_pct = (realized_pnl / total_buy_value * 100) if total_buy_value > 0 else 0.0
+
+        results.append({
+            "ticker": ticker,
+            "buy_count": buy_count,
+            "sell_count": sell_count,
+            "total_buy_value": round(total_buy_value, 2),
+            "total_sell_value": round(total_sell_value, 2),
+            "realized_pnl": round(realized_pnl, 2),
+            "pnl_pct": round(pnl_pct, 2),
+            "win_count": win_count,
+            "loss_count": loss_count,
+        })
+
+    # Sort by realized_pnl descending
+    results.sort(key=lambda x: x["realized_pnl"], reverse=True)
+    return results
 
 
 def _cap_weights(

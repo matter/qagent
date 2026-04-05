@@ -34,6 +34,8 @@ import {
   NavCurveChart,
   DrawdownChart,
   MonthlyReturnsHeatmap,
+  TradeLogTable,
+  StockPnLTable,
 } from "./BacktestCharts";
 
 const { Text } = Typography;
@@ -318,6 +320,8 @@ export default function BacktestRunnerPanel({ onBacktestComplete }: BacktestRunn
             <NavCurveChart navSeries={result.nav_series} benchmarkNav={result.benchmark_nav} />
             <DrawdownChart drawdownSeries={result.drawdown_series} />
             <MonthlyReturnsHeatmap monthlyReturns={result.monthly_returns} />
+            <StockPnLTable stockPnl={result.stock_pnl ?? null} backtestId={result.id} />
+            <TradeLogTable trades={result.trades ?? null} />
           </Space>
         )}
       </Space>

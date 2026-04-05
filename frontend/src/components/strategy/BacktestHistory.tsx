@@ -21,6 +21,8 @@ import {
   NavCurveChart,
   DrawdownChart,
   MonthlyReturnsHeatmap,
+  TradeLogTable,
+  StockPnLTable,
 } from "./BacktestCharts";
 
 const { Text } = Typography;
@@ -203,6 +205,8 @@ export default function BacktestHistory({ refreshKey }: BacktestHistoryProps) {
             <NavCurveChart navSeries={detail.nav_series} benchmarkNav={detail.benchmark_nav} />
             <DrawdownChart drawdownSeries={detail.drawdown_series} />
             <MonthlyReturnsHeatmap monthlyReturns={detail.monthly_returns} />
+            <StockPnLTable stockPnl={detail.stock_pnl ?? null} backtestId={detail.id} />
+            <TradeLogTable trades={detail.trades ?? null} />
           </Space>
         ) : null}
       </Modal>

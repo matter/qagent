@@ -1,6 +1,12 @@
-import { Card, Col, Row, Statistic } from "antd";
+import { useState, useMemo } from "react";
+import { Card, Col, Row, Statistic, Table, Tag, Select, Typography } from "antd";
+import type { ColumnsType } from "antd/es/table";
 import ReactECharts from "echarts-for-react";
 import type { EChartsOption } from "echarts";
+import type { TradeRecord, StockPnL } from "../../api";
+import StockTradeChart from "./StockTradeChart";
+
+const { Text } = Typography;
 
 // ---- Helpers to normalize API data shapes ----
 
@@ -393,5 +399,245 @@ export function MonthlyReturnsHeatmap({
     >
       <ReactECharts option={option} style={{ height }} notMerge lazyUpdate />
     </Card>
+  );
+}
+
+// ---- Trade Log Table ----
+
+interface TradeLogProps {
+  trades: TradeRecord[] | null;
+}
+
+export function TradeLogTable({ trades }: TradeLogProps) {
+  const [tickerFilter, setTickerFilter] = useState<string | undefined>(undefined);
+
+  const allTickers = useMemo(() => {
+    if (!trades) return [];
+    const s = new Set(trades.map((t) => t.ticker));
+    return Array.from(s).sort();
+  }, [trades]);
+
+  const filtered = useMemo(() => {
+    if (!trades) return [];
+    if (!tickerFilter) return trades;
+    return trades.filter((t) => t.ticker === tickerFilter);
+  }, [trades, tickerFilter]);
+
+  if (!trades || trades.length === 0) return null;
+
+  const columns: ColumnsType<TradeRecord> = [
+    {
+      title: "日期",
+      dataIndex: "date",
+      key: "date",
+      width: 110,
+      sorter: (a, b) => a.date.localeCompare(b.date),
+    },
+    {
+      title: "股票",
+      dataIndex: "ticker",
+      key: "ticker",
+      width: 90,
+    },
+    {
+      title: "方向",
+      dataIndex: "action",
+      key: "action",
+      width: 70,
+      render: (action: string) =>
+        action === "buy" ? (
+          <Tag color="green">买入</Tag>
+        ) : (
+          <Tag color="red">卖出</Tag>
+        ),
+    },
+    {
+      title: "数量",
+      dataIndex: "shares",
+      key: "shares",
+      width: 100,
+      align: "right",
+      render: (v: number) => v.toFixed(2),
+    },
+    {
+      title: "价格",
+      dataIndex: "price",
+      key: "price",
+      width: 100,
+      align: "right",
+      render: (v: number) => v.toFixed(2),
+    },
+    {
+      title: "费用",
+      dataIndex: "cost",
+      key: "cost",
+      width: 90,
+      align: "right",
+      render: (v: number) => v.toFixed(2),
+    },
+  ];
+
+  return (
+    <Card
+      title={`交易记录 (${trades.length} 条)`}
+      size="small"
+      style={{ background: "rgba(0,0,0,0.2)" }}
+      extra={
+        <Select
+          allowClear
+          placeholder="筛选股票"
+          style={{ width: 140 }}
+          size="small"
+          value={tickerFilter}
+          onChange={setTickerFilter}
+          options={allTickers.map((t) => ({ value: t, label: t }))}
+          showSearch
+        />
+      }
+    >
+      <Table
+        dataSource={filtered}
+        columns={columns}
+        rowKey={(_, idx) => String(idx)}
+        size="small"
+        pagination={{ pageSize: 20, showSizeChanger: true, pageSizeOptions: [20, 50, 100] }}
+      />
+    </Card>
+  );
+}
+
+// ---- Stock P&L Table ----
+
+interface StockPnLTableProps {
+  stockPnl: StockPnL[] | null;
+  backtestId?: string;
+}
+
+export function StockPnLTable({ stockPnl, backtestId }: StockPnLTableProps) {
+  const [chartOpen, setChartOpen] = useState(false);
+  const [selectedTicker, setSelectedTicker] = useState("");
+
+  if (!stockPnl || stockPnl.length === 0) return null;
+
+  const handleTickerClick = (ticker: string) => {
+    if (!backtestId) return;
+    setSelectedTicker(ticker);
+    setChartOpen(true);
+  };
+
+  const columns: ColumnsType<StockPnL> = [
+    {
+      title: "股票",
+      dataIndex: "ticker",
+      key: "ticker",
+      width: 90,
+      render: (ticker: string) => (
+        <a
+          onClick={(e) => {
+            e.stopPropagation();
+            handleTickerClick(ticker);
+          }}
+          style={{ cursor: backtestId ? "pointer" : "default" }}
+        >
+          {ticker}
+        </a>
+      ),
+    },
+    {
+      title: "买入次数",
+      dataIndex: "buy_count",
+      key: "buy_count",
+      width: 80,
+      align: "right",
+    },
+    {
+      title: "卖出次数",
+      dataIndex: "sell_count",
+      key: "sell_count",
+      width: 80,
+      align: "right",
+    },
+    {
+      title: "买入总额",
+      dataIndex: "total_buy_value",
+      key: "total_buy_value",
+      width: 120,
+      align: "right",
+      render: (v: number) => v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+    },
+    {
+      title: "卖出总额",
+      dataIndex: "total_sell_value",
+      key: "total_sell_value",
+      width: 120,
+      align: "right",
+      render: (v: number) => v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+    },
+    {
+      title: "已实现盈亏",
+      dataIndex: "realized_pnl",
+      key: "realized_pnl",
+      width: 120,
+      align: "right",
+      defaultSortOrder: "descend",
+      sorter: (a, b) => a.realized_pnl - b.realized_pnl,
+      render: (v: number) => (
+        <Text style={{ color: v > 0 ? "#52c41a" : v < 0 ? "#ff4d4f" : "#aaa" }}>
+          {v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+        </Text>
+      ),
+    },
+    {
+      title: "盈亏%",
+      dataIndex: "pnl_pct",
+      key: "pnl_pct",
+      width: 90,
+      align: "right",
+      sorter: (a, b) => a.pnl_pct - b.pnl_pct,
+      render: (v: number) => (
+        <Text style={{ color: v > 0 ? "#52c41a" : v < 0 ? "#ff4d4f" : "#aaa" }}>
+          {v.toFixed(2)}%
+        </Text>
+      ),
+    },
+    {
+      title: "胜/负",
+      key: "win_loss",
+      width: 80,
+      align: "center",
+      render: (_: unknown, r: StockPnL) => (
+        <span>
+          <Text style={{ color: "#52c41a" }}>{r.win_count}</Text>
+          {" / "}
+          <Text style={{ color: "#ff4d4f" }}>{r.loss_count}</Text>
+        </span>
+      ),
+    },
+  ];
+
+  return (
+    <>
+      <Card
+        title={`个股盈亏 (${stockPnl.length} 只)`}
+        size="small"
+        style={{ background: "rgba(0,0,0,0.2)" }}
+      >
+        <Table
+          dataSource={stockPnl}
+          columns={columns}
+          rowKey="ticker"
+          size="small"
+          pagination={{ pageSize: 20, showSizeChanger: true, pageSizeOptions: [20, 50, 100] }}
+        />
+      </Card>
+      {backtestId && (
+        <StockTradeChart
+          open={chartOpen}
+          onClose={() => setChartOpen(false)}
+          backtestId={backtestId}
+          ticker={selectedTicker}
+        />
+      )}
+    </>
   );
 }
