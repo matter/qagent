@@ -34,3 +34,4 @@ logs/
 .backend.pid
 .frontend.pid
 uv.lock
+data/backup/
