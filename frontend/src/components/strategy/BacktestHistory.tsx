@@ -117,7 +117,7 @@ export default function BacktestHistory({ refreshKey }: BacktestHistoryProps) {
       key: "sharpe",
       width: 80,
       render: (_: unknown, r: BacktestRow) => {
-        const v = r.summary?.sharpe;
+        const v = r.summary?.sharpe ?? r.summary?.sharpe_ratio;
         if (v === undefined || v === null) return "-";
         return (
           <Text style={{ color: v > 1 ? "#52c41a" : v > 0 ? "#1677ff" : "#ff4d4f" }}>

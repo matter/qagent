@@ -1,7 +1,46 @@
 import { Card, Col, Row, Statistic } from "antd";
 import ReactECharts from "echarts-for-react";
 import type { EChartsOption } from "echarts";
-import type { BacktestResultDetail } from "../../api";
+
+// ---- Helpers to normalize API data shapes ----
+
+interface NavPoint { date: string; value: number }
+type NavInput = NavPoint[] | { dates: string[]; values: number[] } | null | undefined;
+
+function normalizeTimeSeries(input: NavInput): NavPoint[] {
+  if (!input) return [];
+  if (Array.isArray(input)) return input;
+  // {dates: [...], values: [...]} format
+  if (input.dates && input.values) {
+    return input.dates.map((d: string, i: number) => ({ date: d, value: input.values[i] }));
+  }
+  return [];
+}
+
+type MonthlyInput = Array<{ year: number; month: number; return: number }> | Record<string, Record<string, number>> | null | undefined;
+
+function normalizeMonthlyReturns(input: MonthlyInput): Record<string, Record<string, number>> {
+  if (!input) return {};
+  if (Array.isArray(input)) {
+    // [{year, month, return}, ...] -> {year: {month: value}}
+    const result: Record<string, Record<string, number>> = {};
+    for (const item of input) {
+      const y = String(item.year);
+      if (!result[y]) result[y] = {};
+      result[y][String(item.month)] = item.return;
+    }
+    return result;
+  }
+  return input;
+}
+
+// Normalize summary keys (API uses sharpe_ratio, calmar_ratio, etc.)
+function normalizeSummaryKey(summary: Record<string, number>, key: string): number | undefined {
+  if (summary[key] !== undefined) return summary[key];
+  // Try _ratio suffix
+  if (summary[key + "_ratio"] !== undefined) return summary[key + "_ratio"];
+  return undefined;
+}
 
 // ---- Summary Cards ----
 
@@ -74,7 +113,7 @@ export function BacktestSummaryCards({ summary }: BacktestSummaryCardsProps) {
   return (
     <Row gutter={[12, 12]}>
       {items.map((item) => {
-        const raw = summary[item.key];
+        const raw = normalizeSummaryKey(summary, item.key);
         if (raw === undefined || raw === null) return null;
         const v = item.multiply ? raw * 100 : raw;
         const color = item.colorFn ? item.colorFn(raw) : undefined;
@@ -102,14 +141,16 @@ export function NavCurveChart({
   navSeries,
   benchmarkNav,
 }: {
-  navSeries: BacktestResultDetail["nav_series"];
-  benchmarkNav: BacktestResultDetail["benchmark_nav"];
+  navSeries: NavInput;
+  benchmarkNav: NavInput;
 }) {
-  if (!navSeries || navSeries.length === 0) return null;
+  const nav = normalizeTimeSeries(navSeries);
+  const bench = normalizeTimeSeries(benchmarkNav);
+  if (nav.length === 0) return null;
 
-  const dates = navSeries.map((d) => d.date);
-  const strategyValues = navSeries.map((d) => d.value);
-  const benchmarkValues = benchmarkNav?.map((d) => d.value) ?? [];
+  const dates = nav.map((d) => d.date);
+  const strategyValues = nav.map((d) => d.value);
+  const benchmarkValues = bench.map((d) => d.value);
 
   const option: EChartsOption = {
     animation: false,
@@ -179,12 +220,13 @@ export function NavCurveChart({
 export function DrawdownChart({
   drawdownSeries,
 }: {
-  drawdownSeries: BacktestResultDetail["drawdown_series"];
+  drawdownSeries: NavInput;
 }) {
-  if (!drawdownSeries || drawdownSeries.length === 0) return null;
+  const dd = normalizeTimeSeries(drawdownSeries);
+  if (dd.length === 0) return null;
 
-  const dates = drawdownSeries.map((d) => d.date);
-  const values = drawdownSeries.map((d) => +(d.value * 100).toFixed(3));
+  const dates = dd.map((d) => d.date);
+  const values = dd.map((d) => +(d.value * 100).toFixed(3));
 
   const option: EChartsOption = {
     animation: false,
@@ -247,11 +289,12 @@ export function DrawdownChart({
 export function MonthlyReturnsHeatmap({
   monthlyReturns,
 }: {
-  monthlyReturns: BacktestResultDetail["monthly_returns"];
+  monthlyReturns: MonthlyInput;
 }) {
-  if (!monthlyReturns || Object.keys(monthlyReturns).length === 0) return null;
+  const normalized = normalizeMonthlyReturns(monthlyReturns);
+  if (Object.keys(normalized).length === 0) return null;
 
-  const years = Object.keys(monthlyReturns).sort();
+  const years = Object.keys(normalized).sort();
   const months = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"];
   const monthLabels = ["1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月"];
 
@@ -260,7 +303,7 @@ export function MonthlyReturnsHeatmap({
   let maxVal = 0;
 
   for (let yi = 0; yi < years.length; yi++) {
-    const yearData = monthlyReturns[years[yi]];
+    const yearData = normalized[years[yi]];
     for (let mi = 0; mi < 12; mi++) {
       const v = yearData?.[months[mi]] ?? null;
       if (v !== null) {
