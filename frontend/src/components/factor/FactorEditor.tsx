@@ -149,18 +149,36 @@ export default function FactorEditor({ editingFactor, onFactorSaved }: FactorEdi
     try {
       let factor: Factor;
       if (currentFactor) {
+        // Update existing factor
         factor = await updateFactor(currentFactor.id, {
           source_code: code,
           description: description || undefined,
           category,
         });
       } else {
-        factor = await createFactor({
-          name: factorName,
-          source_code: code,
-          description: description || undefined,
-          category,
-        });
+        // Try create; if name already exists (400), find it and update instead
+        try {
+          factor = await createFactor({
+            name: factorName,
+            source_code: code,
+            description: description || undefined,
+            category,
+          });
+        } catch {
+          // Name conflict - find existing factor and update it
+          const { listFactors } = await import("../../api");
+          const all = await listFactors();
+          const existing = all.find((f) => f.name === factorName);
+          if (existing) {
+            factor = await updateFactor(existing.id, {
+              source_code: code,
+              description: description || undefined,
+              category,
+            });
+          } else {
+            throw new Error("保存失败：因子名称冲突");
+          }
+        }
       }
       setCurrentFactor(factor);
       messageApi.success("因子已保存");
