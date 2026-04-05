@@ -3,6 +3,7 @@ import {
   Button,
   Card,
   Col,
+  Descriptions,
   message,
   Modal,
   Popconfirm,
@@ -22,10 +23,18 @@ const { Text } = Typography;
 
 const STATUS_TAG: Record<string, { color: string; label: string }> = {
   training: { color: "processing", label: "训练中" },
+  trained: { color: "success", label: "已训练" },
   ready: { color: "success", label: "就绪" },
   failed: { color: "error", label: "失败" },
   archived: { color: "warning", label: "已归档" },
 };
+
+function metricVal(r: Model, key: string): number | undefined {
+  const em = r.eval_metrics as Record<string, unknown> | null;
+  if (!em) return undefined;
+  const v = em[key] as number | undefined;
+  return v ?? undefined;
+}
 
 interface ModelListProps {
   refreshKey?: number;
@@ -82,6 +91,8 @@ export default function ModelList({ refreshKey }: ModelListProps) {
 
   const metrics = detailModel?.eval_metrics as Record<string, unknown> | null;
   const featureImportance = (metrics?.feature_importance ?? null) as Record<string, number> | null;
+  const trainConfig = detailModel?.train_config as Record<string, string> | null;
+  const modelParams = detailModel?.model_params as Record<string, string | number> | null;
 
   const columns = [
     {
@@ -89,37 +100,21 @@ export default function ModelList({ refreshKey }: ModelListProps) {
       dataIndex: "name",
       key: "name",
       render: (name: string, record: Model) => (
-        <a onClick={() => handleRowClick(record)}>{name}</a>
+        <a onClick={(e) => { e.stopPropagation(); handleRowClick(record); }}>{name}</a>
       ),
-    },
-    {
-      title: "特征集",
-      dataIndex: "feature_set_id",
-      key: "feature_set_id",
-      width: 120,
-      ellipsis: true,
-      render: (v: string) => <Text type="secondary">{v?.slice(0, 8)}...</Text>,
-    },
-    {
-      title: "标签",
-      dataIndex: "label_id",
-      key: "label_id",
-      width: 120,
-      ellipsis: true,
-      render: (v: string) => <Text type="secondary">{v?.slice(0, 8)}...</Text>,
     },
     {
       title: "类型",
       dataIndex: "model_type",
       key: "model_type",
-      width: 100,
+      width: 90,
       render: (v: string) => <Tag color="blue">{v}</Tag>,
     },
     {
       title: "状态",
       dataIndex: "status",
       key: "status",
-      width: 90,
+      width: 80,
       render: (s: string) => {
         const cfg = STATUS_TAG[s] ?? { color: "default", label: s };
         return <Tag color={cfg.color}>{cfg.label}</Tag>;
@@ -127,12 +122,12 @@ export default function ModelList({ refreshKey }: ModelListProps) {
     },
     {
       title: "IC",
-      key: "ic",
+      key: "ic_mean",
       width: 80,
+      sorter: (a: Model, b: Model) => (metricVal(a, "ic_mean") ?? 0) - (metricVal(b, "ic_mean") ?? 0),
       render: (_: unknown, r: Model) => {
-        const em = r.eval_metrics as Record<string, unknown> | null;
-        const v = em?.ic_mean as number | undefined;
-        if (v === undefined || v === null) return <Text type="secondary">-</Text>;
+        const v = metricVal(r, "ic_mean");
+        if (v === undefined) return <Text type="secondary">-</Text>;
         return (
           <Text style={{ color: v > 0 ? "#52c41a" : "#ff4d4f" }}>
             {v.toFixed(4)}
@@ -141,13 +136,73 @@ export default function ModelList({ refreshKey }: ModelListProps) {
       },
     },
     {
+      title: "IR",
+      key: "ir",
+      width: 70,
+      sorter: (a: Model, b: Model) => (metricVal(a, "ir") ?? 0) - (metricVal(b, "ir") ?? 0),
+      render: (_: unknown, r: Model) => {
+        const v = metricVal(r, "ir");
+        if (v === undefined) return <Text type="secondary">-</Text>;
+        return (
+          <Text style={{ color: v > 1 ? "#52c41a" : v > 0 ? "#1677ff" : "#ff4d4f" }}>
+            {v.toFixed(3)}
+          </Text>
+        );
+      },
+    },
+    {
       title: "Sharpe",
       key: "sharpe",
       width: 80,
+      sorter: (a: Model, b: Model) => (metricVal(a, "sharpe") ?? 0) - (metricVal(b, "sharpe") ?? 0),
       render: (_: unknown, r: Model) => {
-        const em = r.eval_metrics as Record<string, unknown> | null;
-        const v = em?.sharpe as number | undefined;
-        if (v === undefined || v === null) return <Text type="secondary">-</Text>;
+        const v = metricVal(r, "sharpe");
+        if (v === undefined) return <Text type="secondary">-</Text>;
+        return (
+          <Text style={{ color: v > 1 ? "#52c41a" : v > 0 ? "#1677ff" : "#ff4d4f" }}>
+            {v.toFixed(3)}
+          </Text>
+        );
+      },
+    },
+    {
+      title: "年化收益",
+      key: "annual_return",
+      width: 90,
+      sorter: (a: Model, b: Model) => (metricVal(a, "annual_return") ?? 0) - (metricVal(b, "annual_return") ?? 0),
+      render: (_: unknown, r: Model) => {
+        const v = metricVal(r, "annual_return");
+        if (v === undefined) return <Text type="secondary">-</Text>;
+        return (
+          <Text style={{ color: v > 0 ? "#52c41a" : "#ff4d4f" }}>
+            {(v * 100).toFixed(2)}%
+          </Text>
+        );
+      },
+    },
+    {
+      title: "最大回撤",
+      key: "max_drawdown",
+      width: 90,
+      sorter: (a: Model, b: Model) => (metricVal(a, "max_drawdown") ?? 0) - (metricVal(b, "max_drawdown") ?? 0),
+      render: (_: unknown, r: Model) => {
+        const v = metricVal(r, "max_drawdown");
+        if (v === undefined) return <Text type="secondary">-</Text>;
+        return (
+          <Text style={{ color: "#ff4d4f" }}>
+            {(v * 100).toFixed(2)}%
+          </Text>
+        );
+      },
+    },
+    {
+      title: "Calmar",
+      key: "calmar",
+      width: 80,
+      sorter: (a: Model, b: Model) => (metricVal(a, "calmar") ?? 0) - (metricVal(b, "calmar") ?? 0),
+      render: (_: unknown, r: Model) => {
+        const v = metricVal(r, "calmar");
+        if (v === undefined) return <Text type="secondary">-</Text>;
         return (
           <Text style={{ color: v > 1 ? "#52c41a" : v > 0 ? "#1677ff" : "#ff4d4f" }}>
             {v.toFixed(3)}
@@ -168,11 +223,33 @@ export default function ModelList({ refreshKey }: ModelListProps) {
       key: "actions",
       width: 80,
       render: (_: unknown, record: Model) => (
-        <Popconfirm title="确定删除此模型?" onConfirm={() => handleDelete(record.id)}>
-          <Button size="small" danger icon={<DeleteOutlined />} />
+        <Popconfirm title="确定删除此模型?" onConfirm={(e) => { e?.stopPropagation(); handleDelete(record.id); }}>
+          <Button size="small" danger icon={<DeleteOutlined />} onClick={(e) => e.stopPropagation()} />
         </Popconfirm>
       ),
     },
+  ];
+
+  // Detail modal metric cards config
+  const metricCards: Array<{
+    key: string;
+    title: string;
+    precision: number;
+    suffix?: string;
+    multiply?: boolean;
+    colorFn?: (v: number) => string;
+  }> = [
+    { key: "ic_mean", title: "IC Mean", precision: 4, colorFn: (v) => (v > 0 ? "#52c41a" : "#ff4d4f") },
+    { key: "ic_std", title: "IC Std", precision: 4 },
+    { key: "ir", title: "IR", precision: 4, colorFn: (v) => (v > 1 ? "#52c41a" : v > 0 ? "#1677ff" : "#ff4d4f") },
+    { key: "sharpe", title: "Sharpe", precision: 3, colorFn: (v) => (v > 1 ? "#52c41a" : v > 0 ? "#1677ff" : "#ff4d4f") },
+    { key: "annual_return", title: "年化收益", precision: 2, suffix: "%", multiply: true, colorFn: (v) => (v > 0 ? "#52c41a" : "#ff4d4f") },
+    { key: "max_drawdown", title: "最大回撤", precision: 2, suffix: "%", multiply: true, colorFn: () => "#ff4d4f" },
+    { key: "calmar", title: "Calmar", precision: 3, colorFn: (v) => (v > 1 ? "#52c41a" : v > 0 ? "#1677ff" : "#ff4d4f") },
+    { key: "valid_ic", title: "验证IC", precision: 4, colorFn: (v) => (v > 0 ? "#52c41a" : "#ff4d4f") },
+    { key: "test_ic", title: "测试IC", precision: 4, colorFn: (v) => (v > 0 ? "#52c41a" : "#ff4d4f") },
+    { key: "valid_rmse", title: "验证RMSE", precision: 4 },
+    { key: "test_rmse", title: "测试RMSE", precision: 4 },
   ];
 
   return (
@@ -193,6 +270,7 @@ export default function ModelList({ refreshKey }: ModelListProps) {
           loading={loading}
           size="small"
           pagination={{ pageSize: 15 }}
+          scroll={{ x: 1100 }}
           onRow={(record) => ({
             onClick: () => handleRowClick(record),
             style: { cursor: "pointer" },
@@ -205,7 +283,7 @@ export default function ModelList({ refreshKey }: ModelListProps) {
         open={detailOpen}
         onCancel={() => setDetailOpen(false)}
         footer={null}
-        width={900}
+        width={960}
         destroyOnClose
       >
         {detailLoading ? (
@@ -214,35 +292,79 @@ export default function ModelList({ refreshKey }: ModelListProps) {
           </div>
         ) : detailModel ? (
           <Space direction="vertical" style={{ width: "100%" }} size="middle">
+            {/* Evaluation metrics cards */}
             {metrics && (
               <Row gutter={[12, 12]}>
-                {(["ic_mean", "ic_std", "ir", "sharpe", "annual_return", "max_drawdown"] as const).map((key) => {
-                  const v = metrics[key] as number | undefined;
-                  if (v === undefined || v === null) return null;
-                  const labels: Record<string, string> = {
-                    ic_mean: "IC Mean",
-                    ic_std: "IC Std",
-                    ir: "IR",
-                    sharpe: "Sharpe",
-                    annual_return: "年化收益",
-                    max_drawdown: "最大回撤",
-                  };
-                  const isPercent = key === "annual_return" || key === "max_drawdown";
+                {metricCards.map((item) => {
+                  const raw = metrics[item.key] as number | undefined;
+                  if (raw === undefined || raw === null) return null;
+                  const v = item.multiply ? raw * 100 : raw;
+                  const color = item.colorFn ? item.colorFn(raw) : undefined;
                   return (
-                    <Col xs={12} sm={8} md={4} key={key}>
+                    <Col xs={12} sm={8} md={6} lg={4} key={item.key}>
                       <Card size="small">
                         <Statistic
-                          title={labels[key]}
-                          value={isPercent ? v * 100 : v}
-                          precision={isPercent ? 2 : 4}
-                          suffix={isPercent ? "%" : undefined}
-                          valueStyle={{ fontSize: 18 }}
+                          title={item.title}
+                          value={v}
+                          precision={item.precision}
+                          suffix={item.suffix}
+                          valueStyle={{ fontSize: 18, color }}
                         />
                       </Card>
                     </Col>
                   );
                 })}
               </Row>
+            )}
+
+            {/* Train config + model params */}
+            {(trainConfig || modelParams) && (
+              <Card title="训练配置" size="small">
+                <Row gutter={24}>
+                  {trainConfig && (
+                    <Col span={12}>
+                      <Descriptions column={1} size="small" bordered>
+                        {trainConfig.train_start && (
+                          <Descriptions.Item label="训练区间">
+                            {String(trainConfig.train_start)} ~ {String(trainConfig.train_end)}
+                          </Descriptions.Item>
+                        )}
+                        {trainConfig.valid_start && (
+                          <Descriptions.Item label="验证区间">
+                            {String(trainConfig.valid_start)} ~ {String(trainConfig.valid_end)}
+                          </Descriptions.Item>
+                        )}
+                        {trainConfig.test_start && (
+                          <Descriptions.Item label="测试区间">
+                            {String(trainConfig.test_start)} ~ {String(trainConfig.test_end)}
+                          </Descriptions.Item>
+                        )}
+                        {trainConfig.purge_gap !== undefined && (
+                          <Descriptions.Item label="Purge Gap">
+                            {String(trainConfig.purge_gap)} 天
+                          </Descriptions.Item>
+                        )}
+                        {metrics?.train_samples !== undefined && (
+                          <Descriptions.Item label="样本量">
+                            训练 {String(metrics.train_samples)} / 验证 {String(metrics.valid_samples)} / 测试 {String(metrics.test_samples)}
+                          </Descriptions.Item>
+                        )}
+                      </Descriptions>
+                    </Col>
+                  )}
+                  {modelParams && Object.keys(modelParams).length > 0 && (
+                    <Col span={12}>
+                      <Descriptions column={1} size="small" bordered title="模型参数">
+                        {Object.entries(modelParams).map(([k, v]) => (
+                          <Descriptions.Item key={k} label={k}>
+                            {String(v)}
+                          </Descriptions.Item>
+                        ))}
+                      </Descriptions>
+                    </Col>
+                  )}
+                </Row>
+              </Card>
             )}
 
             {featureImportance && Object.keys(featureImportance).length > 0 && (

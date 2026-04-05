@@ -580,6 +580,25 @@ class ModelService:
                 preds_binary = (preds_test >= 0.5).astype(int)
                 metrics["test_f1"] = round(float(f1_score(y_test, preds_binary, zero_division=0)), 6)
 
+        # ---- Promote daily IC summary to top-level for easy access ----
+        for prefix in ("test", "valid"):
+            daily_key = f"{prefix}_daily_ic"
+            if daily_key in metrics and isinstance(metrics[daily_key], dict):
+                dic = metrics[daily_key]
+                if "mean_ic" in dic and "ic_mean" not in metrics:
+                    metrics["ic_mean"] = dic["mean_ic"]
+                if "std_ic" in dic and "ic_std" not in metrics:
+                    metrics["ic_std"] = dic["std_ic"]
+                if "ir" in dic and "ir" not in metrics:
+                    metrics["ir"] = dic["ir"]
+                break  # prefer test over valid
+
+        # ---- Long-short portfolio metrics (Sharpe, return, drawdown) ----
+        ls_src_y, ls_src_p = (y_test, preds_test) if len(y_test) > 0 else (y_valid, preds_valid)
+        ls_metrics = _compute_long_short_metrics(ls_src_y, ls_src_p)
+        if ls_metrics:
+            metrics.update(ls_metrics)
+
         return metrics
 
     # ------------------------------------------------------------------
@@ -696,4 +715,67 @@ def _compute_daily_ic(y: pd.Series, preds: pd.Series) -> dict:
         "std_ic": round(std_ic, 6),
         "ir": round(ir, 6),
         "num_days": len(daily_ics),
+    }
+
+
+def _compute_long_short_metrics(
+    y: pd.Series, preds: pd.Series
+) -> dict[str, Any]:
+    """Compute long-short portfolio metrics from model predictions.
+
+    On each date, go long the top quintile and short the bottom quintile
+    (by predicted score).  The daily return is the mean return of the long
+    leg minus the mean return of the short leg.
+
+    Returns dict with sharpe, annual_return, max_drawdown, calmar.
+    """
+    if not isinstance(y.index, pd.MultiIndex) or len(y) == 0:
+        return {}
+
+    dates = sorted(y.index.get_level_values("date").unique())
+    if len(dates) < 10:
+        return {}
+
+    daily_returns: list[float] = []
+    for dt in dates:
+        try:
+            y_day = y.xs(dt, level="date")
+            p_day = preds.xs(dt, level="date")
+            common = y_day.index.intersection(p_day.index)
+            if len(common) < 10:
+                continue
+            p_vals = p_day.loc[common]
+            y_vals = y_day.loc[common]
+            n = max(1, len(common) // 5)  # quintile
+            top_idx = p_vals.nlargest(n).index
+            bot_idx = p_vals.nsmallest(n).index
+            ret = float(y_vals.loc[top_idx].mean() - y_vals.loc[bot_idx].mean())
+            daily_returns.append(ret)
+        except (KeyError, ValueError):
+            continue
+
+    if len(daily_returns) < 10:
+        return {}
+
+    arr = np.array(daily_returns)
+    ann_factor = 252
+    mean_ret = float(np.mean(arr))
+    std_ret = float(np.std(arr))
+    annual_return = mean_ret * ann_factor
+    annual_vol = std_ret * np.sqrt(ann_factor)
+    sharpe = float(annual_return / annual_vol) if annual_vol > 0 else 0.0
+
+    # Max drawdown from cumulative returns
+    cum = np.cumsum(arr)
+    running_max = np.maximum.accumulate(cum)
+    drawdowns = running_max - cum
+    max_dd = float(np.max(drawdowns)) if len(drawdowns) > 0 else 0.0
+
+    calmar = float(annual_return / max_dd) if max_dd > 0 else 0.0
+
+    return {
+        "sharpe": round(sharpe, 4),
+        "annual_return": round(annual_return, 6),
+        "max_drawdown": round(max_dd, 6),
+        "calmar": round(calmar, 4),
     }
