@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from io import StringIO
 from pathlib import Path
 
 import pandas as pd
+import requests
 
 from backend.db import get_connection
 from backend.logger import get_logger
@@ -42,49 +44,48 @@ def _validate_filter_expr(expr: str) -> str:
     return expr.strip()
 
 
+_WIKI_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko)"
+}
+
+
+def _wiki_read_html(url: str) -> list[pd.DataFrame]:
+    """Download a Wikipedia page with proper User-Agent and parse HTML tables."""
+    resp = requests.get(url, headers=_WIKI_HEADERS, timeout=20)
+    resp.raise_for_status()
+    return pd.read_html(StringIO(resp.text))
+
+
 def _fetch_index_tickers(index_id: str) -> list[str]:
     """Fetch latest index constituents from Wikipedia. Returns ticker list."""
     try:
         if index_id == "sp500":
             url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-            tables = pd.read_html(url)
+            tables = _wiki_read_html(url)
             df = tables[0]
             tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()
         elif index_id == "nasdaq100":
             url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-            tables = pd.read_html(url)
+            tables = _wiki_read_html(url)
             # Find the table with a "Ticker" or "Symbol" column
             df = None
+            col = None
             for t in tables:
-                cols = [c.lower() for c in t.columns]
-                if "ticker" in cols:
+                str_cols = [c for c in t.columns if isinstance(c, str)]
+                str_cols_lower = [c.lower() for c in str_cols]
+                if "ticker" in str_cols_lower:
                     df = t
-                    col = t.columns[[c.lower() for c in t.columns].index("ticker")]
+                    col = str_cols[str_cols_lower.index("ticker")]
                     break
-                if "symbol" in cols:
+                if "symbol" in str_cols_lower:
                     df = t
-                    col = t.columns[[c.lower() for c in t.columns].index("symbol")]
+                    col = str_cols[str_cols_lower.index("symbol")]
                     break
-            if df is None:
+            if df is None or col is None:
                 log.warning("group.index_fetch.no_table", index=index_id)
                 return []
             tickers = df[col].str.replace(".", "-", regex=False).tolist()
         elif index_id == "russell3000":
-            # Russell 3000 is not on Wikipedia in a clean table.
-            # Use the iShares Russell 3000 ETF holdings page as proxy.
-            # Fallback: return empty and log, user can manually populate.
-            try:
-                url = "https://en.wikipedia.org/wiki/Russell_3000_Index"
-                tables = pd.read_html(url)
-                # Try to find a constituents table
-                for t in tables:
-                    cols = [c.lower() for c in t.columns]
-                    if "ticker" in cols or "symbol" in cols:
-                        col_name = "ticker" if "ticker" in cols else "symbol"
-                        col = t.columns[[c.lower() for c in t.columns].index(col_name)]
-                        return t[col].str.replace(".", "-", regex=False).tolist()
-            except Exception:
-                pass
             # Russell 3000 is ~3000 stocks; approximate with all active NYSE+NASDAQ stocks
             log.info("group.russell3000.using_filter", msg="Using all active stocks as Russell 3000 proxy")
             return []  # Will be created as filter group instead
