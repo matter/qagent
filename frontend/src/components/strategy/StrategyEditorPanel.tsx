@@ -10,11 +10,12 @@ import {
   Space,
   Typography,
 } from "antd";
-import { SaveOutlined } from "@ant-design/icons";
+import { SaveOutlined, CopyOutlined } from "@ant-design/icons";
 import Editor from "@monaco-editor/react";
 import {
   listStrategyTemplates,
   getStrategyTemplate,
+  listStrategies,
   createStrategy,
   updateStrategy,
 } from "../../api";
@@ -95,18 +96,81 @@ export default function StrategyEditorPanel({
         });
         setCurrentStrategy(updated);
       } else {
-        const created = await createStrategy({
-          name: strategyName,
-          source_code: code,
-          description: description || undefined,
-          position_sizing: positionSizing,
-        });
-        setCurrentStrategy(created);
+        // Try create; if name already exists (400), find it and update instead
+        try {
+          const created = await createStrategy({
+            name: strategyName,
+            source_code: code,
+            description: description || undefined,
+            position_sizing: positionSizing,
+          });
+          setCurrentStrategy(created);
+        } catch {
+          const all = await listStrategies();
+          const existing = all.find((s) => s.name === strategyName);
+          if (existing) {
+            const updated = await updateStrategy(existing.id, {
+              source_code: code,
+              description: description || undefined,
+              position_sizing: positionSizing,
+            });
+            setCurrentStrategy(updated);
+          } else {
+            throw new Error("保存失败");
+          }
+        }
       }
       messageApi.success("策略已保存");
       onStrategySaved?.();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "保存失败";
+      messageApi.error(msg);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleSaveAs = async () => {
+    if (!code.trim()) {
+      messageApi.warning("请输入策略代码");
+      return;
+    }
+
+    const newName = strategyName.trim()
+      ? `${strategyName.trim()} (副本)`
+      : "未命名策略 (副本)";
+
+    setStrategyName(newName);
+    setCurrentStrategy(null);
+
+    setSaving(true);
+    try {
+      try {
+        const created = await createStrategy({
+          name: newName,
+          source_code: code,
+          description: description || undefined,
+          position_sizing: positionSizing,
+        });
+        setCurrentStrategy(created);
+      } catch {
+        const all = await listStrategies();
+        const existing = all.find((s) => s.name === newName);
+        if (existing) {
+          const updated = await updateStrategy(existing.id, {
+            source_code: code,
+            description: description || undefined,
+            position_sizing: positionSizing,
+          });
+          setCurrentStrategy(updated);
+        } else {
+          throw new Error("另存为失败");
+        }
+      }
+      messageApi.success("已另存为新策略");
+      onStrategySaved?.();
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "另存为失败";
       messageApi.error(msg);
     } finally {
       setSaving(false);
@@ -194,6 +258,14 @@ export default function StrategyEditorPanel({
               block
             >
               保存策略
+            </Button>
+            <Button
+              icon={<CopyOutlined />}
+              loading={saving}
+              onClick={handleSaveAs}
+              block
+            >
+              另存为新策略
             </Button>
           </Space>
         </Col>

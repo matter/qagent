@@ -3,6 +3,7 @@ import {
   Button,
   Card,
   Col,
+  Collapse,
   DatePicker,
   Input,
   InputNumber,
@@ -54,6 +55,17 @@ export default function TrainConfigPanel({ onTrainComplete }: TrainConfigPanelPr
   const [testEnd, setTestEnd] = useState<Dayjs>(dayjs("2023-12-31"));
   const [purgeGap, setPurgeGap] = useState<number>(5);
 
+  // LightGBM model parameters
+  const [nEstimators, setNEstimators] = useState<number>(200);
+  const [maxDepth, setMaxDepth] = useState<number>(6);
+  const [learningRate, setLearningRate] = useState<number>(0.05);
+  const [numLeaves, setNumLeaves] = useState<number>(31);
+  const [minChildSamples, setMinChildSamples] = useState<number>(20);
+  const [subsample, setSubsample] = useState<number>(0.8);
+  const [colsampleBytree, setColsampleBytree] = useState<number>(0.8);
+  const [regAlpha, setRegAlpha] = useState<number>(0.0);
+  const [regLambda, setRegLambda] = useState<number>(0.0);
+
   const [training, setTraining] = useState(false);
   const [trainError, setTrainError] = useState<string | null>(null);
 
@@ -87,6 +99,17 @@ export default function TrainConfigPanel({ onTrainComplete }: TrainConfigPanelPr
         feature_set_id: selectedFS,
         label_id: selectedLabel,
         model_type: "lightgbm",
+        model_params: {
+          n_estimators: nEstimators,
+          max_depth: maxDepth,
+          learning_rate: learningRate,
+          num_leaves: numLeaves,
+          min_child_samples: minChildSamples,
+          subsample,
+          colsample_bytree: colsampleBytree,
+          reg_alpha: regAlpha,
+          reg_lambda: regLambda,
+        },
         train_config: {
           method: "single_split",
           train_period: {
@@ -270,6 +293,121 @@ export default function TrainConfigPanel({ onTrainComplete }: TrainConfigPanelPr
             </Row>
           </Space>
         </Card>
+
+        <Collapse
+          size="small"
+          items={[
+            {
+              key: "model_params",
+              label: "模型参数 (LightGBM)",
+              children: (
+                <Space direction="vertical" style={{ width: "100%" }} size="small">
+                  <Row gutter={12}>
+                    <Col span={8}>
+                      <Text type="secondary" style={{ fontSize: 12 }}>n_estimators</Text>
+                      <InputNumber
+                        style={{ width: "100%" }}
+                        value={nEstimators}
+                        onChange={(v) => setNEstimators(v ?? 200)}
+                        min={10}
+                        max={2000}
+                      />
+                    </Col>
+                    <Col span={8}>
+                      <Text type="secondary" style={{ fontSize: 12 }}>max_depth</Text>
+                      <InputNumber
+                        style={{ width: "100%" }}
+                        value={maxDepth}
+                        onChange={(v) => setMaxDepth(v ?? 6)}
+                        min={2}
+                        max={15}
+                      />
+                    </Col>
+                    <Col span={8}>
+                      <Text type="secondary" style={{ fontSize: 12 }}>learning_rate</Text>
+                      <InputNumber
+                        style={{ width: "100%" }}
+                        value={learningRate}
+                        onChange={(v) => setLearningRate(v ?? 0.05)}
+                        min={0.001}
+                        max={1.0}
+                        step={0.01}
+                      />
+                    </Col>
+                  </Row>
+                  <Row gutter={12}>
+                    <Col span={8}>
+                      <Text type="secondary" style={{ fontSize: 12 }}>num_leaves</Text>
+                      <InputNumber
+                        style={{ width: "100%" }}
+                        value={numLeaves}
+                        onChange={(v) => setNumLeaves(v ?? 31)}
+                        min={8}
+                        max={256}
+                      />
+                    </Col>
+                    <Col span={8}>
+                      <Text type="secondary" style={{ fontSize: 12 }}>min_child_samples</Text>
+                      <InputNumber
+                        style={{ width: "100%" }}
+                        value={minChildSamples}
+                        onChange={(v) => setMinChildSamples(v ?? 20)}
+                        min={5}
+                        max={200}
+                      />
+                    </Col>
+                    <Col span={8}>
+                      <Text type="secondary" style={{ fontSize: 12 }}>subsample</Text>
+                      <InputNumber
+                        style={{ width: "100%" }}
+                        value={subsample}
+                        onChange={(v) => setSubsample(v ?? 0.8)}
+                        min={0.1}
+                        max={1.0}
+                        step={0.05}
+                      />
+                    </Col>
+                  </Row>
+                  <Row gutter={12}>
+                    <Col span={8}>
+                      <Text type="secondary" style={{ fontSize: 12 }}>colsample_bytree</Text>
+                      <InputNumber
+                        style={{ width: "100%" }}
+                        value={colsampleBytree}
+                        onChange={(v) => setColsampleBytree(v ?? 0.8)}
+                        min={0.1}
+                        max={1.0}
+                        step={0.05}
+                      />
+                    </Col>
+                    <Col span={8}>
+                      <Text type="secondary" style={{ fontSize: 12 }}>reg_alpha</Text>
+                      <InputNumber
+                        style={{ width: "100%" }}
+                        value={regAlpha}
+                        onChange={(v) => setRegAlpha(v ?? 0.0)}
+                        min={0}
+                        max={10}
+                        step={0.01}
+                      />
+                    </Col>
+                    <Col span={8}>
+                      <Text type="secondary" style={{ fontSize: 12 }}>reg_lambda</Text>
+                      <InputNumber
+                        style={{ width: "100%" }}
+                        value={regLambda}
+                        onChange={(v) => setRegLambda(v ?? 0.0)}
+                        min={0}
+                        max={10}
+                        step={0.01}
+                      />
+                    </Col>
+                  </Row>
+                </Space>
+              ),
+            },
+          ]}
+        />
 
         <Card size="small">
           <Row gutter={12} align="middle">

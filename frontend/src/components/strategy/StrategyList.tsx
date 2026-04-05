@@ -9,7 +9,7 @@ import {
   Tag,
   Typography,
 } from "antd";
-import { ReloadOutlined, DeleteOutlined } from "@ant-design/icons";
+import { ReloadOutlined, DeleteOutlined, EyeOutlined } from "@ant-design/icons";
 import { listStrategies, deleteStrategy } from "../../api";
 import type { Strategy } from "../../api";
 
@@ -31,9 +31,10 @@ const SIZING_LABEL: Record<string, string> = {
 
 interface StrategyListProps {
   refreshKey?: number;
+  onViewStrategy?: (strategy: Strategy) => void;
 }
 
-export default function StrategyList({ refreshKey }: StrategyListProps) {
+export default function StrategyList({ refreshKey, onViewStrategy }: StrategyListProps) {
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [loading, setLoading] = useState(false);
   const [messageApi, contextHolder] = message.useMessage();
@@ -105,9 +106,16 @@ export default function StrategyList({ refreshKey }: StrategyListProps) {
     {
       title: "操作",
       key: "actions",
-      width: 80,
+      width: 120,
       render: (_: unknown, record: Strategy) => (
         <Space size="small">
+          <Button
+            size="small"
+            icon={<EyeOutlined />}
+            onClick={() => onViewStrategy?.(record)}
+          >
+            查看
+          </Button>
           <Popconfirm title="确定删除此策略?" onConfirm={() => handleDelete(record.id)}>
             <Button size="small" danger icon={<DeleteOutlined />} />
           </Popconfirm>

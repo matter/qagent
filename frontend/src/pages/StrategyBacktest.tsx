@@ -10,11 +10,13 @@ import StrategyEditorPanel from "../components/strategy/StrategyEditorPanel";
 import BacktestRunnerPanel from "../components/strategy/BacktestRunnerPanel";
 import StrategyList from "../components/strategy/StrategyList";
 import BacktestHistory from "../components/strategy/BacktestHistory";
+import type { Strategy } from "../api";
 
 export default function StrategyBacktest() {
   const [activeTab, setActiveTab] = useState("editor");
   const [strategyRefreshKey, setStrategyRefreshKey] = useState(0);
   const [backtestRefreshKey, setBacktestRefreshKey] = useState(0);
+  const [editingStrategy, setEditingStrategy] = useState<Strategy | null>(null);
 
   const handleStrategySaved = useCallback(() => {
     setStrategyRefreshKey((k) => k + 1);
@@ -22,6 +24,11 @@ export default function StrategyBacktest() {
 
   const handleBacktestComplete = useCallback(() => {
     setBacktestRefreshKey((k) => k + 1);
+  }, []);
+
+  const handleViewStrategy = useCallback((strategy: Strategy) => {
+    setEditingStrategy(strategy);
+    setActiveTab("editor");
   }, []);
 
   const tabItems = [
@@ -33,7 +40,7 @@ export default function StrategyBacktest() {
           {" "}策略编辑器
         </span>
       ),
-      children: <StrategyEditorPanel onStrategySaved={handleStrategySaved} />,
+      children: <StrategyEditorPanel editingStrategy={editingStrategy} onStrategySaved={handleStrategySaved} />,
     },
     {
       key: "backtest",
@@ -53,7 +60,7 @@ export default function StrategyBacktest() {
           {" "}策略列表
         </span>
       ),
-      children: <StrategyList refreshKey={strategyRefreshKey} />,
+      children: <StrategyList refreshKey={strategyRefreshKey} onViewStrategy={handleViewStrategy} />,
     },
     {
       key: "history",
