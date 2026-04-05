@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Restore stock market data from a Parquet backup into the current database.
+# Restore all QAgent data from a Parquet backup into the current database.
 # Safe to run on a fresh DB — creates tables if needed, then inserts data.
 #
 # Usage:
@@ -41,13 +41,12 @@ if lsof "$DB_PATH" >/dev/null 2>&1; then
     exit 1
 fi
 
-echo "==> Restoring market data from $BACKUP_DIR"
+echo "==> Restoring all QAgent data from $BACKUP_DIR"
 echo "    Target DB: $DB_PATH"
 echo ""
 
 cd "$PROJECT_ROOT"
 uv run python << PYEOF
-import duckdb
 import os
 from pathlib import Path
 
@@ -62,13 +61,34 @@ init_db()
 from backend.db import get_connection
 conn = get_connection()
 
-# Restore order matters: stocks first (referenced by daily_bars), groups before members
+# Restore order matters: parent tables before children
 restore_order = [
+    # Market data
     "stocks",
     "daily_bars",
     "index_bars",
     "stock_groups",
     "stock_group_members",
+    "data_update_log",
+    # Factors
+    "factors",
+    "factor_values_cache",
+    "factor_eval_results",
+    # Feature sets
+    "feature_sets",
+    # Labels
+    "label_definitions",
+    # Models
+    "models",
+    # Strategies
+    "strategies",
+    # Backtest results
+    "backtest_results",
+    # Signals
+    "signal_runs",
+    "signal_details",
+    # Tasks
+    "task_runs",
 ]
 
 total_rows = 0
@@ -79,7 +99,11 @@ for table in restore_order:
         continue
 
     # Clear existing data in this table
-    conn.execute(f"DELETE FROM {table}")
+    try:
+        conn.execute(f"DELETE FROM {table}")
+    except Exception:
+        print(f"  {table}: table not found in DB, skipping")
+        continue
 
     # Load from parquet
     conn.execute(f"INSERT INTO {table} SELECT * FROM read_parquet('{pq}')")
@@ -88,7 +112,7 @@ for table in restore_order:
     print(f"  {table}: restored {count:,} rows from {size_mb:.1f} MB parquet")
     total_rows += count
 
-print(f"\nDone! {total_rows:,} total rows restored.")
+print(f"\nDB tables: {total_rows:,} total rows restored.")
 
 # Show summary
 stocks = conn.execute("SELECT COUNT(*) FROM stocks").fetchone()[0]
@@ -96,13 +120,33 @@ bars = conn.execute("SELECT COUNT(*) FROM daily_bars").fetchone()[0]
 date_range = conn.execute("SELECT MIN(date), MAX(date) FROM daily_bars").fetchone()
 idx = conn.execute("SELECT COUNT(*) FROM index_bars").fetchone()[0]
 groups = conn.execute("SELECT COUNT(*) FROM stock_groups").fetchone()[0]
+factors = conn.execute("SELECT COUNT(*) FROM factors").fetchone()[0]
+models = conn.execute("SELECT COUNT(*) FROM models").fetchone()[0]
+strategies = conn.execute("SELECT COUNT(*) FROM strategies").fetchone()[0]
+backtests = conn.execute("SELECT COUNT(*) FROM backtest_results").fetchone()[0]
 
 print(f"\nData summary:")
 print(f"  Stocks:     {stocks:,}")
 print(f"  Daily bars: {bars:,} ({date_range[0]} to {date_range[1]})")
 print(f"  Index bars: {idx:,}")
 print(f"  Groups:     {groups}")
+print(f"  Factors:    {factors}")
+print(f"  Models:     {models}")
+print(f"  Strategies: {strategies}")
+print(f"  Backtests:  {backtests}")
 PYEOF
+
+# Restore model files
+MODELS_SRC="$BACKUP_DIR/models"
+MODELS_DEST="$PROJECT_ROOT/data/models"
+if [ -d "$MODELS_SRC" ] && [ "$(ls -A "$MODELS_SRC" 2>/dev/null)" ]; then
+    echo ""
+    echo "==> Restoring model files to $MODELS_DEST"
+    mkdir -p "$MODELS_DEST"
+    cp -r "$MODELS_SRC"/* "$MODELS_DEST/"
+    MODEL_COUNT=$(find "$MODELS_DEST" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
+    echo "  Restored $MODEL_COUNT model directories"
+fi
 
 echo ""
 echo "==> Restore complete. You can now start the backend:"
