@@ -9,6 +9,7 @@ import {
   RocketOutlined,
   FundOutlined,
   ThunderboltOutlined,
+  ScheduleOutlined,
   SettingOutlined,
 } from "@ant-design/icons";
 import type { MenuProps } from "antd";
@@ -21,6 +22,7 @@ import ModelTraining from "./pages/ModelTraining";
 import StrategyBacktest from "./pages/StrategyBacktest";
 import SignalGeneration from "./pages/SignalGeneration";
 import SystemSettings from "./pages/SystemSettings";
+import TaskManagement from "./pages/TaskManagement";
 
 const { Sider, Content, Header } = Layout;
 const { Title } = Typography;
@@ -33,6 +35,7 @@ const menuItems: MenuProps["items"] = [
   { key: "/models", icon: <RocketOutlined />, label: "模型训练" },
   { key: "/backtest", icon: <FundOutlined />, label: "策略回测" },
   { key: "/signals", icon: <ThunderboltOutlined />, label: "信号生成" },
+  { key: "/tasks", icon: <ScheduleOutlined />, label: "任务管理" },
   { key: "/settings", icon: <SettingOutlined />, label: "系统设置" },
 ];
 
@@ -112,6 +115,7 @@ export default function App() {
               <Route path="/models" element={<ModelTraining />} />
               <Route path="/backtest" element={<StrategyBacktest />} />
               <Route path="/signals" element={<SignalGeneration />} />
+              <Route path="/tasks" element={<TaskManagement />} />
               <Route path="/settings" element={<SystemSettings />} />
             </Routes>
           </Content>

@@ -307,6 +307,20 @@ export async function getTaskStatus(taskId: string): Promise<TaskStatus> {
   return data;
 }
 
+export async function listTasks(params?: {
+  task_type?: string;
+  status?: string;
+  limit?: number;
+}): Promise<TaskStatus[]> {
+  const { data } = await client.get<TaskStatus[]>("/tasks", { params });
+  return data;
+}
+
+export async function cancelTask(taskId: string): Promise<{ task_id: string; status: string }> {
+  const { data } = await client.post<{ task_id: string; status: string }>(`/tasks/${taskId}/cancel`, {});
+  return data;
+}
+
 // ---- Feature Set Types ----
 
 export interface FeatureSet {
