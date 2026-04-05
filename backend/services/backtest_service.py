@@ -129,13 +129,23 @@ class BacktestService:
         rebalance_dates = self._backtest_engine._get_rebalance_dates(
             all_trading_days, bt_config.rebalance_freq
         )
+        rebalance_dates_set = set(rebalance_dates)
 
         # Build a prices DataFrame with MultiIndex columns (field, ticker)
-        # for the StrategyContext
+        # for the StrategyContext — computed once, strategies slice via current_date
         prices_multi = self._build_prices_multi(prices_close, prices_open, tickers)
 
         # Create weight signals: DataFrame(index=dates, columns=tickers)
         all_weights = pd.DataFrame(0.0, index=prices_close.index, columns=tickers)
+
+        # ---- 6a. Pre-compute model predictions for ALL rebalance dates at once ----
+        # This avoids per-date DB lookups, model loading, feature computation
+        model_preds_by_date: dict[str, dict[str, pd.Series]] = {}
+        if required_models:
+            model_preds_by_date = self._batch_predict_all_dates(
+                required_models, tickers, start_str, end_str,
+                [d for d in all_trading_days if d in rebalance_dates_set],
+            )
 
         log.info(
             "backtest_service.signals",
@@ -145,38 +155,22 @@ class BacktestService:
             models=len(required_models),
         )
 
+        prev_weights = None
         for trade_date in all_trading_days:
             trade_ts = pd.Timestamp(trade_date)
-            if trade_ts not in rebalance_dates:
+            if trade_ts not in rebalance_dates_set:
                 # Carry forward previous weights
-                idx = all_trading_days.index(trade_date)
-                if idx > 0:
-                    prev_date = all_trading_days[idx - 1]
-                    all_weights.loc[trade_ts] = all_weights.loc[pd.Timestamp(prev_date)]
+                if prev_weights is not None:
+                    all_weights.loc[trade_ts] = prev_weights
                 continue
 
-            # Build model predictions for this date
-            model_predictions: dict[str, pd.Series] = {}
-            for model_id in required_models:
-                try:
-                    preds = self._model_service.predict(
-                        model_id=model_id,
-                        tickers=tickers,
-                        date=str(trade_ts.date()),
-                    )
-                    if not preds.empty:
-                        model_predictions[model_id] = preds
-                except Exception as exc:
-                    log.warning(
-                        "backtest_service.model_predict_failed",
-                        model_id=model_id,
-                        date=str(trade_ts.date()),
-                        error=str(exc),
-                    )
+            # Look up pre-computed model predictions for this date
+            date_key = str(trade_ts.date()) if hasattr(trade_ts, "date") else str(trade_ts)[:10]
+            model_predictions = model_preds_by_date.get(date_key, {})
 
-            # Build context
+            # Build context — pass full prices_multi, strategy uses current_date to filter
             context = StrategyContext(
-                prices=prices_multi.loc[:trade_ts],
+                prices=prices_multi,
                 factor_values=factor_data,
                 model_predictions=model_predictions,
                 current_date=trade_ts,
@@ -188,19 +182,18 @@ class BacktestService:
             except Exception as exc:
                 log.warning(
                     "backtest_service.signal_failed",
-                    date=str(trade_ts.date()),
+                    date=date_key,
                     error=str(exc),
                 )
                 # Carry forward previous weights
-                idx = all_trading_days.index(trade_date)
-                if idx > 0:
-                    prev_date = all_trading_days[idx - 1]
-                    all_weights.loc[trade_ts] = all_weights.loc[pd.Timestamp(prev_date)]
+                if prev_weights is not None:
+                    all_weights.loc[trade_ts] = prev_weights
                 continue
 
             if raw_signals.empty:
                 # No signals -- go to cash (all zeros)
                 all_weights.loc[trade_ts] = 0.0
+                prev_weights = all_weights.loc[trade_ts].values
                 continue
 
             # Apply position sizing
@@ -215,6 +208,7 @@ class BacktestService:
             for ticker, w in weights.items():
                 if ticker in all_weights.columns:
                     all_weights.loc[trade_ts, ticker] = w
+            prev_weights = all_weights.loc[trade_ts].values
 
         # ---- 7. Run BacktestEngine ----
         result = self._backtest_engine.run(all_weights, bt_config)
@@ -508,6 +502,124 @@ class BacktestService:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _batch_predict_all_dates(
+        self,
+        model_ids: list[str],
+        tickers: list[str],
+        start_date: str,
+        end_date: str,
+        rebalance_days: list,
+    ) -> dict[str, dict[str, pd.Series]]:
+        """Pre-compute model predictions for ALL rebalance dates at once.
+
+        Instead of calling predict() per-date (which reloads model + features
+        each time), this method:
+          1. Loads each model from disk ONCE.
+          2. Computes features for the FULL date range ONCE.
+          3. Builds the full X matrix ONCE.
+          4. Runs model.predict() on the entire X matrix.
+          5. Slices predictions by date for lookup.
+
+        Returns:
+            dict[date_str -> dict[model_id -> Series(ticker -> prediction)]]
+        """
+        from backend.services.model_service import ModelService
+
+        result: dict[str, dict[str, pd.Series]] = {}
+
+        for model_id in model_ids:
+            try:
+                record = self._model_service.get_model(model_id)
+                model_instance = self._model_service.load_model(model_id)
+                fs_id = record["feature_set_id"]
+
+                # Compute features for full date range (one DB + factor pass)
+                feature_data = self._model_service._feature_service.compute_features(
+                    fs_id, tickers, start_date, end_date
+                )
+
+                # Build full X matrix: (date, ticker) x factors
+                X, _ = ModelService._build_Xy(
+                    feature_data,
+                    # Dummy label_df: we only need X, not y
+                    pd.DataFrame(columns=["ticker", "date", "label_value"]),
+                )
+
+                # _build_Xy returns empty if no labels overlap.
+                # Instead, build X directly from feature_data.
+                if X.empty:
+                    X = self._build_full_X(feature_data)
+
+                if X.empty:
+                    log.warning("backtest_service.batch_predict.empty_X", model_id=model_id)
+                    continue
+
+                # Run prediction on entire X at once
+                all_preds = model_instance.predict(X)
+                all_preds.index = X.index
+
+                # Slice by date and store
+                dates_in_X = all_preds.index.get_level_values("date").unique()
+                for rebal_day in rebalance_days:
+                    rebal_ts = pd.Timestamp(rebal_day)
+                    date_key = str(rebal_ts.date()) if hasattr(rebal_ts, "date") else str(rebal_ts)[:10]
+
+                    # Find the closest date <= rebal_ts in the predictions
+                    available = dates_in_X[dates_in_X <= rebal_ts]
+                    if len(available) == 0:
+                        continue
+                    closest = available[-1]
+
+                    try:
+                        day_preds = all_preds.xs(closest, level="date")
+                        if not day_preds.empty:
+                            day_preds.name = "prediction"
+                            if date_key not in result:
+                                result[date_key] = {}
+                            result[date_key][model_id] = day_preds
+                    except KeyError:
+                        continue
+
+                log.info(
+                    "backtest_service.batch_predict.done",
+                    model_id=model_id,
+                    total_predictions=len(all_preds),
+                    dates_covered=len([d for d in result if model_id in result.get(d, {})]),
+                )
+
+            except Exception as exc:
+                log.warning(
+                    "backtest_service.batch_predict.failed",
+                    model_id=model_id,
+                    error=str(exc),
+                )
+
+        return result
+
+    @staticmethod
+    def _build_full_X(feature_data: dict[str, pd.DataFrame]) -> pd.DataFrame:
+        """Build a full X matrix from feature data without requiring labels.
+
+        Returns DataFrame with MultiIndex (date, ticker), columns = factor names.
+        """
+        long_frames: list[pd.Series] = []
+        factor_names = sorted(feature_data.keys())
+
+        for factor_name in factor_names:
+            df = feature_data[factor_name]
+            stacked = df.stack()
+            stacked.name = factor_name
+            stacked.index.names = ["date", "ticker"]
+            long_frames.append(stacked)
+
+        if not long_frames:
+            return pd.DataFrame()
+
+        X = pd.concat(long_frames, axis=1)
+        X.index.names = ["date", "ticker"]
+        X = X.dropna()
+        return X
 
     def _resolve_factor_ids(self, factor_names: list[str]) -> dict[str, str]:
         """Resolve factor names to factor IDs.
