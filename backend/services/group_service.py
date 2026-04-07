@@ -21,6 +21,7 @@ _BUILTIN_ALL_MARKET_NAME = "全市场"
 # Built-in index groups: id -> (name, description, filter_expr or None, tickers_fetcher)
 _BUILTIN_INDEX_GROUPS = {
     "sp500": ("标普500", "S&P 500 成分股", "sp500"),
+    "sp400": ("标普中型股400", "S&P MidCap 400 成分股", "sp400"),
     "nasdaq100": ("纳斯达克100", "NASDAQ 100 成分股", "nasdaq100"),
     "russell3000": ("罗素3000", "Russell 3000 成分股", "russell3000"),
 }
@@ -82,6 +83,20 @@ def _fetch_index_tickers(index_id: str) -> list[str]:
                     col = str_cols[str_cols_lower.index("symbol")]
                     break
             if df is None or col is None:
+                log.warning("group.index_fetch.no_table", index=index_id)
+                return []
+            tickers = df[col].str.replace(".", "-", regex=False).tolist()
+        elif index_id == "sp400":
+            url = "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies"
+            tables = _wiki_read_html(url)
+            df = tables[0]
+            # Find Symbol/Ticker column
+            col = None
+            for c in df.columns:
+                if isinstance(c, str) and c.lower() in ("symbol", "ticker"):
+                    col = c
+                    break
+            if col is None:
                 log.warning("group.index_fetch.no_table", index=index_id)
                 return []
             tickers = df[col].str.replace(".", "-", regex=False).tolist()
