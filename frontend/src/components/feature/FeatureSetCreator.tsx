@@ -54,11 +54,14 @@ const NEUTRALIZE_OPTIONS = [
   { value: "none", label: "不处理" },
 ];
 
+import type { FeatureSetRestoreConfig } from "./FeatureSetList";
+
 interface FeatureSetCreatorProps {
   onCreated?: () => void;
+  restoreConfig?: FeatureSetRestoreConfig | null;
 }
 
-export default function FeatureSetCreator({ onCreated }: FeatureSetCreatorProps) {
+export default function FeatureSetCreator({ onCreated, restoreConfig }: FeatureSetCreatorProps) {
   const [factors, setFactors] = useState<Factor[]>([]);
   const [groups, setGroups] = useState<StockGroup[]>([]);
   const [selectedFactorIds, setSelectedFactorIds] = useState<string[]>([]);
@@ -78,6 +81,20 @@ export default function FeatureSetCreator({ onCreated }: FeatureSetCreatorProps)
     listFactors().then(setFactors).catch(() => {});
     listGroups().then(setGroups).catch(() => {});
   }, []);
+
+  // Restore config from feature set list
+  useEffect(() => {
+    if (restoreConfig) {
+      setSelectedFactorIds(restoreConfig.factorIds);
+      const pp = restoreConfig.preprocessing;
+      if (pp) {
+        setMissing(pp.missing ?? "ffill");
+        setOutlier(pp.outlier ?? "winsorize");
+        setNormalize(pp.normalize ?? "zscore");
+        setNeutralize(pp.neutralize ?? "none");
+      }
+    }
+  }, [restoreConfig]);
 
   const selectedFactors = factors.filter((f) => selectedFactorIds.includes(f.id));
 

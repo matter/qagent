@@ -7,9 +7,10 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from "antd";
-import { ReloadOutlined, DeleteOutlined } from "@ant-design/icons";
+import { ReloadOutlined, DeleteOutlined, RollbackOutlined } from "@ant-design/icons";
 import { listFeatureSets, deleteFeatureSet } from "../../api";
 import type { FeatureSet } from "../../api";
 
@@ -22,11 +23,17 @@ const STATUS_TAG: Record<string, { color: string; label: string }> = {
   archived: { color: "warning", label: "已归档" },
 };
 
-interface FeatureSetListProps {
-  refreshKey?: number;
+export interface FeatureSetRestoreConfig {
+  factorIds: string[];
+  preprocessing: Record<string, string> | null;
 }
 
-export default function FeatureSetList({ refreshKey }: FeatureSetListProps) {
+interface FeatureSetListProps {
+  refreshKey?: number;
+  onRestoreConfig?: (config: FeatureSetRestoreConfig) => void;
+}
+
+export default function FeatureSetList({ refreshKey, onRestoreConfig }: FeatureSetListProps) {
   const [featureSets, setFeatureSets] = useState<FeatureSet[]>([]);
   const [loading, setLoading] = useState(false);
   const [messageApi, contextHolder] = message.useMessage();
@@ -55,6 +62,15 @@ export default function FeatureSetList({ refreshKey }: FeatureSetListProps) {
     } catch {
       messageApi.error("删除失败");
     }
+  };
+
+  const handleRestore = (record: FeatureSet) => {
+    if (!onRestoreConfig) return;
+    onRestoreConfig({
+      factorIds: record.factor_refs?.map((r) => r.factor_id) ?? [],
+      preprocessing: record.preprocessing,
+    });
+    messageApi.success("已还原特征集配置");
   };
 
   const columns = [
@@ -111,16 +127,28 @@ export default function FeatureSetList({ refreshKey }: FeatureSetListProps) {
       key: "created_at",
       width: 160,
       ellipsis: true,
+      sorter: (a: FeatureSet, b: FeatureSet) => (a.created_at ?? "").localeCompare(b.created_at ?? ""),
+      defaultSortOrder: "descend" as const,
       render: (d: string) => d?.slice(0, 19) ?? "-",
     },
     {
       title: "操作",
       key: "actions",
-      width: 80,
+      width: 120,
       render: (_: unknown, record: FeatureSet) => (
-        <Popconfirm title="确定删除此特征集?" onConfirm={() => handleDelete(record.id)}>
-          <Button size="small" danger icon={<DeleteOutlined />} />
-        </Popconfirm>
+        <Space size={4}>
+          <Tooltip title="还原配置">
+            <Button
+              size="small"
+              icon={<RollbackOutlined />}
+              onClick={() => handleRestore(record)}
+              disabled={!onRestoreConfig}
+            />
+          </Tooltip>
+          <Popconfirm title="确定删除此特征集?" onConfirm={() => handleDelete(record.id)}>
+            <Button size="small" danger icon={<DeleteOutlined />} />
+          </Popconfirm>
+        </Space>
       ),
     },
   ];

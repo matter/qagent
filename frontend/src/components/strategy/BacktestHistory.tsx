@@ -7,9 +7,10 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from "antd";
-import { ReloadOutlined } from "@ant-design/icons";
+import { ReloadOutlined, RollbackOutlined } from "@ant-design/icons";
 import {
   listBacktests,
   getBacktest,
@@ -38,11 +39,25 @@ interface BacktestRow extends BacktestResultSummary {
   strategy_name?: string;
 }
 
-interface BacktestHistoryProps {
-  refreshKey?: number;
+export interface BacktestRestoreConfig {
+  strategyId: string;
+  groupId: string;
+  startDate: string;
+  endDate: string;
+  initialCapital: number;
+  commission: number;
+  slippage: number;
+  maxPositions: number;
+  benchmark: string;
+  rebalanceFreq: string;
 }
 
-export default function BacktestHistory({ refreshKey }: BacktestHistoryProps) {
+interface BacktestHistoryProps {
+  refreshKey?: number;
+  onRestoreConfig?: (config: BacktestRestoreConfig) => void;
+}
+
+export default function BacktestHistory({ refreshKey, onRestoreConfig }: BacktestHistoryProps) {
   const [rows, setRows] = useState<BacktestRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [detailOpen, setDetailOpen] = useState(false);
@@ -93,17 +108,38 @@ export default function BacktestHistory({ refreshKey }: BacktestHistoryProps) {
     }
   };
 
+  const handleRestore = (record: BacktestRow, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!onRestoreConfig) return;
+    const cfg = record.config as Record<string, unknown> | null;
+    onRestoreConfig({
+      strategyId: record.strategy_id,
+      groupId: (cfg?.universe_group_id as string) ?? "",
+      startDate: (cfg?.start_date as string) ?? "",
+      endDate: (cfg?.end_date as string) ?? "",
+      initialCapital: (cfg?.initial_capital as number) ?? 1000000,
+      commission: (cfg?.commission_rate as number) ?? 0.001,
+      slippage: (cfg?.slippage_rate as number) ?? 0.001,
+      maxPositions: (cfg?.max_positions as number) ?? 50,
+      benchmark: (cfg?.benchmark as string) ?? "SPY",
+      rebalanceFreq: (cfg?.rebalance_frequency as string) ?? "daily",
+    });
+    messageApi.success("已还原回测配置");
+  };
+
   const columns = [
     {
       title: "策略",
       dataIndex: "strategy_name",
       key: "strategy_name",
+      sorter: (a: BacktestRow, b: BacktestRow) => (a.strategy_name ?? "").localeCompare(b.strategy_name ?? ""),
       render: (name: string | undefined) => name ?? "-",
     },
     {
       title: "年化收益",
       key: "annual_return",
       width: 110,
+      sorter: (a: BacktestRow, b: BacktestRow) => (a.summary?.annual_return ?? 0) - (b.summary?.annual_return ?? 0),
       render: (_: unknown, r: BacktestRow) => {
         const v = r.summary?.annual_return;
         if (v === undefined || v === null) return "-";
@@ -118,6 +154,7 @@ export default function BacktestHistory({ refreshKey }: BacktestHistoryProps) {
       title: "Sharpe",
       key: "sharpe",
       width: 80,
+      sorter: (a: BacktestRow, b: BacktestRow) => ((a.summary?.sharpe ?? a.summary?.sharpe_ratio ?? 0) as number) - ((b.summary?.sharpe ?? b.summary?.sharpe_ratio ?? 0) as number),
       render: (_: unknown, r: BacktestRow) => {
         const v = r.summary?.sharpe ?? r.summary?.sharpe_ratio;
         if (v === undefined || v === null) return "-";
@@ -132,6 +169,7 @@ export default function BacktestHistory({ refreshKey }: BacktestHistoryProps) {
       title: "最大回撤",
       key: "max_drawdown",
       width: 100,
+      sorter: (a: BacktestRow, b: BacktestRow) => (a.summary?.max_drawdown ?? 0) - (b.summary?.max_drawdown ?? 0),
       render: (_: unknown, r: BacktestRow) => {
         const v = r.summary?.max_drawdown;
         if (v === undefined || v === null) return "-";
@@ -158,7 +196,24 @@ export default function BacktestHistory({ refreshKey }: BacktestHistoryProps) {
       dataIndex: "created_at",
       key: "created_at",
       width: 160,
+      sorter: (a: BacktestRow, b: BacktestRow) => (a.created_at ?? "").localeCompare(b.created_at ?? ""),
+      defaultSortOrder: "descend" as const,
       render: (d: string | null) => d?.slice(0, 19) ?? "-",
+    },
+    {
+      title: "操作",
+      key: "actions",
+      width: 60,
+      render: (_: unknown, record: BacktestRow) => (
+        <Tooltip title="还原回测配置">
+          <Button
+            size="small"
+            icon={<RollbackOutlined />}
+            onClick={(e) => handleRestore(record, e)}
+            disabled={!onRestoreConfig}
+          />
+        </Tooltip>
+      ),
     },
   ];
 

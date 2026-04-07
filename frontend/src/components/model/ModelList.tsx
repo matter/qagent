@@ -12,9 +12,10 @@ import {
   Statistic,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from "antd";
-import { ReloadOutlined, DeleteOutlined } from "@ant-design/icons";
+import { ReloadOutlined, DeleteOutlined, RollbackOutlined } from "@ant-design/icons";
 import { listModels, getModel, deleteModel } from "../../api";
 import type { Model } from "../../api";
 import FeatureImportanceChart from "./FeatureImportanceChart";
@@ -36,11 +37,20 @@ function metricVal(r: Model, key: string): number | undefined {
   return v ?? undefined;
 }
 
-interface ModelListProps {
-  refreshKey?: number;
+export interface ModelRestoreConfig {
+  featureSetId: string;
+  labelId: string;
+  groupId: string;
+  modelParams: Record<string, unknown> | null;
+  trainConfig: Record<string, unknown> | null;
 }
 
-export default function ModelList({ refreshKey }: ModelListProps) {
+interface ModelListProps {
+  refreshKey?: number;
+  onRestoreConfig?: (config: ModelRestoreConfig) => void;
+}
+
+export default function ModelList({ refreshKey, onRestoreConfig }: ModelListProps) {
   const [models, setModels] = useState<Model[]>([]);
   const [loading, setLoading] = useState(false);
   const [detailOpen, setDetailOpen] = useState(false);
@@ -93,6 +103,20 @@ export default function ModelList({ refreshKey }: ModelListProps) {
   const featureImportance = (metrics?.feature_importance ?? null) as Record<string, number> | null;
   const trainConfig = detailModel?.train_config as Record<string, string> | null;
   const modelParams = detailModel?.model_params as Record<string, string | number> | null;
+
+  const handleRestore = (record: Model, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!onRestoreConfig) return;
+    const tc = record.train_config as Record<string, unknown> | null;
+    onRestoreConfig({
+      featureSetId: record.feature_set_id,
+      labelId: record.label_id,
+      groupId: (tc?.universe_group_id as string) ?? "",
+      modelParams: record.model_params,
+      trainConfig: record.train_config,
+    });
+    messageApi.success("已还原训练配置");
+  };
 
   const columns = [
     {
@@ -216,16 +240,28 @@ export default function ModelList({ refreshKey }: ModelListProps) {
       key: "created_at",
       width: 160,
       ellipsis: true,
+      sorter: (a: Model, b: Model) => (a.created_at ?? "").localeCompare(b.created_at ?? ""),
+      defaultSortOrder: "descend" as const,
       render: (d: string) => d?.slice(0, 19) ?? "-",
     },
     {
       title: "操作",
       key: "actions",
-      width: 80,
+      width: 120,
       render: (_: unknown, record: Model) => (
-        <Popconfirm title="确定删除此模型?" onConfirm={(e) => { e?.stopPropagation(); handleDelete(record.id); }}>
-          <Button size="small" danger icon={<DeleteOutlined />} onClick={(e) => e.stopPropagation()} />
-        </Popconfirm>
+        <Space size={4}>
+          <Tooltip title="还原训练配置">
+            <Button
+              size="small"
+              icon={<RollbackOutlined />}
+              onClick={(e) => handleRestore(record, e)}
+              disabled={!onRestoreConfig}
+            />
+          </Tooltip>
+          <Popconfirm title="确定删除此模型?" onConfirm={(e) => { e?.stopPropagation(); handleDelete(record.id); }}>
+            <Button size="small" danger icon={<DeleteOutlined />} onClick={(e) => e.stopPropagation()} />
+          </Popconfirm>
+        </Space>
       ),
     },
   ];

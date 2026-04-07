@@ -33,6 +33,9 @@ _MODEL_REGISTRY: dict[str, type] = {
 # Label target types that should be treated as classification
 _CLASSIFICATION_TARGETS = {"binary"}
 
+# Parameters determined by the system, not user-configurable
+_RESERVED_MODEL_PARAMS = {"task", "objective", "metric", "verbosity", "n_jobs"}
+
 
 class ModelService:
     """Train, persist, load and run inference with ML models."""
@@ -80,6 +83,12 @@ class ModelService:
 
         train_config = train_config or {}
         model_params = model_params or {}
+
+        # ---- Strip reserved params that are set by the system ----
+        stripped = [k for k in model_params if k in _RESERVED_MODEL_PARAMS]
+        if stripped:
+            log.warning("model.train.reserved_params_stripped", params=stripped)
+            model_params = {k: v for k, v in model_params.items() if k not in _RESERVED_MODEL_PARAMS}
 
         # ---- Normalize train_config from frontend nested format ----
         # Frontend sends: { train_period: {start, end}, valid_period: ..., test_period: ... }
@@ -136,6 +145,10 @@ class ModelService:
 
         # ---- 5. Split by date ranges ----
         purge_gap = int(train_config.get("purge_gap", 5))
+
+        # Preflight: validate date ordering and coverage
+        self._validate_split_config(train_config, X, y, purge_gap)
+
         splits = self._split_by_dates(X, y, train_config, purge_gap)
 
         X_train, y_train = splits["train"]
@@ -462,6 +475,69 @@ class ModelService:
                     pass  # leave as-is, will fail downstream with a clear error
 
         return result
+
+    @staticmethod
+    def _validate_split_config(
+        train_config: dict, X: pd.DataFrame, y: pd.Series, purge_gap: int
+    ) -> None:
+        """Preflight validation for train/valid/test split configuration.
+
+        Raises ValueError with a clear message if the config is invalid.
+        """
+        required = ["train_start", "train_end", "valid_start", "valid_end", "test_start", "test_end"]
+        for key in required:
+            if not train_config.get(key):
+                raise ValueError(f"train_config 缺少必要字段: {key}")
+
+        ts = {k: pd.Timestamp(train_config[k]) for k in required}
+
+        # Date ordering
+        if ts["train_start"] > ts["train_end"]:
+            raise ValueError(f"训练开始日期 ({ts['train_start'].date()}) 晚于结束日期 ({ts['train_end'].date()})")
+        if ts["valid_start"] > ts["valid_end"]:
+            raise ValueError(f"验证开始日期 ({ts['valid_start'].date()}) 晚于结束日期 ({ts['valid_end'].date()})")
+        if ts["test_start"] > ts["test_end"]:
+            raise ValueError(f"测试开始日期 ({ts['test_start'].date()}) 晚于结束日期 ({ts['test_end'].date()})")
+        if ts["train_end"] >= ts["valid_start"]:
+            raise ValueError(
+                f"训练结束日期 ({ts['train_end'].date()}) 不早于验证开始日期 ({ts['valid_start'].date()})，"
+                "请确保区间不重叠"
+            )
+        if ts["valid_end"] >= ts["test_start"]:
+            raise ValueError(
+                f"验证结束日期 ({ts['valid_end'].date()}) 不早于测试开始日期 ({ts['test_start'].date()})，"
+                "请确保区间不重叠"
+            )
+
+        # Check sample counts
+        dates = X.index.get_level_values("date")
+        train_n = ((dates >= ts["train_start"]) & (dates <= ts["train_end"])).sum()
+        valid_n = ((dates >= ts["valid_start"]) & (dates <= ts["valid_end"])).sum()
+        test_n = ((dates >= ts["test_start"]) & (dates <= ts["test_end"])).sum()
+
+        if train_n == 0:
+            raise ValueError(
+                f"训练集在 {ts['train_start'].date()} ~ {ts['train_end'].date()} 区间内无样本。"
+                "请检查特征/标签数据是否覆盖该区间。"
+            )
+        if valid_n == 0:
+            raise ValueError(
+                f"验证集在 {ts['valid_start'].date()} ~ {ts['valid_end'].date()} 区间内无样本。"
+                "空验证集会导致模型无法早停和评估，请调整区间。"
+            )
+        if test_n == 0:
+            raise ValueError(
+                f"测试集在 {ts['test_start'].date()} ~ {ts['test_end'].date()} 区间内无样本。"
+                "请检查数据覆盖范围。"
+            )
+
+        # Warn if purge would consume too many training samples
+        train_dates = sorted(dates[(dates >= ts["train_start"]) & (dates <= ts["train_end"])].unique())
+        if purge_gap > 0 and len(train_dates) <= purge_gap:
+            raise ValueError(
+                f"训练集仅有 {len(train_dates)} 个交易日，purge_gap={purge_gap} 天会清空全部训练数据。"
+                "请扩大训练区间或减小 purge_gap。"
+            )
 
     @staticmethod
     def _split_by_dates(

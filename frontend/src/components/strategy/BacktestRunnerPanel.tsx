@@ -40,11 +40,14 @@ import {
 
 const { Text } = Typography;
 
+import type { BacktestRestoreConfig } from "./BacktestHistory";
+
 interface BacktestRunnerPanelProps {
   onBacktestComplete?: () => void;
+  restoreConfig?: BacktestRestoreConfig | null;
 }
 
-export default function BacktestRunnerPanel({ onBacktestComplete }: BacktestRunnerPanelProps) {
+export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig }: BacktestRunnerPanelProps) {
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [groups, setGroups] = useState<StockGroup[]>([]);
 
@@ -70,6 +73,21 @@ export default function BacktestRunnerPanel({ onBacktestComplete }: BacktestRunn
     listStrategies().then(setStrategies).catch(() => {});
     listGroups().then(setGroups).catch(() => {});
   }, []);
+
+  // Restore config from backtest history
+  useEffect(() => {
+    if (!restoreConfig) return;
+    setSelectedStrategy(restoreConfig.strategyId);
+    if (restoreConfig.groupId) setSelectedGroup(restoreConfig.groupId);
+    if (restoreConfig.startDate) setStartDate(dayjs(restoreConfig.startDate));
+    if (restoreConfig.endDate) setEndDate(dayjs(restoreConfig.endDate));
+    if (restoreConfig.initialCapital) setInitialCapital(restoreConfig.initialCapital);
+    if (restoreConfig.commission) setCommission(restoreConfig.commission);
+    if (restoreConfig.slippage) setSlippage(restoreConfig.slippage);
+    if (restoreConfig.maxPositions) setMaxPositions(restoreConfig.maxPositions);
+    if (restoreConfig.benchmark) setBenchmark(restoreConfig.benchmark);
+    if (restoreConfig.rebalanceFreq) setRebalanceFreq(restoreConfig.rebalanceFreq);
+  }, [restoreConfig]);
 
   useEffect(() => {
     return () => {

@@ -52,12 +52,15 @@ const CATEGORY_OPTIONS = [
   { value: "custom", label: "自定义 (Custom)" },
 ];
 
+import type { EvalRestoreConfig } from "./EvalHistory";
+
 interface FactorEditorProps {
   editingFactor: Factor | null;
+  evalConfig?: EvalRestoreConfig | null;
   onFactorSaved?: (factor: Factor) => void;
 }
 
-export default function FactorEditor({ editingFactor, onFactorSaved }: FactorEditorProps) {
+export default function FactorEditor({ editingFactor, evalConfig, onFactorSaved }: FactorEditorProps) {
   // Editor state
   const [code, setCode] = useState<string>("");
   const [factorName, setFactorName] = useState("");
@@ -103,6 +106,17 @@ export default function FactorEditor({ editingFactor, onFactorSaved }: FactorEdi
       setEvalError(null);
     }
   }, [editingFactor]);
+
+  // Restore eval config from history
+  useEffect(() => {
+    if (evalConfig) {
+      setSelectedLabel(evalConfig.labelId);
+      setSelectedGroup(evalConfig.groupId);
+      if (evalConfig.startDate && evalConfig.endDate) {
+        setDateRange([dayjs(evalConfig.startDate), dayjs(evalConfig.endDate)]);
+      }
+    }
+  }, [evalConfig]);
 
   // Load templates, labels, groups on mount
   useEffect(() => {

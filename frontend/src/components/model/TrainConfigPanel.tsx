@@ -33,11 +33,14 @@ import type {
 
 const { Text } = Typography;
 
+import type { ModelRestoreConfig } from "./ModelList";
+
 interface TrainConfigPanelProps {
   onTrainComplete?: () => void;
+  restoreConfig?: ModelRestoreConfig | null;
 }
 
-export default function TrainConfigPanel({ onTrainComplete }: TrainConfigPanelProps) {
+export default function TrainConfigPanel({ onTrainComplete, restoreConfig }: TrainConfigPanelProps) {
   const [featureSets, setFeatureSets] = useState<FeatureSet[]>([]);
   const [labels, setLabels] = useState<LabelDefinition[]>([]);
   const [groups, setGroups] = useState<StockGroup[]>([]);
@@ -77,6 +80,38 @@ export default function TrainConfigPanel({ onTrainComplete }: TrainConfigPanelPr
     listLabels().then(setLabels).catch(() => {});
     listGroups().then(setGroups).catch(() => {});
   }, []);
+
+  // Restore config from model list
+  useEffect(() => {
+    if (!restoreConfig) return;
+    setSelectedFS(restoreConfig.featureSetId);
+    setSelectedLabel(restoreConfig.labelId);
+    if (restoreConfig.groupId) setSelectedGroup(restoreConfig.groupId);
+
+    const tc = restoreConfig.trainConfig as Record<string, string> | null;
+    if (tc) {
+      if (tc.train_start) setTrainStart(dayjs(tc.train_start));
+      if (tc.train_end) setTrainEnd(dayjs(tc.train_end));
+      if (tc.valid_start) setValidStart(dayjs(tc.valid_start));
+      if (tc.valid_end) setValidEnd(dayjs(tc.valid_end));
+      if (tc.test_start) setTestStart(dayjs(tc.test_start));
+      if (tc.test_end) setTestEnd(dayjs(tc.test_end));
+      if (tc.purge_gap !== undefined) setPurgeGap(Number(tc.purge_gap));
+    }
+
+    const mp = restoreConfig.modelParams as Record<string, number> | null;
+    if (mp) {
+      if (mp.n_estimators !== undefined) setNEstimators(mp.n_estimators);
+      if (mp.max_depth !== undefined) setMaxDepth(mp.max_depth);
+      if (mp.learning_rate !== undefined) setLearningRate(mp.learning_rate);
+      if (mp.num_leaves !== undefined) setNumLeaves(mp.num_leaves);
+      if (mp.min_child_samples !== undefined) setMinChildSamples(mp.min_child_samples);
+      if (mp.subsample !== undefined) setSubsample(mp.subsample);
+      if (mp.colsample_bytree !== undefined) setColsampleBytree(mp.colsample_bytree);
+      if (mp.reg_alpha !== undefined) setRegAlpha(mp.reg_alpha);
+      if (mp.reg_lambda !== undefined) setRegLambda(mp.reg_lambda);
+    }
+  }, [restoreConfig]);
 
   useEffect(() => {
     return () => {

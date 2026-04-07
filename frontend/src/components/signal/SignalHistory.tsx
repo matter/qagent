@@ -9,11 +9,13 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from "antd";
 import {
   DownloadOutlined,
   ReloadOutlined,
+  RollbackOutlined,
 } from "@ant-design/icons";
 import type { ColumnsType } from "antd/es/table";
 import {
@@ -26,11 +28,18 @@ import SignalTable from "./SignalTable";
 
 const { Text } = Typography;
 
-interface SignalHistoryProps {
-  refreshKey: number;
+export interface SignalRestoreConfig {
+  strategyId: string;
+  groupId: string;
+  targetDate: string;
 }
 
-export default function SignalHistory({ refreshKey }: SignalHistoryProps) {
+interface SignalHistoryProps {
+  refreshKey: number;
+  onRestoreConfig?: (config: SignalRestoreConfig) => void;
+}
+
+export default function SignalHistory({ refreshKey, onRestoreConfig }: SignalHistoryProps) {
   const [runs, setRuns] = useState<SignalRun[]>([]);
   const [loading, setLoading] = useState(false);
   const [detailOpen, setDetailOpen] = useState(false);
@@ -75,6 +84,17 @@ export default function SignalHistory({ refreshKey }: SignalHistoryProps) {
     } catch {
       messageApi.error("导出失败");
     }
+  };
+
+  const handleRestore = (record: SignalRun, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!onRestoreConfig) return;
+    onRestoreConfig({
+      strategyId: record.strategy_id,
+      groupId: record.universe_group_id,
+      targetDate: record.target_date,
+    });
+    messageApi.success("已还原信号配置");
   };
 
   const columns: ColumnsType<SignalRun> = [
@@ -122,6 +142,21 @@ export default function SignalHistory({ refreshKey }: SignalHistoryProps) {
       ellipsis: true,
       sorter: (a, b) => a.created_at.localeCompare(b.created_at),
       defaultSortOrder: "descend" as const,
+    },
+    {
+      title: "操作",
+      key: "actions",
+      width: 60,
+      render: (_: unknown, record: SignalRun) => (
+        <Tooltip title="还原信号配置">
+          <Button
+            size="small"
+            icon={<RollbackOutlined />}
+            onClick={(e) => handleRestore(record, e)}
+            disabled={!onRestoreConfig}
+          />
+        </Tooltip>
+      ),
     },
   ];
 

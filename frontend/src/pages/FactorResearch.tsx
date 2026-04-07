@@ -5,15 +5,18 @@ import {
   AppstoreOutlined,
   HistoryOutlined,
 } from "@ant-design/icons";
+import { getFactor } from "../api";
 import type { Factor } from "../api";
 import FactorEditor from "../components/factor/FactorEditor";
 import FactorLibrary from "../components/factor/FactorLibrary";
 import EvalHistory from "../components/factor/EvalHistory";
+import type { EvalRestoreConfig } from "../components/factor/EvalHistory";
 
 export default function FactorResearch() {
   const [activeTab, setActiveTab] = useState("editor");
   const [editingFactor, setEditingFactor] = useState<Factor | null>(null);
   const [libraryRefreshKey, setLibraryRefreshKey] = useState(0);
+  const [evalConfig, setEvalConfig] = useState<EvalRestoreConfig | null>(null);
 
   const handleViewFactor = useCallback((factor: Factor) => {
     setEditingFactor(factor);
@@ -22,6 +25,20 @@ export default function FactorResearch() {
 
   const handleFactorSaved = useCallback(() => {
     setLibraryRefreshKey((k) => k + 1);
+  }, []);
+
+  const handleRestoreEvalConfig = useCallback(async (config: EvalRestoreConfig) => {
+    try {
+      const factor = await getFactor(config.factorId);
+      setEditingFactor(factor);
+      setEvalConfig(config);
+      setActiveTab("editor");
+    } catch {
+      // If factor was deleted, still switch to editor with config
+      setEditingFactor(null);
+      setEvalConfig(config);
+      setActiveTab("editor");
+    }
   }, []);
 
   const tabItems = [
@@ -36,6 +53,7 @@ export default function FactorResearch() {
       children: (
         <FactorEditor
           editingFactor={editingFactor}
+          evalConfig={evalConfig}
           onFactorSaved={handleFactorSaved}
         />
       ),
@@ -63,7 +81,7 @@ export default function FactorResearch() {
           {" "}评价历史
         </span>
       ),
-      children: <EvalHistory />,
+      children: <EvalHistory onRestoreConfig={handleRestoreEvalConfig} />,
     },
   ];
 

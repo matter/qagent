@@ -37,11 +37,14 @@ import SignalTable from "./SignalTable";
 
 const { Text } = Typography;
 
+import type { SignalRestoreConfig } from "./SignalHistory";
+
 interface SignalGeneratorPanelProps {
   onSignalComplete?: () => void;
+  restoreConfig?: SignalRestoreConfig | null;
 }
 
-export default function SignalGeneratorPanel({ onSignalComplete }: SignalGeneratorPanelProps) {
+export default function SignalGeneratorPanel({ onSignalComplete, restoreConfig }: SignalGeneratorPanelProps) {
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [groups, setGroups] = useState<StockGroup[]>([]);
 
@@ -60,6 +63,14 @@ export default function SignalGeneratorPanel({ onSignalComplete }: SignalGenerat
     listStrategies().then(setStrategies).catch(() => {});
     listGroups().then(setGroups).catch(() => {});
   }, []);
+
+  // Restore config from signal history
+  useEffect(() => {
+    if (!restoreConfig) return;
+    setSelectedStrategy(restoreConfig.strategyId);
+    if (restoreConfig.groupId) setSelectedGroup(restoreConfig.groupId);
+    if (restoreConfig.targetDate) setTargetDate(dayjs(restoreConfig.targetDate));
+  }, [restoreConfig]);
 
   useEffect(() => {
     return () => {

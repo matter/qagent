@@ -6,13 +6,20 @@ import {
 } from "@ant-design/icons";
 import TrainConfigPanel from "../components/model/TrainConfigPanel";
 import ModelList from "../components/model/ModelList";
+import type { ModelRestoreConfig } from "../components/model/ModelList";
 
 export default function ModelTraining() {
   const [activeTab, setActiveTab] = useState("config");
   const [listRefreshKey, setListRefreshKey] = useState(0);
+  const [restoreConfig, setRestoreConfig] = useState<ModelRestoreConfig | null>(null);
 
   const handleTrainComplete = useCallback(() => {
     setListRefreshKey((k) => k + 1);
+  }, []);
+
+  const handleRestoreConfig = useCallback((config: ModelRestoreConfig) => {
+    setRestoreConfig(config);
+    setActiveTab("config");
   }, []);
 
   const tabItems = [
@@ -24,7 +31,7 @@ export default function ModelTraining() {
           {" "}训练配置
         </span>
       ),
-      children: <TrainConfigPanel onTrainComplete={handleTrainComplete} />,
+      children: <TrainConfigPanel onTrainComplete={handleTrainComplete} restoreConfig={restoreConfig} />,
     },
     {
       key: "models",
@@ -34,7 +41,7 @@ export default function ModelTraining() {
           {" "}模型列表
         </span>
       ),
-      children: <ModelList refreshKey={listRefreshKey} />,
+      children: <ModelList refreshKey={listRefreshKey} onRestoreConfig={handleRestoreConfig} />,
     },
   ];
 

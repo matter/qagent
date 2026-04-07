@@ -6,9 +6,10 @@ import {
   Modal,
   Space,
   Table,
+  Tooltip,
   Typography,
 } from "antd";
-import { ReloadOutlined } from "@ant-design/icons";
+import { ReloadOutlined, RollbackOutlined } from "@ant-design/icons";
 import {
   listFactors,
   listEvaluations,
@@ -23,7 +24,20 @@ interface EvalRow extends FactorEvalRecord {
   factor_name?: string;
 }
 
-export default function EvalHistory() {
+export interface EvalRestoreConfig {
+  factorId: string;
+  factorName: string;
+  labelId: string;
+  groupId: string;
+  startDate: string;
+  endDate: string;
+}
+
+interface EvalHistoryProps {
+  onRestoreConfig?: (config: EvalRestoreConfig) => void;
+}
+
+export default function EvalHistory({ onRestoreConfig }: EvalHistoryProps) {
   const [rows, setRows] = useState<EvalRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [detailOpen, setDetailOpen] = useState(false);
@@ -91,11 +105,26 @@ export default function EvalHistory() {
     }
   };
 
+  const handleRestore = (record: EvalRow, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!onRestoreConfig) return;
+    onRestoreConfig({
+      factorId: record.factor_id,
+      factorName: record.factor_name ?? "",
+      labelId: record.label_id,
+      groupId: record.universe_group_id,
+      startDate: record.start_date ?? "",
+      endDate: record.end_date ?? "",
+    });
+    messageApi.success("已还原配置并跳转到编辑器");
+  };
+
   const columns = [
     {
       title: "因子",
       dataIndex: "factor_name",
       key: "factor_name",
+      sorter: (a: EvalRow, b: EvalRow) => (a.factor_name ?? "").localeCompare(b.factor_name ?? ""),
       render: (name: string | undefined) => name ?? "-",
     },
     {
@@ -109,6 +138,7 @@ export default function EvalHistory() {
       title: "IC Mean",
       key: "ic_mean",
       width: 100,
+      sorter: (a: EvalRow, b: EvalRow) => (a.summary?.ic_mean ?? 0) - (b.summary?.ic_mean ?? 0),
       render: (_: unknown, r: EvalRow) => {
         const v = r.summary?.ic_mean;
         if (v === undefined || v === null) return "-";
@@ -123,6 +153,7 @@ export default function EvalHistory() {
       title: "IR",
       key: "ir",
       width: 80,
+      sorter: (a: EvalRow, b: EvalRow) => (a.summary?.ir ?? 0) - (b.summary?.ir ?? 0),
       render: (_: unknown, r: EvalRow) => {
         const v = r.summary?.ir;
         if (v === undefined || v === null) return "-";
@@ -137,6 +168,7 @@ export default function EvalHistory() {
       title: "胜率",
       key: "ic_win_rate",
       width: 90,
+      sorter: (a: EvalRow, b: EvalRow) => (a.summary?.ic_win_rate ?? 0) - (b.summary?.ic_win_rate ?? 0),
       render: (_: unknown, r: EvalRow) => {
         const v = r.summary?.ic_win_rate;
         if (v === undefined || v === null) return "-";
@@ -147,6 +179,7 @@ export default function EvalHistory() {
       title: "多空收益",
       key: "ls_return",
       width: 100,
+      sorter: (a: EvalRow, b: EvalRow) => (a.summary?.long_short_annual_return ?? 0) - (b.summary?.long_short_annual_return ?? 0),
       render: (_: unknown, r: EvalRow) => {
         const v = r.summary?.long_short_annual_return;
         if (v === undefined || v === null) return "-";
@@ -162,7 +195,24 @@ export default function EvalHistory() {
       dataIndex: "created_at",
       key: "created_at",
       width: 160,
+      sorter: (a: EvalRow, b: EvalRow) => (a.created_at ?? "").localeCompare(b.created_at ?? ""),
+      defaultSortOrder: "descend" as const,
       render: (d: string | null) => d?.slice(0, 19) ?? "-",
+    },
+    {
+      title: "操作",
+      key: "actions",
+      width: 60,
+      render: (_: unknown, record: EvalRow) => (
+        <Tooltip title="还原配置到编辑器">
+          <Button
+            size="small"
+            icon={<RollbackOutlined />}
+            onClick={(e) => handleRestore(record, e)}
+            disabled={!onRestoreConfig}
+          />
+        </Tooltip>
+      ),
     },
   ];
 
