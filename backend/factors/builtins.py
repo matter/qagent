@@ -10,6 +10,8 @@ These are stored as plain strings so users can view and modify them.
 
 from __future__ import annotations
 
+from backend.factors.alpha360 import ALPHA360_TEMPLATES
+
 TEMPLATES: dict[str, str] = {}
 
 # ------------------------------------------------------------------
@@ -288,6 +290,10 @@ class LinRegSlope20(FactorBase):
     def compute(self, data: pd.DataFrame) -> pd.Series:
         return ta.linreg_slope(data["close"], period=self.params["period"])
 '''
+
+
+# Merge Alpha360 templates
+TEMPLATES.update(ALPHA360_TEMPLATES)
 
 
 def get_template_names() -> list[str]:
