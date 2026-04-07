@@ -191,21 +191,36 @@ class FactorEngine:
     ) -> list[str]:
         """Determine which tickers need fresh computation.
 
-        A ticker needs computation if it has no cached data at all, or if
-        the cached data has significant gaps in the requested date range.
+        A ticker needs computation if:
+        - It has no cached data at all
+        - The cached data is all NaN
+        - The cached date range does not cover the requested [start, end]
         """
         if cached_df.empty:
             return list(all_tickers)
 
         cached_tickers = set(cached_df.columns)
-        missing = [t for t in all_tickers if t not in cached_tickers]
+        req_start = pd.Timestamp(start_date)
+        req_end = pd.Timestamp(end_date)
+        missing: list[str] = []
 
-        # Also re-compute tickers with mostly-NaN cached data
         for t in all_tickers:
-            if t in cached_tickers and t not in missing:
-                col = cached_df[t]
-                if col.notna().sum() == 0:
-                    missing.append(t)
+            if t not in cached_tickers:
+                missing.append(t)
+                continue
+
+            col = cached_df[t]
+            valid = col.dropna()
+            if valid.empty:
+                missing.append(t)
+                continue
+
+            # Check that cached data covers the requested date range
+            cached_min = valid.index.min()
+            cached_max = valid.index.max()
+            # Allow 5 trading-day tolerance for edge alignment
+            if cached_min > req_start + pd.Timedelta(days=7) or cached_max < req_end - pd.Timedelta(days=7):
+                missing.append(t)
 
         return missing
 

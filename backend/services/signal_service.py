@@ -73,7 +73,7 @@ class SignalService:
         )
 
         # ---- 2. Validate dependency chain ----
-        validation = self._validate_dependency_chain(strategy_def, target_date)
+        validation = self._validate_dependency_chain(strategy_def, target_date, universe_group_id)
 
         # If pipeline is blocked (a critical step cannot proceed), raise
         if validation["blocked"]:
@@ -306,7 +306,7 @@ class SignalService:
     # ------------------------------------------------------------------
 
     def _validate_dependency_chain(
-        self, strategy_def: dict, target_date: str
+        self, strategy_def: dict, target_date: str, universe_group_id: str | None = None
     ) -> dict:
         """Validate the full dependency chain before signal generation.
 
@@ -400,6 +400,38 @@ class SignalService:
             data_fresh = False
             warnings.append("No price data available in database")
 
+        # -- Universe coverage check --
+        # Verify that the target_date has sufficient data across the universe
+        universe_coverage = 1.0
+        if universe_group_id:
+            from backend.services.group_service import GroupService
+            group_svc = GroupService()
+            try:
+                universe_tickers = group_svc.get_group_tickers(universe_group_id)
+                if universe_tickers:
+                    placeholders = ",".join(f"'{t}'" for t in universe_tickers)
+                    covered = conn.execute(
+                        f"SELECT COUNT(DISTINCT ticker) FROM daily_bars "
+                        f"WHERE ticker IN ({placeholders}) AND date = ?",
+                        [target_date],
+                    ).fetchone()[0]
+                    universe_coverage = covered / len(universe_tickers)
+                    if universe_coverage < 0.95:
+                        warnings.append(
+                            f"Universe coverage is low: {covered}/{len(universe_tickers)} "
+                            f"({universe_coverage:.0%}) tickers have data for {target_date}. "
+                            f"Signals may be biased toward the available subset."
+                        )
+                    if universe_coverage < 0.5:
+                        errors.append(
+                            f"Universe coverage too low: only {universe_coverage:.0%} "
+                            f"of tickers have data for {target_date}. "
+                            f"Wait for data update to complete."
+                        )
+                        blocked = True
+            except Exception:
+                pass  # group lookup failure should not block validation
+
         return {
             "blocked": blocked,
             "errors": errors,
@@ -408,6 +440,7 @@ class SignalService:
             "factor_statuses": factor_statuses,
             "model_statuses": model_statuses,
             "data_fresh": data_fresh,
+            "universe_coverage": universe_coverage,
         }
 
     def _determine_result_level(self, validation: dict) -> str:
