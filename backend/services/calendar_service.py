@@ -53,11 +53,30 @@ def offset_trading_days(dt: date, n: int) -> date:
 
 
 def get_latest_trading_day() -> date:
-    """Return the most recent completed trading day (<= today)."""
+    """Return the most recent *completed* trading day (<= today).
+
+    If the market is currently open, returns the previous session instead
+    of today, to prevent fetching incomplete intraday data.
+    """
     cal = _calendar()
     today = pd.Timestamp(date.today())
     ts = cal.date_to_session(today, direction="previous")
+
+    # If today IS a session and the market is still open, step back one day
+    if ts.date() == date.today() and is_market_open():
+        ts = cal.session_offset(ts, -1)
+
     return ts.date()
+
+
+def is_market_open() -> bool:
+    """Return True if the US market session is currently open."""
+    cal = _calendar()
+    now_utc = pd.Timestamp.now(tz="UTC")
+    try:
+        return cal.is_open_on_minute(now_utc)
+    except Exception:
+        return False
 
 
 def snap_to_trading_day(dt: date, direction: str = "backward") -> date:

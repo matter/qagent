@@ -124,6 +124,22 @@ async def quality_check() -> dict:
     return svc.run_quality_check()
 
 
+@router.delete("/data/bars")
+async def delete_bars_by_date(
+    target_date: date = Query(..., alias="date", description="Delete all daily bars for this date"),
+) -> dict:
+    """Delete all daily bar records for a specific date."""
+    conn = get_connection()
+    count_before = conn.execute(
+        "SELECT COUNT(*) FROM daily_bars WHERE date = ?", [target_date]
+    ).fetchone()[0]
+    if count_before == 0:
+        raise HTTPException(status_code=404, detail=f"No bars found for {target_date}")
+    conn.execute("DELETE FROM daily_bars WHERE date = ?", [target_date])
+    log.info("api.data.bars_deleted", date=str(target_date), count=count_before)
+    return {"date": str(target_date), "deleted_rows": count_before}
+
+
 @router.get("/stocks/search")
 async def search_stocks(
     q: str = Query(..., min_length=1, description="Search query for ticker or name"),
