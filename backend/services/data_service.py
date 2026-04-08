@@ -54,29 +54,10 @@ class DataService:
         started_at = datetime.utcnow()
         conn = get_connection()
 
-        # --- For incremental mode, check if data is already up to date ---
-        if mode == "incremental":
-            latest_completed = get_latest_trading_day()
-            max_bar_row = conn.execute(
-                "SELECT MAX(date) FROM daily_bars"
-            ).fetchone()
-            if max_bar_row and max_bar_row[0]:
-                max_bar_date = max_bar_row[0]
-                if isinstance(max_bar_date, str):
-                    max_bar_date = date.fromisoformat(max_bar_date)
-                elif hasattr(max_bar_date, "date") and callable(max_bar_date.date):
-                    max_bar_date = max_bar_date.date()
-                if max_bar_date >= latest_completed:
-                    log.info("data.update.already_up_to_date", max_date=str(max_bar_date))
-                    return {
-                        "run_id": run_id,
-                        "mode": mode,
-                        "total": 0,
-                        "success": 0,
-                        "failed": 0,
-                        "duration_seconds": 0.0,
-                        "message": "Data is already up to date",
-                    }
+        # NOTE: We intentionally do NOT short-circuit here based on
+        # global MAX(date).  A single ticker with recent data would mask
+        # thousands of stale tickers.  The per-ticker check in
+        # _get_incremental_starts handles the "already up to date" case.
 
         # Log the start
         conn.execute(
