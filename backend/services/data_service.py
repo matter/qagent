@@ -54,10 +54,28 @@ class DataService:
         started_at = datetime.utcnow()
         conn = get_connection()
 
-        # NOTE: We intentionally do NOT short-circuit here based on
-        # global MAX(date).  A single ticker with recent data would mask
-        # thousands of stale tickers.  The per-ticker check in
-        # _get_incremental_starts handles the "already up to date" case.
+        # --- Fast check: if ALL tickers already have the latest bar, skip ---
+        if mode == "incremental":
+            latest_completed = get_latest_trading_day()
+            stale_count = conn.execute(
+                """SELECT COUNT(*) FROM stocks s
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM daily_bars b
+                       WHERE b.ticker = s.ticker AND b.date >= ?
+                   )""",
+                [latest_completed],
+            ).fetchone()[0]
+            if stale_count == 0:
+                log.info("data.update.already_up_to_date")
+                return {
+                    "run_id": run_id,
+                    "mode": mode,
+                    "total": 0,
+                    "success": 0,
+                    "failed": 0,
+                    "duration_seconds": 0.0,
+                    "message": "Data is already up to date",
+                }
 
         # Log the start
         conn.execute(
