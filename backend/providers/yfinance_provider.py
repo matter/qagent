@@ -19,13 +19,13 @@ from backend.providers.base import DataProvider
 
 log = get_logger(__name__)
 
-_BATCH_SIZE = 200
-_BASE_DELAY = 2.0
-_JITTER_RANGE = (0.5, 1.5)
-_BACKOFF_BASE = 5.0
-_BACKOFF_MAX = 120.0
-_MAX_RETRIES = 4
-_RATE_LIMIT_WAIT = 60
+_BATCH_SIZE = 500
+_BASE_DELAY = 0.5
+_JITTER_RANGE = (0.0, 0.5)
+_BACKOFF_BASE = 3.0
+_BACKOFF_MAX = 60.0
+_MAX_RETRIES = 3
+_RATE_LIMIT_WAIT = 30
 
 _NASDAQ_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
 _OTHER_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
@@ -230,7 +230,7 @@ class YFinanceProvider(DataProvider):
                     auto_adjust=False,
                     progress=False,
                     group_by="ticker",
-                    threads=False,
+                    threads=True,
                 )
 
                 if raw.empty:

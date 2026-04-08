@@ -124,22 +124,41 @@ class DataService:
                 completed_batches = set(progress.get("completed_batches", []))
                 log.info("data.update.resume", completed_batches=len(completed_batches))
 
-            # --- Step 4: Batch download ---
+            # --- Step 4: Group tickers by start date then batch ---
+            # Separate new tickers (full history) from incremental tickers
+            # so one new ticker doesn't drag an entire batch back to 2016.
+            full_history_start = date(end_date.year - _FULL_HISTORY_YEARS, 1, 1)
+            new_tickers = [t for t in tickers_to_update if ticker_starts[t] <= full_history_start]
+            incremental_tickers = [t for t in tickers_to_update if ticker_starts[t] > full_history_start]
+
+            log.info(
+                "data.update.plan",
+                incremental=len(incremental_tickers),
+                new_tickers=len(new_tickers),
+            )
+
+            # Build ordered batch list: incremental first, then new
             batch_size = 500
+            batches: list[tuple[list[str], date]] = []
+            for i in range(0, len(incremental_tickers), batch_size):
+                batch = incremental_tickers[i : i + batch_size]
+                batch_start = min(ticker_starts[t] for t in batch)
+                batches.append((batch, batch_start))
+            for i in range(0, len(new_tickers), batch_size):
+                batch = new_tickers[i : i + batch_size]
+                batches.append((batch, full_history_start))
+
             success_count = 0
             fail_count = 0
             failed_tickers: list[str] = []
+            pending_frames: list[pd.DataFrame] = []
+            pending_bytes = 0
+            _FLUSH_THRESHOLD = 200_000  # flush accumulated rows to DB
 
-            for batch_idx in range(0, len(tickers_to_update), batch_size):
-                batch_num = batch_idx // batch_size
+            for batch_num, (batch, batch_start) in enumerate(batches):
                 if batch_num in completed_batches:
                     log.info("data.update.skip_batch", batch=batch_num)
                     continue
-
-                batch = tickers_to_update[batch_idx : batch_idx + batch_size]
-
-                # Find the earliest start date in this batch
-                batch_start = min(ticker_starts[t] for t in batch)
 
                 log.info(
                     "data.update.batch",
@@ -152,7 +171,8 @@ class DataService:
                 try:
                     bars_df = self._provider.get_daily_bars(batch, batch_start, end_date)
                     if not bars_df.empty:
-                        self._upsert_daily_bars(bars_df)
+                        pending_frames.append(bars_df)
+                        pending_bytes += len(bars_df)
                         downloaded_tickers = set(bars_df["ticker"].unique())
                         success_count += len(downloaded_tickers)
                         batch_failed = [t for t in batch if t not in downloaded_tickers]
@@ -166,6 +186,13 @@ class DataService:
                     fail_count += len(batch)
                     failed_tickers.extend(batch)
 
+                # Flush accumulated data to DB periodically
+                if pending_bytes >= _FLUSH_THRESHOLD:
+                    combined = pd.concat(pending_frames, ignore_index=True)
+                    self._upsert_daily_bars(combined)
+                    pending_frames.clear()
+                    pending_bytes = 0
+
                 # Save progress
                 completed_batches.add(batch_num)
                 self._save_progress(
@@ -177,6 +204,12 @@ class DataService:
                         "fail_count": fail_count,
                     }
                 )
+
+            # Flush remaining
+            if pending_frames:
+                combined = pd.concat(pending_frames, ignore_index=True)
+                self._upsert_daily_bars(combined)
+                pending_frames.clear()
 
             # --- Step 5: Update index data ---
             log.info("data.update.index", symbol="SPY")
