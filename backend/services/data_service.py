@@ -357,11 +357,13 @@ class DataService:
 
         # 3. Date gaps (tickers missing > 5 consecutive trading days)
         gap_check = conn.execute(
-            """SELECT ticker, date,
-                      LEAD(date) OVER (PARTITION BY ticker ORDER BY date) AS next_date,
-                      LEAD(date) OVER (PARTITION BY ticker ORDER BY date) - date AS gap_days
-               FROM daily_bars
-               HAVING gap_days > 7
+            """SELECT ticker, date, next_date, gap_days FROM (
+                   SELECT ticker, date,
+                          LEAD(date) OVER (PARTITION BY ticker ORDER BY date) AS next_date,
+                          LEAD(date) OVER (PARTITION BY ticker ORDER BY date) - date AS gap_days
+                   FROM daily_bars
+               ) sub
+               WHERE gap_days > 7
                ORDER BY gap_days DESC
                LIMIT 20"""
         ).fetchall()
