@@ -399,7 +399,8 @@ def run_backtest(
         strategy_id: ID of the strategy to backtest.
         config_json: JSON string with backtest configuration. Keys:
             initial_capital, start_date, end_date, benchmark,
-            commission_rate, slippage_rate, max_positions, rebalance_freq.
+            commission_rate, slippage_rate, max_positions, rebalance_freq,
+            rebalance_buffer, min_holding_days, reentry_cooldown_days.
         universe_group_id: ID of the stock group for the backtest universe.
 
     Returns:

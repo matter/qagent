@@ -50,6 +50,9 @@ export interface BacktestRestoreConfig {
   maxPositions: number;
   benchmark: string;
   rebalanceFreq: string;
+  rebalanceBuffer?: number;
+  minHoldingDays?: number;
+  reentryCooldownDays?: number;
 }
 
 interface BacktestHistoryProps {
@@ -123,6 +126,9 @@ export default function BacktestHistory({ refreshKey, onRestoreConfig }: Backtes
       maxPositions: (cfg?.max_positions as number) ?? 50,
       benchmark: (cfg?.benchmark as string) ?? "SPY",
       rebalanceFreq: (cfg?.rebalance_frequency as string) ?? "daily",
+      rebalanceBuffer: (cfg?.rebalance_buffer as number) ?? 0,
+      minHoldingDays: (cfg?.min_holding_days as number) ?? 0,
+      reentryCooldownDays: (cfg?.reentry_cooldown_days as number) ?? 0,
     });
     messageApi.success("已还原回测配置");
   };

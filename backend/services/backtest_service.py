@@ -87,6 +87,9 @@ class BacktestService:
             slippage_rate=config_dict.get("slippage_rate", 0.001),
             max_positions=config_dict.get("max_positions", 50),
             rebalance_freq=config_dict.get("rebalance_freq", "monthly"),
+            rebalance_buffer=config_dict.get("rebalance_buffer", 0.0),
+            min_holding_days=config_dict.get("min_holding_days", 0),
+            reentry_cooldown_days=config_dict.get("reentry_cooldown_days", 0),
         )
 
         position_sizing = strategy_def.get("position_sizing", "equal_weight")
@@ -96,8 +99,8 @@ class BacktestService:
         end_str = str(bt_config.end_date)
 
         # ---- 4. Load OHLCV price data ----
-        prices_close, prices_open = self._backtest_engine._load_prices(
-            tickers, start_str, end_str
+        prices_close, prices_open, prices_high, prices_low, prices_volume = (
+            self._backtest_engine._load_prices(tickers, start_str, end_str)
         )
         if prices_close.empty:
             raise ValueError("No price data available for the given tickers and date range")
@@ -133,7 +136,9 @@ class BacktestService:
 
         # Build a prices DataFrame with MultiIndex columns (field, ticker)
         # for the StrategyContext — computed once, strategies slice via current_date
-        prices_multi = self._build_prices_multi(prices_close, prices_open, tickers)
+        prices_multi = self._build_prices_multi(
+            prices_close, prices_open, prices_high, prices_low, prices_volume, tickers,
+        )
 
         # Create weight signals: DataFrame(index=dates, columns=tickers)
         all_weights = pd.DataFrame(0.0, index=prices_close.index, columns=tickers)
@@ -156,8 +161,30 @@ class BacktestService:
         )
 
         prev_weights = None
+        # Portfolio state tracking for StrategyContext
+        port_weights: dict[str, float] = {}     # current weight per ticker
+        port_holding_days: dict[str, int] = {}   # consecutive days held
+        port_entry_price: dict[str, float] = {}  # avg entry price per ticker
+
         for trade_date in all_trading_days:
             trade_ts = pd.Timestamp(trade_date)
+
+            # Update holding_days for all held tickers
+            for t in list(port_holding_days):
+                port_holding_days[t] += 1
+
+            # Compute unrealized P&L from entry prices
+            port_unrealized: dict[str, float] = {}
+            if port_entry_price:
+                for t, entry in port_entry_price.items():
+                    if (
+                        trade_ts in prices_close.index
+                        and t in prices_close.columns
+                    ):
+                        cur_price = prices_close.loc[trade_ts, t]
+                        if pd.notna(cur_price) and entry > 0:
+                            port_unrealized[t] = cur_price / entry - 1.0
+
             if trade_ts not in rebalance_dates_set:
                 # Carry forward previous weights
                 if prev_weights is not None:
@@ -168,12 +195,16 @@ class BacktestService:
             date_key = str(trade_ts.date()) if hasattr(trade_ts, "date") else str(trade_ts)[:10]
             model_predictions = model_preds_by_date.get(date_key, {})
 
-            # Build context — pass full prices_multi, strategy uses current_date to filter
+            # Build context with portfolio state
             context = StrategyContext(
                 prices=prices_multi,
                 factor_values=factor_data,
                 model_predictions=model_predictions,
                 current_date=trade_ts,
+                current_weights=dict(port_weights),
+                holding_days=dict(port_holding_days),
+                avg_entry_price=dict(port_entry_price),
+                unrealized_pnl=dict(port_unrealized),
             )
 
             # Generate signals
@@ -194,6 +225,9 @@ class BacktestService:
                 # No signals -- go to cash (all zeros)
                 all_weights.loc[trade_ts] = 0.0
                 prev_weights = all_weights.loc[trade_ts].values
+                port_weights.clear()
+                port_holding_days.clear()
+                port_entry_price.clear()
                 continue
 
             # Apply position sizing
@@ -209,6 +243,31 @@ class BacktestService:
                 if ticker in all_weights.columns:
                     all_weights.loc[trade_ts, ticker] = w
             prev_weights = all_weights.loc[trade_ts].values
+
+            # Update portfolio state tracking
+            new_held = {t for t, w in weights.items() if w > 1e-8}
+            old_held = set(port_weights.keys())
+
+            # Exited tickers
+            for t in old_held - new_held:
+                port_weights.pop(t, None)
+                port_holding_days.pop(t, None)
+                port_entry_price.pop(t, None)
+
+            # New entries — record entry price from current close
+            for t in new_held - old_held:
+                port_holding_days[t] = 0
+                if (
+                    trade_ts in prices_close.index
+                    and t in prices_close.columns
+                ):
+                    p = prices_close.loc[trade_ts, t]
+                    port_entry_price[t] = float(p) if pd.notna(p) else 0.0
+                else:
+                    port_entry_price[t] = 0.0
+
+            # Update weights for all held tickers
+            port_weights = {t: w for t, w in weights.items() if w > 1e-8}
 
         # ---- 7. Run BacktestEngine ----
         result = self._backtest_engine.run(all_weights, bt_config)
@@ -649,18 +708,27 @@ class BacktestService:
     def _build_prices_multi(
         prices_close: pd.DataFrame,
         prices_open: pd.DataFrame,
+        prices_high: pd.DataFrame,
+        prices_low: pd.DataFrame,
+        prices_volume: pd.DataFrame,
         tickers: list[str],
     ) -> pd.DataFrame:
         """Build a MultiIndex-column DataFrame with (field, ticker) columns.
 
-        Fields: close, open.
+        Fields: close, open, high, low, volume.
         """
         frames = {}
-        for ticker in tickers:
-            if ticker in prices_close.columns:
-                frames[("close", ticker)] = prices_close[ticker]
-            if ticker in prices_open.columns:
-                frames[("open", ticker)] = prices_open[ticker]
+        field_dfs = [
+            ("close", prices_close),
+            ("open", prices_open),
+            ("high", prices_high),
+            ("low", prices_low),
+            ("volume", prices_volume),
+        ]
+        for field_name, df in field_dfs:
+            for ticker in tickers:
+                if ticker in df.columns:
+                    frames[(field_name, ticker)] = df[ticker]
 
         if not frames:
             return pd.DataFrame()

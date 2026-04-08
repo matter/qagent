@@ -61,6 +61,9 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
   const [maxPositions, setMaxPositions] = useState<number>(50);
   const [benchmark, setBenchmark] = useState("SPY");
   const [rebalanceFreq, setRebalanceFreq] = useState("daily");
+  const [rebalanceBuffer, setRebalanceBuffer] = useState<number>(0);
+  const [minHoldingDays, setMinHoldingDays] = useState<number>(0);
+  const [reentryCooldownDays, setReentryCooldownDays] = useState<number>(0);
 
   const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
@@ -87,6 +90,9 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
     if (restoreConfig.maxPositions) setMaxPositions(restoreConfig.maxPositions);
     if (restoreConfig.benchmark) setBenchmark(restoreConfig.benchmark);
     if (restoreConfig.rebalanceFreq) setRebalanceFreq(restoreConfig.rebalanceFreq);
+    if (restoreConfig.rebalanceBuffer != null) setRebalanceBuffer(restoreConfig.rebalanceBuffer);
+    if (restoreConfig.minHoldingDays != null) setMinHoldingDays(restoreConfig.minHoldingDays);
+    if (restoreConfig.reentryCooldownDays != null) setReentryCooldownDays(restoreConfig.reentryCooldownDays);
   }, [restoreConfig]);
 
   useEffect(() => {
@@ -120,6 +126,9 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
           max_positions: maxPositions,
           benchmark,
           rebalance_frequency: rebalanceFreq,
+          rebalance_buffer: rebalanceBuffer,
+          min_holding_days: minHoldingDays,
+          reentry_cooldown_days: reentryCooldownDays,
         },
         universe_group_id: selectedGroup,
       });
@@ -293,6 +302,41 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
                   <Radio.Button value="weekly">每周</Radio.Button>
                   <Radio.Button value="monthly">每月</Radio.Button>
                 </Radio.Group>
+              </Col>
+            </Row>
+
+            <Row gutter={12}>
+              <Col span={8}>
+                <Text type="secondary" style={{ fontSize: 12 }}>调仓缓冲带</Text>
+                <InputNumber
+                  style={{ width: "100%" }}
+                  value={rebalanceBuffer}
+                  onChange={(v) => setRebalanceBuffer(v ?? 0)}
+                  min={0}
+                  max={0.5}
+                  step={0.01}
+                  placeholder="权重变化低于此值不交易"
+                />
+              </Col>
+              <Col span={8}>
+                <Text type="secondary" style={{ fontSize: 12 }}>最小持仓天数</Text>
+                <InputNumber
+                  style={{ width: "100%" }}
+                  value={minHoldingDays}
+                  onChange={(v) => setMinHoldingDays(v ?? 0)}
+                  min={0}
+                  max={60}
+                />
+              </Col>
+              <Col span={8}>
+                <Text type="secondary" style={{ fontSize: 12 }}>再入场冷却天数</Text>
+                <InputNumber
+                  style={{ width: "100%" }}
+                  value={reentryCooldownDays}
+                  onChange={(v) => setReentryCooldownDays(v ?? 0)}
+                  min={0}
+                  max={60}
+                />
               </Col>
             </Row>
           </Space>

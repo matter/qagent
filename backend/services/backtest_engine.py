@@ -39,6 +39,11 @@ class BacktestConfig:
     max_positions: int = 50
     rebalance_freq: str = "daily"    # daily / weekly / monthly
 
+    # Low-turnover controls
+    rebalance_buffer: float = 0.0       # ignore weight change below this threshold
+    min_holding_days: int = 0           # don't sell a position before N trading days
+    reentry_cooldown_days: int = 0      # after selling, wait N days before re-buying
+
     def __post_init__(self) -> None:
         if isinstance(self.start_date, str):
             self.start_date = date.fromisoformat(self.start_date)
@@ -58,6 +63,9 @@ class BacktestConfig:
             "slippage_rate": self.slippage_rate,
             "max_positions": self.max_positions,
             "rebalance_freq": self.rebalance_freq,
+            "rebalance_buffer": self.rebalance_buffer,
+            "min_holding_days": self.min_holding_days,
+            "reentry_cooldown_days": self.reentry_cooldown_days,
         }
 
 
@@ -151,7 +159,7 @@ class BacktestEngine:
 
         # 1. Load price data
         tickers = list(signals.columns)
-        prices_close, prices_open = self._load_prices(
+        prices_close, prices_open, _high, _low, _vol = self._load_prices(
             tickers, str(config.start_date), str(config.end_date)
         )
         benchmark_close = self._load_benchmark(
@@ -176,6 +184,10 @@ class BacktestEngine:
         holdings: dict[str, float] = {}
         current_weights: dict[str, float] = {}
 
+        # Low-turnover state tracking
+        ticker_holding_days: dict[str, int] = {}   # days held per ticker
+        ticker_exit_day: dict[str, int] = {}        # day_idx when last sold
+
         nav_series: list[float] = []
         date_series: list[str] = []
         trade_log: list[dict] = []
@@ -185,6 +197,10 @@ class BacktestEngine:
 
         for day_idx, trade_date in enumerate(all_trading_days):
             trade_date_ts = pd.Timestamp(trade_date)
+
+            # Increment holding days for all held tickers
+            for t in ticker_holding_days:
+                ticker_holding_days[t] += 1
 
             # --- Check if previous day was a signal/rebalance day ---
             # We look for signals from the PREVIOUS trading day to execute today
@@ -225,14 +241,51 @@ class BacktestEngine:
                         portfolio_value = capital
 
                     # Compute trades: current weights vs target weights
+                    # Apply low-turnover constraints before executing trades
+                    effective_targets = dict(target_weights)
+
+                    if config.rebalance_buffer > 0 or config.min_holding_days > 0 or config.reentry_cooldown_days > 0:
+                        all_involved_tickers = set(current_weights.keys()) | set(
+                            target_weights.keys()
+                        )
+                        for ticker in all_involved_tickers:
+                            old_w = current_weights.get(ticker, 0.0)
+                            new_w = target_weights.get(ticker, 0.0)
+
+                            # Buffer: skip trade if weight change is below threshold
+                            if config.rebalance_buffer > 0 and abs(new_w - old_w) < config.rebalance_buffer:
+                                effective_targets[ticker] = old_w
+                                continue
+
+                            # Min holding days: prevent selling before N days
+                            if config.min_holding_days > 0 and old_w > 0 and new_w < old_w:
+                                days_held = ticker_holding_days.get(ticker, 0)
+                                if days_held < config.min_holding_days:
+                                    effective_targets[ticker] = old_w
+                                    continue
+
+                            # Re-entry cooldown: prevent buying back after recent sell
+                            if config.reentry_cooldown_days > 0 and old_w == 0 and new_w > 0:
+                                exit_idx = ticker_exit_day.get(ticker)
+                                if exit_idx is not None and (day_idx - exit_idx) < config.reentry_cooldown_days:
+                                    effective_targets.pop(ticker, None)
+                                    continue
+
+                        # Re-normalize if constraints altered the weights
+                        eff_sum = sum(w for w in effective_targets.values() if w > 0)
+                        if eff_sum > 0:
+                            effective_targets = {
+                                t: w / eff_sum for t, w in effective_targets.items() if w > 0
+                            }
+
                     all_involved_tickers = set(current_weights.keys()) | set(
-                        target_weights.keys()
+                        effective_targets.keys()
                     )
 
                     day_turnover = 0.0
                     for ticker in all_involved_tickers:
                         old_w = current_weights.get(ticker, 0.0)
-                        new_w = target_weights.get(ticker, 0.0)
+                        new_w = effective_targets.get(ticker, 0.0)
                         weight_change = abs(new_w - old_w)
                         day_turnover += weight_change
 
@@ -263,11 +316,18 @@ class BacktestEngine:
                         portfolio_value -= trade_cost
                         capital -= trade_cost
 
-                        # Update holdings
+                        # Update holdings and track exits
                         if target_shares > 1e-8:
                             holdings[ticker] = target_shares
-                        elif ticker in holdings:
-                            del holdings[ticker]
+                            # Track new entry for holding days
+                            if ticker not in ticker_holding_days:
+                                ticker_holding_days[ticker] = 0
+                        else:
+                            if ticker in holdings:
+                                del holdings[ticker]
+                            # Record exit day for cooldown
+                            ticker_exit_day[ticker] = day_idx
+                            ticker_holding_days.pop(ticker, None)
 
                         # Log the trade
                         action = "buy" if share_change > 0 else "sell"
@@ -284,7 +344,7 @@ class BacktestEngine:
 
                     total_weight_turnover += day_turnover
                     num_rebalance_periods += 1
-                    current_weights = dict(target_weights)
+                    current_weights = dict(effective_targets)
 
             # --- Value portfolio at today's close ---
             portfolio_value = 0.0
@@ -380,16 +440,17 @@ class BacktestEngine:
         tickers: list[str],
         start_date: str,
         end_date: str,
-    ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """Load close and open prices from daily_bars.
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """Load OHLCV prices from daily_bars.
 
         Returns:
-            (close_df, open_df) each with DatetimeIndex and ticker columns.
+            (close_df, open_df, high_df, low_df, volume_df) each with
+            DatetimeIndex and ticker columns.
         """
         conn = get_connection()
         placeholders = ",".join(f"'{t}'" for t in tickers)
         query = f"""
-            SELECT ticker, date, open, close
+            SELECT ticker, date, open, high, low, close, volume
             FROM daily_bars
             WHERE ticker IN ({placeholders})
               AND date >= ?
@@ -399,14 +460,18 @@ class BacktestEngine:
         rows = conn.execute(query, [start_date, end_date]).fetchdf()
 
         if rows.empty:
-            return pd.DataFrame(), pd.DataFrame()
+            empty = pd.DataFrame()
+            return empty, empty, empty, empty, empty
 
         close_df = rows.pivot(index="date", columns="ticker", values="close")
         open_df = rows.pivot(index="date", columns="ticker", values="open")
-        close_df.index = pd.to_datetime(close_df.index)
-        open_df.index = pd.to_datetime(open_df.index)
+        high_df = rows.pivot(index="date", columns="ticker", values="high")
+        low_df = rows.pivot(index="date", columns="ticker", values="low")
+        volume_df = rows.pivot(index="date", columns="ticker", values="volume")
+        for df in (close_df, open_df, high_df, low_df, volume_df):
+            df.index = pd.to_datetime(df.index)
 
-        return close_df, open_df
+        return close_df, open_df, high_df, low_df, volume_df
 
     def _load_benchmark(
         self, symbol: str, start_date: str, end_date: str

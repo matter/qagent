@@ -17,12 +17,20 @@ class StrategyContext:
         factor_values: Mapping of factor_name -> DataFrame(dates x tickers).
         model_predictions: Mapping of model_id -> Series(ticker -> prediction).
         current_date: The date being evaluated.
+        current_weights: Current portfolio weights per ticker (from last rebalance).
+        holding_days: Number of consecutive trading days each ticker has been held.
+        avg_entry_price: Volume-weighted average entry price per ticker.
+        unrealized_pnl: Unrealised P&L fraction per ticker (price / entry - 1).
     """
 
     prices: pd.DataFrame
     factor_values: dict[str, pd.DataFrame] = field(default_factory=dict)
     model_predictions: dict[str, pd.Series] = field(default_factory=dict)
     current_date: object = None
+    current_weights: dict[str, float] = field(default_factory=dict)
+    holding_days: dict[str, int] = field(default_factory=dict)
+    avg_entry_price: dict[str, float] = field(default_factory=dict)
+    unrealized_pnl: dict[str, float] = field(default_factory=dict)
 
 
 class StrategyBase(ABC):

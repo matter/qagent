@@ -100,7 +100,9 @@ class SignalService:
         row = conn.execute(lookback_query, [target_date]).fetchone()
         start_date = str(row[0]) if row and row[0] else target_date
 
-        prices_close, prices_open = self._load_prices(tickers, start_date, target_date)
+        prices_close, prices_open, prices_high, prices_low, prices_volume = (
+            self._load_prices(tickers, start_date, target_date)
+        )
         if prices_close.empty:
             raise ValueError("No price data available for the given tickers and date range")
 
@@ -145,7 +147,9 @@ class SignalService:
                 )
 
         # ---- 7. Build StrategyContext ----
-        prices_multi = self._build_prices_multi(prices_close, prices_open, tickers)
+        prices_multi = self._build_prices_multi(
+            prices_close, prices_open, prices_high, prices_low, prices_volume, tickers,
+        )
         trade_ts = pd.Timestamp(target_date)
 
         context = StrategyContext(
@@ -647,12 +651,12 @@ class SignalService:
         tickers: list[str],
         start_date: str,
         end_date: str,
-    ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """Load close and open price DataFrames from daily_bars."""
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """Load OHLCV price DataFrames from daily_bars."""
         conn = get_connection()
         placeholders = ",".join(f"'{t}'" for t in tickers)
         query = f"""
-            SELECT ticker, date, open, close
+            SELECT ticker, date, open, high, low, close, volume
             FROM daily_bars
             WHERE ticker IN ({placeholders})
               AND date >= ? AND date <= ?
@@ -660,26 +664,39 @@ class SignalService:
         """
         df = conn.execute(query, [start_date, end_date]).fetchdf()
         if df.empty:
-            return pd.DataFrame(), pd.DataFrame()
+            empty = pd.DataFrame()
+            return empty, empty, empty, empty, empty
 
         df["date"] = pd.to_datetime(df["date"])
         close_pivot = df.pivot(index="date", columns="ticker", values="close")
         open_pivot = df.pivot(index="date", columns="ticker", values="open")
-        return close_pivot, open_pivot
+        high_pivot = df.pivot(index="date", columns="ticker", values="high")
+        low_pivot = df.pivot(index="date", columns="ticker", values="low")
+        volume_pivot = df.pivot(index="date", columns="ticker", values="volume")
+        return close_pivot, open_pivot, high_pivot, low_pivot, volume_pivot
 
     @staticmethod
     def _build_prices_multi(
         prices_close: pd.DataFrame,
         prices_open: pd.DataFrame,
+        prices_high: pd.DataFrame,
+        prices_low: pd.DataFrame,
+        prices_volume: pd.DataFrame,
         tickers: list[str],
     ) -> pd.DataFrame:
         """Build a MultiIndex-column DataFrame with (field, ticker) columns."""
         frames = {}
-        for ticker in tickers:
-            if ticker in prices_close.columns:
-                frames[("close", ticker)] = prices_close[ticker]
-            if ticker in prices_open.columns:
-                frames[("open", ticker)] = prices_open[ticker]
+        field_dfs = [
+            ("close", prices_close),
+            ("open", prices_open),
+            ("high", prices_high),
+            ("low", prices_low),
+            ("volume", prices_volume),
+        ]
+        for field_name, df in field_dfs:
+            for ticker in tickers:
+                if ticker in df.columns:
+                    frames[(field_name, ticker)] = df[ticker]
 
         if not frames:
             return pd.DataFrame()
