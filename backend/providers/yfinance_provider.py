@@ -230,7 +230,7 @@ class YFinanceProvider(DataProvider):
                     auto_adjust=False,
                     progress=False,
                     group_by="ticker",
-                    threads=True,
+                    threads=False,
                 )
 
                 if raw.empty:
