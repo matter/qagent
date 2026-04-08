@@ -100,7 +100,10 @@ class BacktestResult:
     monthly_returns: list[dict]    # [{year, month, return}]
 
     # Trade log
-    trades: list[dict]             # [{date, ticker, action, shares, price, cost}]
+    trades: list[dict]             # [{date, ticker, action, shares, price, cost, trade_reason, position_state, holding_days}]
+
+    # Trade diagnostics
+    trade_diagnostics: dict        # aggregate stats by trade_reason and position_state
 
     def to_dict(self) -> dict:
         """Serialize to a plain dict."""
@@ -124,6 +127,7 @@ class BacktestResult:
             "total_cost": self.total_cost,
             "monthly_returns": self.monthly_returns,
             "trades": self.trades,
+            "trade_diagnostics": self.trade_diagnostics,
         }
 
 
@@ -316,6 +320,27 @@ class BacktestEngine:
                         portfolio_value -= trade_cost
                         capital -= trade_cost
 
+                        # Determine trade reason and position state
+                        was_held = old_shares > 1e-8
+                        will_hold = target_shares > 1e-8
+                        if share_change > 0:
+                            if not was_held:
+                                # Check if this is a re-entry
+                                if ticker in ticker_exit_day:
+                                    trade_reason = "reentry"
+                                else:
+                                    trade_reason = "new_entry"
+                            else:
+                                trade_reason = "add"
+                        else:
+                            if will_hold:
+                                trade_reason = "reduce"
+                            else:
+                                trade_reason = "exit"
+
+                        days_held = ticker_holding_days.get(ticker, 0)
+                        position_state = "core" if days_held > 5 else "tactical"
+
                         # Update holdings and track exits
                         if target_shares > 1e-8:
                             holdings[ticker] = target_shares
@@ -339,6 +364,9 @@ class BacktestEngine:
                                 "shares": round(abs(share_change), 4),
                                 "price": round(exec_price, 4),
                                 "cost": round(trade_cost, 4),
+                                "trade_reason": trade_reason,
+                                "position_state": position_state,
+                                "holding_days": days_held,
                             }
                         )
 
@@ -400,6 +428,9 @@ class BacktestEngine:
 
         annual_turnover = (total_weight_turnover / years) if years > 0 else 0.0
 
+        # Compute trade diagnostics
+        trade_diagnostics = _calc_trade_diagnostics(trade_log)
+
         result = BacktestResult(
             config=config.to_dict(),
             dates=date_series,
@@ -420,6 +451,7 @@ class BacktestEngine:
             total_cost=round(total_cost, 2),
             monthly_returns=monthly_rets,
             trades=trade_log,
+            trade_diagnostics=trade_diagnostics,
         )
 
         log.info(
@@ -680,6 +712,61 @@ def _calc_trade_stats(trade_log: list[dict]) -> tuple[float, float]:
     pl_ratio = float(avg_profit / avg_loss) if avg_loss > 0 else 0.0
 
     return float(win_rate), pl_ratio
+
+
+def _calc_trade_diagnostics(trade_log: list[dict]) -> dict:
+    """Compute aggregate trade diagnostics by reason and position state."""
+    by_reason: dict[str, dict] = {}
+    by_state: dict[str, dict] = {}
+
+    for t in trade_log:
+        reason = t.get("trade_reason", "unknown")
+        state = t.get("position_state", "unknown")
+        value = t.get("shares", 0) * t.get("price", 0)
+        cost = t.get("cost", 0)
+
+        # Aggregate by reason
+        if reason not in by_reason:
+            by_reason[reason] = {"count": 0, "total_value": 0.0, "total_cost": 0.0}
+        by_reason[reason]["count"] += 1
+        by_reason[reason]["total_value"] += value
+        by_reason[reason]["total_cost"] += cost
+
+        # Aggregate by position state
+        if state not in by_state:
+            by_state[state] = {"count": 0, "total_value": 0.0, "total_cost": 0.0}
+        by_state[state]["count"] += 1
+        by_state[state]["total_value"] += value
+        by_state[state]["total_cost"] += cost
+
+    # Round values
+    for d in list(by_reason.values()) + list(by_state.values()):
+        d["total_value"] = round(d["total_value"], 2)
+        d["total_cost"] = round(d["total_cost"], 2)
+
+    # Compute tactical P&L: sum of (sell_value - buy_value) for tactical trades
+    # Group tactical trades by ticker to compute per-ticker P&L
+    tactical_buys: dict[str, float] = {}   # ticker -> total buy value
+    tactical_sells: dict[str, float] = {}  # ticker -> total sell value
+    for t in trade_log:
+        if t.get("position_state") != "tactical":
+            continue
+        ticker = t["ticker"]
+        value = t.get("shares", 0) * t.get("price", 0)
+        if t["action"] == "buy":
+            tactical_buys[ticker] = tactical_buys.get(ticker, 0) + value
+        else:
+            tactical_sells[ticker] = tactical_sells.get(ticker, 0) + value
+
+    tactical_pnl = sum(tactical_sells.values()) - sum(tactical_buys.values())
+    tactical_cost = by_state.get("tactical", {}).get("total_cost", 0)
+
+    return {
+        "by_reason": by_reason,
+        "by_position_state": by_state,
+        "tactical_pnl": round(tactical_pnl, 2),
+        "tactical_net_pnl": round(tactical_pnl - tactical_cost, 2),
+    }
 
 
 def _calc_monthly_returns(

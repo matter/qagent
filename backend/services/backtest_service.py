@@ -762,6 +762,7 @@ class BacktestService:
             "total_trades": result.total_trades,
             "annual_turnover": result.annual_turnover,
             "total_cost": result.total_cost,
+            "trade_diagnostics": result.trade_diagnostics,
         }
 
         # Build nav_series as {dates: [...], values: [...]}
