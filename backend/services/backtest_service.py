@@ -294,6 +294,30 @@ class BacktestService:
         result_dict["result_level"] = result_level
         result_dict["universe_group_id"] = universe_group_id
 
+        # ---- 11. Check for data leakage ----
+        leakage_warnings = self._check_data_leakage(
+            required_models, bt_config, tickers, universe_group_id,
+        )
+        if leakage_warnings:
+            result_dict["leakage_warnings"] = leakage_warnings
+            # Persist warnings into the stored summary
+            conn = get_connection()
+            row = conn.execute(
+                "SELECT summary FROM backtest_results WHERE id = ?", [bt_id]
+            ).fetchone()
+            if row:
+                summary_data = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
+                summary_data["leakage_warnings"] = leakage_warnings
+                conn.execute(
+                    "UPDATE backtest_results SET summary = ? WHERE id = ?",
+                    [json.dumps(summary_data, default=str), bt_id],
+                )
+            log.warning(
+                "backtest_service.leakage_detected",
+                backtest_id=bt_id,
+                warnings=len(leakage_warnings),
+            )
+
         log.info(
             "backtest_service.done",
             backtest_id=bt_id,
@@ -736,6 +760,130 @@ class BacktestService:
         result = pd.DataFrame(frames)
         result.columns = pd.MultiIndex.from_tuples(result.columns, names=["field", "ticker"])
         return result
+
+    def _check_data_leakage(
+        self,
+        model_ids: list[str],
+        bt_config: BacktestConfig,
+        backtest_tickers: list[str],
+        backtest_group_id: str,
+    ) -> list[dict]:
+        """Detect overlap between model training data and backtest window.
+
+        Returns a list of warning dicts, one per model with detected leakage.
+        Each warning includes:
+          - model_id, model_name
+          - time_overlap: bool (backtest window intersects train/valid window)
+          - ticker_overlap: bool (backtest tickers intersect training tickers)
+          - overlap_level: 'fully_unseen' | 'time_unseen' | 'ticker_unseen' | 'contaminated'
+          - details: human-readable description
+        """
+        if not model_ids:
+            return []
+
+        warnings: list[dict] = []
+        bt_start = bt_config.start_date
+        bt_end = bt_config.end_date
+        backtest_ticker_set = set(backtest_tickers)
+
+        for model_id in model_ids:
+            try:
+                record = self._model_service.get_model(model_id)
+            except Exception:
+                continue
+
+            tc = record.get("train_config") or {}
+            model_name = record.get("name", model_id)
+
+            # Parse training date boundaries
+            train_end_str = tc.get("train_end") or tc.get("valid_end") or tc.get("test_end")
+            train_start_str = tc.get("train_start")
+            if not train_end_str:
+                continue
+
+            from datetime import date as _date
+            try:
+                model_train_end = _date.fromisoformat(str(train_end_str))
+                model_train_start = _date.fromisoformat(str(train_start_str)) if train_start_str else None
+            except (ValueError, TypeError):
+                continue
+
+            # Include valid/test window as "seen" data
+            for key in ("valid_end", "test_end"):
+                val = tc.get(key)
+                if val:
+                    try:
+                        d = _date.fromisoformat(str(val))
+                        if d > model_train_end:
+                            model_train_end = d
+                    except (ValueError, TypeError):
+                        pass
+
+            # Check time overlap: does the backtest window start before
+            # the model's last seen date?
+            time_overlap = bt_start <= model_train_end
+
+            # Check ticker overlap: read training universe from metadata.json
+            ticker_overlap = False
+            model_group_id = None
+            try:
+                import json as _json
+                from backend.config import settings as _settings
+                meta_path = _settings.models_dir / model_id / "metadata.json"
+                if meta_path.exists():
+                    meta = _json.loads(meta_path.read_text())
+                    model_group_id = meta.get("universe_group_id")
+            except Exception:
+                pass
+
+            if model_group_id:
+                if model_group_id == backtest_group_id:
+                    ticker_overlap = True
+                else:
+                    try:
+                        model_tickers = set(
+                            self._group_service.get_group_tickers(model_group_id)
+                        )
+                        if backtest_ticker_set & model_tickers:
+                            ticker_overlap = True
+                    except Exception:
+                        pass
+
+            # Classify overlap level
+            if time_overlap and ticker_overlap:
+                level = "contaminated"
+            elif time_overlap:
+                level = "ticker_unseen"
+            elif ticker_overlap:
+                level = "time_unseen"
+            else:
+                level = "fully_unseen"
+
+            if level == "fully_unseen":
+                continue  # no warning needed
+
+            # Build detail message
+            detail_parts = []
+            if time_overlap:
+                detail_parts.append(
+                    f"回测起始 {bt_start} 在模型训练数据截止日 {model_train_end} 之前，"
+                    f"存在 {(model_train_end - bt_start).days + 1} 天时间重叠"
+                )
+            if ticker_overlap:
+                detail_parts.append("回测股票池与模型训练股票池存在重叠")
+
+            warnings.append({
+                "model_id": model_id,
+                "model_name": model_name,
+                "time_overlap": time_overlap,
+                "ticker_overlap": ticker_overlap,
+                "overlap_level": level,
+                "model_data_end": str(model_train_end),
+                "backtest_start": str(bt_start),
+                "details": "；".join(detail_parts),
+            })
+
+        return warnings
 
     def _save_result(
         self,
