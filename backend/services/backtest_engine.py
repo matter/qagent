@@ -715,7 +715,12 @@ def _calc_trade_stats(trade_log: list[dict]) -> tuple[float, float]:
 
 
 def _calc_trade_diagnostics(trade_log: list[dict]) -> dict:
-    """Compute aggregate trade diagnostics by reason and position state."""
+    """Compute aggregate trade diagnostics by reason and position state.
+
+    Tactical P&L is computed via round-trip matching: each buy is paired
+    with its corresponding sell for the same ticker (FIFO order).  A
+    round-trip held <= 5 trading days is classified as tactical.
+    """
     by_reason: dict[str, dict] = {}
     by_state: dict[str, dict] = {}
 
@@ -744,28 +749,81 @@ def _calc_trade_diagnostics(trade_log: list[dict]) -> dict:
         d["total_value"] = round(d["total_value"], 2)
         d["total_cost"] = round(d["total_cost"], 2)
 
-    # Compute tactical P&L: sum of (sell_value - buy_value) for tactical trades
-    # Group tactical trades by ticker to compute per-ticker P&L
-    tactical_buys: dict[str, float] = {}   # ticker -> total buy value
-    tactical_sells: dict[str, float] = {}  # ticker -> total sell value
-    for t in trade_log:
-        if t.get("position_state") != "tactical":
-            continue
-        ticker = t["ticker"]
-        value = t.get("shares", 0) * t.get("price", 0)
-        if t["action"] == "buy":
-            tactical_buys[ticker] = tactical_buys.get(ticker, 0) + value
-        else:
-            tactical_sells[ticker] = tactical_sells.get(ticker, 0) + value
+    # ---- Round-trip P&L computation ----
+    # Track open buy lots per ticker as FIFO queue: [(shares, price, date, cost)]
+    open_lots: dict[str, list[list]] = {}
+    tactical_pnl = 0.0
+    tactical_cost = 0.0
+    tactical_trips = 0
+    core_pnl = 0.0
+    core_cost = 0.0
+    core_trips = 0
 
-    tactical_pnl = sum(tactical_sells.values()) - sum(tactical_buys.values())
-    tactical_cost = by_state.get("tactical", {}).get("total_cost", 0)
+    for t in trade_log:
+        ticker = t["ticker"]
+        shares = t.get("shares", 0.0)
+        price = t.get("price", 0.0)
+        cost = t.get("cost", 0.0)
+        trade_date = t.get("date", "")
+
+        if t["action"] == "buy":
+            if ticker not in open_lots:
+                open_lots[ticker] = []
+            open_lots[ticker].append([shares, price, trade_date, cost])
+        elif t["action"] == "sell" and ticker in open_lots:
+            remaining = shares
+            sell_revenue = shares * price
+            sell_cost = cost
+            buy_cost_total = 0.0
+            buy_trade_cost = 0.0
+            earliest_buy_date = trade_date
+
+            # Match against open lots FIFO
+            while remaining > 1e-8 and open_lots[ticker]:
+                lot = open_lots[ticker][0]
+                lot_shares, lot_price, lot_date, lot_cost = lot
+                matched = min(remaining, lot_shares)
+                frac = matched / lot_shares if lot_shares > 1e-8 else 0
+
+                buy_cost_total += matched * lot_price
+                buy_trade_cost += lot_cost * frac
+                earliest_buy_date = lot_date
+                remaining -= matched
+                lot[0] -= matched
+                lot[3] -= lot_cost * frac
+
+                if lot[0] < 1e-8:
+                    open_lots[ticker].pop(0)
+
+            if not open_lots[ticker]:
+                del open_lots[ticker]
+
+            # Compute P&L for this round-trip
+            trip_pnl = sell_revenue - buy_cost_total
+            trip_cost = sell_cost + buy_trade_cost
+
+            # Classify by holding duration
+            holding = t.get("holding_days", 0)
+            if holding <= 5:
+                tactical_pnl += trip_pnl
+                tactical_cost += trip_cost
+                tactical_trips += 1
+            else:
+                core_pnl += trip_pnl
+                core_cost += trip_cost
+                core_trips += 1
 
     return {
         "by_reason": by_reason,
         "by_position_state": by_state,
         "tactical_pnl": round(tactical_pnl, 2),
+        "tactical_cost": round(tactical_cost, 2),
         "tactical_net_pnl": round(tactical_pnl - tactical_cost, 2),
+        "tactical_trips": tactical_trips,
+        "core_pnl": round(core_pnl, 2),
+        "core_cost": round(core_cost, 2),
+        "core_net_pnl": round(core_pnl - core_cost, 2),
+        "core_trips": core_trips,
     }
 
 
