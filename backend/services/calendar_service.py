@@ -53,22 +53,23 @@ def offset_trading_days(dt: date, n: int) -> date:
 
 
 def get_latest_trading_day() -> date:
-    """Return the most recent *completed* trading day (<= today).
+    """Return the most recent *completed* trading day.
 
-    If today is a trading session but the market hasn't closed yet,
-    returns the previous session to prevent fetching incomplete data.
+    Uses US Eastern time to determine "today" so that timezone
+    differences don't cause fetching of future trading days.
+    If today's session hasn't closed yet, returns the previous session.
     """
     cal = _calendar()
-    today = pd.Timestamp(date.today())
-    ts = cal.date_to_session(today, direction="previous")
+    now_utc = pd.Timestamp.now(tz="UTC")
+    now_et = now_utc.tz_convert("America/New_York")
+    today_et = now_et.normalize().tz_localize(None)  # midnight ET, tz-naive
+    ts = cal.date_to_session(today_et, direction="previous")
 
-    # If resolved session is today, check if today's session has finished
-    if ts.date() == date.today():
-        now_utc = pd.Timestamp.now(tz="UTC")
+    # If resolved session is today (ET), check if market has closed
+    if ts.normalize() == today_et:
         try:
             close_time = cal.session_close(ts)
             if now_utc < close_time:
-                # Market hasn't closed yet – use previous session
                 ts = cal.session_offset(ts, -1)
         except Exception:
             pass

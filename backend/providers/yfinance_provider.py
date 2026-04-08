@@ -327,4 +327,15 @@ class YFinanceProvider(DataProvider):
             return pd.DataFrame(
                 columns=["date", "ticker", "open", "high", "low", "close", "volume", "adj_factor"]
             )
-        return pd.concat(frames, ignore_index=True)
+        result = pd.concat(frames, ignore_index=True)
+
+        # Drop rows with missing close price (incomplete bars from intraday fetches)
+        before = len(result)
+        result = result.dropna(subset=["close"])
+        if len(result) < before:
+            log.warning(
+                "provider.parse.dropped_null_close",
+                dropped=before - len(result),
+            )
+
+        return result
