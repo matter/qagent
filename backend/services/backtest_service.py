@@ -657,6 +657,7 @@ class BacktestService:
                     try:
                         day_preds = all_preds.xs(closest, level="date")
                         if not day_preds.empty:
+                            day_preds = self._model_service._break_prediction_ties(day_preds)
                             day_preds.name = "prediction"
                             if date_key not in result:
                                 result[date_key] = {}

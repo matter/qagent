@@ -375,9 +375,10 @@ class FeatureService:
     def _handle_missing(df: pd.DataFrame, method: str) -> pd.DataFrame:
         """Handle missing values."""
         if method == "forward_fill":
-            # Forward fill per ticker (column-wise), then backward fill
-            # for any remaining NaNs at the start
-            return df.ffill().bfill()
+            # Forward fill per ticker (column-wise) only.
+            # Backward filling would leak future information into earlier dates
+            # and make features depend on the requested end_date.
+            return df.ffill()
         elif method == "cross_sectional_mean":
             # Replace NaN with the cross-sectional mean for that date (row mean)
             row_means = df.mean(axis=1)

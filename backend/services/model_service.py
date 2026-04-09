@@ -332,6 +332,7 @@ class ModelService:
         preds = model_instance.predict(X)
         # Re-index by ticker
         preds.index = X.index.get_level_values("ticker") if "ticker" in X.index.names else X.index
+        preds = self._break_prediction_ties(preds)
         preds.name = "prediction"
         return preds
 
@@ -434,6 +435,31 @@ class ModelService:
         # Drop rows with any NaN
         X = X.dropna()
         return X
+
+    @staticmethod
+    def _break_prediction_ties(preds: pd.Series) -> pd.Series:
+        """Make equal-score ordering deterministic across windows and runs.
+
+        LightGBM predictions are often discretized, so ties are common. Many
+        strategies sort scores directly, and pandas' default sort is not stable
+        for equal values. We add a tiny ticker-based epsilon so ties break
+        consistently without changing materially different scores.
+        """
+        if preds.empty:
+            return preds
+
+        adjusted = preds.astype(float).copy()
+        tickers = pd.Index(adjusted.index.astype(str))
+        alpha_order = pd.Series(
+            np.arange(len(tickers), dtype=float),
+            index=tickers.sort_values(),
+        )
+        # Alphabetically earlier ticker gets a slightly larger adjusted score.
+        ranks = tickers.map(alpha_order).to_numpy(dtype=float)
+        epsilon = 1e-12
+        adjusted = adjusted + (len(tickers) - ranks) * epsilon
+        adjusted.name = preds.name
+        return adjusted
 
     @staticmethod
     def _normalize_train_config(train_config: dict) -> dict:
