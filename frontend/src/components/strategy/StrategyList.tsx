@@ -101,6 +101,8 @@ export default function StrategyList({ refreshKey, onViewStrategy }: StrategyLis
       key: "created_at",
       width: 160,
       ellipsis: true,
+      sorter: (a: Strategy, b: Strategy) => (a.created_at ?? "").localeCompare(b.created_at ?? ""),
+      defaultSortOrder: "descend" as const,
       render: (d: string) => d?.slice(0, 19) ?? "-",
     },
     {

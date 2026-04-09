@@ -741,10 +741,14 @@ export async function resumePaperSession(sessionId: string): Promise<PaperTradin
 export async function advancePaperSession(
   sessionId: string,
   targetDate?: string,
+  steps?: number,
 ): Promise<PaperAdvanceResult> {
+  const body: Record<string, unknown> = {};
+  if (targetDate) body.target_date = targetDate;
+  if (steps && steps > 0) body.steps = steps;
   const { data } = await client.post<PaperAdvanceResult>(
     `/paper-trading/sessions/${sessionId}/advance`,
-    targetDate ? { target_date: targetDate } : {},
+    body,
   );
   return data;
 }
@@ -773,5 +777,29 @@ export async function getPaperSummary(sessionId: string): Promise<PaperTradingSe
   latest_nav?: number;
 }> {
   const { data } = await client.get(`/paper-trading/sessions/${sessionId}/summary`);
+  return data;
+}
+
+export interface PaperActionPlan {
+  ticker: string;
+  action: string;
+  current_shares: number;
+  target_weight: number;
+}
+
+export interface PaperSignalsResult {
+  signals: Array<{ ticker: string; signal: number; target_weight: number; strength: number }>;
+  action_plan: PaperActionPlan[];
+  target_date: string | null;
+  error?: string;
+}
+
+export async function getPaperLatestSignals(sessionId: string): Promise<PaperSignalsResult> {
+  const { data } = await client.get<PaperSignalsResult>(`/paper-trading/sessions/${sessionId}/signals`);
+  return data;
+}
+
+export async function getPaperStockChart(sessionId: string, ticker: string): Promise<StockChartData> {
+  const { data } = await client.get<StockChartData>(`/paper-trading/sessions/${sessionId}/stock/${ticker}`);
   return data;
 }

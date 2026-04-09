@@ -1,9 +1,11 @@
 import { useState, useEffect, useCallback } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   Button,
   Card,
   Col,
   DatePicker,
+  Dropdown,
   Input,
   InputNumber,
   message,
@@ -25,7 +27,11 @@ import {
   ReloadOutlined,
   FastForwardOutlined,
   CaretRightOutlined,
+  StepForwardOutlined,
+  LineChartOutlined,
 } from "@ant-design/icons";
+import ReactECharts from "echarts-for-react";
+import type { EChartsOption } from "echarts";
 import dayjs from "dayjs";
 import {
   listStrategies,
@@ -40,17 +46,30 @@ import {
   getPaperPositions,
   getPaperTrades,
   getPaperSummary,
+  getPaperLatestSignals,
+  getPaperStockChart,
 } from "../api";
 import type {
   Strategy,
   StockGroup,
+  StockChartData,
   PaperTradingSession,
   PaperDailyRecord,
   PaperPosition,
   PaperTrade,
+  PaperActionPlan,
 } from "../api";
 
 const { Text } = Typography;
+
+export interface PaperTradingPrefill {
+  strategyId?: string;
+  groupId?: string;
+  initialCapital?: number;
+  maxPositions?: number;
+  commission?: number;
+  slippage?: number;
+}
 
 export default function PaperTrading() {
   const [sessions, setSessions] = useState<PaperTradingSession[]>([]);
@@ -58,6 +77,25 @@ export default function PaperTrading() {
   const [createOpen, setCreateOpen] = useState(false);
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
   const [messageApi, contextHolder] = message.useMessage();
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  // Read prefill params from URL (e.g. coming from backtest history)
+  const [prefill, setPrefill] = useState<PaperTradingPrefill | null>(null);
+  useEffect(() => {
+    const sid = searchParams.get("strategy_id");
+    if (sid) {
+      setPrefill({
+        strategyId: sid,
+        groupId: searchParams.get("group_id") ?? undefined,
+        initialCapital: searchParams.get("initial_capital") ? Number(searchParams.get("initial_capital")) : undefined,
+        maxPositions: searchParams.get("max_positions") ? Number(searchParams.get("max_positions")) : undefined,
+        commission: searchParams.get("commission") ? Number(searchParams.get("commission")) : undefined,
+        slippage: searchParams.get("slippage") ? Number(searchParams.get("slippage")) : undefined,
+      });
+      setCreateOpen(true);
+      setSearchParams({}, { replace: true });
+    }
+  }, [searchParams, setSearchParams]);
 
   const fetchSessions = useCallback(async () => {
     setLoading(true);
@@ -116,12 +154,14 @@ export default function PaperTrading() {
 
       <CreateSessionModal
         open={createOpen}
-        onClose={() => setCreateOpen(false)}
+        onClose={() => { setCreateOpen(false); setPrefill(null); }}
         onCreated={() => {
           setCreateOpen(false);
+          setPrefill(null);
           fetchSessions();
         }}
         messageApi={messageApi}
+        prefill={prefill}
       />
     </>
   );
@@ -144,10 +184,10 @@ function SessionTable({
 }) {
   const [advancing, setAdvancing] = useState<string | null>(null);
 
-  const handleAdvance = async (id: string) => {
+  const handleAdvance = async (id: string, steps?: number) => {
     setAdvancing(id);
     try {
-      const result = await advancePaperSession(id);
+      const result = await advancePaperSession(id, undefined, steps);
       if (result.days_processed > 0) {
         messageApi.success(`推进了 ${result.days_processed} 个交易日，${result.new_trades ?? 0} 笔交易`);
       } else {
@@ -254,22 +294,41 @@ function SessionTable({
     {
       title: "操作",
       key: "actions",
-      width: 180,
+      width: 220,
       render: (_: unknown, r: PaperTradingSession) => (
         <Space size="small">
-          <Button
-            size="small"
-            type="primary"
-            icon={<FastForwardOutlined />}
-            loading={advancing === r.id}
-            disabled={r.status !== "active"}
-            onClick={(e) => {
-              e.stopPropagation();
-              handleAdvance(r.id);
+          <Dropdown
+            menu={{
+              items: [
+                {
+                  key: "step",
+                  icon: <StepForwardOutlined />,
+                  label: "推进 1 天",
+                  onClick: () => handleAdvance(r.id, 1),
+                },
+                {
+                  key: "all",
+                  icon: <FastForwardOutlined />,
+                  label: "推进至最新",
+                  onClick: () => handleAdvance(r.id),
+                },
+              ],
             }}
+            disabled={r.status !== "active" || advancing === r.id}
           >
-            推进
-          </Button>
+            <Button
+              size="small"
+              type="primary"
+              icon={<FastForwardOutlined />}
+              loading={advancing === r.id}
+              disabled={r.status !== "active"}
+              onClick={(e) => {
+                e.stopPropagation();
+              }}
+            >
+              推进
+            </Button>
+          </Dropdown>
           {r.status === "active" ? (
             <Button
               size="small"
@@ -341,6 +400,17 @@ function SessionDetail({
   const [summary, setSummary] = useState<any>(null);
   const [loading, setLoading] = useState(false);
 
+  // Signals / T+1
+  const [actionPlan, setActionPlan] = useState<PaperActionPlan[]>([]);
+  const [signalTargetDate, setSignalTargetDate] = useState<string | null>(null);
+  const [signalsLoading, setSignalsLoading] = useState(false);
+
+  // Stock chart modal
+  const [chartOpen, setChartOpen] = useState(false);
+  const [chartTicker, setChartTicker] = useState("");
+  const [chartData, setChartData] = useState<StockChartData | null>(null);
+  const [chartLoading, setChartLoading] = useState(false);
+
   const fetchDetail = useCallback(async () => {
     setLoading(true);
     try {
@@ -361,9 +431,40 @@ function SessionDetail({
     }
   }, [sessionId, messageApi]);
 
+  const fetchSignals = useCallback(async () => {
+    setSignalsLoading(true);
+    try {
+      const result = await getPaperLatestSignals(sessionId);
+      setActionPlan(result.action_plan);
+      setSignalTargetDate(result.target_date);
+    } catch {
+      messageApi.error("加载信号失败");
+    } finally {
+      setSignalsLoading(false);
+    }
+  }, [sessionId, messageApi]);
+
   useEffect(() => {
     fetchDetail();
   }, [fetchDetail]);
+
+  const openStockChart = useCallback(async (ticker: string) => {
+    setChartTicker(ticker);
+    setChartOpen(true);
+    setChartLoading(true);
+    setChartData(null);
+    try {
+      const data = await getPaperStockChart(sessionId, ticker);
+      setChartData(data);
+    } catch {
+      messageApi.error("加载股票数据失败");
+    } finally {
+      setChartLoading(false);
+    }
+  }, [sessionId, messageApi]);
+
+  // Collect unique traded tickers from trade history
+  const tradedTickers = [...new Set(trades.map(t => t.ticker))].sort();
 
   const tabItems = [
     {
@@ -374,12 +475,35 @@ function SessionDetail({
     {
       key: "positions",
       label: `持仓 (${positions.length})`,
-      children: <PositionsTable data={positions} />,
+      children: <PositionsTable data={positions} onTickerClick={openStockChart} />,
     },
     {
       key: "trades",
       label: `交易记录 (${trades.length})`,
-      children: <TradesTable data={trades} />,
+      children: <TradesTable data={trades} onTickerClick={openStockChart} />,
+    },
+    {
+      key: "signals",
+      label: "T+1 操作计划",
+      children: (
+        <SignalsPanel
+          actionPlan={actionPlan}
+          targetDate={signalTargetDate}
+          loading={signalsLoading}
+          onRefresh={fetchSignals}
+          onTickerClick={openStockChart}
+        />
+      ),
+    },
+    {
+      key: "chart",
+      label: `买卖打点 (${tradedTickers.length})`,
+      children: (
+        <TradedTickersList
+          tickers={tradedTickers}
+          onTickerClick={openStockChart}
+        />
+      ),
     },
   ];
 
@@ -428,7 +552,21 @@ function SessionDetail({
           />
         </Col>
       </Row>
-      <Tabs items={tabItems} />
+      <Tabs
+        items={tabItems}
+        onChange={(key) => {
+          if (key === "signals" && actionPlan.length === 0) fetchSignals();
+        }}
+      />
+
+      {/* Stock chart modal */}
+      <StockChartModal
+        open={chartOpen}
+        onClose={() => setChartOpen(false)}
+        ticker={chartTicker}
+        data={chartData}
+        loading={chartLoading}
+      />
     </Card>
   );
 }
@@ -474,9 +612,19 @@ function NavTable({ data, initialCapital }: { data: PaperDailyRecord[]; initialC
   );
 }
 
-function PositionsTable({ data }: { data: PaperPosition[] }) {
+function PositionsTable({ data, onTickerClick }: { data: PaperPosition[]; onTickerClick: (t: string) => void }) {
   const columns = [
-    { title: "股票", dataIndex: "ticker", key: "ticker", width: 100 },
+    {
+      title: "股票",
+      dataIndex: "ticker",
+      key: "ticker",
+      width: 100,
+      render: (v: string) => (
+        <Button type="link" size="small" onClick={() => onTickerClick(v)} style={{ padding: 0 }}>
+          {v}
+        </Button>
+      ),
+    },
     {
       title: "持仓数量",
       dataIndex: "shares",
@@ -501,10 +649,20 @@ function PositionsTable({ data }: { data: PaperPosition[] }) {
   );
 }
 
-function TradesTable({ data }: { data: PaperTrade[] }) {
+function TradesTable({ data, onTickerClick }: { data: PaperTrade[]; onTickerClick: (t: string) => void }) {
   const columns = [
     { title: "日期", dataIndex: "date", key: "date", width: 110 },
-    { title: "股票", dataIndex: "ticker", key: "ticker", width: 80 },
+    {
+      title: "股票",
+      dataIndex: "ticker",
+      key: "ticker",
+      width: 80,
+      render: (v: string) => (
+        <Button type="link" size="small" onClick={() => onTickerClick(v)} style={{ padding: 0 }}>
+          {v}
+        </Button>
+      ),
+    },
     {
       title: "方向",
       dataIndex: "action",
@@ -546,6 +704,302 @@ function TradesTable({ data }: { data: PaperTrade[] }) {
   );
 }
 
+// ---- Signals / T+1 Plan ----
+
+function SignalsPanel({
+  actionPlan,
+  targetDate,
+  loading,
+  onRefresh,
+  onTickerClick,
+}: {
+  actionPlan: PaperActionPlan[];
+  targetDate: string | null;
+  loading: boolean;
+  onRefresh: () => void;
+  onTickerClick: (t: string) => void;
+}) {
+  const columns = [
+    {
+      title: "股票",
+      dataIndex: "ticker",
+      key: "ticker",
+      width: 100,
+      render: (v: string) => (
+        <Button type="link" size="small" onClick={() => onTickerClick(v)} style={{ padding: 0 }}>
+          {v}
+        </Button>
+      ),
+    },
+    {
+      title: "操作",
+      dataIndex: "action",
+      key: "action",
+      width: 80,
+      render: (v: string) => {
+        const map: Record<string, { color: string; label: string }> = {
+          buy: { color: "green", label: "买入" },
+          sell: { color: "red", label: "卖出" },
+          hold: { color: "blue", label: "持有" },
+        };
+        const c = map[v] ?? { color: "default", label: v };
+        return <Tag color={c.color}>{c.label}</Tag>;
+      },
+    },
+    {
+      title: "当前持仓",
+      dataIndex: "current_shares",
+      key: "current_shares",
+      render: (v: number) => v > 0 ? v.toFixed(2) : "-",
+    },
+    {
+      title: "目标权重",
+      dataIndex: "target_weight",
+      key: "target_weight",
+      render: (v: number) => v > 0 ? `${(v * 100).toFixed(2)}%` : "-",
+    },
+  ];
+
+  return (
+    <div>
+      <Space style={{ marginBottom: 12 }}>
+        <Text type="secondary">
+          {targetDate ? `T+1 目标日期: ${targetDate}` : "暂无信号"}
+        </Text>
+        <Button size="small" icon={<ReloadOutlined />} onClick={onRefresh} loading={loading}>
+          刷新信号
+        </Button>
+      </Space>
+      <Table
+        dataSource={actionPlan}
+        columns={columns}
+        rowKey="ticker"
+        size="small"
+        loading={loading}
+        pagination={{ pageSize: 50 }}
+      />
+    </div>
+  );
+}
+
+// ---- Traded tickers list for chart browsing ----
+
+function TradedTickersList({
+  tickers,
+  onTickerClick,
+}: {
+  tickers: string[];
+  onTickerClick: (t: string) => void;
+}) {
+  return (
+    <div>
+      <Text type="secondary" style={{ display: "block", marginBottom: 12 }}>
+        点击股票代码查看 K 线及买卖标记
+      </Text>
+      <Space wrap>
+        {tickers.map((t) => (
+          <Button
+            key={t}
+            size="small"
+            icon={<LineChartOutlined />}
+            onClick={() => onTickerClick(t)}
+          >
+            {t}
+          </Button>
+        ))}
+        {tickers.length === 0 && <Text type="secondary">暂无交易记录</Text>}
+      </Space>
+    </div>
+  );
+}
+
+// ---- Stock Chart Modal (reuses backtest chart logic) ----
+
+function StockChartModal({
+  open,
+  onClose,
+  ticker,
+  data,
+  loading,
+}: {
+  open: boolean;
+  onClose: () => void;
+  ticker: string;
+  data: StockChartData | null;
+  loading: boolean;
+}) {
+  const buildOption = (d: StockChartData): EChartsOption => {
+    const dates = d.daily_bars.map((b) => b.date);
+    const ohlc = d.daily_bars.map((b) => [b.open, b.close, b.low, b.high]);
+    const volumes = d.daily_bars.map((b) => b.volume);
+
+    const buyMarkers = d.trades
+      .filter((t) => t.action === "buy")
+      .map((t) => ({
+        name: "BUY",
+        coord: [t.date, t.price],
+        value: t.price.toFixed(2),
+        itemStyle: { color: "#52c41a" },
+      }));
+
+    const sellMarkers = d.trades
+      .filter((t) => t.action === "sell")
+      .map((t) => ({
+        name: "SELL",
+        coord: [t.date, t.price],
+        value: t.price.toFixed(2),
+        itemStyle: { color: "#ff4d4f" },
+      }));
+
+    return {
+      animation: false,
+      tooltip: {
+        trigger: "axis",
+        axisPointer: { type: "cross" },
+        backgroundColor: "rgba(30,30,30,0.9)",
+        borderColor: "#555",
+        textStyle: { color: "#eee", fontSize: 12 },
+      },
+      legend: {
+        data: [ticker, "成交量"],
+        textStyle: { color: "#aaa", fontSize: 11 },
+        top: 5,
+      },
+      grid: [
+        { left: 60, right: 20, top: 50, height: "55%" },
+        { left: 60, right: 20, top: "75%", height: "15%" },
+      ],
+      xAxis: [
+        {
+          type: "category",
+          data: dates,
+          axisLine: { lineStyle: { color: "#555" } },
+          axisLabel: { color: "#aaa", fontSize: 10 },
+          splitLine: { show: false },
+          boundaryGap: true,
+          axisPointer: { z: 100 },
+        },
+        {
+          type: "category",
+          gridIndex: 1,
+          data: dates,
+          axisLine: { lineStyle: { color: "#555" } },
+          axisLabel: { show: false },
+          splitLine: { show: false },
+          boundaryGap: true,
+        },
+      ],
+      yAxis: [
+        {
+          type: "value",
+          scale: true,
+          axisLine: { lineStyle: { color: "#555" } },
+          axisLabel: { color: "#aaa", fontSize: 10 },
+          splitLine: { lineStyle: { color: "rgba(255,255,255,0.06)" } },
+        },
+        {
+          type: "value",
+          gridIndex: 1,
+          scale: true,
+          axisLine: { lineStyle: { color: "#555" } },
+          axisLabel: { color: "#aaa", fontSize: 9 },
+          splitLine: { show: false },
+        },
+      ],
+      dataZoom: [
+        { type: "inside", xAxisIndex: [0, 1], start: 0, end: 100 },
+        {
+          type: "slider", xAxisIndex: [0, 1], top: "92%", height: 20,
+          borderColor: "#555", textStyle: { color: "#aaa" },
+        },
+      ],
+      series: [
+        {
+          name: ticker,
+          type: "candlestick",
+          data: ohlc,
+          itemStyle: {
+            color: "#ef5350",
+            color0: "#26a69a",
+            borderColor: "#ef5350",
+            borderColor0: "#26a69a",
+          },
+          markPoint: {
+            symbol: "triangle",
+            symbolSize: 12,
+            data: [
+              ...buyMarkers.map((m) => ({
+                ...m,
+                symbolRotate: 0,
+                symbolSize: 14,
+                label: {
+                  show: true, position: "bottom" as const, formatter: "B",
+                  fontSize: 9, color: "#52c41a", fontWeight: "bold" as const,
+                },
+              })),
+              ...sellMarkers.map((m) => ({
+                ...m,
+                symbolRotate: 180,
+                symbolSize: 14,
+                label: {
+                  show: true, position: "top" as const, formatter: "S",
+                  fontSize: 9, color: "#ff4d4f", fontWeight: "bold" as const,
+                },
+              })),
+            ],
+          },
+        },
+        {
+          name: "成交量",
+          type: "bar",
+          xAxisIndex: 1,
+          yAxisIndex: 1,
+          data: volumes,
+          itemStyle: {
+            color: (params: { dataIndex: number }) => {
+              const idx = params.dataIndex;
+              const item = ohlc[idx];
+              return item && item[1] >= item[0]
+                ? "rgba(239,83,80,0.5)"
+                : "rgba(38,166,154,0.5)";
+            },
+          },
+        },
+      ],
+    };
+  };
+
+  return (
+    <Modal
+      title={`${ticker} K线 & 交易标记`}
+      open={open}
+      onCancel={onClose}
+      footer={null}
+      width={1100}
+      destroyOnClose
+    >
+      {loading && (
+        <div style={{ textAlign: "center", padding: 48 }}>
+          <Text type="secondary">加载中...</Text>
+        </div>
+      )}
+      {!loading && data && (
+        <ReactECharts
+          option={buildOption(data)}
+          style={{ height: 520 }}
+          notMerge
+          lazyUpdate
+        />
+      )}
+      {!loading && !data && (
+        <div style={{ textAlign: "center", padding: 48 }}>
+          <Text type="secondary">暂无数据</Text>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
 // ---- Create Session Modal ----
 
 function CreateSessionModal({
@@ -553,11 +1007,13 @@ function CreateSessionModal({
   onClose,
   onCreated,
   messageApi,
+  prefill,
 }: {
   open: boolean;
   onClose: () => void;
   onCreated: () => void;
   messageApi: ReturnType<typeof message.useMessage>[0];
+  prefill?: PaperTradingPrefill | null;
 }) {
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [groups, setGroups] = useState<StockGroup[]>([]);
@@ -577,6 +1033,17 @@ function CreateSessionModal({
       listGroups().then(setGroups).catch(() => {});
     }
   }, [open]);
+
+  // Apply prefill values from backtest history
+  useEffect(() => {
+    if (!prefill) return;
+    if (prefill.strategyId) setStrategyId(prefill.strategyId);
+    if (prefill.groupId) setGroupId(prefill.groupId);
+    if (prefill.initialCapital) setInitialCapital(prefill.initialCapital);
+    if (prefill.maxPositions) setMaxPositions(prefill.maxPositions);
+    if (prefill.commission) setCommission(prefill.commission);
+    if (prefill.slippage) setSlippage(prefill.slippage);
+  }, [prefill]);
 
   const handleCreate = async () => {
     if (!strategyId || !groupId) {

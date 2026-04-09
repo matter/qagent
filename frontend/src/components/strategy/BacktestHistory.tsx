@@ -10,7 +10,8 @@ import {
   Tooltip,
   Typography,
 } from "antd";
-import { ReloadOutlined, RollbackOutlined } from "@ant-design/icons";
+import { ReloadOutlined, RollbackOutlined, PlayCircleOutlined } from "@ant-design/icons";
+import { useNavigate } from "react-router-dom";
 import {
   listBacktests,
   getBacktest,
@@ -67,6 +68,7 @@ export default function BacktestHistory({ refreshKey, onRestoreConfig }: Backtes
   const [detail, setDetail] = useState<BacktestResultDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [messageApi, contextHolder] = message.useMessage();
+  const navigate = useNavigate();
 
   const fetchAll = useCallback(async () => {
     setLoading(true);
@@ -131,6 +133,19 @@ export default function BacktestHistory({ refreshKey, onRestoreConfig }: Backtes
       reentryCooldownDays: (cfg?.reentry_cooldown_days as number) ?? 0,
     });
     messageApi.success("已还原回测配置");
+  };
+
+  const handleEnterPaperTrading = (record: BacktestRow, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const cfg = record.config as Record<string, unknown> | null;
+    const params = new URLSearchParams();
+    params.set("strategy_id", record.strategy_id);
+    if (cfg?.universe_group_id) params.set("group_id", cfg.universe_group_id as string);
+    if (cfg?.initial_capital) params.set("initial_capital", String(cfg.initial_capital));
+    if (cfg?.max_positions) params.set("max_positions", String(cfg.max_positions));
+    if (cfg?.commission_rate) params.set("commission", String(cfg.commission_rate));
+    if (cfg?.slippage_rate) params.set("slippage", String(cfg.slippage_rate));
+    navigate(`/paper-trading?${params.toString()}`);
   };
 
   const columns = [
@@ -209,16 +224,25 @@ export default function BacktestHistory({ refreshKey, onRestoreConfig }: Backtes
     {
       title: "操作",
       key: "actions",
-      width: 60,
+      width: 100,
       render: (_: unknown, record: BacktestRow) => (
-        <Tooltip title="还原回测配置">
-          <Button
-            size="small"
-            icon={<RollbackOutlined />}
-            onClick={(e) => handleRestore(record, e)}
-            disabled={!onRestoreConfig}
-          />
-        </Tooltip>
+        <Space size="small">
+          <Tooltip title="还原回测配置">
+            <Button
+              size="small"
+              icon={<RollbackOutlined />}
+              onClick={(e) => handleRestore(record, e)}
+              disabled={!onRestoreConfig}
+            />
+          </Tooltip>
+          <Tooltip title="进入模拟交易">
+            <Button
+              size="small"
+              icon={<PlayCircleOutlined />}
+              onClick={(e) => handleEnterPaperTrading(record, e)}
+            />
+          </Tooltip>
+        </Space>
       ),
     },
   ];

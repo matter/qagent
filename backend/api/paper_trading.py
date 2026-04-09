@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import date
-
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
@@ -36,6 +34,7 @@ class CreateSessionRequest(BaseModel):
 
 class AdvanceRequest(BaseModel):
     target_date: str | None = None
+    steps: int = 0  # 0 = advance to target_date/latest; >0 = advance N days
 
 
 # ---- Endpoints ----
@@ -96,7 +95,8 @@ async def resume_session(session_id: str) -> dict:
 async def advance_session(session_id: str, body: AdvanceRequest | None = None) -> dict:
     try:
         target = body.target_date if body else None
-        return _get_svc().advance(session_id, target)
+        steps = body.steps if body else 0
+        return _get_svc().advance(session_id, target, steps)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -123,5 +123,21 @@ async def get_trades(
 async def get_summary(session_id: str) -> dict:
     try:
         return _get_svc().get_summary(session_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.get("/paper-trading/sessions/{session_id}/signals")
+async def get_latest_signals(session_id: str) -> dict:
+    try:
+        return _get_svc().get_latest_signals(session_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.get("/paper-trading/sessions/{session_id}/stock/{ticker}")
+async def get_stock_chart(session_id: str, ticker: str) -> dict:
+    try:
+        return _get_svc().get_stock_chart(session_id, ticker)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
