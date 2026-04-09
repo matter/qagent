@@ -9,6 +9,7 @@ import {
   RocketOutlined,
   FundOutlined,
   ThunderboltOutlined,
+  PlayCircleOutlined,
   ScheduleOutlined,
   SettingOutlined,
 } from "@ant-design/icons";
@@ -21,6 +22,7 @@ import FeatureEngineering from "./pages/FeatureEngineering";
 import ModelTraining from "./pages/ModelTraining";
 import StrategyBacktest from "./pages/StrategyBacktest";
 import SignalGeneration from "./pages/SignalGeneration";
+import PaperTrading from "./pages/PaperTrading";
 import SystemSettings from "./pages/SystemSettings";
 import TaskManagement from "./pages/TaskManagement";
 
@@ -35,6 +37,7 @@ const menuItems: MenuProps["items"] = [
   { key: "/models", icon: <RocketOutlined />, label: "模型训练" },
   { key: "/backtest", icon: <FundOutlined />, label: "策略回测" },
   { key: "/signals", icon: <ThunderboltOutlined />, label: "信号生成" },
+  { key: "/paper-trading", icon: <PlayCircleOutlined />, label: "模拟交易" },
   { key: "/tasks", icon: <ScheduleOutlined />, label: "任务管理" },
   { key: "/settings", icon: <SettingOutlined />, label: "系统设置" },
 ];
@@ -115,6 +118,7 @@ export default function App() {
               <Route path="/models" element={<ModelTraining />} />
               <Route path="/backtest" element={<StrategyBacktest />} />
               <Route path="/signals" element={<SignalGeneration />} />
+              <Route path="/paper-trading" element={<PaperTrading />} />
               <Route path="/tasks" element={<TaskManagement />} />
               <Route path="/settings" element={<SystemSettings />} />
             </Routes>

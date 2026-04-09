@@ -19,6 +19,7 @@ from backend.api.features import router as features_router
 from backend.api.models import router as models_router
 from backend.api.strategies import router as strategies_router
 from backend.api.signals import router as signals_router
+from backend.api.paper_trading import router as paper_trading_router
 from backend.config import settings
 from backend.db import close_db, init_db
 from backend.logger import get_logger, setup_logging
@@ -87,6 +88,7 @@ app.include_router(features_router)
 app.include_router(models_router)
 app.include_router(strategies_router)
 app.include_router(signals_router)
+app.include_router(paper_trading_router)
 
 # MCP Server -- mount at /mcp
 from backend.mcp_server import mcp as _mcp_server

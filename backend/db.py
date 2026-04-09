@@ -247,6 +247,36 @@ CREATE TABLE IF NOT EXISTS signal_details (
 );
 """
 
+_PAPER_SESSIONS_DDL = """\
+CREATE TABLE IF NOT EXISTS paper_trading_sessions (
+    id              VARCHAR PRIMARY KEY,
+    name            VARCHAR NOT NULL,
+    strategy_id     VARCHAR NOT NULL,
+    universe_group_id VARCHAR NOT NULL,
+    config          JSON,
+    status          VARCHAR NOT NULL DEFAULT 'active',
+    start_date      DATE NOT NULL,
+    current_date    DATE,
+    initial_capital DOUBLE NOT NULL DEFAULT 1000000,
+    current_nav     DOUBLE,
+    total_trades    INTEGER NOT NULL DEFAULT 0,
+    created_at      TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    updated_at      TIMESTAMP
+);
+"""
+
+_PAPER_DAILY_DDL = """\
+CREATE TABLE IF NOT EXISTS paper_trading_daily (
+    session_id      VARCHAR NOT NULL,
+    date            DATE NOT NULL,
+    nav             DOUBLE NOT NULL,
+    cash            DOUBLE NOT NULL,
+    positions_json  JSON,
+    trades_json     JSON,
+    PRIMARY KEY (session_id, date)
+);
+"""
+
 
 def get_connection() -> duckdb.DuckDBPyConnection:
     """Return a thread-local cursor from the singleton DuckDB connection.
@@ -286,6 +316,8 @@ def init_db() -> None:
         ("backtest_results", _BACKTEST_RESULTS_DDL),
         ("signal_runs", _SIGNAL_RUNS_DDL),
         ("signal_details", _SIGNAL_DETAILS_DDL),
+        ("paper_trading_sessions", _PAPER_SESSIONS_DDL),
+        ("paper_trading_daily", _PAPER_DAILY_DDL),
     ):
         conn.execute(ddl)
         log.info("db.init", table=name)

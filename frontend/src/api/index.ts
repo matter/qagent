@@ -655,3 +655,123 @@ export async function getSystemInfo(): Promise<SystemInfo> {
   const { data } = await client.get<SystemInfo>("/system/info");
   return data;
 }
+
+// ---- Paper Trading Types ----
+
+export interface PaperTradingSession {
+  id: string;
+  name: string;
+  strategy_id: string;
+  universe_group_id: string;
+  config: Record<string, unknown> | null;
+  status: string;
+  start_date: string | null;
+  current_date: string | null;
+  initial_capital: number;
+  current_nav: number | null;
+  total_trades: number;
+  created_at: string | null;
+  updated_at: string | null;
+  strategy_name: string | null;
+}
+
+export interface PaperDailyRecord {
+  date: string;
+  nav: number;
+  cash: number;
+}
+
+export interface PaperPosition {
+  ticker: string;
+  shares: number;
+  avg_price: number;
+  date: string;
+}
+
+export interface PaperTrade {
+  date: string;
+  ticker: string;
+  action: string;
+  shares: number;
+  price: number;
+  cost: number;
+}
+
+export interface PaperAdvanceResult {
+  session_id: string;
+  days_processed: number;
+  new_trades?: number;
+  current_date?: string | null;
+  message?: string;
+}
+
+// ---- Paper Trading API ----
+
+export async function listPaperSessions(): Promise<PaperTradingSession[]> {
+  const { data } = await client.get<PaperTradingSession[]>("/paper-trading/sessions");
+  return data;
+}
+
+export async function createPaperSession(body: {
+  strategy_id: string;
+  universe_group_id: string;
+  start_date: string;
+  name?: string;
+  config?: Record<string, unknown>;
+}): Promise<PaperTradingSession> {
+  const { data } = await client.post<PaperTradingSession>("/paper-trading/sessions", body);
+  return data;
+}
+
+export async function deletePaperSession(sessionId: string) {
+  const { data } = await client.delete(`/paper-trading/sessions/${sessionId}`);
+  return data;
+}
+
+export async function pausePaperSession(sessionId: string): Promise<PaperTradingSession> {
+  const { data } = await client.post<PaperTradingSession>(`/paper-trading/sessions/${sessionId}/pause`);
+  return data;
+}
+
+export async function resumePaperSession(sessionId: string): Promise<PaperTradingSession> {
+  const { data } = await client.post<PaperTradingSession>(`/paper-trading/sessions/${sessionId}/resume`);
+  return data;
+}
+
+export async function advancePaperSession(
+  sessionId: string,
+  targetDate?: string,
+): Promise<PaperAdvanceResult> {
+  const { data } = await client.post<PaperAdvanceResult>(
+    `/paper-trading/sessions/${sessionId}/advance`,
+    targetDate ? { target_date: targetDate } : {},
+  );
+  return data;
+}
+
+export async function getPaperDailySeries(sessionId: string): Promise<PaperDailyRecord[]> {
+  const { data } = await client.get<PaperDailyRecord[]>(`/paper-trading/sessions/${sessionId}/daily`);
+  return data;
+}
+
+export async function getPaperPositions(sessionId: string): Promise<PaperPosition[]> {
+  const { data } = await client.get<PaperPosition[]>(`/paper-trading/sessions/${sessionId}/positions`);
+  return data;
+}
+
+export async function getPaperTrades(sessionId: string, limit = 200): Promise<PaperTrade[]> {
+  const { data } = await client.get<PaperTrade[]>(`/paper-trading/sessions/${sessionId}/trades`, {
+    params: { limit },
+  });
+  return data;
+}
+
+export async function getPaperSummary(sessionId: string): Promise<PaperTradingSession & {
+  total_return: number;
+  max_drawdown: number;
+  trading_days: number;
+  latest_nav?: number;
+}> {
+  const { data } = await client.get(`/paper-trading/sessions/${sessionId}/summary`);
+  return data;
+}
