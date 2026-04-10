@@ -147,6 +147,13 @@ async def get_template(template_name: str) -> dict:
 # catch-all to avoid routing conflicts.
 
 
+@router.get("/factors/evaluations")
+async def list_all_evaluations() -> list[dict]:
+    """List all evaluation results across all factors (single JOIN query)."""
+    svc = _get_eval_service()
+    return svc.list_all_evaluations()
+
+
 @router.get("/factors/evaluations/{eval_id}")
 async def get_evaluation_detail(eval_id: str) -> dict:
     """Get a specific evaluation result with full detail (ic_series, group_returns)."""

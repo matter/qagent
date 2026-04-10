@@ -4,6 +4,7 @@ import {
   Card,
   Col,
   Descriptions,
+  Input,
   message,
   Modal,
   Popconfirm,
@@ -15,7 +16,7 @@ import {
   Tooltip,
   Typography,
 } from "antd";
-import { ReloadOutlined, DeleteOutlined, RollbackOutlined } from "@ant-design/icons";
+import { ReloadOutlined, DeleteOutlined, RollbackOutlined, SearchOutlined } from "@ant-design/icons";
 import { listModels, getModel, deleteModel } from "../../api";
 import type { Model } from "../../api";
 import FeatureImportanceChart from "./FeatureImportanceChart";
@@ -53,6 +54,7 @@ interface ModelListProps {
 export default function ModelList({ refreshKey, onRestoreConfig }: ModelListProps) {
   const [models, setModels] = useState<Model[]>([]);
   const [loading, setLoading] = useState(false);
+  const [idSearch, setIdSearch] = useState<string>("");
   const [detailOpen, setDetailOpen] = useState(false);
   const [detailModel, setDetailModel] = useState<Model | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -118,7 +120,25 @@ export default function ModelList({ refreshKey, onRestoreConfig }: ModelListProp
     messageApi.success("已还原训练配置");
   };
 
+  const displayData = idSearch
+    ? models.filter((m) => m.id.toLowerCase().includes(idSearch.toLowerCase()))
+    : models;
+
   const columns = [
+    {
+      title: "ID",
+      dataIndex: "id",
+      key: "id",
+      width: 90,
+      ellipsis: true,
+      render: (id: string) => (
+        <Tooltip title={id}>
+          <Text copyable={{ text: id }} style={{ fontSize: 12 }}>
+            {id.slice(0, 8)}
+          </Text>
+        </Tooltip>
+      ),
+    },
     {
       title: "名称",
       dataIndex: "name",
@@ -294,13 +314,23 @@ export default function ModelList({ refreshKey, onRestoreConfig }: ModelListProp
       <Card
         title="模型列表"
         extra={
-          <Button icon={<ReloadOutlined />} size="small" onClick={fetchModels}>
-            刷新
-          </Button>
+          <Space>
+            <Input
+              prefix={<SearchOutlined />}
+              placeholder="搜索 ID"
+              allowClear
+              style={{ width: 160 }}
+              value={idSearch}
+              onChange={(e) => setIdSearch(e.target.value)}
+            />
+            <Button icon={<ReloadOutlined />} size="small" onClick={fetchModels}>
+              刷新
+            </Button>
+          </Space>
         }
       >
         <Table
-          dataSource={models}
+          dataSource={displayData}
           columns={columns}
           rowKey="id"
           loading={loading}

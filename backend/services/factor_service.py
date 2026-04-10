@@ -213,28 +213,57 @@ class FactorService:
         category: str | None = None,
         status: str | None = None,
     ) -> list[dict]:
-        """List factors with optional filters."""
+        """List factors with optional filters.
+
+        Includes ``latest_ir`` for each factor via a single LEFT JOIN,
+        avoiding N+1 per-factor evaluation queries.
+        """
         conn = get_connection()
         where_parts: list[str] = []
         params: list = []
 
         if category:
-            where_parts.append("category = ?")
+            where_parts.append("f.category = ?")
             params.append(category)
         if status:
-            where_parts.append("status = ?")
+            where_parts.append("f.status = ?")
             params.append(status)
 
         where_clause = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
         rows = conn.execute(
-            f"""SELECT id, name, version, description, category, source_code, params,
-                       status, created_at, updated_at
-                FROM factors{where_clause}
-                ORDER BY name, version""",
+            f"""SELECT f.id, f.name, f.version, f.description, f.category,
+                       f.source_code, f.params, f.status, f.created_at, f.updated_at,
+                       le.summary AS latest_eval_summary
+                FROM factors f
+                LEFT JOIN (
+                    SELECT factor_id, summary,
+                           ROW_NUMBER() OVER (PARTITION BY factor_id ORDER BY created_at DESC) AS rn
+                    FROM factor_eval_results
+                ) le ON le.factor_id = f.id AND le.rn = 1
+                {where_clause}
+                ORDER BY f.name, f.version""",
             params,
         ).fetchall()
-        return [self._row_to_dict(r) for r in rows]
+
+        results = []
+        for r in rows:
+            d = self._row_to_dict(r)
+            # Extract latest IR from joined eval summary
+            summary_raw = r[10]
+            ir = None
+            if summary_raw is not None:
+                if isinstance(summary_raw, str):
+                    try:
+                        summary_parsed = json.loads(summary_raw)
+                        ir = summary_parsed.get("ir")
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                elif isinstance(summary_raw, dict):
+                    ir = summary_raw.get("ir")
+            d["latest_ir"] = ir
+            results.append(d)
+        return results
 
     # ------------------------------------------------------------------
     # Internal helpers

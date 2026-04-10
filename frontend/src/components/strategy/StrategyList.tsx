@@ -2,14 +2,16 @@ import { useState, useEffect, useCallback } from "react";
 import {
   Button,
   Card,
+  Input,
   message,
   Popconfirm,
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from "antd";
-import { ReloadOutlined, DeleteOutlined, EyeOutlined } from "@ant-design/icons";
+import { ReloadOutlined, DeleteOutlined, EyeOutlined, SearchOutlined } from "@ant-design/icons";
 import { listStrategies, deleteStrategy } from "../../api";
 import type { Strategy } from "../../api";
 
@@ -37,6 +39,7 @@ interface StrategyListProps {
 export default function StrategyList({ refreshKey, onViewStrategy }: StrategyListProps) {
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [loading, setLoading] = useState(false);
+  const [idSearch, setIdSearch] = useState<string>("");
   const [messageApi, contextHolder] = message.useMessage();
 
   const fetchData = useCallback(async () => {
@@ -65,7 +68,25 @@ export default function StrategyList({ refreshKey, onViewStrategy }: StrategyLis
     }
   };
 
+  const displayData = idSearch
+    ? strategies.filter((s) => s.id.toLowerCase().includes(idSearch.toLowerCase()))
+    : strategies;
+
   const columns = [
+    {
+      title: "ID",
+      dataIndex: "id",
+      key: "id",
+      width: 90,
+      ellipsis: true,
+      render: (id: string) => (
+        <Tooltip title={id}>
+          <Text copyable={{ text: id }} style={{ fontSize: 12 }}>
+            {id.slice(0, 8)}
+          </Text>
+        </Tooltip>
+      ),
+    },
     {
       title: "名称",
       dataIndex: "name",
@@ -132,13 +153,23 @@ export default function StrategyList({ refreshKey, onViewStrategy }: StrategyLis
       <Card
         title="策略列表"
         extra={
-          <Button icon={<ReloadOutlined />} size="small" onClick={fetchData}>
-            刷新
-          </Button>
+          <Space>
+            <Input
+              prefix={<SearchOutlined />}
+              placeholder="搜索 ID"
+              allowClear
+              style={{ width: 160 }}
+              value={idSearch}
+              onChange={(e) => setIdSearch(e.target.value)}
+            />
+            <Button icon={<ReloadOutlined />} size="small" onClick={fetchData}>
+              刷新
+            </Button>
+          </Space>
         }
       >
         <Table
-          dataSource={strategies}
+          dataSource={displayData}
           columns={columns}
           rowKey="id"
           loading={loading}

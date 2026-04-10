@@ -11,18 +11,13 @@ import {
 } from "antd";
 import { ReloadOutlined, RollbackOutlined } from "@ant-design/icons";
 import {
-  listFactors,
-  listEvaluations,
+  listAllEvaluations,
   getEvaluation,
 } from "../../api";
-import type { Factor, FactorEvalRecord, FactorEvalDetail } from "../../api";
+import type { FactorEvalRecordWithName, FactorEvalDetail } from "../../api";
 import { EvalSummaryCards, ICSeriesChart, GroupReturnsChart } from "./EvalCharts";
 
 const { Text } = Typography;
-
-interface EvalRow extends FactorEvalRecord {
-  factor_name?: string;
-}
 
 export interface EvalRestoreConfig {
   factorId: string;
@@ -38,7 +33,7 @@ interface EvalHistoryProps {
 }
 
 export default function EvalHistory({ onRestoreConfig }: EvalHistoryProps) {
-  const [rows, setRows] = useState<EvalRow[]>([]);
+  const [rows, setRows] = useState<FactorEvalRecordWithName[]>([]);
   const [loading, setLoading] = useState(false);
   const [detailOpen, setDetailOpen] = useState(false);
   const [detail, setDetail] = useState<FactorEvalDetail | null>(null);
@@ -48,37 +43,8 @@ export default function EvalHistory({ onRestoreConfig }: EvalHistoryProps) {
   const fetchAll = useCallback(async () => {
     setLoading(true);
     try {
-      const factors = await listFactors();
-      const factorMap: Record<string, Factor> = {};
-      for (const f of factors) {
-        factorMap[f.id] = f;
-      }
-
-      const allEvals: EvalRow[] = [];
-      await Promise.all(
-        factors.map(async (f) => {
-          try {
-            const evals = await listEvaluations(f.id);
-            for (const ev of evals) {
-              allEvals.push({
-                ...ev,
-                factor_name: f.name,
-              });
-            }
-          } catch {
-            // skip
-          }
-        }),
-      );
-
-      // Sort by created_at desc
-      allEvals.sort((a, b) => {
-        const da = a.created_at ?? "";
-        const db = b.created_at ?? "";
-        return db.localeCompare(da);
-      });
-
-      setRows(allEvals);
+      const data = await listAllEvaluations();
+      setRows(data);
     } catch {
       messageApi.error("加载评价历史失败");
     } finally {
@@ -90,7 +56,7 @@ export default function EvalHistory({ onRestoreConfig }: EvalHistoryProps) {
     fetchAll();
   }, [fetchAll]);
 
-  const handleRowClick = async (record: EvalRow) => {
+  const handleRowClick = async (record: FactorEvalRecordWithName) => {
     setDetailOpen(true);
     setDetailLoading(true);
     setDetail(null);
@@ -105,7 +71,7 @@ export default function EvalHistory({ onRestoreConfig }: EvalHistoryProps) {
     }
   };
 
-  const handleRestore = (record: EvalRow, e: React.MouseEvent) => {
+  const handleRestore = (record: FactorEvalRecordWithName, e: React.MouseEvent) => {
     e.stopPropagation();
     if (!onRestoreConfig) return;
     onRestoreConfig({
@@ -124,7 +90,8 @@ export default function EvalHistory({ onRestoreConfig }: EvalHistoryProps) {
       title: "因子",
       dataIndex: "factor_name",
       key: "factor_name",
-      sorter: (a: EvalRow, b: EvalRow) => (a.factor_name ?? "").localeCompare(b.factor_name ?? ""),
+      sorter: (a: FactorEvalRecordWithName, b: FactorEvalRecordWithName) =>
+        (a.factor_name ?? "").localeCompare(b.factor_name ?? ""),
       render: (name: string | undefined) => name ?? "-",
     },
     {
@@ -138,8 +105,9 @@ export default function EvalHistory({ onRestoreConfig }: EvalHistoryProps) {
       title: "IC Mean",
       key: "ic_mean",
       width: 100,
-      sorter: (a: EvalRow, b: EvalRow) => (a.summary?.ic_mean ?? 0) - (b.summary?.ic_mean ?? 0),
-      render: (_: unknown, r: EvalRow) => {
+      sorter: (a: FactorEvalRecordWithName, b: FactorEvalRecordWithName) =>
+        (a.summary?.ic_mean ?? 0) - (b.summary?.ic_mean ?? 0),
+      render: (_: unknown, r: FactorEvalRecordWithName) => {
         const v = r.summary?.ic_mean;
         if (v === undefined || v === null) return "-";
         return (
@@ -153,8 +121,9 @@ export default function EvalHistory({ onRestoreConfig }: EvalHistoryProps) {
       title: "IR",
       key: "ir",
       width: 80,
-      sorter: (a: EvalRow, b: EvalRow) => (a.summary?.ir ?? 0) - (b.summary?.ir ?? 0),
-      render: (_: unknown, r: EvalRow) => {
+      sorter: (a: FactorEvalRecordWithName, b: FactorEvalRecordWithName) =>
+        (a.summary?.ir ?? 0) - (b.summary?.ir ?? 0),
+      render: (_: unknown, r: FactorEvalRecordWithName) => {
         const v = r.summary?.ir;
         if (v === undefined || v === null) return "-";
         return (
@@ -168,8 +137,9 @@ export default function EvalHistory({ onRestoreConfig }: EvalHistoryProps) {
       title: "胜率",
       key: "ic_win_rate",
       width: 90,
-      sorter: (a: EvalRow, b: EvalRow) => (a.summary?.ic_win_rate ?? 0) - (b.summary?.ic_win_rate ?? 0),
-      render: (_: unknown, r: EvalRow) => {
+      sorter: (a: FactorEvalRecordWithName, b: FactorEvalRecordWithName) =>
+        (a.summary?.ic_win_rate ?? 0) - (b.summary?.ic_win_rate ?? 0),
+      render: (_: unknown, r: FactorEvalRecordWithName) => {
         const v = r.summary?.ic_win_rate;
         if (v === undefined || v === null) return "-";
         return `${(v * 100).toFixed(1)}%`;
@@ -179,8 +149,9 @@ export default function EvalHistory({ onRestoreConfig }: EvalHistoryProps) {
       title: "多空收益",
       key: "ls_return",
       width: 100,
-      sorter: (a: EvalRow, b: EvalRow) => (a.summary?.long_short_annual_return ?? 0) - (b.summary?.long_short_annual_return ?? 0),
-      render: (_: unknown, r: EvalRow) => {
+      sorter: (a: FactorEvalRecordWithName, b: FactorEvalRecordWithName) =>
+        (a.summary?.long_short_annual_return ?? 0) - (b.summary?.long_short_annual_return ?? 0),
+      render: (_: unknown, r: FactorEvalRecordWithName) => {
         const v = r.summary?.long_short_annual_return;
         if (v === undefined || v === null) return "-";
         return (
@@ -195,7 +166,8 @@ export default function EvalHistory({ onRestoreConfig }: EvalHistoryProps) {
       dataIndex: "created_at",
       key: "created_at",
       width: 160,
-      sorter: (a: EvalRow, b: EvalRow) => (a.created_at ?? "").localeCompare(b.created_at ?? ""),
+      sorter: (a: FactorEvalRecordWithName, b: FactorEvalRecordWithName) =>
+        (a.created_at ?? "").localeCompare(b.created_at ?? ""),
       defaultSortOrder: "descend" as const,
       render: (d: string | null) => d?.slice(0, 19) ?? "-",
     },
@@ -203,7 +175,7 @@ export default function EvalHistory({ onRestoreConfig }: EvalHistoryProps) {
       title: "操作",
       key: "actions",
       width: 60,
-      render: (_: unknown, record: EvalRow) => (
+      render: (_: unknown, record: FactorEvalRecordWithName) => (
         <Tooltip title="还原配置到编辑器">
           <Button
             size="small"

@@ -248,6 +248,45 @@ class FactorEvalService:
             })
         return results
 
+    def list_all_evaluations(self) -> list[dict]:
+        """List all evaluation results across all factors with factor names.
+
+        Uses a single JOIN query instead of N per-factor queries.
+        """
+        conn = get_connection()
+        rows = conn.execute(
+            """SELECT e.id, e.factor_id, f.name AS factor_name,
+                      e.label_id, e.universe_group_id,
+                      e.start_date, e.end_date, e.summary, e.created_at
+               FROM factor_eval_results e
+               JOIN factors f ON f.id = e.factor_id
+               ORDER BY e.created_at DESC""",
+        ).fetchall()
+
+        results = []
+        for r in rows:
+            summary_raw = r[7]
+            if isinstance(summary_raw, str):
+                try:
+                    summary_parsed = json.loads(summary_raw)
+                except (json.JSONDecodeError, TypeError):
+                    summary_parsed = {}
+            else:
+                summary_parsed = summary_raw if summary_raw else {}
+
+            results.append({
+                "id": r[0],
+                "factor_id": r[1],
+                "factor_name": r[2],
+                "label_id": r[3],
+                "universe_group_id": r[4],
+                "start_date": str(r[5]) if r[5] else None,
+                "end_date": str(r[6]) if r[6] else None,
+                "summary": summary_parsed,
+                "created_at": str(r[8]) if r[8] else None,
+            })
+        return results
+
     def get_evaluation(self, eval_id: str) -> dict:
         """Get a specific evaluation result with full detail."""
         conn = get_connection()

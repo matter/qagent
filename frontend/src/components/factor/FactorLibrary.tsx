@@ -2,20 +2,23 @@ import { useState, useEffect, useCallback } from "react";
 import {
   Button,
   Card,
+  Input,
   message,
   Popconfirm,
   Select,
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from "antd";
 import {
   ReloadOutlined,
   DeleteOutlined,
   EyeOutlined,
+  SearchOutlined,
 } from "@ant-design/icons";
-import { listFactors, deleteFactor, listEvaluations } from "../../api";
+import { listFactors, deleteFactor } from "../../api";
 import type { Factor } from "../../api";
 
 const { Text } = Typography;
@@ -47,7 +50,7 @@ export default function FactorLibrary({ onViewFactor, refreshKey }: FactorLibrar
   const [loading, setLoading] = useState(false);
   const [categoryFilter, setCategoryFilter] = useState<string>("");
   const [statusFilter, setStatusFilter] = useState<string>("");
-  const [irMap, setIrMap] = useState<Record<string, number | null>>({});
+  const [idSearch, setIdSearch] = useState<string>("");
   const [messageApi, contextHolder] = message.useMessage();
 
   const fetchFactors = useCallback(async () => {
@@ -58,24 +61,6 @@ export default function FactorLibrary({ onViewFactor, refreshKey }: FactorLibrar
         statusFilter || undefined,
       );
       setFactors(data);
-
-      // Fetch latest IR for each factor
-      const irEntries: Record<string, number | null> = {};
-      await Promise.all(
-        data.map(async (f) => {
-          try {
-            const evals = await listEvaluations(f.id);
-            if (evals.length > 0) {
-              irEntries[f.id] = evals[0].summary?.ir ?? null;
-            } else {
-              irEntries[f.id] = null;
-            }
-          } catch {
-            irEntries[f.id] = null;
-          }
-        }),
-      );
-      setIrMap(irEntries);
     } catch {
       messageApi.error("加载因子列表失败");
     } finally {
@@ -97,7 +82,25 @@ export default function FactorLibrary({ onViewFactor, refreshKey }: FactorLibrar
     }
   };
 
+  const displayData = idSearch
+    ? factors.filter((f) => f.id.toLowerCase().includes(idSearch.toLowerCase()))
+    : factors;
+
   const columns = [
+    {
+      title: "ID",
+      dataIndex: "id",
+      key: "id",
+      width: 90,
+      ellipsis: true,
+      render: (id: string) => (
+        <Tooltip title={id}>
+          <Text copyable={{ text: id }} style={{ fontSize: 12 }}>
+            {id.slice(0, 8)}
+          </Text>
+        </Tooltip>
+      ),
+    },
     {
       title: "名称",
       dataIndex: "name",
@@ -136,8 +139,9 @@ export default function FactorLibrary({ onViewFactor, refreshKey }: FactorLibrar
       title: "IR",
       key: "ir",
       width: 80,
+      sorter: (a: Factor, b: Factor) => (a.latest_ir ?? -999) - (b.latest_ir ?? -999),
       render: (_: unknown, record: Factor) => {
-        const ir = irMap[record.id];
+        const ir = record.latest_ir;
         if (ir === undefined || ir === null) return <Text type="secondary">-</Text>;
         return (
           <Text style={{ color: ir > 0.5 ? "#52c41a" : ir > 0 ? "#1677ff" : "#ff4d4f" }}>
@@ -152,6 +156,8 @@ export default function FactorLibrary({ onViewFactor, refreshKey }: FactorLibrar
       key: "created_at",
       width: 160,
       ellipsis: true,
+      sorter: (a: Factor, b: Factor) => (a.created_at ?? "").localeCompare(b.created_at ?? ""),
+      defaultSortOrder: "descend" as const,
       render: (d: string) => d?.slice(0, 19) ?? "-",
     },
     {
@@ -176,6 +182,14 @@ export default function FactorLibrary({ onViewFactor, refreshKey }: FactorLibrar
         title="因子库"
         extra={
           <Space>
+            <Input
+              prefix={<SearchOutlined />}
+              placeholder="搜索 ID"
+              allowClear
+              style={{ width: 160 }}
+              value={idSearch}
+              onChange={(e) => setIdSearch(e.target.value)}
+            />
             <Select
               style={{ width: 140 }}
               placeholder="分类"
@@ -212,7 +226,7 @@ export default function FactorLibrary({ onViewFactor, refreshKey }: FactorLibrar
         }
       >
         <Table
-          dataSource={factors}
+          dataSource={displayData}
           columns={columns}
           rowKey="id"
           loading={loading}

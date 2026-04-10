@@ -155,6 +155,7 @@ export interface Factor {
   status: string;
   created_at: string;
   updated_at: string;
+  latest_ir?: number | null;
 }
 
 export interface FactorTemplate {
@@ -285,6 +286,15 @@ export async function evaluateFactor(
 
 export async function listEvaluations(factorId: string): Promise<FactorEvalRecord[]> {
   const { data } = await client.get<FactorEvalRecord[]>(`/factors/${factorId}/evaluations`);
+  return data;
+}
+
+export interface FactorEvalRecordWithName extends FactorEvalRecord {
+  factor_name: string;
+}
+
+export async function listAllEvaluations(): Promise<FactorEvalRecordWithName[]> {
+  const { data } = await client.get<FactorEvalRecordWithName[]>("/factors/evaluations");
   return data;
 }
 
