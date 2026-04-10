@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from backend.db import get_connection
 from backend.logger import get_logger
 from backend.services.data_service import DataService
+from backend.services.group_service import GroupService
 from backend.tasks.executor import TaskExecutor
 from backend.tasks.models import TaskSource
 
@@ -37,6 +38,16 @@ def _get_service() -> DataService:
     return _service
 
 
+_group_service: GroupService | None = None
+
+
+def _get_group_service() -> GroupService:
+    global _group_service
+    if _group_service is None:
+        _group_service = GroupService()
+    return _group_service
+
+
 # ------------------------------------------------------------------
 # Request / response models
 # ------------------------------------------------------------------
@@ -44,6 +55,14 @@ def _get_service() -> DataService:
 
 class UpdateRequest(BaseModel):
     mode: str = "incremental"
+
+
+class UpdateTickersRequest(BaseModel):
+    tickers: list[str]
+
+
+class UpdateGroupRequest(BaseModel):
+    group_id: str
 
 
 # ------------------------------------------------------------------
@@ -85,6 +104,68 @@ async def trigger_update(body: UpdateRequest) -> dict:
 
     log.info("api.data.update_triggered", task_id=task_id, mode=body.mode)
     return {"task_id": task_id, "status": "queued", "mode": body.mode}
+
+
+@router.post("/data/update/tickers")
+async def update_tickers(body: UpdateTickersRequest) -> dict:
+    """Update data for specific tickers as a background task."""
+    if not body.tickers:
+        raise HTTPException(status_code=400, detail="tickers list is empty")
+
+    executor = _get_executor()
+    svc = _get_service()
+
+    running_id = executor.has_running_task("data_update")
+    if running_id:
+        raise HTTPException(
+            status_code=409,
+            detail=f"数据更新正在运行 (task_id={running_id})，请等待完成",
+        )
+
+    task_id = executor.submit(
+        task_type="data_update",
+        fn=svc.update_tickers,
+        params={"tickers": [t.upper() for t in body.tickers]},
+        timeout=600,
+        source=TaskSource.UI,
+    )
+
+    log.info("api.data.update_tickers", task_id=task_id, count=len(body.tickers))
+    return {"task_id": task_id, "status": "queued", "tickers": len(body.tickers)}
+
+
+@router.post("/data/update/group")
+async def update_group(body: UpdateGroupRequest) -> dict:
+    """Update data for all tickers in a stock group."""
+    gsvc = _get_group_service()
+    try:
+        tickers = gsvc.get_group_tickers(body.group_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    if not tickers:
+        raise HTTPException(status_code=400, detail="分组无成员")
+
+    executor = _get_executor()
+    svc = _get_service()
+
+    running_id = executor.has_running_task("data_update")
+    if running_id:
+        raise HTTPException(
+            status_code=409,
+            detail=f"数据更新正在运行 (task_id={running_id})，请等待完成",
+        )
+
+    task_id = executor.submit(
+        task_type="data_update",
+        fn=svc.update_tickers,
+        params={"tickers": tickers},
+        timeout=3600,
+        source=TaskSource.UI,
+    )
+
+    log.info("api.data.update_group", task_id=task_id, group=body.group_id, tickers=len(tickers))
+    return {"task_id": task_id, "status": "queued", "tickers": len(tickers)}
 
 
 @router.get("/data/update/progress")

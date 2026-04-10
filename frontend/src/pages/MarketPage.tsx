@@ -1,10 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { AutoComplete, Space, Button, Card, Spin, Typography, Empty } from "antd";
-import { SearchOutlined } from "@ant-design/icons";
+import { AutoComplete, Space, Button, Card, Spin, Typography, Empty, message, Tooltip } from "antd";
+import { SearchOutlined, SyncOutlined } from "@ant-design/icons";
 import ReactECharts from "echarts-for-react";
 import type { EChartsOption } from "echarts";
 import dayjs from "dayjs";
-import { searchStocks, getDailyBars } from "../api";
+import { searchStocks, getDailyBars, updateTickers, getUpdateProgress } from "../api";
 import type { DailyBar, StockSearchResult } from "../api";
 
 const { Text } = Typography;
@@ -279,7 +279,9 @@ export default function MarketPage() {
   const [loading, setLoading] = useState(false);
   const [range, setRange] = useState("1Y");
   const [error, setError] = useState<string | null>(null);
+  const [updating, setUpdating] = useState(false);
   const searchTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const [messageApi, contextHolder] = message.useMessage();
 
   const fetchBars = useCallback(
     async (t: string, rangeKey: string) => {
@@ -305,6 +307,36 @@ export default function MarketPage() {
   useEffect(() => {
     fetchBars(ticker, range);
   }, [ticker, range, fetchBars]);
+
+  const handleUpdateTicker = async () => {
+    setUpdating(true);
+    try {
+      await updateTickers([ticker]);
+      messageApi.success(`${ticker} 数据更新已提交`);
+      // Poll for completion then refresh chart
+      const poll = setInterval(async () => {
+        try {
+          const p = await getUpdateProgress();
+          if (p.status !== "running" && p.status !== "queued") {
+            clearInterval(poll);
+            setUpdating(false);
+            fetchBars(ticker, range);
+            if (p.status === "completed") {
+              messageApi.success(`${ticker} 数据已更新`);
+            } else if (p.error) {
+              messageApi.error(`更新失败: ${p.error}`);
+            }
+          }
+        } catch {
+          clearInterval(poll);
+          setUpdating(false);
+        }
+      }, 2000);
+    } catch {
+      messageApi.error("更新提交失败");
+      setUpdating(false);
+    }
+  };
 
   const handleSearch = (value: string) => {
     setSearchValue(value);
@@ -346,6 +378,7 @@ export default function MarketPage() {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      {contextHolder}
       {/* Search + Range controls */}
       <Space wrap>
         <AutoComplete
@@ -373,6 +406,16 @@ export default function MarketPage() {
         <Text strong style={{ fontSize: 16, marginLeft: 8 }}>
           {ticker}
         </Text>
+        <Tooltip title={`更新 ${ticker} 行情数据`}>
+          <Button
+            icon={<SyncOutlined spin={updating} />}
+            size="small"
+            loading={updating}
+            onClick={handleUpdateTicker}
+          >
+            更新数据
+          </Button>
+        </Tooltip>
       </Space>
 
       {/* Chart */}

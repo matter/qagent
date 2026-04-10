@@ -41,6 +41,73 @@ class DataService:
     # Public API
     # ------------------------------------------------------------------
 
+    def update_tickers(self, tickers: list[str]) -> dict:
+        """Update market data for a specific list of tickers (incremental).
+
+        Used for single-stock or group-based updates.  Much faster than a
+        full incremental update because it skips stock-list refresh and
+        only touches the given tickers.
+        """
+        if not tickers:
+            return {"total": 0, "success": 0, "failed": 0, "duration_seconds": 0}
+
+        from datetime import datetime as _dt
+        started = _dt.utcnow()
+        conn = get_connection()
+        end_date = get_latest_trading_day()
+
+        # Determine start dates per ticker
+        ticker_starts = self._get_incremental_starts(tickers, end_date)
+        tickers_to_update = [t for t in tickers if t in ticker_starts]
+
+        if not tickers_to_update:
+            return {
+                "total": len(tickers),
+                "success": len(tickers),
+                "failed": 0,
+                "duration_seconds": 0,
+                "message": "所有股票数据已是最新",
+            }
+
+        # Download in one batch (or a few if very large)
+        batch_size = 500
+        success = 0
+        failed = 0
+        failed_tickers: list[str] = []
+        all_frames: list[pd.DataFrame] = []
+
+        for i in range(0, len(tickers_to_update), batch_size):
+            batch = tickers_to_update[i : i + batch_size]
+            batch_start = min(ticker_starts[t] for t in batch)
+            try:
+                bars_df = self._provider.get_daily_bars(batch, batch_start, end_date)
+                if not bars_df.empty:
+                    all_frames.append(bars_df)
+                    downloaded = set(bars_df["ticker"].unique())
+                    success += len(downloaded)
+                    batch_failed = [t for t in batch if t not in downloaded]
+                else:
+                    batch_failed = batch
+                failed += len(batch_failed)
+                failed_tickers.extend(batch_failed)
+            except Exception as e:
+                log.error("data.update_tickers.batch_error", error=str(e))
+                failed += len(batch)
+                failed_tickers.extend(batch)
+
+        if all_frames:
+            combined = pd.concat(all_frames, ignore_index=True)
+            self._upsert_daily_bars(combined)
+
+        duration = (_dt.utcnow() - started).total_seconds()
+        return {
+            "total": len(tickers),
+            "success": success,
+            "failed": failed,
+            "duration_seconds": round(duration, 1),
+            "failed_tickers_sample": failed_tickers[:20],
+        }
+
     def update_data(self, mode: str = "incremental") -> dict:
         """Main entry point: fetch and store market data.
 

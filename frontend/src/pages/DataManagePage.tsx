@@ -34,6 +34,7 @@ import {
   getDataStatus,
   triggerUpdate,
   getUpdateProgress,
+  updateGroupData,
   listGroups,
   createGroup,
   updateGroup,
@@ -369,6 +370,7 @@ function StockGroupsSection() {
   const [detailGroup, setDetailGroup] = useState<StockGroup | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
   const [refreshingIndices, setRefreshingIndices] = useState(false);
+  const [updatingGroupId, setUpdatingGroupId] = useState<string | null>(null);
   const [form] = Form.useForm<GroupFormValues>();
   const [submitting, setSubmitting] = useState(false);
   const [messageApi, contextHolder] = message.useMessage();
@@ -487,6 +489,39 @@ function StockGroupsSection() {
     }
   };
 
+  const handleUpdateGroupData = async (groupId: string, groupName: string) => {
+    setUpdatingGroupId(groupId);
+    try {
+      await updateGroupData(groupId);
+      messageApi.success(`${groupName} 数据更新已提交`);
+      // Poll for completion
+      const poll = setInterval(async () => {
+        try {
+          const p = await getUpdateProgress();
+          if (p.status !== "running" && p.status !== "queued") {
+            clearInterval(poll);
+            setUpdatingGroupId(null);
+            if (p.status === "completed") {
+              messageApi.success(`${groupName} 数据更新完成`);
+            } else if (p.error) {
+              messageApi.error(`更新失败: ${p.error}`);
+            }
+          }
+        } catch {
+          clearInterval(poll);
+          setUpdatingGroupId(null);
+        }
+      }, 3000);
+    } catch (err: unknown) {
+      const detail =
+        err && typeof err === "object" && "response" in err
+          ? ((err as Record<string, Record<string, unknown>>).response?.data as Record<string, string>)?.detail
+          : undefined;
+      messageApi.error(detail || "更新提交失败");
+      setUpdatingGroupId(null);
+    }
+  };
+
   const groupType = Form.useWatch("group_type", form);
 
   const columns = [
@@ -531,18 +566,28 @@ function StockGroupsSection() {
     {
       title: "操作",
       key: "actions",
-      width: 120,
-      render: (_: unknown, record: StockGroup) =>
-        record.group_type === "builtin" ? (
-          <Text type="secondary">-</Text>
-        ) : (
-          <Space size="small">
-            <Button size="small" icon={<EditOutlined />} onClick={() => openEdit(record)} />
-            <Popconfirm title="确定删除此分组?" onConfirm={() => handleDelete(record.id)}>
-              <Button size="small" danger icon={<DeleteOutlined />} />
-            </Popconfirm>
-          </Space>
-        ),
+      width: 160,
+      render: (_: unknown, record: StockGroup) => (
+        <Space size="small">
+          <Button
+            size="small"
+            icon={<CloudDownloadOutlined />}
+            loading={updatingGroupId === record.id}
+            disabled={updatingGroupId !== null && updatingGroupId !== record.id}
+            onClick={() => handleUpdateGroupData(record.id, record.name)}
+          >
+            更新数据
+          </Button>
+          {record.group_type !== "builtin" && (
+            <>
+              <Button size="small" icon={<EditOutlined />} onClick={() => openEdit(record)} />
+              <Popconfirm title="确定删除此分组?" onConfirm={() => handleDelete(record.id)}>
+                <Button size="small" danger icon={<DeleteOutlined />} />
+              </Popconfirm>
+            </>
+          )}
+        </Space>
+      ),
     },
   ];
 

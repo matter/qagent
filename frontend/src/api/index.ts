@@ -86,6 +86,16 @@ export async function triggerUpdate(mode: "incremental" | "full") {
   return data;
 }
 
+export async function updateTickers(tickers: string[]): Promise<{ task_id: string; status: string; tickers: number }> {
+  const { data } = await client.post("/data/update/tickers", { tickers });
+  return data;
+}
+
+export async function updateGroupData(groupId: string): Promise<{ task_id: string; status: string; tickers: number }> {
+  const { data } = await client.post("/data/update/group", { group_id: groupId });
+  return data;
+}
+
 export async function getUpdateProgress(): Promise<UpdateProgress> {
   const { data } = await client.get<UpdateProgress>("/data/update/progress");
   return data;

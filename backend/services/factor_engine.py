@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from datetime import date as date_type, datetime
+from datetime import date as date_type, timedelta
 
 import numpy as np
 import pandas as pd
@@ -17,7 +17,7 @@ from backend.services.factor_service import FactorService
 log = get_logger(__name__)
 
 # How many tickers to process per batch to manage memory.
-_BATCH_SIZE = 200
+_BATCH_SIZE = 500
 
 
 class FactorEngine:
@@ -41,23 +41,13 @@ class FactorEngine:
 
         Checks cache first, only computes missing (ticker, date) pairs,
         then writes new values back to the cache.
-
-        Args:
-            factor_id: ID of the factor definition.
-            universe_tickers: List of ticker symbols.
-            start_date: Start date string (YYYY-MM-DD).
-            end_date: End date string (YYYY-MM-DD).
-
-        Returns:
-            DataFrame with DatetimeIndex rows, ticker columns, factor values.
         """
         if not universe_tickers:
             return pd.DataFrame()
 
         # Snap user-provided dates to nearest trading days
-        from datetime import date as _date
-        _start = _date.fromisoformat(start_date)
-        _end = _date.fromisoformat(end_date)
+        _start = date_type.fromisoformat(start_date)
+        _end = date_type.fromisoformat(end_date)
         _start = snap_to_trading_day(_start, direction="forward")
         _end = snap_to_trading_day(_end, direction="backward")
         start_date = str(_start)
@@ -81,23 +71,26 @@ class FactorEngine:
             end=end_date,
         )
 
-        # 2. Load cached values
-        cached_df = self._load_cached_values(factor_id, universe_tickers, start_date, end_date)
-
-        # 3. Determine which tickers need computation
-        tickers_to_compute = self._find_missing_tickers(
-            cached_df, universe_tickers, start_date, end_date
+        # 2. Lightweight cache coverage check (metadata only, no full data load)
+        tickers_to_compute = self._find_uncovered_tickers(
+            factor_id, universe_tickers, start_date, end_date
         )
+        cached_tickers = [t for t in universe_tickers if t not in set(tickers_to_compute)]
 
         log.info(
             "factor_engine.compute.cache_status",
-            cached_tickers=len(universe_tickers) - len(tickers_to_compute),
+            cached_tickers=len(cached_tickers),
             to_compute=len(tickers_to_compute),
         )
 
+        # 3. Load cached data only for covered tickers (skip if none)
+        cached_df = pd.DataFrame()
+        if cached_tickers:
+            cached_df = self._load_cached_values(factor_id, cached_tickers, start_date, end_date)
+
         # 4. Compute missing values in batches
         new_values_frames: list[pd.DataFrame] = []
-        total_batches = math.ceil(len(tickers_to_compute) / _BATCH_SIZE)
+        total_batches = math.ceil(len(tickers_to_compute) / _BATCH_SIZE) if tickers_to_compute else 0
 
         for batch_idx in range(0, len(tickers_to_compute), _BATCH_SIZE):
             batch_num = batch_idx // _BATCH_SIZE + 1
@@ -148,6 +141,62 @@ class FactorEngine:
     # Cache helpers
     # ------------------------------------------------------------------
 
+    def _find_uncovered_tickers(
+        self,
+        factor_id: str,
+        tickers: list[str],
+        start_date: str,
+        end_date: str,
+    ) -> list[str]:
+        """Fast metadata-only check: which tickers lack sufficient cache coverage?
+
+        Queries only MIN/MAX date and non-null count per ticker from the cache
+        table — never loads the actual values.  This is O(index scan) even for
+        very large universes.
+        """
+        conn = get_connection()
+
+        # Single aggregate query — DuckDB handles the GROUP BY efficiently
+        # even with the PRIMARY KEY (factor_id, ticker, date).
+        meta_rows = conn.execute(
+            """SELECT ticker, MIN(date) AS min_d, MAX(date) AS max_d,
+                      COUNT(*) AS cnt
+               FROM factor_values_cache
+               WHERE factor_id = ?
+                 AND date >= ? AND date <= ?
+               GROUP BY ticker""",
+            [factor_id, start_date, end_date],
+        ).fetchall()
+
+        # Build lookup: ticker -> (min_date, max_date, count)
+        coverage: dict[str, tuple] = {}
+        for r in meta_rows:
+            coverage[r[0]] = (r[1], r[2], r[3])
+
+        req_start = date_type.fromisoformat(start_date)
+        req_end = date_type.fromisoformat(end_date)
+        tolerance = timedelta(days=7)
+
+        missing: list[str] = []
+        for t in tickers:
+            info = coverage.get(t)
+            if info is None:
+                missing.append(t)
+                continue
+            min_d, max_d, cnt = info
+            if not isinstance(min_d, date_type):
+                min_d = date_type.fromisoformat(str(min_d))
+            if not isinstance(max_d, date_type):
+                max_d = date_type.fromisoformat(str(max_d))
+            # Must cover the requested range (with tolerance) and have
+            # a reasonable number of rows (at least 1 row per 2 calendar days)
+            if min_d > req_start + tolerance or max_d < req_end - tolerance:
+                missing.append(t)
+            elif cnt < 5:
+                missing.append(t)
+
+        return missing
+
     def _load_cached_values(
         self,
         factor_id: str,
@@ -158,6 +207,7 @@ class FactorEngine:
         """Load cached factor values from factor_values_cache table.
 
         Returns a DataFrame with DatetimeIndex and ticker columns.
+        Only called for tickers known to have coverage.
         """
         conn = get_connection()
 
@@ -182,84 +232,38 @@ class FactorEngine:
         pivot.index = pd.to_datetime(pivot.index)
         return pivot
 
-    def _find_missing_tickers(
-        self,
-        cached_df: pd.DataFrame,
-        all_tickers: list[str],
-        start_date: str,
-        end_date: str,
-    ) -> list[str]:
-        """Determine which tickers need fresh computation.
-
-        A ticker needs computation if:
-        - It has no cached data at all
-        - The cached data is all NaN
-        - The cached date range does not cover the requested [start, end]
-        """
-        if cached_df.empty:
-            return list(all_tickers)
-
-        cached_tickers = set(cached_df.columns)
-        req_start = pd.Timestamp(start_date)
-        req_end = pd.Timestamp(end_date)
-        missing: list[str] = []
-
-        for t in all_tickers:
-            if t not in cached_tickers:
-                missing.append(t)
-                continue
-
-            col = cached_df[t]
-            valid = col.dropna()
-            if valid.empty:
-                missing.append(t)
-                continue
-
-            # Check that cached data covers the requested date range
-            cached_min = valid.index.min()
-            cached_max = valid.index.max()
-            # Allow 5 trading-day tolerance for edge alignment
-            if cached_min > req_start + pd.Timedelta(days=7) or cached_max < req_end - pd.Timedelta(days=7):
-                missing.append(t)
-
-        return missing
-
     def _write_cache(self, factor_id: str, df: pd.DataFrame) -> None:
-        """Write computed factor values to the cache table."""
-        conn = get_connection()
-
-        # Convert wide DataFrame to long format for insertion
-        records: list[tuple] = []
-        for ticker in df.columns:
-            series = df[ticker].dropna()
-            for dt, val in series.items():
-                date_str = pd.Timestamp(dt).strftime("%Y-%m-%d")
-                records.append((factor_id, ticker, date_str, float(val)))
-
-        if not records:
+        """Write computed factor values to the cache table using vectorized ops."""
+        if df.empty:
             return
 
-        # Batch insert using INSERT OR REPLACE
-        batch_size = 5000
-        for i in range(0, len(records), batch_size):
-            batch = records[i : i + batch_size]
-            insert_df = pd.DataFrame(
-                batch, columns=["factor_id", "ticker", "date", "value"]
-            )
-            conn.execute(
-                "CREATE OR REPLACE TEMP TABLE _tmp_fv AS SELECT * FROM insert_df"
-            )
-            conn.execute(
-                """INSERT OR REPLACE INTO factor_values_cache
-                   (factor_id, ticker, date, value)
-                   SELECT factor_id, ticker, date, value FROM _tmp_fv"""
-            )
-            conn.execute("DROP TABLE IF EXISTS _tmp_fv")
+        conn = get_connection()
+
+        # Vectorized conversion: wide -> long using stack (much faster than
+        # nested Python loops for 7000+ tickers).
+        long = df.stack(dropna=True).reset_index()
+        long.columns = ["date", "ticker", "value"]
+        long["factor_id"] = factor_id
+        long["date"] = pd.to_datetime(long["date"]).dt.strftime("%Y-%m-%d")
+        long["value"] = long["value"].astype(float)
+        long = long[["factor_id", "ticker", "date", "value"]]
+
+        if long.empty:
+            return
+
+        # Single bulk upsert via DuckDB DataFrame scan
+        conn.execute("CREATE OR REPLACE TEMP TABLE _tmp_fv AS SELECT * FROM long")
+        conn.execute(
+            """INSERT OR REPLACE INTO factor_values_cache
+               (factor_id, ticker, date, value)
+               SELECT factor_id, ticker, date, value FROM _tmp_fv"""
+        )
+        conn.execute("DROP TABLE IF EXISTS _tmp_fv")
 
         log.info(
             "factor_engine.cache.written",
             factor_id=factor_id,
-            records=len(records),
+            records=len(long),
         )
 
     # ------------------------------------------------------------------
@@ -283,14 +287,14 @@ class FactorEngine:
         # Load OHLCV data for all tickers in this batch.
         # We request extra history before start_date for warm-up periods.
         # Many indicators (e.g. 200-day MA) need ~250 bars of warm-up.
-        from datetime import timedelta
-        sd = start_date if isinstance(start_date, date_type) else date_type.fromisoformat(str(start_date))
-        ed = end_date if isinstance(end_date, date_type) else date_type.fromisoformat(str(end_date))
+        sd = date_type.fromisoformat(str(start_date))
+        ed = date_type.fromisoformat(str(end_date))
         warm_start = sd - timedelta(days=400)
+        placeholders = ",".join(f"'{t}'" for t in tickers)
         warm_up_query = f"""
             SELECT ticker, date, open, high, low, close, volume
             FROM daily_bars
-            WHERE ticker IN ({','.join(f"'{t}'" for t in tickers)})
+            WHERE ticker IN ({placeholders})
               AND date >= ?
               AND date <= ?
             ORDER BY ticker, date
@@ -313,7 +317,6 @@ class FactorEngine:
                 ohlcv = ohlcv[["open", "high", "low", "close", "volume"]].astype(float)
 
                 if ohlcv.empty or len(ohlcv) < 5:
-                    log.debug("factor_engine.compute.skip_short", ticker=ticker, rows=len(ohlcv))
                     continue
 
                 factor_values = factor_instance.compute(ohlcv)
