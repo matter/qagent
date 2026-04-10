@@ -15,7 +15,7 @@ import pandas as pd
 
 from backend.db import get_connection
 from backend.logger import get_logger
-from backend.services.calendar_service import get_latest_trading_day, get_trading_days
+from backend.services.calendar_service import get_latest_trading_day, get_trading_days, offset_trading_days
 from backend.services.group_service import GroupService
 from backend.services.signal_service import SignalService
 from backend.services.strategy_service import StrategyService
@@ -153,9 +153,9 @@ class PaperTradingService:
                    0 means advance to target_date or latest trading day.
 
         Processes each unprocessed trading day sequentially:
-          1. Generate signals using data up to that day
-          2. Execute trades at that day's open (T+1 model)
-          3. Value portfolio at close
+          1. Generate signals using data up to T-1 (previous trading day)
+          2. Execute trades at T's open price
+          3. Value portfolio at T's close price
           4. Record daily snapshot
 
         Returns summary of the advancement.
@@ -200,6 +200,36 @@ class PaperTradingService:
             }
 
         conn = get_connection()
+
+        # --- Data availability check ---
+        # To advance to trade_date T, we need T's daily bars (open for
+        # execution, close for valuation).  Query the latest bar date
+        # and reject any trading days beyond it.
+        latest_bar_row = conn.execute("SELECT MAX(date) FROM daily_bars").fetchone()
+        if not latest_bar_row or not latest_bar_row[0]:
+            raise ValueError("本地无行情数据，请先更新数据")
+        latest_bar_date = (
+            latest_bar_row[0]
+            if isinstance(latest_bar_row[0], date)
+            else date.fromisoformat(str(latest_bar_row[0]))
+        )
+
+        # Filter trading_days to those with data available
+        days_with_data = [d for d in trading_days if d <= latest_bar_date]
+        days_without = [d for d in trading_days if d > latest_bar_date]
+
+        if not days_with_data:
+            # None of the requested days have data
+            first_needed = trading_days[0]
+            raise ValueError(
+                f"无法推进：本地数据截止到 {latest_bar_date}，"
+                f"下一交易日 {first_needed} 尚无数据。"
+                f"请先更新行情数据。"
+            )
+
+        # If step mode requested specific count but data covers fewer days,
+        # only process what we have but warn in the response
+        trading_days = days_with_data
 
         # Pre-load already processed dates to skip them
         processed = set()
@@ -246,13 +276,16 @@ class PaperTradingService:
         )
 
         for trade_date in trading_days:
-            date_str = str(trade_date)
+            # Signal generation uses data up to T-1 (the previous trading
+            # day).  Decisions are made at end of T-1 and executed at T's
+            # open -- the standard T+1 model.
+            signal_date = self._prev_trading_day(trade_date)
 
-            # 1. Generate signals for this date
+            # 1. Generate signals based on T-1 data
             try:
                 signal_result = self._signal_service.generate_signals(
                     strategy_id=session["strategy_id"],
-                    target_date=date_str,
+                    target_date=str(signal_date),
                     universe_group_id=session["universe_group_id"],
                 )
                 signals = signal_result.get("signals", [])
@@ -329,12 +362,19 @@ class PaperTradingService:
             trades=total_new_trades,
             signal_errors=signal_errors,
         )
-        return {
+        result = {
             "session_id": session_id,
             "days_processed": days_processed,
             "new_trades": total_new_trades,
             "current_date": str(trading_days[-1]) if trading_days else None,
         }
+        if days_without:
+            result["message"] = (
+                f"已推进 {days_processed} 天。"
+                f"另有 {len(days_without)} 天因本地数据不足被跳过"
+                f"（数据截止 {latest_bar_date}）。"
+            )
+        return result
 
     # ------------------------------------------------------------------
     # Latest signals / T+1 action plan
@@ -343,7 +383,8 @@ class PaperTradingService:
     def get_latest_signals(self, session_id: str) -> dict:
         """Generate signals for the next trading day (T+1 action plan).
 
-        Returns the signal list plus current positions for comparison.
+        Uses data up to session's current_date (T) to generate signals
+        for T+1.  This mirrors what advance() would do on the next step.
         """
         session = self.get_session(session_id)
         current = session.get("current_date")
@@ -352,17 +393,20 @@ class PaperTradingService:
 
         # Next trading day after current_date
         if isinstance(current, str):
-            current = date.fromisoformat(current)
-        next_days = get_trading_days(current + timedelta(days=1), current + timedelta(days=10))
+            current_d = date.fromisoformat(current)
+        else:
+            current_d = current
+        next_days = get_trading_days(current_d + timedelta(days=1), current_d + timedelta(days=10))
         if not next_days:
             return {"signals": [], "action_plan": [], "target_date": None}
         target_date = next_days[0]
 
-        # Generate signals for T+1
+        # Generate signals using data through current_date (T),
+        # producing the action plan for T+1.
         try:
             signal_result = self._signal_service.generate_signals(
                 strategy_id=session["strategy_id"],
-                target_date=str(target_date),
+                target_date=str(current_d),
                 universe_group_id=session["universe_group_id"],
             )
             signals = signal_result.get("signals", [])
@@ -571,6 +615,11 @@ class PaperTradingService:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _prev_trading_day(d: date) -> date:
+        """Return the trading day immediately before *d*."""
+        return offset_trading_days(d, -1)
 
     @staticmethod
     def _preload_prices(

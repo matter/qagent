@@ -189,13 +189,20 @@ function SessionTable({
     try {
       const result = await advancePaperSession(id, undefined, steps);
       if (result.days_processed > 0) {
-        messageApi.success(`推进了 ${result.days_processed} 个交易日，${result.new_trades ?? 0} 笔交易`);
+        const msg = result.message
+          ? result.message
+          : `推进了 ${result.days_processed} 个交易日，${result.new_trades ?? 0} 笔交易`;
+        messageApi.success(msg);
       } else {
         messageApi.info(result.message ?? "已是最新");
       }
       onRefresh();
-    } catch {
-      messageApi.error("推进失败");
+    } catch (err: unknown) {
+      const detail =
+        err && typeof err === "object" && "response" in err
+          ? ((err as Record<string, Record<string, unknown>>).response?.data as Record<string, string>)?.detail
+          : undefined;
+      messageApi.error(detail || "推进失败");
     } finally {
       setAdvancing(null);
     }
