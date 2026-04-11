@@ -19,6 +19,9 @@ from backend.services.calendar_service import get_latest_trading_day, get_tradin
 from backend.services.group_service import GroupService
 from backend.services.signal_service import SignalService
 from backend.services.strategy_service import StrategyService
+from backend.services.factor_engine import FactorEngine
+from backend.services.model_service import ModelService
+from backend.strategies.base import StrategyContext
 
 log = get_logger(__name__)
 
@@ -30,6 +33,8 @@ class PaperTradingService:
         self._signal_service = SignalService()
         self._strategy_service = StrategyService()
         self._group_service = GroupService()
+        self._factor_engine = FactorEngine()
+        self._model_service = ModelService()
 
     # ------------------------------------------------------------------
     # Session CRUD
@@ -160,6 +165,194 @@ class PaperTradingService:
 
         Returns summary of the advancement.
         """
+        # Use batch-optimized version for multiple days
+        session = self.get_session(session_id)
+        if session["status"] != "active":
+            raise ValueError(f"Session is {session['status']}, not active")
+
+        # Determine which days to process
+        current = session["current_date"]
+        if current:
+            if isinstance(current, str):
+                current = date.fromisoformat(current)
+            start_from = current + timedelta(days=1)
+        else:
+            start_from = date.fromisoformat(session["start_date"])
+
+        if steps > 0:
+            generous_end = start_from + timedelta(days=steps * 3 + 30)
+            all_days = get_trading_days(start_from, generous_end)
+            trading_days = all_days[:steps] if all_days else []
+        else:
+            if target_date:
+                end = date.fromisoformat(target_date)
+            else:
+                end = get_latest_trading_day()
+            if start_from > end:
+                return {
+                    "session_id": session_id,
+                    "days_processed": 0,
+                    "message": "Already up to date",
+                }
+            trading_days = get_trading_days(start_from, end)
+
+        if not trading_days:
+            return {
+                "session_id": session_id,
+                "days_processed": 0,
+                "message": "No trading days in range",
+            }
+
+        conn = get_connection()
+        latest_bar_row = conn.execute("SELECT MAX(date) FROM daily_bars").fetchone()
+        if not latest_bar_row or not latest_bar_row[0]:
+            raise ValueError("本地无行情数据，请先更新数据")
+        latest_bar_date = (
+            latest_bar_row[0]
+            if isinstance(latest_bar_row[0], date)
+            else date.fromisoformat(str(latest_bar_row[0]))
+        )
+
+        days_with_data = [d for d in trading_days if d <= latest_bar_date]
+        days_without = [d for d in trading_days if d > latest_bar_date]
+
+        if not days_with_data:
+            first_needed = trading_days[0]
+            raise ValueError(
+                f"无法推进：本地数据截止到 {latest_bar_date}，"
+                f"下一交易日 {first_needed} 尚无数据。"
+                f"请先更新行情数据。"
+            )
+
+        trading_days = days_with_data
+
+        processed = set()
+        rows = conn.execute(
+            "SELECT date FROM paper_trading_daily WHERE session_id = ?",
+            [session_id],
+        ).fetchall()
+        for r in rows:
+            processed.add(r[0] if isinstance(r[0], date) else date.fromisoformat(str(r[0])))
+        trading_days = [d for d in trading_days if d not in processed]
+
+        if not trading_days:
+            return {
+                "session_id": session_id,
+                "days_processed": 0,
+                "message": "Already up to date",
+            }
+
+        config = session.get("config") or {}
+        capital = session["initial_capital"]
+        commission_rate = config.get("commission_rate", 0.001)
+        slippage_rate = config.get("slippage_rate", 0.001)
+        max_positions = config.get("max_positions", 50)
+        cost_rate = commission_rate + slippage_rate
+
+        tickers = self._group_service.get_group_tickers(session["universe_group_id"])
+
+        # Batch load signals for all trading days at once (includes price loading internally)
+        signal_dates = [self._prev_trading_day(d) for d in trading_days]
+        batch_signals = self._generate_signals_batch(
+            strategy_id=session["strategy_id"],
+            signal_dates=signal_dates,
+            universe_group_id=session["universe_group_id"],
+            tickers=tickers,
+        )
+
+        # Load price cache for trade execution (separate from signal generation)
+        price_cache = self._preload_prices(tickers, trading_days[0], trading_days[-1], conn)
+
+        positions, cash = self._load_latest_state(session_id, capital)
+        days_processed = 0
+        total_new_trades = 0
+        signal_errors = 0
+        daily_snapshots: list[tuple] = []
+
+        log.info(
+            "paper_trading.advance_start",
+            session_id=session_id,
+            days_to_process=len(trading_days),
+            range=f"{trading_days[0]}~{trading_days[-1]}",
+        )
+
+        for idx, trade_date in enumerate(trading_days):
+            signals = batch_signals.get(idx, [])
+            if not signals:
+                signal_errors += 1
+
+            target_weights: dict[str, float] = {}
+            for sig in signals:
+                ticker = sig.get("ticker", "")
+                weight = sig.get("target_weight", 0.0)
+                if weight and weight > 0:
+                    target_weights[ticker] = float(weight)
+
+            if len(target_weights) > max_positions:
+                sorted_tw = sorted(
+                    target_weights.items(), key=lambda x: x[1], reverse=True
+                )
+                target_weights = dict(sorted_tw[:max_positions])
+
+            w_sum = sum(target_weights.values())
+            if w_sum > 0:
+                target_weights = {t: w / w_sum for t, w in target_weights.items()}
+
+            day_trades = self._execute_trades_cached(
+                positions, cash, target_weights,
+                trade_date, cost_rate, price_cache,
+            )
+            cash = day_trades["cash_after"]
+            positions = day_trades["positions_after"]
+            total_new_trades += len(day_trades["trades"])
+            nav = self._value_portfolio_cached(positions, cash, trade_date, price_cache)
+
+            daily_snapshots.append((
+                session_id, trade_date, nav, cash,
+                json.dumps(positions, default=str),
+                json.dumps(day_trades["trades"], default=str),
+            ))
+            days_processed += 1
+
+        if daily_snapshots:
+            conn.executemany(
+                """INSERT OR REPLACE INTO paper_trading_daily
+                   (session_id, date, nav, cash, positions_json, trades_json)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                daily_snapshots,
+            )
+            last_date = trading_days[-1] if trading_days else None
+            last_nav = daily_snapshots[-1][2] if daily_snapshots else None
+            conn.execute(
+                """UPDATE paper_trading_sessions
+                   SET current_date = ?, current_nav = ?,
+                       total_trades = total_trades + ?,
+                       updated_at = ?
+                   WHERE id = ?""",
+                [last_date, last_nav, total_new_trades,
+                 datetime.utcnow(), session_id],
+            )
+
+        log.info(
+            "paper_trading.advance_done",
+            session_id=session_id,
+            days=days_processed,
+            trades=total_new_trades,
+            signal_errors=signal_errors,
+        )
+        result = {
+            "session_id": session_id,
+            "days_processed": days_processed,
+            "new_trades": total_new_trades,
+            "current_date": str(trading_days[-1]) if trading_days else None,
+        }
+        if days_without:
+            result["message"] = (
+                f"已推进 {days_processed} 天。"
+                f"另有 {len(days_without)} 天因本地数据不足被跳过"
+                f"（数据截止 {latest_bar_date}）。"
+            )
+        return result
         session = self.get_session(session_id)
         if session["status"] != "active":
             raise ValueError(f"Session is {session['status']}, not active")
@@ -401,15 +594,13 @@ class PaperTradingService:
             return {"signals": [], "action_plan": [], "target_date": None}
         target_date = next_days[0]
 
-        # Generate signals using data through current_date (T),
-        # producing the action plan for T+1.
+        # Lightweight signal generation: no validation, no persistence, just signals
         try:
-            signal_result = self._signal_service.generate_signals(
+            signals = self._generate_signals_lightweight(
                 strategy_id=session["strategy_id"],
-                target_date=str(current_d),
+                signal_date=current_d,
                 universe_group_id=session["universe_group_id"],
             )
-            signals = signal_result.get("signals", [])
         except Exception as exc:
             log.warning("paper_trading.signal_preview_error", error=str(exc))
             return {"signals": [], "action_plan": [], "target_date": str(target_date), "error": str(exc)}
@@ -441,7 +632,6 @@ class PaperTradingService:
         for ticker in sorted(all_tickers):
             current_shares = positions.get(ticker, {}).get("shares", 0.0)
             target_w = target_weights.get(ticker, 0.0)
-            current_w = 0.0  # approximate
             action = "hold"
             if current_shares > 0 and target_w == 0:
                 action = "sell"
@@ -461,6 +651,99 @@ class PaperTradingService:
             "action_plan": action_plan,
             "target_date": str(target_date),
         }
+
+    def _generate_signals_lightweight(
+        self,
+        strategy_id: str,
+        signal_date: date,
+        universe_group_id: str,
+    ) -> list[dict]:
+        """Generate signals for a single date without validation or persistence.
+
+        Returns list of signal dicts with ticker, signal, target_weight, strength.
+        """
+        # Load strategy
+        strategy_def = self._strategy_service.get_strategy(strategy_id)
+        strategy_instance = self._load_strategy_instance(strategy_def)
+
+        # Resolve universe tickers
+        tickers = self._group_service.get_group_tickers(universe_group_id)
+        if not tickers:
+            return []
+
+        # Load OHLCV data with lookback
+        start_lookback = signal_date - timedelta(days=250)
+        end_date = signal_date
+        prices_close, prices_open, prices_high, prices_low, prices_volume = self._load_prices(
+            tickers, str(start_lookback), str(end_date)
+        )
+        if prices_close.empty:
+            return []
+
+        # Load required factors
+        required_factors = strategy_def.get("required_factors", [])
+        factor_data: dict[str, pd.DataFrame] = {}
+        if required_factors:
+            factor_id_map = self._resolve_factor_ids(required_factors)
+            for factor_name, factor_id in factor_id_map.items():
+                try:
+                    df = self._factor_engine.compute_factor(
+                        factor_id, tickers, str(start_lookback), str(end_date)
+                    )
+                    if not df.empty:
+                        factor_data[factor_name] = df
+                except Exception as exc:
+                    log.warning(
+                        "paper_trading.lightweight_factor_failed",
+                        factor_name=factor_name,
+                        error=str(exc),
+                    )
+
+        # Load model predictions
+        required_models = strategy_def.get("required_models", [])
+        model_predictions: dict[str, pd.Series] = {}
+        for model_id in required_models:
+            try:
+                preds = self._model_service.predict(
+                    model_id=model_id,
+                    tickers=tickers,
+                    date=str(signal_date),
+                )
+                if not preds.empty:
+                    model_predictions[model_id] = preds
+            except Exception as exc:
+                log.warning(
+                    "paper_trading.lightweight_model_failed",
+                    model_id=model_id,
+                    error=str(exc),
+                )
+
+        # Build context and generate signals
+        trade_ts = pd.Timestamp(signal_date)
+        prices_multi = self._build_prices_multi(
+            prices_close, prices_open, prices_high, prices_low, prices_volume, tickers
+        )
+        context = StrategyContext(
+            prices=prices_multi.loc[:trade_ts],
+            factor_values=factor_data,
+            model_predictions=model_predictions,
+            current_date=trade_ts,
+        )
+
+        raw_signals = strategy_instance.generate_signals(context)
+        if raw_signals.empty:
+            return []
+
+        signal_list = []
+        for ticker in raw_signals.index:
+            row = raw_signals.loc[ticker]
+            signal_list.append({
+                "ticker": str(ticker),
+                "signal": int(row.get("signal", 0)),
+                "target_weight": float(row.get("weight", 0.0)),
+                "strength": float(row.get("strength", 0.0)),
+            })
+        return signal_list
 
     # ------------------------------------------------------------------
     # Stock trade chart data
@@ -620,6 +903,216 @@ class PaperTradingService:
     def _prev_trading_day(d: date) -> date:
         """Return the trading day immediately before *d*."""
         return offset_trading_days(d, -1)
+
+    def _generate_signals_batch(
+        self,
+        strategy_id: str,
+        signal_dates: list[date],
+        universe_group_id: str,
+        tickers: list[str],
+        price_cache: dict[date, dict[str, tuple[float, float]]],
+    ) -> dict[int, list[dict]]:
+        """Generate signals for multiple dates in one batch.
+
+        Loads strategy, factors, and models once, then generates signals
+        for each date without persisting to DB or re-validating dependencies.
+
+        Returns: dict[date_index, list[signal_dict]]
+        """
+        if not signal_dates:
+            return {}
+
+        # Load strategy definition and instantiate once
+        strategy_def = self._strategy_service.get_strategy(strategy_id)
+        strategy_instance = self._load_strategy_instance(strategy_def)
+
+        # Resolve required factors and models once
+        required_factors = strategy_def.get("required_factors", [])
+        required_models = strategy_def.get("required_models", [])
+
+        # Pre-load factor values for the entire date range (with lookback)
+        factor_data: dict[str, pd.DataFrame] = {}
+        if required_factors:
+            start_date = min(signal_dates) - timedelta(days=250)
+            end_date = max(signal_dates)
+            factor_id_map = self._resolve_factor_ids(required_factors)
+            for factor_name, factor_id in factor_id_map.items():
+                try:
+                    df = self._factor_engine.compute_factor(
+                        factor_id, tickers, str(start_date), str(end_date)
+                    )
+                    if not df.empty:
+                        factor_data[factor_name] = df
+                except Exception as exc:
+                    log.warning(
+                        "paper_trading.batch_factor_failed",
+                        factor_name=factor_name,
+                        error=str(exc),
+                    )
+
+        # Pre-load model predictions for all dates
+        model_predictions: dict[str, dict[date, pd.Series]] = {}
+        for model_id in required_models:
+            model_predictions[model_id] = {}
+            for d in signal_dates:
+                try:
+                    preds = self._model_service.predict(
+                        model_id=model_id,
+                        tickers=tickers,
+                        date=str(d),
+                    )
+                    if not preds.empty:
+                        model_predictions[model_id][d] = preds
+                except Exception as exc:
+                    log.warning(
+                        "paper_trading.batch_model_failed",
+                        model_id=model_id,
+                        date=str(d),
+                        error=str(exc),
+                    )
+
+        # Pre-load OHLCV data for the entire range
+        conn = get_connection()
+        start_lookback = min(signal_dates) - timedelta(days=250)
+        end_date = max(signal_dates)
+        prices_close, prices_open, prices_high, prices_low, prices_volume = self._load_prices(
+            tickers, str(start_lookback), str(end_date)
+        )
+
+        # Generate signals per date
+        results: dict[int, list[dict]] = {}
+        for idx, target_date in enumerate(signal_dates):
+            # Build context for this date
+            trade_ts = pd.Timestamp(target_date)
+            prices_multi = self._build_prices_multi(
+                prices_close, prices_open, prices_high, prices_low, prices_volume, tickers
+            )
+            # Filter factor data up to this date
+            date_factor_data = {}
+            for name, df in factor_data.items():
+                if not df.empty:
+                    date_factor_data[name] = df[df.index <= trade_ts]
+            # Filter model predictions for this date
+            date_model_preds = {}
+            for model_id, preds_by_date in model_predictions.items():
+                if target_date in preds_by_date:
+                    date_model_preds[model_id] = preds_by_date[target_date]
+
+            context = StrategyContext(
+                prices=prices_multi.loc[:trade_ts],
+                factor_values=date_factor_data,
+                model_predictions=date_model_preds,
+                current_date=trade_ts,
+            )
+
+            # Generate signals
+            try:
+                raw_signals = strategy_instance.generate_signals(context)
+                if raw_signals.empty:
+                    results[idx] = []
+                    continue
+
+                signal_list = []
+                for ticker in raw_signals.index:
+                    row = raw_signals.loc[ticker]
+                    signal_list.append({
+                        "ticker": str(ticker),
+                        "signal": int(row.get("signal", 0)),
+                        "target_weight": float(row.get("weight", 0.0)),
+                        "strength": float(row.get("strength", 0.0)),
+                    })
+                results[idx] = signal_list
+            except Exception as exc:
+                log.warning(
+                    "paper_trading.batch_signal_failed",
+                    date=str(target_date),
+                    error=str(exc),
+                )
+                results[idx] = []
+
+        return results
+
+    def _load_strategy_instance(self, strategy_def: dict):
+        """Load and return strategy instance from definition."""
+        from backend.strategies.loader import load_strategy_from_code
+        return load_strategy_from_code(strategy_def["source_code"])
+
+    def _resolve_factor_ids(self, factor_names: list[str]) -> dict[str, str]:
+        """Resolve factor names to factor IDs (latest version)."""
+        conn = get_connection()
+        result: dict[str, str] = {}
+        for name in factor_names:
+            row = conn.execute(
+                """SELECT id FROM factors
+                   WHERE name = ?
+                   ORDER BY version DESC
+                   LIMIT 1""",
+                [name],
+            ).fetchone()
+            if row:
+                result[name] = row[0]
+        return result
+
+    @staticmethod
+    def _load_prices(
+        tickers: list[str],
+        start_date: str,
+        end_date: str,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """Load OHLCV price DataFrames from daily_bars."""
+        conn = get_connection()
+        placeholders = ",".join(f"'{t}'" for t in tickers)
+        query = f"""
+            SELECT ticker, date, open, high, low, close, volume
+            FROM daily_bars
+            WHERE ticker IN ({placeholders})
+              AND date >= ? AND date <= ?
+            ORDER BY date
+        """
+        df = conn.execute(query, [start_date, end_date]).fetchdf()
+        if df.empty:
+            empty = pd.DataFrame()
+            return empty, empty, empty, empty, empty
+
+        df["date"] = pd.to_datetime(df["date"])
+        close_pivot = df.pivot(index="date", columns="ticker", values="close")
+        open_pivot = df.pivot(index="date", columns="ticker", values="open")
+        high_pivot = df.pivot(index="date", columns="ticker", values="high")
+        low_pivot = df.pivot(index="date", columns="ticker", values="low")
+        volume_pivot = df.pivot(index="date", columns="ticker", values="volume")
+        return close_pivot, open_pivot, high_pivot, low_pivot, volume_pivot
+
+    @staticmethod
+    def _build_prices_multi(
+        prices_close: pd.DataFrame,
+        prices_open: pd.DataFrame,
+        prices_high: pd.DataFrame,
+        prices_low: pd.DataFrame,
+        prices_volume: pd.DataFrame,
+        tickers: list[str],
+    ) -> pd.DataFrame:
+        """Build a MultiIndex-column DataFrame with (field, ticker) columns."""
+        frames = {}
+        field_dfs = [
+            ("close", prices_close),
+            ("open", prices_open),
+            ("high", prices_high),
+            ("low", prices_low),
+            ("volume", prices_volume),
+        ]
+        for field_name, df in field_dfs:
+            for ticker in tickers:
+                if ticker in df.columns:
+                    frames[(field_name, ticker)] = df[ticker]
+
+        if not frames:
+            return pd.DataFrame()
+
+        result = pd.DataFrame(frames)
+        result.columns = pd.MultiIndex.from_tuples(
+            result.columns, names=["field", "ticker"]
+        )
+        return result
 
     @staticmethod
     def _preload_prices(
