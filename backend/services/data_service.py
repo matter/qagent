@@ -33,6 +33,13 @@ def _get_provider() -> DataProvider:
 class DataService:
     """Orchestrate data fetching, storage, and quality checks."""
 
+    # Batch sizes tuned by date range — fewer API calls for short ranges,
+    # gentler on Yahoo for long ranges.
+    _SHORT_RANGE_BATCH = 500   # <= 30 days: large batches, minimal data per ticker
+    _MEDIUM_RANGE_BATCH = 200  # 30-365 days: medium batches
+    _LONG_RANGE_BATCH = 50     # > 365 days: small batches, heavy downloads
+    _FLUSH_THRESHOLD = 200_000  # flush accumulated rows to DB periodically
+
     def __init__(self, provider: DataProvider | None = None) -> None:
         self._provider = provider or _get_provider()
         self._progress_path = settings.project_root / "data" / _PROGRESS_FILE
@@ -44,16 +51,14 @@ class DataService:
     def update_tickers(self, tickers: list[str]) -> dict:
         """Update market data for a specific list of tickers (incremental).
 
-        Used for single-stock or group-based updates.  Much faster than a
-        full incremental update because it skips stock-list refresh and
-        only touches the given tickers.
+        Groups tickers by date range and uses appropriate batch sizes:
+        large batches for recent data, small batches for long history.
         """
         if not tickers:
             return {"total": 0, "success": 0, "failed": 0, "duration_seconds": 0}
 
         from datetime import datetime as _dt
         started = _dt.utcnow()
-        conn = get_connection()
         end_date = get_latest_trading_day()
 
         # Determine start dates per ticker
@@ -69,31 +74,25 @@ class DataService:
                 "message": "所有股票数据已是最新",
             }
 
-        # Download in one batch (or a few if very large)
-        batch_size = 500
+        # Group tickers by date range and build batches
+        batches = self._build_smart_batches(tickers_to_update, ticker_starts, end_date)
+
         success = 0
         failed = 0
         failed_tickers: list[str] = []
         all_frames: list[pd.DataFrame] = []
 
-        for i in range(0, len(tickers_to_update), batch_size):
-            batch = tickers_to_update[i : i + batch_size]
-            batch_start = min(ticker_starts[t] for t in batch)
-            try:
-                bars_df = self._provider.get_daily_bars(batch, batch_start, end_date)
-                if not bars_df.empty:
-                    all_frames.append(bars_df)
-                    downloaded = set(bars_df["ticker"].unique())
-                    success += len(downloaded)
-                    batch_failed = [t for t in batch if t not in downloaded]
-                else:
-                    batch_failed = batch
-                failed += len(batch_failed)
-                failed_tickers.extend(batch_failed)
-            except Exception as e:
-                log.error("data.update_tickers.batch_error", error=str(e))
-                failed += len(batch)
-                failed_tickers.extend(batch)
+        for batch, batch_start in batches:
+            bars_df = self._provider.get_daily_bars(batch, batch_start, end_date)
+            if bars_df is not None and not bars_df.empty:
+                all_frames.append(bars_df)
+                downloaded = set(bars_df["ticker"].unique())
+                success += len(downloaded)
+                batch_failed = [t for t in batch if t not in downloaded]
+            else:
+                batch_failed = batch
+            failed += len(batch_failed)
+            failed_tickers.extend(batch_failed)
 
         if all_frames:
             combined = pd.concat(all_frames, ignore_index=True)
@@ -172,16 +171,26 @@ class DataService:
             else:
                 ticker_starts = self._get_incremental_starts(tickers, end_date)
 
-            # Filter out tickers that are already up-to-date
-            tickers_to_update = [
-                t for t in tickers if t in ticker_starts
-            ]
+            tickers_to_update = [t for t in tickers if t in ticker_starts]
 
-            # Update log with total count
             conn.execute(
                 "UPDATE data_update_log SET total_tickers = ? WHERE id = ?",
                 [len(tickers_to_update), run_id],
             )
+
+            if not tickers_to_update:
+                conn.execute(
+                    """UPDATE data_update_log
+                       SET status = 'completed', completed_at = ?, message = ?
+                       WHERE id = ?""",
+                    [datetime.utcnow(), "Nothing to update", run_id],
+                )
+                return {
+                    "run_id": run_id, "mode": mode,
+                    "total": 0, "success": 0, "failed": 0,
+                    "duration_seconds": 0.0,
+                    "message": "Data is already up to date",
+                }
 
             # --- Step 3: Check for resume ---
             progress = self._load_progress()
@@ -190,92 +199,75 @@ class DataService:
                 completed_batches = set(progress.get("completed_batches", []))
                 log.info("data.update.resume", completed_batches=len(completed_batches))
 
-            # --- Step 4: Group tickers by start date then batch ---
-            # Separate new tickers (full history) from incremental tickers
-            # so one new ticker doesn't drag an entire batch back to 2016.
-            full_history_start = date(end_date.year - _FULL_HISTORY_YEARS, 1, 1)
-            new_tickers = [t for t in tickers_to_update if ticker_starts[t] <= full_history_start]
-            incremental_tickers = [t for t in tickers_to_update if ticker_starts[t] > full_history_start]
+            # --- Step 4: Build smart batches (grouped by date range) ---
+            batches = self._build_smart_batches(tickers_to_update, ticker_starts, end_date)
 
             log.info(
                 "data.update.plan",
-                incremental=len(incremental_tickers),
-                new_tickers=len(new_tickers),
+                tickers=len(tickers_to_update),
+                batches=len(batches),
             )
-
-            # Build ordered batch list: incremental first, then new
-            batch_size = 500
-            batches: list[tuple[list[str], date]] = []
-            for i in range(0, len(incremental_tickers), batch_size):
-                batch = incremental_tickers[i : i + batch_size]
-                batch_start = min(ticker_starts[t] for t in batch)
-                batches.append((batch, batch_start))
-            for i in range(0, len(new_tickers), batch_size):
-                batch = new_tickers[i : i + batch_size]
-                batches.append((batch, full_history_start))
 
             success_count = 0
             fail_count = 0
             failed_tickers: list[str] = []
             pending_frames: list[pd.DataFrame] = []
-            pending_bytes = 0
-            _FLUSH_THRESHOLD = 200_000  # flush accumulated rows to DB
+            pending_rows = 0
 
             for batch_num, (batch, batch_start) in enumerate(batches):
                 if batch_num in completed_batches:
-                    log.info("data.update.skip_batch", batch=batch_num)
                     continue
 
                 log.info(
                     "data.update.batch",
-                    batch=batch_num,
+                    batch=f"{batch_num + 1}/{len(batches)}",
                     size=len(batch),
                     start=str(batch_start),
-                    end=str(end_date),
                 )
 
+                # Provider already handles retries + rate limiting
                 try:
                     bars_df = self._provider.get_daily_bars(batch, batch_start, end_date)
-                    if not bars_df.empty:
-                        pending_frames.append(bars_df)
-                        pending_bytes += len(bars_df)
-                        downloaded_tickers = set(bars_df["ticker"].unique())
-                        success_count += len(downloaded_tickers)
-                        batch_failed = [t for t in batch if t not in downloaded_tickers]
-                    else:
-                        batch_failed = batch
-
-                    fail_count += len(batch_failed)
-                    failed_tickers.extend(batch_failed)
                 except Exception as e:
                     log.error("data.update.batch_error", batch=batch_num, error=str(e))
                     fail_count += len(batch)
                     failed_tickers.extend(batch)
+                    bars_df = None
+
+                if bars_df is not None and not bars_df.empty:
+                    pending_frames.append(bars_df)
+                    pending_rows += len(bars_df)
+                    downloaded_tickers = set(bars_df["ticker"].unique())
+                    success_count += len(downloaded_tickers)
+                    batch_failed = [t for t in batch if t not in downloaded_tickers]
+                    fail_count += len(batch_failed)
+                    failed_tickers.extend(batch_failed)
+                elif bars_df is not None:
+                    # Empty result (no error)
+                    fail_count += len(batch)
+                    failed_tickers.extend(batch)
 
                 # Flush accumulated data to DB periodically
-                if pending_bytes >= _FLUSH_THRESHOLD:
+                if pending_rows >= self._FLUSH_THRESHOLD:
                     combined = pd.concat(pending_frames, ignore_index=True)
                     self._upsert_daily_bars(combined)
                     pending_frames.clear()
-                    pending_bytes = 0
+                    pending_rows = 0
 
                 # Save progress
                 completed_batches.add(batch_num)
-                self._save_progress(
-                    {
-                        "run_id": run_id,
-                        "mode": mode,
-                        "completed_batches": list(completed_batches),
-                        "success_count": success_count,
-                        "fail_count": fail_count,
-                    }
-                )
+                self._save_progress({
+                    "run_id": run_id,
+                    "mode": mode,
+                    "completed_batches": list(completed_batches),
+                    "success_count": success_count,
+                    "fail_count": fail_count,
+                })
 
             # Flush remaining
             if pending_frames:
                 combined = pd.concat(pending_frames, ignore_index=True)
                 self._upsert_daily_bars(combined)
-                pending_frames.clear()
 
             # --- Step 5: Update index data ---
             log.info("data.update.index", symbol="SPY")
@@ -298,16 +290,13 @@ class DataService:
                        failed_tickers = ?, message = ?
                    WHERE id = ?""",
                 [
-                    completed_at,
-                    success_count,
-                    fail_count,
-                    json.dumps(failed_tickers[:100]),  # cap stored list
+                    completed_at, success_count, fail_count,
+                    json.dumps(failed_tickers[:100]),
                     f"Completed in {duration:.1f}s",
                     run_id,
                 ],
             )
 
-            # Clean up progress file
             if self._progress_path.exists():
                 self._progress_path.unlink()
 
@@ -553,3 +542,91 @@ class DataService:
         """Persist progress to disk for resume capability."""
         self._progress_path.parent.mkdir(parents=True, exist_ok=True)
         self._progress_path.write_text(json.dumps(data))
+
+    @classmethod
+    def _build_smart_batches(
+        cls,
+        tickers: list[str],
+        ticker_starts: dict[str, date],
+        end_date: date,
+    ) -> list[tuple[list[str], date]]:
+        """Group tickers by date-range bucket and build appropriately-sized batches.
+
+        Short ranges (<=30 days) get large batches (500 tickers) because
+        yfinance downloads very little data per ticker.
+        Medium ranges (30-365 days) get medium batches (200).
+        Long ranges (>365 days, typically new tickers) get small batches (50)
+        to avoid timeouts and rate limits on heavy downloads.
+
+        Within each bucket, tickers sharing the same start date are grouped
+        together so the yfinance request doesn't over-fetch.
+        """
+        # Classify tickers into buckets
+        short: dict[date, list[str]] = {}   # <= 30 days
+        medium: dict[date, list[str]] = {}  # 30-365 days
+        long: dict[date, list[str]] = {}    # > 365 days
+
+        for t in tickers:
+            start = ticker_starts[t]
+            days_back = (end_date - start).days
+            if days_back <= 30:
+                short.setdefault(start, []).append(t)
+            elif days_back <= 365:
+                medium.setdefault(start, []).append(t)
+            else:
+                long.setdefault(start, []).append(t)
+
+        batches: list[tuple[list[str], date]] = []
+
+        # Short range: merge all start dates within 7 days of each other
+        # to reduce number of API calls
+        batches.extend(
+            cls._merge_and_chunk(short, cls._SHORT_RANGE_BATCH, merge_window_days=7)
+        )
+        batches.extend(
+            cls._merge_and_chunk(medium, cls._MEDIUM_RANGE_BATCH, merge_window_days=30)
+        )
+        batches.extend(
+            cls._merge_and_chunk(long, cls._LONG_RANGE_BATCH, merge_window_days=0)
+        )
+
+        return batches
+
+    @staticmethod
+    def _merge_and_chunk(
+        date_groups: dict[date, list[str]],
+        batch_size: int,
+        merge_window_days: int = 0,
+    ) -> list[tuple[list[str], date]]:
+        """Merge nearby date groups and chunk into batches.
+
+        If merge_window_days > 0, groups whose start dates are within
+        that window are merged (using the earliest date as start).
+        Then the merged list is chunked into batches of batch_size.
+        """
+        if not date_groups:
+            return []
+
+        sorted_dates = sorted(date_groups.keys())
+        merged: list[tuple[date, list[str]]] = []
+
+        current_start = sorted_dates[0]
+        current_tickers: list[str] = list(date_groups[sorted_dates[0]])
+
+        for d in sorted_dates[1:]:
+            if merge_window_days > 0 and (d - current_start).days <= merge_window_days:
+                # Merge: keep earliest start, combine tickers
+                current_tickers.extend(date_groups[d])
+            else:
+                merged.append((current_start, current_tickers))
+                current_start = d
+                current_tickers = list(date_groups[d])
+        merged.append((current_start, current_tickers))
+
+        # Chunk each merged group
+        batches: list[tuple[list[str], date]] = []
+        for start, tickers_list in merged:
+            for i in range(0, len(tickers_list), batch_size):
+                batches.append((tickers_list[i : i + batch_size], start))
+
+        return batches
