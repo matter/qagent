@@ -112,6 +112,7 @@ CREATE TABLE IF NOT EXISTS label_definitions (
     target_type VARCHAR NOT NULL,
     horizon     INTEGER NOT NULL,
     benchmark   VARCHAR,
+    config      TEXT,
     status      VARCHAR DEFAULT 'draft',
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -321,6 +322,24 @@ def init_db() -> None:
     ):
         conn.execute(ddl)
         log.info("db.init", table=name)
+
+    # ---- Lightweight migrations for existing databases ----
+    _run_migrations(conn)
+
+
+def _run_migrations(conn) -> None:
+    """Apply lightweight schema migrations for existing databases."""
+    # Migration: add 'config' column to label_definitions
+    try:
+        cols = conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'label_definitions' AND column_name = 'config'"
+        ).fetchall()
+        if not cols:
+            conn.execute("ALTER TABLE label_definitions ADD COLUMN config TEXT")
+            log.info("db.migration", action="added label_definitions.config column")
+    except Exception:
+        pass  # Table may not exist yet (handled by DDL above)
 
 
 def close_db() -> None:

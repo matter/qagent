@@ -12,6 +12,7 @@ import {
   Select,
   Space,
   Spin,
+  Tag,
   Typography,
   Alert,
 } from "antd";
@@ -32,6 +33,12 @@ import type {
 } from "../../api";
 
 const { Text } = Typography;
+
+const _CLASSIFICATION_TYPES = new Set(["binary", "top_quantile", "bottom_quantile", "large_move", "excess_binary"]);
+
+function taskTypeForLabel(targetType: string): "classification" | "regression" {
+  return _CLASSIFICATION_TYPES.has(targetType) ? "classification" : "regression";
+}
 
 import type { ModelRestoreConfig } from "./ModelList";
 
@@ -220,12 +227,32 @@ export default function TrainConfigPanel({ onTrainComplete, restoreConfig }: Tra
                 placeholder="选择标签..."
                 value={selectedLabel || undefined}
                 onChange={setSelectedLabel}
-                options={labels.map((l) => ({
-                  value: l.id,
-                  label: `${l.name} (${l.target_type}, H=${l.horizon})`,
-                }))}
+                options={labels.map((l) => {
+                  const task = taskTypeForLabel(l.target_type);
+                  const tagText = task === "classification" ? "分类" : "回归";
+                  return {
+                    value: l.id,
+                    label: `[${tagText}] ${l.name} (${l.target_type}, H=${l.horizon})`,
+                  };
+                })}
                 showSearch
                 optionFilterProp="label"
+                optionRender={(option) => {
+                  const lbl = labels.find((l) => l.id === option.value);
+                  if (!lbl) return option.label;
+                  const task = taskTypeForLabel(lbl.target_type);
+                  return (
+                    <Space size={4}>
+                      <Tag color={task === "classification" ? "blue" : "green"} style={{ marginRight: 0 }}>
+                        {task === "classification" ? "分类" : "回归"}
+                      </Tag>
+                      <span>{lbl.name}</span>
+                      <Text type="secondary" style={{ fontSize: 11 }}>
+                        ({lbl.target_type}, H={lbl.horizon})
+                      </Text>
+                    </Space>
+                  );
+                }}
               />
             </Col>
             <Col span={8}>

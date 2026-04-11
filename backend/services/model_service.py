@@ -31,7 +31,7 @@ _MODEL_REGISTRY: dict[str, type] = {
 }
 
 # Label target types that should be treated as classification
-_CLASSIFICATION_TARGETS = {"binary"}
+_CLASSIFICATION_TARGETS = {"binary", "top_quantile", "bottom_quantile", "large_move", "excess_binary"}
 
 # Parameters determined by the system, not user-configurable
 _RESERVED_MODEL_PARAMS = {"task", "objective", "metric", "verbosity", "n_jobs"}
@@ -695,7 +695,7 @@ class ModelService:
                 metrics["test_daily_ic"] = _compute_daily_ic(y_test, preds_test)
 
         elif task == "classification":
-            from sklearn.metrics import f1_score, roc_auc_score
+            from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
 
             # Validation metrics
             if len(y_valid) > 0 and len(preds_valid) > 0:
@@ -705,6 +705,12 @@ class ModelService:
                     metrics["valid_auc"] = None
                 preds_binary = (preds_valid >= 0.5).astype(int)
                 metrics["valid_f1"] = round(float(f1_score(y_valid, preds_binary, zero_division=0)), 6)
+                metrics["valid_accuracy"] = round(float(accuracy_score(y_valid, preds_binary)), 6)
+                metrics["valid_precision"] = round(float(precision_score(y_valid, preds_binary, zero_division=0)), 6)
+                metrics["valid_recall"] = round(float(recall_score(y_valid, preds_binary, zero_division=0)), 6)
+
+                # Daily IC on predicted probabilities (ranking quality)
+                metrics["valid_daily_ic"] = _compute_daily_ic(y_valid, preds_valid)
 
             # Test metrics
             if len(y_test) > 0 and len(preds_test) > 0:
@@ -714,6 +720,11 @@ class ModelService:
                     metrics["test_auc"] = None
                 preds_binary = (preds_test >= 0.5).astype(int)
                 metrics["test_f1"] = round(float(f1_score(y_test, preds_binary, zero_division=0)), 6)
+                metrics["test_accuracy"] = round(float(accuracy_score(y_test, preds_binary)), 6)
+                metrics["test_precision"] = round(float(precision_score(y_test, preds_binary, zero_division=0)), 6)
+                metrics["test_recall"] = round(float(recall_score(y_test, preds_binary, zero_division=0)), 6)
+
+                metrics["test_daily_ic"] = _compute_daily_ic(y_test, preds_test)
 
         # ---- Promote daily IC summary to top-level for easy access ----
         for prefix in ("test", "valid"):

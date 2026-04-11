@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -35,6 +35,7 @@ class CreateLabelRequest(BaseModel):
     target_type: str = "return"
     horizon: int = 5
     benchmark: Optional[str] = None
+    config: Optional[dict[str, Any]] = None
 
 
 class UpdateLabelRequest(BaseModel):
@@ -43,6 +44,7 @@ class UpdateLabelRequest(BaseModel):
     target_type: Optional[str] = None
     horizon: Optional[int] = None
     benchmark: Optional[str] = None
+    config: Optional[dict[str, Any]] = None
     status: Optional[str] = None
 
 
@@ -62,6 +64,7 @@ async def create_label(body: CreateLabelRequest) -> dict:
             target_type=body.target_type,
             horizon=body.horizon,
             benchmark=body.benchmark,
+            config=body.config,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -96,6 +99,7 @@ async def update_label(label_id: str, body: UpdateLabelRequest) -> dict:
             target_type=body.target_type,
             horizon=body.horizon,
             benchmark=body.benchmark,
+            config=body.config,
             status=body.status,
         )
     except ValueError as e:

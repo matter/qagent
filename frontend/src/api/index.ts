@@ -180,6 +180,7 @@ export interface LabelDefinition {
   target_type: string;
   horizon: number;
   benchmark: string | null;
+  config: Record<string, unknown> | null;
   status: string;
 }
 
