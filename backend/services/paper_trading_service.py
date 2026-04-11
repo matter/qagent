@@ -251,14 +251,33 @@ class PaperTradingService:
 
         tickers = self._group_service.get_group_tickers(session["universe_group_id"])
 
-        # Batch load signals for all trading days at once (includes price loading internally)
+        # Batch load signals for all trading days at once
         signal_dates = [self._prev_trading_day(d) for d in trading_days]
-        batch_signals = self._generate_signals_batch(
-            strategy_id=session["strategy_id"],
-            signal_dates=signal_dates,
-            universe_group_id=session["universe_group_id"],
-            tickers=tickers,
-        )
+        try:
+            batch_signals = self._generate_signals_batch(
+                strategy_id=session["strategy_id"],
+                signal_dates=signal_dates,
+                universe_group_id=session["universe_group_id"],
+                tickers=tickers,
+            )
+        except Exception as exc:
+            log.warning(
+                "paper_trading.batch_signal_fallback",
+                error=str(exc),
+                msg="Falling back to SignalService per-day generation",
+            )
+            # Fallback: generate signals one day at a time via SignalService
+            batch_signals = {}
+            for idx, sig_date in enumerate(signal_dates):
+                try:
+                    result = self._signal_service.generate_signals(
+                        strategy_id=session["strategy_id"],
+                        target_date=str(sig_date),
+                        universe_group_id=session["universe_group_id"],
+                    )
+                    batch_signals[idx] = result.get("signals", [])
+                except Exception:
+                    batch_signals[idx] = []
 
         # Load price cache for trade execution (separate from signal generation)
         price_cache = self._preload_prices(tickers, trading_days[0], trading_days[-1], conn)
@@ -602,8 +621,18 @@ class PaperTradingService:
                 universe_group_id=session["universe_group_id"],
             )
         except Exception as exc:
-            log.warning("paper_trading.signal_preview_error", error=str(exc))
-            return {"signals": [], "action_plan": [], "target_date": str(target_date), "error": str(exc)}
+            log.warning("paper_trading.lightweight_signal_fallback", error=str(exc))
+            # Fallback to full SignalService pipeline
+            try:
+                signal_result = self._signal_service.generate_signals(
+                    strategy_id=session["strategy_id"],
+                    target_date=str(current_d),
+                    universe_group_id=session["universe_group_id"],
+                )
+                signals = signal_result.get("signals", [])
+            except Exception as exc2:
+                log.warning("paper_trading.signal_preview_error", error=str(exc2))
+                return {"signals": [], "action_plan": [], "target_date": str(target_date), "error": str(exc2)}
 
         # Load current positions
         positions, cash = self._load_latest_state(session_id, session["initial_capital"])
@@ -910,7 +939,6 @@ class PaperTradingService:
         signal_dates: list[date],
         universe_group_id: str,
         tickers: list[str],
-        price_cache: dict[date, dict[str, tuple[float, float]]],
     ) -> dict[int, list[dict]]:
         """Generate signals for multiple dates in one batch.
 
