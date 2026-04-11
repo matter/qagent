@@ -137,6 +137,51 @@ class FactorEngine:
         )
         return result
 
+    def load_cached_factors_bulk(
+        self,
+        factor_ids: list[str],
+        tickers: list[str],
+        start_date: str,
+        end_date: str,
+    ) -> dict[str, pd.DataFrame]:
+        """Load cached values for multiple factors in a single DB query.
+
+        Returns dict[factor_id -> DataFrame(dates x tickers)].
+        Only returns factors that have cached data; missing factors are omitted.
+        """
+        if not factor_ids or not tickers:
+            return {}
+
+        conn = get_connection()
+        fid_placeholders = ",".join(f"'{fid}'" for fid in factor_ids)
+        tk_placeholders = ",".join(f"'{t}'" for t in tickers)
+
+        query = f"""
+            SELECT factor_id, ticker, date, value
+            FROM factor_values_cache
+            WHERE factor_id IN ({fid_placeholders})
+              AND ticker IN ({tk_placeholders})
+              AND date >= ? AND date <= ?
+            ORDER BY factor_id, date, ticker
+        """
+        df = conn.execute(query, [start_date, end_date]).fetchdf()
+        if df.empty:
+            return {}
+
+        df["date"] = pd.to_datetime(df["date"])
+        result: dict[str, pd.DataFrame] = {}
+        for fid, grp in df.groupby("factor_id"):
+            pivot = grp.pivot(index="date", columns="ticker", values="value")
+            result[str(fid)] = pivot
+
+        log.info(
+            "factor_engine.bulk_cache.loaded",
+            requested=len(factor_ids),
+            loaded=len(result),
+            rows=len(df),
+        )
+        return result
+
     # ------------------------------------------------------------------
     # Cache helpers
     # ------------------------------------------------------------------

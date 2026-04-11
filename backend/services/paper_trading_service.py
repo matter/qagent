@@ -20,6 +20,7 @@ from backend.services.group_service import GroupService
 from backend.services.signal_service import SignalService
 from backend.services.strategy_service import StrategyService
 from backend.services.factor_engine import FactorEngine
+from backend.services.feature_service import FeatureService
 from backend.services.model_service import ModelService
 from backend.strategies.base import StrategyContext
 
@@ -34,6 +35,7 @@ class PaperTradingService:
         self._strategy_service = StrategyService()
         self._group_service = GroupService()
         self._factor_engine = FactorEngine()
+        self._feature_service = FeatureService()
         self._model_service = ModelService()
 
     # ------------------------------------------------------------------
@@ -689,63 +691,108 @@ class PaperTradingService:
     ) -> list[dict]:
         """Generate signals for a single date without validation or persistence.
 
+        Optimized: bulk-loads all factor cache data (strategy + model features)
+        in a single DB query, then passes pre-computed features to the model.
+
         Returns list of signal dicts with ticker, signal, target_weight, strength.
         """
-        # Load strategy
         strategy_def = self._strategy_service.get_strategy(strategy_id)
         strategy_instance = self._load_strategy_instance(strategy_def)
 
-        # Resolve universe tickers
         tickers = self._group_service.get_group_tickers(universe_group_id)
         if not tickers:
             return []
 
-        # Load OHLCV data with lookback
         start_lookback = signal_date - timedelta(days=250)
-        end_date = signal_date
+        start_str = str(start_lookback)
+        end_str = str(signal_date)
+
+        # Load OHLCV data with lookback
         prices_close, prices_open, prices_high, prices_low, prices_volume = self._load_prices(
-            tickers, str(start_lookback), str(end_date)
+            tickers, start_str, end_str
         )
         if prices_close.empty:
             return []
 
-        # Load required factors
+        # --- Bulk load ALL factor data (strategy + model features) ---
         required_factors = strategy_def.get("required_factors", [])
+        required_models = strategy_def.get("required_models", [])
+
+        strategy_factor_map = self._resolve_factor_ids(required_factors) if required_factors else {}
+        all_factor_ids = set(strategy_factor_map.values())
+
+        # Resolve model feature sets
+        model_fs_map: dict[str, tuple[str, dict[str, str]]] = {}
+        for model_id in required_models:
+            try:
+                model_record = self._model_service.get_model(model_id)
+                fs_id = model_record["feature_set_id"]
+                fs = self._feature_service.get_feature_set(fs_id)
+                fs_id_to_name: dict[str, str] = {}
+                for ref in fs["factor_refs"]:
+                    fid = ref["factor_id"]
+                    fname = ref.get("factor_name", fid)
+                    fs_id_to_name[fid] = fname
+                    all_factor_ids.add(fid)
+                model_fs_map[model_id] = (fs_id, fs_id_to_name)
+            except Exception as exc:
+                log.warning("paper_trading.lightweight_model_fs_failed", model_id=model_id, error=str(exc))
+
+        # Bulk load all cached factor values in ONE query
+        cached_by_id = self._factor_engine.load_cached_factors_bulk(
+            list(all_factor_ids), tickers, start_str, end_str
+        )
+
+        # Build strategy factor_data
         factor_data: dict[str, pd.DataFrame] = {}
-        if required_factors:
-            factor_id_map = self._resolve_factor_ids(required_factors)
-            for factor_name, factor_id in factor_id_map.items():
+        for factor_name, factor_id in strategy_factor_map.items():
+            if factor_id in cached_by_id and not cached_by_id[factor_id].empty:
+                factor_data[factor_name] = cached_by_id[factor_id]
+            else:
                 try:
-                    df = self._factor_engine.compute_factor(
-                        factor_id, tickers, str(start_lookback), str(end_date)
-                    )
+                    df = self._factor_engine.compute_factor(factor_id, tickers, start_str, end_str)
                     if not df.empty:
                         factor_data[factor_name] = df
                 except Exception as exc:
-                    log.warning(
-                        "paper_trading.lightweight_factor_failed",
-                        factor_name=factor_name,
-                        error=str(exc),
-                    )
+                    log.warning("paper_trading.lightweight_factor_failed", factor_name=factor_name, error=str(exc))
 
-        # Load model predictions
-        required_models = strategy_def.get("required_models", [])
+        # Build model predictions using pre-computed features
         model_predictions: dict[str, pd.Series] = {}
         for model_id in required_models:
+            if model_id not in model_fs_map:
+                continue
+            fs_id, fs_id_to_name = model_fs_map[model_id]
+            fs = self._feature_service.get_feature_set(fs_id)
+            preprocessing = fs["preprocessing"]
+
+            feature_data: dict[str, pd.DataFrame] = {}
+            for fid, fname in fs_id_to_name.items():
+                if fid in cached_by_id and not cached_by_id[fid].empty:
+                    feature_data[fname] = cached_by_id[fid]
+                else:
+                    try:
+                        df = self._factor_engine.compute_factor(fid, tickers, start_str, end_str)
+                        if not df.empty:
+                            feature_data[fname] = df
+                    except Exception as exc:
+                        log.warning("paper_trading.lightweight_model_factor_failed", factor=fname, error=str(exc))
+
+            # Apply preprocessing
+            processed: dict[str, pd.DataFrame] = {}
+            for fname, df in feature_data.items():
+                processed[fname] = self._feature_service._apply_preprocessing(df, preprocessing)
+
             try:
-                preds = self._model_service.predict(
+                preds = self._model_service.predict_with_features(
                     model_id=model_id,
+                    feature_data=processed,
                     tickers=tickers,
-                    date=str(signal_date),
+                    date=end_str,
                 )
                 if not preds.empty:
                     model_predictions[model_id] = preds
             except Exception as exc:
-                log.warning(
-                    "paper_trading.lightweight_model_failed",
-                    model_id=model_id,
-                    error=str(exc),
-                )
+                log.warning("paper_trading.lightweight_model_failed", model_id=model_id, error=str(exc))
 
         # Build context and generate signals
         trade_ts = pd.Timestamp(signal_date)
@@ -945,6 +992,10 @@ class PaperTradingService:
         Loads strategy, factors, and models once, then generates signals
         for each date without persisting to DB or re-validating dependencies.
 
+        Optimized: uses bulk cache loading for all factors (strategy + model
+        feature set) in a single DB query, then passes pre-computed features
+        directly to the model — avoiding 264 individual factor queries.
+
         Returns: dict[date_index, list[signal_dict]]
         """
         if not signal_dates:
@@ -954,67 +1005,119 @@ class PaperTradingService:
         strategy_def = self._strategy_service.get_strategy(strategy_id)
         strategy_instance = self._load_strategy_instance(strategy_def)
 
-        # Resolve required factors and models once
         required_factors = strategy_def.get("required_factors", [])
         required_models = strategy_def.get("required_models", [])
 
-        # Pre-load factor values for the entire date range (with lookback)
-        factor_data: dict[str, pd.DataFrame] = {}
-        if required_factors:
-            start_date = min(signal_dates) - timedelta(days=250)
-            end_date = max(signal_dates)
-            factor_id_map = self._resolve_factor_ids(required_factors)
-            for factor_name, factor_id in factor_id_map.items():
-                try:
-                    df = self._factor_engine.compute_factor(
-                        factor_id, tickers, str(start_date), str(end_date)
-                    )
-                    if not df.empty:
-                        factor_data[factor_name] = df
-                except Exception as exc:
-                    log.warning(
-                        "paper_trading.batch_factor_failed",
-                        factor_name=factor_name,
-                        error=str(exc),
-                    )
+        start_lookback = min(signal_dates) - timedelta(days=250)
+        end_date = max(signal_dates)
+        start_str = str(start_lookback)
+        end_str = str(end_date)
 
-        # Pre-load model predictions for all dates
+        # --- Bulk load ALL factor data (strategy + model features) ---
+        # 1. Collect all factor IDs we need
+        strategy_factor_map = self._resolve_factor_ids(required_factors) if required_factors else {}
+        all_factor_ids = set(strategy_factor_map.values())
+
+        # Resolve model feature sets and collect their factor IDs
+        model_fs_map: dict[str, tuple[str, dict[str, str]]] = {}  # model_id -> (fs_id, {factor_name: factor_id})
+        for model_id in required_models:
+            try:
+                model_record = self._model_service.get_model(model_id)
+                fs_id = model_record["feature_set_id"]
+                fs = self._feature_service.get_feature_set(fs_id)
+                fs_id_to_name: dict[str, str] = {}
+                for ref in fs["factor_refs"]:
+                    fid = ref["factor_id"]
+                    fname = ref.get("factor_name", fid)
+                    fs_id_to_name[fid] = fname
+                    all_factor_ids.add(fid)
+                model_fs_map[model_id] = (fs_id, fs_id_to_name)
+            except Exception as exc:
+                log.warning("paper_trading.batch_model_fs_failed", model_id=model_id, error=str(exc))
+
+        # 2. Bulk load all cached factor values in ONE query
+        all_factor_ids_list = list(all_factor_ids)
+        cached_by_id = self._factor_engine.load_cached_factors_bulk(
+            all_factor_ids_list, tickers, start_str, end_str
+        )
+
+        # 3. Build strategy factor_data (name -> DataFrame)
+        factor_data: dict[str, pd.DataFrame] = {}
+        missing_strategy_factors: list[tuple[str, str]] = []
+        for factor_name, factor_id in strategy_factor_map.items():
+            if factor_id in cached_by_id and not cached_by_id[factor_id].empty:
+                factor_data[factor_name] = cached_by_id[factor_id]
+            else:
+                missing_strategy_factors.append((factor_name, factor_id))
+
+        # Fallback: compute any uncached strategy factors individually
+        for factor_name, factor_id in missing_strategy_factors:
+            try:
+                df = self._factor_engine.compute_factor(factor_id, tickers, start_str, end_str)
+                if not df.empty:
+                    factor_data[factor_name] = df
+            except Exception as exc:
+                log.warning("paper_trading.batch_factor_failed", factor_name=factor_name, error=str(exc))
+
+        # 4. Build model feature data and generate predictions
         model_predictions: dict[str, dict[date, pd.Series]] = {}
         for model_id in required_models:
             model_predictions[model_id] = {}
+            if model_id not in model_fs_map:
+                continue
+            fs_id, fs_id_to_name = model_fs_map[model_id]
+            fs = self._feature_service.get_feature_set(fs_id)
+            preprocessing = fs["preprocessing"]
+
+            # Build feature_data from bulk cache (factor_name -> DataFrame)
+            feature_data: dict[str, pd.DataFrame] = {}
+            missing_model_factors: list[tuple[str, str]] = []
+            for fid, fname in fs_id_to_name.items():
+                if fid in cached_by_id and not cached_by_id[fid].empty:
+                    feature_data[fname] = cached_by_id[fid]
+                else:
+                    missing_model_factors.append((fname, fid))
+
+            # Fallback for uncached model factors
+            for fname, fid in missing_model_factors:
+                try:
+                    df = self._factor_engine.compute_factor(fid, tickers, start_str, end_str)
+                    if not df.empty:
+                        feature_data[fname] = df
+                except Exception as exc:
+                    log.warning("paper_trading.batch_model_factor_failed", factor=fname, error=str(exc))
+
+            # Apply preprocessing
+            processed_features: dict[str, pd.DataFrame] = {}
+            for fname, df in feature_data.items():
+                processed_features[fname] = self._feature_service._apply_preprocessing(df, preprocessing)
+
+            # Generate predictions per date using pre-computed features
             for d in signal_dates:
                 try:
-                    preds = self._model_service.predict(
+                    preds = self._model_service.predict_with_features(
                         model_id=model_id,
+                        feature_data=processed_features,
                         tickers=tickers,
                         date=str(d),
                     )
                     if not preds.empty:
                         model_predictions[model_id][d] = preds
                 except Exception as exc:
-                    log.warning(
-                        "paper_trading.batch_model_failed",
-                        model_id=model_id,
-                        date=str(d),
-                        error=str(exc),
-                    )
+                    log.warning("paper_trading.batch_model_failed", model_id=model_id, date=str(d), error=str(exc))
 
         # Pre-load OHLCV data for the entire range
-        conn = get_connection()
-        start_lookback = min(signal_dates) - timedelta(days=250)
-        end_date = max(signal_dates)
         prices_close, prices_open, prices_high, prices_low, prices_volume = self._load_prices(
-            tickers, str(start_lookback), str(end_date)
+            tickers, start_str, end_str
         )
 
         # Generate signals per date
         results: dict[int, list[dict]] = {}
+        prices_multi = self._build_prices_multi(
+            prices_close, prices_open, prices_high, prices_low, prices_volume, tickers
+        )
         for idx, target_date in enumerate(signal_dates):
-            # Build context for this date
             trade_ts = pd.Timestamp(target_date)
-            prices_multi = self._build_prices_multi(
-                prices_close, prices_open, prices_high, prices_low, prices_volume, tickers
-            )
             # Filter factor data up to this date
             date_factor_data = {}
             for name, df in factor_data.items():
@@ -1033,7 +1136,6 @@ class PaperTradingService:
                 current_date=trade_ts,
             )
 
-            # Generate signals
             try:
                 raw_signals = strategy_instance.generate_signals(context)
                 if raw_signals.empty:
@@ -1051,11 +1153,7 @@ class PaperTradingService:
                     })
                 results[idx] = signal_list
             except Exception as exc:
-                log.warning(
-                    "paper_trading.batch_signal_failed",
-                    date=str(target_date),
-                    error=str(exc),
-                )
+                log.warning("paper_trading.batch_signal_failed", date=str(target_date), error=str(exc))
                 results[idx] = []
 
         return results

@@ -246,6 +246,91 @@ class FeatureService:
         )
         return result
 
+    def compute_features_from_cache(
+        self,
+        fs_id: str,
+        tickers: list[str],
+        start_date: str,
+        end_date: str,
+    ) -> dict[str, pd.DataFrame]:
+        """Load preprocessed features using bulk cache read (single DB query).
+
+        Falls back to the standard per-factor path for any factors missing
+        from the cache.  Much faster when most factors are already cached.
+        """
+        fs = self.get_feature_set(fs_id)
+        factor_refs = fs["factor_refs"]
+        preprocessing = fs["preprocessing"]
+
+        # Build factor_id -> factor_name mapping
+        id_to_name: dict[str, str] = {}
+        for ref in factor_refs:
+            fid = ref["factor_id"]
+            fname = ref.get("factor_name", fid)
+            id_to_name[fid] = fname
+
+        factor_ids = list(id_to_name.keys())
+
+        log.info(
+            "feature_set.compute_from_cache.start",
+            fs_id=fs_id,
+            factors=len(factor_ids),
+            tickers=len(tickers),
+        )
+
+        # Bulk load all cached factor values in one query
+        cached = self._factor_engine.load_cached_factors_bulk(
+            factor_ids, tickers, start_date, end_date
+        )
+
+        # Map factor_id results to factor_name keys
+        raw_data: dict[str, pd.DataFrame] = {}
+        missing_refs: list[dict] = []
+        for ref in factor_refs:
+            fid = ref["factor_id"]
+            fname = ref.get("factor_name", fid)
+            if fid in cached and not cached[fid].empty:
+                raw_data[fname] = cached[fid]
+            else:
+                missing_refs.append(ref)
+
+        # Fall back to per-factor computation for uncached factors
+        if missing_refs:
+            log.info(
+                "feature_set.compute_from_cache.fallback",
+                missing=len(missing_refs),
+            )
+            for ref in missing_refs:
+                fid = ref["factor_id"]
+                fname = ref.get("factor_name", fid)
+                try:
+                    df = self._factor_engine.compute_factor(
+                        fid, tickers, start_date, end_date
+                    )
+                    if not df.empty:
+                        raw_data[fname] = df
+                except Exception as exc:
+                    log.warning(
+                        "feature_set.compute_from_cache.factor_failed",
+                        factor_id=fid,
+                        error=str(exc),
+                    )
+
+        if not raw_data:
+            raise ValueError("No factor data could be loaded for this feature set")
+
+        # Apply preprocessing
+        result: dict[str, pd.DataFrame] = {}
+        for factor_name, df in raw_data.items():
+            result[factor_name] = self._apply_preprocessing(df, preprocessing)
+
+        log.info(
+            "feature_set.compute_from_cache.done",
+            fs_id=fs_id,
+            factors_computed=len(result),
+        )
+        return result
+
     # ------------------------------------------------------------------
     # Correlation matrix
     # ------------------------------------------------------------------

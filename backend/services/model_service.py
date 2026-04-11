@@ -336,6 +336,39 @@ class ModelService:
         preds.name = "prediction"
         return preds
 
+    def predict_with_features(
+        self,
+        model_id: str,
+        feature_data: dict[str, pd.DataFrame],
+        tickers: list[str],
+        date: str,
+    ) -> pd.Series:
+        """Generate predictions using pre-computed feature data.
+
+        Skips FeatureService.compute_features() entirely — the caller is
+        responsible for providing the correct feature DataFrames.
+
+        Args:
+            model_id: ID of the trained model.
+            feature_data: dict[factor_name -> DataFrame(dates x tickers)].
+            tickers: Ticker list.
+            date: Target date string (YYYY-MM-DD).
+
+        Returns:
+            Series indexed by ticker with prediction values.
+        """
+        model_instance = self.load_model(model_id)
+
+        X = self._build_X_for_date(feature_data, tickers, date)
+        if X.empty:
+            return pd.Series(dtype=float, name="prediction")
+
+        preds = model_instance.predict(X)
+        preds.index = X.index.get_level_values("ticker") if "ticker" in X.index.names else X.index
+        preds = self._break_prediction_ties(preds)
+        preds.name = "prediction"
+        return preds
+
     # ------------------------------------------------------------------
     # Data building helpers
     # ------------------------------------------------------------------
