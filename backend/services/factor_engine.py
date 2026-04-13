@@ -284,10 +284,12 @@ class FactorEngine:
 
         conn = get_connection()
 
-        # Vectorized conversion: wide -> long using stack (much faster than
-        # nested Python loops for 7000+ tickers).
-        long = df.stack(dropna=True).reset_index()
+        # Vectorized wide -> long.  stack() without dropna for pandas 2.1+
+        # compatibility (the new stack implementation removed the dropna param);
+        # filter NaN rows explicitly instead.
+        long = df.stack().reset_index()
         long.columns = ["date", "ticker", "value"]
+        long = long.dropna(subset=["value"])
         long["factor_id"] = factor_id
         long["date"] = pd.to_datetime(long["date"]).dt.strftime("%Y-%m-%d")
         long["value"] = long["value"].astype(float)
