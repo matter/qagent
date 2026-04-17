@@ -284,32 +284,35 @@ QAgent 的每个页面对应量化研究链路的一个环节，同时也是 Age
 
 在线编辑因子代码，计算因子值，评估 IC/IR/多空收益。Agent 创建的因子会立即出现在这里，人类可以审阅图表判断因子质量。
 
-【截图：因子研究页面 - 左侧因子列表 + 右侧 IC 时序图和分组收益柱状图】
+![](docs/assets/factors_analysis.png)
+![](docs/assets/factors_result.png)
 
 ### 模型训练
 
 选择特征集、学习目标（22 种内置标签，回归/分类双模式）、训练区间，一键训练。标签选择器带 `[回归]` / `[分类]` 标签，清晰区分任务类型。
 
-【截图：模型训练页面 - 数据配置区（特征集/标签/分组）+ 训练配置区 + 模型列表】
+![](docs/assets/models_train.png)
+![](docs/assets/models_result.png)
 
 ### 策略回测
 
 在线编辑策略代码（引用因子和模型），运行回测查看净值曲线、Sharpe、最大回撤、每笔交易明细。
 
-【截图：策略回测页面 - 净值曲线 + 指标面板 + 交易记录表】
+![](docs/assets/strategy_create.png)
+![](docs/assets/backtest.png)
+![](docs/assets/backtest_result.png)
 
 ### 模拟交易
 
 前向测试策略。逐日推进，查看 T+1 操作计划（买入/卖出/持有），跟踪实际 P&L。这是防止回测过拟合的关键验证环节。
 
-【截图：模拟交易页面 - 会话列表 + 持仓卡片 + T+1 操作计划 + 净值曲线】
+![](docs/assets/sim_trade.png)
 
 ### 数据管理
 
 查看数据覆盖状态，增量更新行情数据，管理股票分组（SP500/NASDAQ100/SP400 等内置分组）。
 
-【截图：数据管理页面 - 数据状态卡片 + 股票分组列表 + 更新按钮】
-
+![](docs/assets/data_manager.png)
 ---
 
 ## 量化全链路
