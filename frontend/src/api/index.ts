@@ -719,11 +719,8 @@ export interface PaperTrade {
 }
 
 export interface PaperAdvanceResult {
-  session_id: string;
-  days_processed: number;
-  new_trades?: number;
-  current_date?: string | null;
-  message?: string;
+  task_id: string;
+  status: string;
 }
 
 // ---- Paper Trading API ----
@@ -763,11 +760,11 @@ export async function advancePaperSession(
   sessionId: string,
   targetDate?: string,
   steps?: number,
-): Promise<PaperAdvanceResult> {
+): Promise<{ task_id: string; status: string }> {
   const body: Record<string, unknown> = {};
   if (targetDate) body.target_date = targetDate;
   if (steps && steps > 0) body.steps = steps;
-  const { data } = await client.post<PaperAdvanceResult>(
+  const { data } = await client.post(
     `/paper-trading/sessions/${sessionId}/advance`,
     body,
   );
@@ -815,8 +812,8 @@ export interface PaperSignalsResult {
   error?: string;
 }
 
-export async function getPaperLatestSignals(sessionId: string): Promise<PaperSignalsResult> {
-  const { data } = await client.get<PaperSignalsResult>(`/paper-trading/sessions/${sessionId}/signals`);
+export async function getPaperLatestSignals(sessionId: string): Promise<{ task_id: string; status: string }> {
+  const { data } = await client.get(`/paper-trading/sessions/${sessionId}/signals`);
   return data;
 }
 

@@ -48,6 +48,7 @@ import {
   getPaperSummary,
   getPaperLatestSignals,
   getPaperStockChart,
+  getTaskStatus,
 } from "../api";
 import type {
   Strategy,
@@ -187,23 +188,41 @@ function SessionTable({
   const handleAdvance = async (id: string, steps?: number) => {
     setAdvancing(id);
     try {
-      const result = await advancePaperSession(id, undefined, steps);
-      if (result.days_processed > 0) {
-        const msg = result.message
-          ? result.message
-          : `推进了 ${result.days_processed} 个交易日，${result.new_trades ?? 0} 笔交易`;
-        messageApi.success(msg);
-      } else {
-        messageApi.info(result.message ?? "已是最新");
-      }
-      onRefresh();
+      const { task_id } = await advancePaperSession(id, undefined, steps);
+      messageApi.info("推进任务已提交，正在后台执行...");
+
+      // Poll task status
+      const pollInterval = setInterval(async () => {
+        try {
+          const status = await getTaskStatus(task_id);
+          if (status.status === "completed") {
+            clearInterval(pollInterval);
+            const result = status.result_summary || {};
+            if (result.days_processed > 0) {
+              const msg = result.message
+                ? result.message
+                : `推进了 ${result.days_processed} 个交易日，${result.new_trades ?? 0} 笔交易`;
+              messageApi.success(msg);
+            } else {
+              messageApi.info(result.message ?? "已是最新");
+            }
+            onRefresh();
+            setAdvancing(null);
+          } else if (status.status === "failed") {
+            clearInterval(pollInterval);
+            messageApi.error(status.error || "推进失败");
+            setAdvancing(null);
+          }
+        } catch {
+          // Keep polling on transient errors
+        }
+      }, 2000);
     } catch (err: unknown) {
       const detail =
         err && typeof err === "object" && "response" in err
           ? ((err as Record<string, Record<string, unknown>>).response?.data as Record<string, string>)?.detail
           : undefined;
       messageApi.error(detail || "推进失败");
-    } finally {
       setAdvancing(null);
     }
   };
@@ -441,12 +460,29 @@ function SessionDetail({
   const fetchSignals = useCallback(async () => {
     setSignalsLoading(true);
     try {
-      const result = await getPaperLatestSignals(sessionId);
-      setActionPlan(result.action_plan);
-      setSignalTargetDate(result.target_date);
+      const { task_id } = await getPaperLatestSignals(sessionId);
+
+      // Poll task status
+      const pollInterval = setInterval(async () => {
+        try {
+          const status = await getTaskStatus(task_id);
+          if (status.status === "completed") {
+            clearInterval(pollInterval);
+            const result = status.result_summary || {};
+            setActionPlan(result.action_plan || []);
+            setSignalTargetDate(result.target_date || null);
+            setSignalsLoading(false);
+          } else if (status.status === "failed") {
+            clearInterval(pollInterval);
+            messageApi.error(status.error || "加载信号失败");
+            setSignalsLoading(false);
+          }
+        } catch {
+          // Keep polling on transient errors
+        }
+      }, 2000);
     } catch {
       messageApi.error("加载信号失败");
-    } finally {
       setSignalsLoading(false);
     }
   }, [sessionId, messageApi]);
