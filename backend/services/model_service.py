@@ -25,6 +25,27 @@ from backend.services.label_service import LabelService
 
 log = get_logger(__name__)
 
+
+def _infer_task_from_model(model_instance) -> str:
+    """Infer task type from model instance.
+
+    Returns 'classification' or 'regression'.
+    """
+    if hasattr(model_instance, "is_classifier") and model_instance.is_classifier:
+        return "classification"
+
+    class_name = model_instance.__class__.__name__
+    if "Classifier" in class_name:
+        return "classification"
+    if "Regressor" in class_name:
+        return "regression"
+
+    if hasattr(model_instance, "task") and model_instance.task == "classification":
+        return "classification"
+
+    return "regression"
+
+
 # Registry of supported model types
 _MODEL_REGISTRY: dict[str, type] = {
     "lightgbm": LightGBMModel,
@@ -136,6 +157,18 @@ class ModelService:
         if label_df.empty:
             raise ValueError("No label data computed for the given parameters")
 
+        label_summary = {
+            "label_id": label_id,
+            "target_type": label_def["target_type"],
+            "horizon": label_def.get("horizon"),
+            "config": label_def.get("config"),
+            "samples": len(label_df),
+            "mean": round(float(label_df["label_value"].mean()), 6),
+            "std": round(float(label_df["label_value"].std()), 6),
+            "min": round(float(label_df["label_value"].min()), 6),
+            "max": round(float(label_df["label_value"].max()), 6),
+        }
+
         # ---- 4. Build X and y aligned by (date, ticker) ----
         X, y = self._build_Xy(feature_data, label_df)
         if X.empty:
@@ -184,6 +217,7 @@ class ModelService:
         eval_metrics = self._compute_eval_metrics(
             task, y_train, y_valid, y_test, preds_valid, preds_test
         )
+        eval_metrics["task_type"] = task
 
         # Feature importance
         try:
@@ -196,7 +230,29 @@ class ModelService:
 
         log.info("model.train.metrics", metrics=eval_metrics)
 
-        # ---- 9. Save model file + metadata ----
+        # ---- 9. Validate feature dimensions ----
+        trained_features = list(X.columns)
+        trained_feature_count = len(trained_features)
+
+        # Get expected features from feature set
+        fs_record = self._feature_service.get_feature_set(feature_set_id)
+        expected_features = [ref["factor_id"] for ref in fs_record["factor_refs"]]
+        expected_feature_count = len(expected_features)
+
+        if trained_feature_count != expected_feature_count:
+            log.warning(
+                "model.train.feature_mismatch",
+                trained=trained_feature_count,
+                expected=expected_feature_count,
+                missing=[f for f in expected_features if f not in trained_features],
+            )
+            raise ValueError(
+                f"Feature dimension mismatch: model trained on {trained_feature_count} features "
+                f"but feature_set {feature_set_id} has {expected_feature_count} features. "
+                f"Missing features: {[f for f in expected_features if f not in trained_features]}"
+            )
+
+        # ---- 10. Save model file + metadata ----
         model_id = uuid.uuid4().hex[:12]
         model_dir = settings.models_dir / model_id
         model_dir.mkdir(parents=True, exist_ok=True)
@@ -213,14 +269,14 @@ class ModelService:
             "model_params": model_instance.get_params(),
             "train_config": train_config,
             "eval_metrics": eval_metrics,
-            "feature_names": list(X.columns),
+            "feature_names": trained_features,
             "universe_group_id": universe_group_id,
             "created_at": datetime.utcnow().isoformat(),
         }
         with open(model_dir / "metadata.json", "w") as f:
             json.dump(metadata, f, indent=2, default=str)
 
-        # ---- 10. Save record to DuckDB ----
+        # ---- 11. Save record to DuckDB ----
         self._insert_model_record(
             model_id=model_id,
             name=name,
@@ -232,7 +288,7 @@ class ModelService:
             eval_metrics=eval_metrics,
         )
 
-        # ---- 11. Return summary ----
+        # ---- 12. Return summary ----
         summary = {
             "model_id": model_id,
             "name": name,
@@ -241,10 +297,12 @@ class ModelService:
             "train_samples": len(X_train),
             "valid_samples": len(X_valid),
             "test_samples": len(X_test),
-            "features": len(X.columns),
+            "features": trained_feature_count,
+            "feature_names": trained_features,
             "eval_metrics": eval_metrics,
+            "label_summary": label_summary,
         }
-        log.info("model.train.done", model_id=model_id)
+        log.info("model.train.done", model_id=model_id, features=trained_feature_count)
         return summary
 
     # ------------------------------------------------------------------
@@ -264,10 +322,19 @@ class ModelService:
         return [self._row_to_dict(r) for r in rows]
 
     def get_model(self, model_id: str) -> dict:
-        """Return a single model record including eval_metrics."""
+        """Return a single model record including eval_metrics and feature_names."""
         row = self._fetch_row(model_id)
         if row is None:
             raise ValueError(f"Model {model_id} not found")
+
+        # Load feature_names from metadata.json if available
+        metadata_path = settings.models_dir / model_id / "metadata.json"
+        if metadata_path.exists():
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+                if "feature_names" in metadata:
+                    row["feature_names"] = metadata["feature_names"]
+
         return row
 
     def delete_model(self, model_id: str) -> None:
@@ -309,6 +376,7 @@ class ModelService:
 
         Returns:
             Series indexed by ticker with prediction values.
+            For classification models, returns probability of positive class.
         """
         record = self.get_model(model_id)
         model_instance = self.load_model(model_id)
@@ -329,12 +397,81 @@ class ModelService:
         if X.empty:
             return pd.Series(dtype=float, name="prediction")
 
-        preds = model_instance.predict(X)
+        # Check if this is a classification model
+        task = record.get("task_type") or _infer_task_from_model(model_instance)
+        if task == "classification" and hasattr(model_instance, "predict_proba"):
+            # Return probability of positive class for classification
+            proba = model_instance.predict_proba(X)
+            # proba is (n_samples, n_classes), take positive class (index 1)
+            preds = pd.Series(proba[:, 1] if proba.shape[1] > 1 else proba[:, 0], index=X.index)
+        else:
+            preds = model_instance.predict(X)
+
         # Re-index by ticker
         preds.index = X.index.get_level_values("ticker") if "ticker" in X.index.names else X.index
         preds = self._break_prediction_ties(preds)
         preds.name = "prediction"
         return preds
+
+    def predict_detailed(
+        self,
+        model_id: str,
+        tickers: list[str],
+        date: str,
+        feature_set_id: str | None = None,
+    ) -> pd.DataFrame:
+        """Generate detailed predictions including prob, label, raw_score.
+
+        For classification models returns DataFrame with columns:
+            prob   – positive-class probability
+            label  – hard classification (0/1)
+            raw_score – raw model output (log-odds if available)
+
+        For regression models returns DataFrame with column:
+            prediction – raw prediction value
+        """
+        record = self.get_model(model_id)
+        model_instance = self.load_model(model_id)
+
+        fs_id = feature_set_id or record["feature_set_id"]
+        if not tickers:
+            raise ValueError("tickers must be provided")
+        if not date:
+            raise ValueError("date must be provided")
+
+        feature_data = self._feature_service.compute_features(fs_id, tickers, date, date)
+        X = self._build_X_for_date(feature_data, tickers, date)
+        if X.empty:
+            return pd.DataFrame()
+
+        ticker_idx = X.index.get_level_values("ticker") if "ticker" in X.index.names else X.index
+        task = record.get("task_type") or _infer_task_from_model(model_instance)
+
+        if task == "classification" and hasattr(model_instance, "predict_proba"):
+            proba = model_instance.predict_proba(X)
+            prob_series = proba[:, 1] if proba.shape[1] > 1 else proba[:, 0]
+            labels = model_instance.predict(X)
+            label_values = labels.values if isinstance(labels, pd.Series) else labels
+
+            raw_score = prob_series.copy()
+            if hasattr(model_instance, "predict_raw"):
+                try:
+                    raw_score = model_instance.predict_raw(X)
+                except Exception:
+                    pass
+
+            result = pd.DataFrame({
+                "prob": prob_series,
+                "label": label_values,
+                "raw_score": raw_score,
+            }, index=ticker_idx)
+        else:
+            preds = model_instance.predict(X)
+            pred_values = preds.values if isinstance(preds, pd.Series) else preds
+            result = pd.DataFrame({"prediction": pred_values}, index=ticker_idx)
+
+        result.index.name = "ticker"
+        return result
 
     def predict_with_features(
         self,
@@ -356,14 +493,25 @@ class ModelService:
 
         Returns:
             Series indexed by ticker with prediction values.
+            For classification models, returns probability of positive class.
         """
+        record = self.get_model(model_id)
         model_instance = self.load_model(model_id)
 
         X = self._build_X_for_date(feature_data, tickers, date)
         if X.empty:
             return pd.Series(dtype=float, name="prediction")
 
-        preds = model_instance.predict(X)
+        # Check if this is a classification model
+        task = record.get("task_type") or _infer_task_from_model(model_instance)
+        if task == "classification" and hasattr(model_instance, "predict_proba"):
+            # Return probability of positive class for classification
+            proba = model_instance.predict_proba(X)
+            # proba is (n_samples, n_classes), take positive class (index 1)
+            preds = pd.Series(proba[:, 1] if proba.shape[1] > 1 else proba[:, 0], index=X.index)
+        else:
+            preds = model_instance.predict(X)
+
         preds.index = X.index.get_level_values("ticker") if "ticker" in X.index.names else X.index
         preds = self._break_prediction_ties(preds)
         preds.name = "prediction"
@@ -808,6 +956,7 @@ class ModelService:
                     return {}
             return raw if raw else {}
 
+        eval_metrics = _parse_json(row[7])
         return {
             "id": row[0],
             "name": row[1],
@@ -816,7 +965,8 @@ class ModelService:
             "model_type": row[4],
             "model_params": _parse_json(row[5]),
             "train_config": _parse_json(row[6]),
-            "eval_metrics": _parse_json(row[7]),
+            "eval_metrics": eval_metrics,
+            "task_type": eval_metrics.get("task_type"),
             "status": row[8],
             "created_at": str(row[9]) if row[9] else None,
             "updated_at": str(row[10]) if row[10] else None,

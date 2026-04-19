@@ -212,8 +212,235 @@ class SignalService:
         return result
 
     # ------------------------------------------------------------------
-    # CRUD for signal runs
+    # Diagnostic snapshot (lightweight, no DB persistence)
     # ------------------------------------------------------------------
+
+    def diagnose_signals(
+        self,
+        strategy_id: str,
+        target_date: str,
+        universe_group_id: str,
+        max_tickers: int = 0,
+    ) -> dict:
+        """Lightweight signal diagnosis for a given date.
+
+        Runs the same pipeline as generate_signals but:
+        - Does NOT save to DB
+        - Returns intermediate diagnostics: model scores, factor values,
+          candidate pool, final signals, and elimination reasons.
+
+        Args:
+            max_tickers: If > 0, randomly sample the universe to this size
+                to keep computation fast on large pools.
+        """
+        # ---- 1. Load strategy ----
+        strategy_def = self._strategy_service.get_strategy(strategy_id)
+        strategy_instance = load_strategy_from_code(strategy_def["source_code"])
+
+        # ---- 2. Resolve universe tickers ----
+        tickers = self._group_service.get_group_tickers(universe_group_id)
+        if not tickers:
+            raise ValueError(f"Universe group '{universe_group_id}' has no members")
+
+        full_universe_size = len(tickers)
+        sampled = False
+        if max_tickers > 0 and len(tickers) > max_tickers:
+            import random
+            tickers = sorted(random.sample(tickers, max_tickers))
+            sampled = True
+
+        # ---- 3. Load OHLCV data up to target_date ----
+        conn = get_connection()
+        lookback_query = """
+            SELECT MIN(date) FROM (
+                SELECT DISTINCT date FROM daily_bars
+                WHERE date <= ?
+                ORDER BY date DESC
+                LIMIT 250
+            )
+        """
+        row = conn.execute(lookback_query, [target_date]).fetchone()
+        start_date = str(row[0]) if row and row[0] else target_date
+
+        prices_close, prices_open, prices_high, prices_low, prices_volume = (
+            self._load_prices(tickers, start_date, target_date)
+        )
+        if prices_close.empty:
+            raise ValueError("No price data available for the given tickers and date range")
+
+        # Track tickers with price data on target_date
+        trade_ts = pd.Timestamp(target_date)
+        has_price = set()
+        if trade_ts in prices_close.index:
+            row_data = prices_close.loc[trade_ts]
+            has_price = {t for t in tickers if t in row_data.index and pd.notna(row_data[t])}
+
+        # ---- 4. Compute required factors ----
+        required_factors = strategy_def.get("required_factors", [])
+        factor_data: dict[str, pd.DataFrame] = {}
+        factor_snapshot: dict[str, dict] = {}
+
+        if required_factors:
+            factor_id_map = self._resolve_factor_ids(required_factors)
+            for factor_name, factor_id in factor_id_map.items():
+                try:
+                    df = self._factor_engine.compute_factor(
+                        factor_id, tickers, start_date, target_date
+                    )
+                    if not df.empty:
+                        factor_data[factor_name] = df
+                        # Extract target_date snapshot
+                        if trade_ts in df.index:
+                            vals = df.loc[trade_ts].dropna()
+                            factor_snapshot[factor_name] = {
+                                "coverage": len(vals),
+                                "mean": round(float(vals.mean()), 6) if len(vals) > 0 else None,
+                                "std": round(float(vals.std()), 6) if len(vals) > 1 else None,
+                                "top5": {t: round(float(v), 6) for t, v in vals.nlargest(5).items()},
+                                "bottom5": {t: round(float(v), 6) for t, v in vals.nsmallest(5).items()},
+                            }
+                except Exception as exc:
+                    factor_snapshot[factor_name] = {"error": str(exc)}
+
+        # ---- 5. Run model predictions ----
+        required_models = strategy_def.get("required_models", [])
+        model_predictions: dict[str, pd.Series] = {}
+        model_snapshot: dict[str, dict] = {}
+
+        for model_id in required_models:
+            try:
+                preds = self._model_service.predict(
+                    model_id=model_id,
+                    tickers=tickers,
+                    date=target_date,
+                )
+                if not preds.empty:
+                    model_predictions[model_id] = preds
+                    model_snapshot[model_id] = {
+                        "coverage": len(preds),
+                        "mean": round(float(preds.mean()), 6),
+                        "std": round(float(preds.std()), 6) if len(preds) > 1 else None,
+                        "top10": {t: round(float(v), 6) for t, v in preds.nlargest(10).items()},
+                        "bottom5": {t: round(float(v), 6) for t, v in preds.nsmallest(5).items()},
+                    }
+                else:
+                    model_snapshot[model_id] = {"coverage": 0, "error": "empty predictions"}
+            except Exception as exc:
+                model_snapshot[model_id] = {"error": str(exc)}
+
+        # ---- 6. Build StrategyContext & generate signals ----
+        prices_multi = self._build_prices_multi(
+            prices_close, prices_open, prices_high, prices_low, prices_volume, tickers,
+        )
+
+        context = StrategyContext(
+            prices=prices_multi.loc[:trade_ts],
+            factor_values=factor_data,
+            model_predictions=model_predictions,
+            current_date=trade_ts,
+        )
+
+        try:
+            raw_signals = strategy_instance.generate_signals(context)
+        except Exception as exc:
+            raise ValueError(f"Strategy signal generation failed: {exc}") from exc
+
+        # ---- 7. Build diagnostic output ----
+        # Extract strategy-populated diagnostics (candidate_pool, gates, etc.)
+        strategy_diagnostics = dict(context.diagnostics) if context.diagnostics else {}
+
+        # Handle both dict and DataFrame signal formats
+        signal_tickers: set[str] = set()
+        signals_list: list[dict] = []
+
+        if isinstance(raw_signals, dict):
+            signal_tickers = set(raw_signals.keys())
+            for ticker, data in sorted(
+                raw_signals.items(),
+                key=lambda x: -(x[1].get("target_weight", 0) if isinstance(x[1], dict) else 0),
+            ):
+                if isinstance(data, dict):
+                    signals_list.append({
+                        "ticker": ticker,
+                        "signal": data.get("signal", "buy"),
+                        "target_weight": round(data.get("target_weight", 0), 6),
+                        "strength": round(data.get("strength", 0), 6),
+                    })
+        elif isinstance(raw_signals, pd.DataFrame) and not raw_signals.empty:
+            signal_tickers = set(raw_signals.index)
+            for ticker in raw_signals.index:
+                row = raw_signals.loc[ticker]
+                signals_list.append({
+                    "ticker": str(ticker),
+                    "signal": int(row.get("signal", 1)) if "signal" in row else 1,
+                    "target_weight": round(float(row.get("weight", 0)), 6) if "weight" in row else 0,
+                    "strength": round(float(row.get("strength", 0)), 6) if "strength" in row else 0,
+                })
+            signals_list.sort(key=lambda x: -x["target_weight"])
+
+        eliminated = sorted(has_price - signal_tickers)
+
+        # Build per-ticker elimination reasons
+        no_price = sorted(set(tickers) - has_price)
+        no_model_coverage: set[str] = set()
+        if required_models and model_predictions:
+            all_model_tickers = set()
+            for preds in model_predictions.values():
+                all_model_tickers.update(preds.index)
+            no_model_coverage = has_price - all_model_tickers - signal_tickers
+
+        strategy_filtered = sorted(
+            has_price - signal_tickers - no_model_coverage
+        )
+
+        elimination_reasons: dict[str, list[str]] = {}
+        if no_price:
+            elimination_reasons["no_price_data"] = no_price[:30]
+        if no_model_coverage:
+            elimination_reasons["no_model_coverage"] = sorted(no_model_coverage)[:30]
+        if strategy_filtered:
+            elimination_reasons["strategy_filtered"] = strategy_filtered[:30]
+
+        # Extract candidate_pool and gates from strategy_diagnostics if available
+        candidate_pool = strategy_diagnostics.get(
+            "candidate_pool",
+            sorted(has_price)[:100],
+        )
+        gates = strategy_diagnostics.get("gates", {})
+
+        # Add model quantiles to model_snapshot
+        for mid, snap in model_snapshot.items():
+            if mid in model_predictions and "error" not in snap:
+                preds = model_predictions[mid]
+                for ticker in list(signal_tickers)[:20]:
+                    if ticker in preds.index:
+                        rank = (preds < preds[ticker]).sum() / max(len(preds) - 1, 1)
+                        snap.setdefault("quantiles", {})[ticker] = round(float(rank), 4)
+
+        return {
+            "strategy_id": strategy_id,
+            "strategy_name": strategy_def["name"],
+            "target_date": target_date,
+            "universe_group_id": universe_group_id,
+            "universe_size": full_universe_size,
+            "sampled": sampled,
+            "tickers_processed": len(tickers),
+            "has_price_count": len(has_price),
+            "signal_count": len(signals_list),
+            "eliminated_count": len(eliminated),
+            "signals": signals_list,
+            "candidate_pool": candidate_pool if isinstance(candidate_pool, list) else sorted(candidate_pool)[:100],
+            "elimination_reasons": elimination_reasons,
+            "eliminated_tickers": eliminated[:50],
+            "gates": gates,
+            "model_diagnostics": model_snapshot,
+            "factor_diagnostics": factor_snapshot,
+            "strategy_diagnostics": {
+                k: v for k, v in strategy_diagnostics.items()
+                if k not in ("candidate_pool", "gates")
+            },
+        }
+
 
     def list_signal_runs(
         self, strategy_id: str | None = None, limit: int = 50

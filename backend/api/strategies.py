@@ -230,11 +230,28 @@ async def run_backtest(strategy_id: str, body: RunBacktestRequest) -> dict:
         config: dict,
         universe_group_id: str,
     ) -> dict:
-        return bt_svc.run_backtest(
+        full = bt_svc.run_backtest(
             strategy_id=strategy_id,
             config_dict=config,
             universe_group_id=universe_group_id,
         )
+        # Return compact summary for task store; full result is persisted in
+        # backtest_results table and retrievable via GET /backtests/{id}.
+        summary = {
+            "backtest_id": full.get("backtest_id"),
+            "strategy_id": full.get("strategy_id"),
+            "strategy_name": full.get("strategy_name"),
+            "result_level": full.get("result_level"),
+            "universe_group_id": full.get("universe_group_id"),
+        }
+        for key in (
+            "total_return", "annual_return", "sharpe_ratio", "max_drawdown",
+            "win_rate", "total_trades", "start_date", "end_date",
+            "leakage_warnings",
+        ):
+            if key in full:
+                summary[key] = full[key]
+        return summary
 
     task_id = executor.submit(
         task_type="strategy_backtest",

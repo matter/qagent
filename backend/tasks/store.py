@@ -135,6 +135,25 @@ class TaskStore:
         rows = get_connection().execute(sql, params).fetchall()
         return [self._row_to_record(r) for r in rows]
 
+    def find_active_by_type_and_name(
+        self, task_type: str, param_name: str, param_value: str,
+    ) -> TaskRecord | None:
+        """Find a queued/running task matching task_type and a named param."""
+        conn = get_connection()
+        rows = conn.execute(
+            """SELECT * FROM task_runs
+               WHERE task_type = ?
+                 AND status IN ('queued', 'running')
+               ORDER BY created_at DESC
+               LIMIT 20""",
+            [task_type],
+        ).fetchall()
+        for row in rows:
+            record = self._row_to_record(row)
+            if record.params and record.params.get(param_name) == param_value:
+                return record
+        return None
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------

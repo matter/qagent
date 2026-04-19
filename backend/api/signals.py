@@ -49,6 +49,13 @@ class GenerateSignalsRequest(BaseModel):
     universe_group_id: str
 
 
+class DiagnoseSignalsRequest(BaseModel):
+    strategy_id: str
+    target_date: str
+    universe_group_id: str
+    max_tickers: int = 0
+
+
 # ------------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------------
@@ -98,6 +105,22 @@ async def generate_signals(body: GenerateSignalsRequest) -> dict:
         "strategy_id": body.strategy_id,
         "target_date": body.target_date,
     }
+
+
+@router.post("/diagnose")
+async def diagnose_signals(body: DiagnoseSignalsRequest) -> dict:
+    """Lightweight signal diagnosis: returns model scores, factor snapshots,
+    candidate pool, final signals, and eliminated tickers without DB persistence."""
+    svc = _get_service()
+    try:
+        return svc.diagnose_signals(
+            strategy_id=body.strategy_id,
+            target_date=body.target_date,
+            universe_group_id=body.universe_group_id,
+            max_tickers=body.max_tickers,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("")

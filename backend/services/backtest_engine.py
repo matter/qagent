@@ -772,8 +772,6 @@ def _calc_trade_diagnostics(trade_log: list[dict]) -> dict:
             open_lots[ticker].append([shares, price, trade_date, cost])
         elif t["action"] == "sell" and ticker in open_lots:
             remaining = shares
-            sell_revenue = shares * price
-            sell_cost = cost
             buy_cost_total = 0.0
             buy_trade_cost = 0.0
             earliest_buy_date = trade_date
@@ -797,6 +795,14 @@ def _calc_trade_diagnostics(trade_log: list[dict]) -> dict:
 
             if not open_lots[ticker]:
                 del open_lots[ticker]
+
+            # Only count the matched portion of the sell
+            matched_shares = shares - remaining
+            if matched_shares < 1e-8:
+                continue
+            sell_revenue = matched_shares * price
+            sell_frac = matched_shares / shares if shares > 1e-8 else 0
+            sell_cost = cost * sell_frac
 
             # Compute P&L for this round-trip
             trip_pnl = sell_revenue - buy_cost_total

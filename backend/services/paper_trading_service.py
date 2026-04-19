@@ -144,6 +144,39 @@ class PaperTradingService:
         )
         return self.get_session(session_id)
 
+    @staticmethod
+    def _session_row_to_dict(row) -> dict:
+        """Convert a DuckDB row from the paper_trading_sessions query to a dict.
+
+        Expected column order (matching list_sessions / get_session SQL):
+          0: id, 1: name, 2: strategy_id, 3: universe_group_id,
+          4: config, 5: status, 6: start_date, 7: current_date,
+          8: initial_capital, 9: current_nav, 10: total_trades,
+          11: created_at, 12: updated_at, 13: strategy_name
+        """
+        config_raw = row[4]
+        if isinstance(config_raw, str):
+            try:
+                config_raw = json.loads(config_raw)
+            except (json.JSONDecodeError, TypeError):
+                config_raw = {}
+        return {
+            "id": row[0],
+            "name": row[1],
+            "strategy_id": row[2],
+            "universe_group_id": row[3],
+            "config": config_raw or {},
+            "status": row[5],
+            "start_date": str(row[6]) if row[6] else None,
+            "current_date": str(row[7]) if row[7] else None,
+            "initial_capital": float(row[8]) if row[8] is not None else 1_000_000.0,
+            "current_nav": float(row[9]) if row[9] is not None else None,
+            "total_trades": int(row[10]) if row[10] is not None else 0,
+            "created_at": str(row[11]) if row[11] else None,
+            "updated_at": str(row[12]) if row[12] else None,
+            "strategy_name": row[13] if len(row) > 13 else None,
+        }
+
     # ------------------------------------------------------------------
     # Day-by-day advancement
     # ------------------------------------------------------------------
@@ -261,6 +294,7 @@ class PaperTradingService:
                 signal_dates=signal_dates,
                 universe_group_id=session["universe_group_id"],
                 tickers=tickers,
+                session_id=session_id,
             )
         except Exception as exc:
             log.warning(
@@ -298,6 +332,12 @@ class PaperTradingService:
         )
 
         for idx, trade_date in enumerate(trading_days):
+            # Build portfolio state for this day (before trading)
+            portfolio_state = self._build_portfolio_state(
+                session_id, positions, cash,
+                self._prev_trading_day(trade_date) if idx > 0 else trading_days[0]
+            )
+
             signals = batch_signals.get(idx, [])
             if not signals:
                 signal_errors += 1
@@ -315,219 +355,30 @@ class PaperTradingService:
                 )
                 target_weights = dict(sorted_tw[:max_positions])
 
-            w_sum = sum(target_weights.values())
-            if w_sum > 0:
-                target_weights = {t: w / w_sum for t, w in target_weights.items()}
-
-            day_trades = self._execute_trades_cached(
-                positions, cash, target_weights,
-                trade_date, cost_rate, price_cache,
-            )
-            cash = day_trades["cash_after"]
-            positions = day_trades["positions_after"]
-            total_new_trades += len(day_trades["trades"])
-            nav = self._value_portfolio_cached(positions, cash, trade_date, price_cache)
-
-            daily_snapshots.append((
-                session_id, trade_date, nav, cash,
-                json.dumps(positions, default=str),
-                json.dumps(day_trades["trades"], default=str),
-            ))
-            days_processed += 1
-
-        if daily_snapshots:
-            conn.executemany(
-                """INSERT OR REPLACE INTO paper_trading_daily
-                   (session_id, date, nav, cash, positions_json, trades_json)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                daily_snapshots,
-            )
-            last_date = trading_days[-1] if trading_days else None
-            last_nav = daily_snapshots[-1][2] if daily_snapshots else None
-            conn.execute(
-                """UPDATE paper_trading_sessions
-                   SET current_date = ?, current_nav = ?,
-                       total_trades = total_trades + ?,
-                       updated_at = ?
-                   WHERE id = ?""",
-                [last_date, last_nav, total_new_trades,
-                 datetime.utcnow(), session_id],
-            )
-
-        log.info(
-            "paper_trading.advance_done",
-            session_id=session_id,
-            days=days_processed,
-            trades=total_new_trades,
-            signal_errors=signal_errors,
-        )
-        result = {
-            "session_id": session_id,
-            "days_processed": days_processed,
-            "new_trades": total_new_trades,
-            "current_date": str(trading_days[-1]) if trading_days else None,
-        }
-        if days_without:
-            result["message"] = (
-                f"已推进 {days_processed} 天。"
-                f"另有 {len(days_without)} 天因本地数据不足被跳过"
-                f"（数据截止 {latest_bar_date}）。"
-            )
-        return result
-        session = self.get_session(session_id)
-        if session["status"] != "active":
-            raise ValueError(f"Session is {session['status']}, not active")
-
-        # Determine which days to process
-        current = session["current_date"]
-        if current:
-            if isinstance(current, str):
-                current = date.fromisoformat(current)
-            start_from = current + timedelta(days=1)
-        else:
-            start_from = date.fromisoformat(session["start_date"])
-
-        if steps > 0:
-            # Step mode: get enough trading days from start_from
-            # Fetch a generous range then slice
-            generous_end = start_from + timedelta(days=steps * 3 + 30)
-            all_days = get_trading_days(start_from, generous_end)
-            trading_days = all_days[:steps] if all_days else []
-        else:
-            if target_date:
-                end = date.fromisoformat(target_date)
+            # Optional: normalize weights to 100% (default behavior for backward compatibility)
+            normalize_weights = config.get("normalize_weights", True)
+            if normalize_weights:
+                w_sum = sum(target_weights.values())
+                if w_sum > 0:
+                    target_weights = {t: w / w_sum for t, w in target_weights.items()}
             else:
-                end = get_latest_trading_day()
-            if start_from > end:
-                return {
-                    "session_id": session_id,
-                    "days_processed": 0,
-                    "message": "Already up to date",
-                }
-            trading_days = get_trading_days(start_from, end)
+                # Absolute weight mode: respect strategy's target weights
+                # Apply cash_reserve and max_position_pct constraints if configured
+                cash_reserve_pct = config.get("cash_reserve_pct", 0.0)
+                max_position_pct = config.get("max_position_pct", 1.0)
 
-        if not trading_days:
-            return {
-                "session_id": session_id,
-                "days_processed": 0,
-                "message": "No trading days in range",
-            }
+                # Cap individual positions
+                for ticker in target_weights:
+                    if target_weights[ticker] > max_position_pct:
+                        target_weights[ticker] = max_position_pct
 
-        conn = get_connection()
+                # Scale down if total exceeds (1 - cash_reserve)
+                max_total = 1.0 - cash_reserve_pct
+                w_sum = sum(target_weights.values())
+                if w_sum > max_total:
+                    scale = max_total / w_sum
+                    target_weights = {t: w * scale for t, w in target_weights.items()}
 
-        # --- Data availability check ---
-        # To advance to trade_date T, we need T's daily bars (open for
-        # execution, close for valuation).  Query the latest bar date
-        # and reject any trading days beyond it.
-        latest_bar_row = conn.execute("SELECT MAX(date) FROM daily_bars").fetchone()
-        if not latest_bar_row or not latest_bar_row[0]:
-            raise ValueError("本地无行情数据，请先更新数据")
-        latest_bar_date = (
-            latest_bar_row[0]
-            if isinstance(latest_bar_row[0], date)
-            else date.fromisoformat(str(latest_bar_row[0]))
-        )
-
-        # Filter trading_days to those with data available
-        days_with_data = [d for d in trading_days if d <= latest_bar_date]
-        days_without = [d for d in trading_days if d > latest_bar_date]
-
-        if not days_with_data:
-            # None of the requested days have data
-            first_needed = trading_days[0]
-            raise ValueError(
-                f"无法推进：本地数据截止到 {latest_bar_date}，"
-                f"下一交易日 {first_needed} 尚无数据。"
-                f"请先更新行情数据。"
-            )
-
-        # If step mode requested specific count but data covers fewer days,
-        # only process what we have but warn in the response
-        trading_days = days_with_data
-
-        # Pre-load already processed dates to skip them
-        processed = set()
-        rows = conn.execute(
-            "SELECT date FROM paper_trading_daily WHERE session_id = ?",
-            [session_id],
-        ).fetchall()
-        for r in rows:
-            processed.add(r[0] if isinstance(r[0], date) else date.fromisoformat(str(r[0])))
-        trading_days = [d for d in trading_days if d not in processed]
-
-        if not trading_days:
-            return {
-                "session_id": session_id,
-                "days_processed": 0,
-                "message": "Already up to date",
-            }
-
-        # Load config
-        config = session.get("config") or {}
-        capital = session["initial_capital"]
-        commission_rate = config.get("commission_rate", 0.001)
-        slippage_rate = config.get("slippage_rate", 0.001)
-        max_positions = config.get("max_positions", 50)
-        cost_rate = commission_rate + slippage_rate
-
-        # Pre-load all prices for the entire date range
-        tickers = self._group_service.get_group_tickers(session["universe_group_id"])
-        price_cache = self._preload_prices(tickers, trading_days[0], trading_days[-1], conn)
-
-        # Load last known portfolio state
-        positions, cash = self._load_latest_state(session_id, capital)
-
-        days_processed = 0
-        total_new_trades = 0
-        signal_errors = 0
-        daily_snapshots: list[tuple] = []
-
-        log.info(
-            "paper_trading.advance_start",
-            session_id=session_id,
-            days_to_process=len(trading_days),
-            range=f"{trading_days[0]}~{trading_days[-1]}",
-        )
-
-        for trade_date in trading_days:
-            # Signal generation uses data up to T-1 (the previous trading
-            # day).  Decisions are made at end of T-1 and executed at T's
-            # open -- the standard T+1 model.
-            signal_date = self._prev_trading_day(trade_date)
-
-            # 1. Generate signals based on T-1 data
-            try:
-                signal_result = self._signal_service.generate_signals(
-                    strategy_id=session["strategy_id"],
-                    target_date=str(signal_date),
-                    universe_group_id=session["universe_group_id"],
-                )
-                signals = signal_result.get("signals", [])
-            except Exception:
-                signal_errors += 1
-                signals = []
-
-            # 2. Build target weights from signals
-            target_weights: dict[str, float] = {}
-            for sig in signals:
-                ticker = sig.get("ticker", "")
-                weight = sig.get("target_weight", 0.0)
-                if weight and weight > 0:
-                    target_weights[ticker] = float(weight)
-
-            # Enforce max positions
-            if len(target_weights) > max_positions:
-                sorted_tw = sorted(
-                    target_weights.items(), key=lambda x: x[1], reverse=True
-                )
-                target_weights = dict(sorted_tw[:max_positions])
-
-            # Normalize
-            w_sum = sum(target_weights.values())
-            if w_sum > 0:
-                target_weights = {t: w / w_sum for t, w in target_weights.items()}
-
-            # 3. Execute trades at this day's open price
             day_trades = self._execute_trades_cached(
                 positions, cash, target_weights,
                 trade_date, cost_rate, price_cache,
@@ -535,20 +386,15 @@ class PaperTradingService:
             cash = day_trades["cash_after"]
             positions = day_trades["positions_after"]
             total_new_trades += len(day_trades["trades"])
-
-            # 4. Value portfolio at close
             nav = self._value_portfolio_cached(positions, cash, trade_date, price_cache)
 
-            # 5. Collect snapshot for batch insert
             daily_snapshots.append((
                 session_id, trade_date, nav, cash,
                 json.dumps(positions, default=str),
                 json.dumps(day_trades["trades"], default=str),
             ))
-
             days_processed += 1
 
-        # Batch insert all daily snapshots
         if daily_snapshots:
             conn.executemany(
                 """INSERT OR REPLACE INTO paper_trading_daily
@@ -556,7 +402,6 @@ class PaperTradingService:
                    VALUES (?, ?, ?, ?, ?, ?)""",
                 daily_snapshots,
             )
-            # Update session once
             last_date = trading_days[-1] if trading_days else None
             last_nav = daily_snapshots[-1][2] if daily_snapshots else None
             conn.execute(
@@ -615,12 +460,18 @@ class PaperTradingService:
             return {"signals": [], "action_plan": [], "target_date": None}
         target_date = next_days[0]
 
+        # Load current portfolio state for stateful strategies
+        positions, cash = self._load_latest_state(session_id, session["initial_capital"])
+        portfolio_state = self._build_portfolio_state(session_id, positions, cash, current_d)
+
         # Lightweight signal generation: no validation, no persistence, just signals
         try:
             signals = self._generate_signals_lightweight(
                 strategy_id=session["strategy_id"],
                 signal_date=current_d,
                 universe_group_id=session["universe_group_id"],
+                tickers_override=None,
+                portfolio_state=portfolio_state,
             )
         except Exception as exc:
             log.warning("paper_trading.lightweight_signal_fallback", error=str(exc))
@@ -653,9 +504,26 @@ class PaperTradingService:
             sorted_tw = sorted(target_weights.items(), key=lambda x: x[1], reverse=True)
             target_weights = dict(sorted_tw[:max_positions])
 
-        w_sum = sum(target_weights.values())
-        if w_sum > 0:
-            target_weights = {t: w / w_sum for t, w in target_weights.items()}
+        # Apply normalization aligned with advance() execution logic
+        normalize_weights = config.get("normalize_weights", True)
+        if normalize_weights:
+            w_sum = sum(target_weights.values())
+            if w_sum > 0:
+                target_weights = {t: w / w_sum for t, w in target_weights.items()}
+        else:
+            # Absolute weight mode: apply cash_reserve and max_position_pct constraints
+            cash_reserve_pct = config.get("cash_reserve_pct", 0.0)
+            max_position_pct = config.get("max_position_pct", 1.0)
+
+            for ticker in list(target_weights.keys()):
+                if target_weights[ticker] > max_position_pct:
+                    target_weights[ticker] = max_position_pct
+
+            max_total = 1.0 - cash_reserve_pct
+            w_sum = sum(target_weights.values())
+            if w_sum > max_total and w_sum > 0:
+                scale = max_total / w_sum
+                target_weights = {t: w * scale for t, w in target_weights.items()}
 
         # Build action plan: compare current positions vs target
         action_plan = []
@@ -688,18 +556,24 @@ class PaperTradingService:
         strategy_id: str,
         signal_date: date,
         universe_group_id: str,
+        tickers_override: list[str] | None = None,
+        portfolio_state: dict | None = None,
     ) -> list[dict]:
         """Generate signals for a single date without validation or persistence.
 
         Optimized: bulk-loads all factor cache data (strategy + model features)
         in a single DB query, then passes pre-computed features to the model.
 
+        Args:
+            portfolio_state: Optional dict with current_weights, holding_days,
+                           avg_entry_price, unrealized_pnl for stateful strategies.
+
         Returns list of signal dicts with ticker, signal, target_weight, strength.
         """
         strategy_def = self._strategy_service.get_strategy(strategy_id)
         strategy_instance = self._load_strategy_instance(strategy_def)
 
-        tickers = self._group_service.get_group_tickers(universe_group_id)
+        tickers = tickers_override if tickers_override else self._group_service.get_group_tickers(universe_group_id)
         if not tickers:
             return []
 
@@ -757,29 +631,35 @@ class PaperTradingService:
                     log.warning("paper_trading.lightweight_factor_failed", factor_name=factor_name, error=str(exc))
 
         # Build model predictions using pre-computed features
+        # Parallelize model predictions to speed up computation
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         model_predictions: dict[str, pd.Series] = {}
-        for model_id in required_models:
+
+        def _predict_single_model(model_id: str) -> tuple[str, pd.Series | None]:
+            """Predict for a single model, returns (model_id, predictions)."""
             if model_id not in model_fs_map:
-                continue
+                return (model_id, None)
+
             fs_id, fs_id_to_name = model_fs_map[model_id]
             fs = self._feature_service.get_feature_set(fs_id)
             preprocessing = fs["preprocessing"]
 
-            feature_data: dict[str, pd.DataFrame] = {}
+            feature_data_local: dict[str, pd.DataFrame] = {}
             for fid, fname in fs_id_to_name.items():
                 if fid in cached_by_id and not cached_by_id[fid].empty:
-                    feature_data[fname] = cached_by_id[fid]
+                    feature_data_local[fname] = cached_by_id[fid]
                 else:
                     try:
                         df = self._factor_engine.compute_factor(fid, tickers, start_str, end_str)
                         if not df.empty:
-                            feature_data[fname] = df
+                            feature_data_local[fname] = df
                     except Exception as exc:
                         log.warning("paper_trading.lightweight_model_factor_failed", factor=fname, error=str(exc))
 
             # Apply preprocessing
             processed: dict[str, pd.DataFrame] = {}
-            for fname, df in feature_data.items():
+            for fname, df in feature_data_local.items():
                 processed[fname] = self._feature_service._apply_preprocessing(df, preprocessing)
 
             try:
@@ -789,22 +669,37 @@ class PaperTradingService:
                     tickers=tickers,
                     date=end_str,
                 )
-                if not preds.empty:
-                    model_predictions[model_id] = preds
+                return (model_id, preds if not preds.empty else None)
             except Exception as exc:
                 log.warning("paper_trading.lightweight_model_failed", model_id=model_id, error=str(exc))
+                return (model_id, None)
+
+        # Execute model predictions in parallel (max 4 workers to avoid overwhelming system)
+        if required_models:
+            with ThreadPoolExecutor(max_workers=min(4, max(1, len(required_models)))) as executor:
+                futures = {executor.submit(_predict_single_model, mid): mid for mid in required_models}
+                for future in as_completed(futures):
+                    model_id, preds = future.result()
+                    if preds is not None:
+                        model_predictions[model_id] = preds
 
         # Build context and generate signals
         trade_ts = pd.Timestamp(signal_date)
         prices_multi = self._build_prices_multi(
             prices_close, prices_open, prices_high, prices_low, prices_volume, tickers
         )
-        context = StrategyContext(
-            prices=prices_multi.loc[:trade_ts],
-            factor_values=factor_data,
-            model_predictions=model_predictions,
-            current_date=trade_ts,
-        )
+
+        # Include portfolio state for stateful strategies
+        context_kwargs = {
+            "prices": prices_multi.loc[:trade_ts],
+            "factor_values": factor_data,
+            "model_predictions": model_predictions,
+            "current_date": trade_ts,
+        }
+        if portfolio_state:
+            context_kwargs.update(portfolio_state)
+
+        context = StrategyContext(**context_kwargs)
 
         raw_signals = strategy_instance.generate_signals(context)
         if raw_signals.empty:
@@ -986,6 +881,7 @@ class PaperTradingService:
         signal_dates: list[date],
         universe_group_id: str,
         tickers: list[str],
+        session_id: str | None = None,
     ) -> dict[int, list[dict]]:
         """Generate signals for multiple dates in one batch.
 
@@ -995,6 +891,9 @@ class PaperTradingService:
         Optimized: uses bulk cache loading for all factors (strategy + model
         feature set) in a single DB query, then passes pre-computed features
         directly to the model — avoiding 264 individual factor queries.
+
+        Args:
+            session_id: Optional paper trading session ID for portfolio state.
 
         Returns: dict[date_index, list[signal_dict]]
         """
@@ -1060,21 +959,27 @@ class PaperTradingService:
                 log.warning("paper_trading.batch_factor_failed", factor_name=factor_name, error=str(exc))
 
         # 4. Build model feature data and generate predictions
+        # Parallelize model predictions to speed up computation
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         model_predictions: dict[str, dict[date, pd.Series]] = {}
-        for model_id in required_models:
-            model_predictions[model_id] = {}
+
+        def _predict_model_batch(model_id: str) -> tuple[str, dict[date, pd.Series]]:
+            """Predict for a single model across all dates, returns (model_id, {date: predictions})."""
+            result: dict[date, pd.Series] = {}
             if model_id not in model_fs_map:
-                continue
+                return (model_id, result)
+
             fs_id, fs_id_to_name = model_fs_map[model_id]
             fs = self._feature_service.get_feature_set(fs_id)
             preprocessing = fs["preprocessing"]
 
             # Build feature_data from bulk cache (factor_name -> DataFrame)
-            feature_data: dict[str, pd.DataFrame] = {}
+            feature_data_local: dict[str, pd.DataFrame] = {}
             missing_model_factors: list[tuple[str, str]] = []
             for fid, fname in fs_id_to_name.items():
                 if fid in cached_by_id and not cached_by_id[fid].empty:
-                    feature_data[fname] = cached_by_id[fid]
+                    feature_data_local[fname] = cached_by_id[fid]
                 else:
                     missing_model_factors.append((fname, fid))
 
@@ -1083,13 +988,13 @@ class PaperTradingService:
                 try:
                     df = self._factor_engine.compute_factor(fid, tickers, start_str, end_str)
                     if not df.empty:
-                        feature_data[fname] = df
+                        feature_data_local[fname] = df
                 except Exception as exc:
                     log.warning("paper_trading.batch_model_factor_failed", factor=fname, error=str(exc))
 
             # Apply preprocessing
             processed_features: dict[str, pd.DataFrame] = {}
-            for fname, df in feature_data.items():
+            for fname, df in feature_data_local.items():
                 processed_features[fname] = self._feature_service._apply_preprocessing(df, preprocessing)
 
             # Generate predictions per date using pre-computed features
@@ -1102,9 +1007,19 @@ class PaperTradingService:
                         date=str(d),
                     )
                     if not preds.empty:
-                        model_predictions[model_id][d] = preds
+                        result[d] = preds
                 except Exception as exc:
                     log.warning("paper_trading.batch_model_failed", model_id=model_id, date=str(d), error=str(exc))
+
+            return (model_id, result)
+
+        # Execute model predictions in parallel (max 4 workers)
+        if required_models:
+            with ThreadPoolExecutor(max_workers=min(4, max(1, len(required_models)))) as executor:
+                futures = {executor.submit(_predict_model_batch, mid): mid for mid in required_models}
+                for future in as_completed(futures):
+                    model_id, preds_by_date = future.result()
+                    model_predictions[model_id] = preds_by_date
 
         # Pre-load OHLCV data for the entire range
         prices_close, prices_open, prices_high, prices_low, prices_volume = self._load_prices(
@@ -1116,6 +1031,29 @@ class PaperTradingService:
         prices_multi = self._build_prices_multi(
             prices_close, prices_open, prices_high, prices_low, prices_volume, tickers
         )
+
+        # Load portfolio state if session_id provided
+        conn = get_connection()
+        positions_by_date: dict[date, dict] = {}
+        cash_by_date: dict[date, float] = {}
+
+        if session_id:
+            # Load historical positions for each signal date
+            for idx, target_date in enumerate(signal_dates):
+                # Get positions as of the day before signal generation
+                row = conn.execute(
+                    """SELECT positions_json, cash FROM paper_trading_daily
+                       WHERE session_id = ? AND date <= ?
+                       ORDER BY date DESC LIMIT 1""",
+                    [session_id, target_date],
+                ).fetchone()
+                if row:
+                    positions_by_date[target_date] = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
+                    cash_by_date[target_date] = row[1]
+                else:
+                    positions_by_date[target_date] = {}
+                    cash_by_date[target_date] = 0.0
+
         for idx, target_date in enumerate(signal_dates):
             trade_ts = pd.Timestamp(target_date)
             # Filter factor data up to this date
@@ -1129,12 +1067,24 @@ class PaperTradingService:
                 if target_date in preds_by_date:
                     date_model_preds[model_id] = preds_by_date[target_date]
 
-            context = StrategyContext(
-                prices=prices_multi.loc[:trade_ts],
-                factor_values=date_factor_data,
-                model_predictions=date_model_preds,
-                current_date=trade_ts,
-            )
+            # Build context with portfolio state if available
+            context_kwargs = {
+                "prices": prices_multi.loc[:trade_ts],
+                "factor_values": date_factor_data,
+                "model_predictions": date_model_preds,
+                "current_date": trade_ts,
+            }
+
+            if session_id and target_date in positions_by_date:
+                portfolio_state = self._build_portfolio_state(
+                    session_id,
+                    positions_by_date[target_date],
+                    cash_by_date[target_date],
+                    target_date,
+                )
+                context_kwargs.update(portfolio_state)
+
+            context = StrategyContext(**context_kwargs)
 
             try:
                 raw_signals = strategy_instance.generate_signals(context)
@@ -1394,8 +1344,127 @@ class PaperTradingService:
                 total += pos["shares"] * pos.get("avg_price", 0)
         return round(total, 2)
 
-    @staticmethod
-    def _session_row_to_dict(row) -> dict:
+    def _build_portfolio_state(
+        self,
+        session_id: str,
+        positions: dict[str, dict],
+        cash: float,
+        current_date: date,
+    ) -> dict:
+        """Build portfolio state dict for StrategyContext.
+
+        Computes current_weights, holding_days, avg_entry_price, unrealized_pnl
+        from positions and historical trades.
+
+        Returns dict with keys: current_weights, holding_days, avg_entry_price, unrealized_pnl
+        """
+        if not positions:
+            return {
+                "current_weights": {},
+                "holding_days": {},
+                "avg_entry_price": {},
+                "unrealized_pnl": {},
+            }
+
+        conn = get_connection()
+
+        # Get latest close prices for current_date
+        tickers = list(positions.keys())
+        placeholders = ",".join(f"'{t}'" for t in tickers)
+        price_rows = conn.execute(
+            f"""SELECT ticker, close FROM daily_bars
+                WHERE date = ? AND ticker IN ({placeholders})""",
+            [current_date],
+        ).fetchall()
+        current_prices = {r[0]: float(r[1]) for r in price_rows if r[1]}
+
+        # Calculate portfolio value
+        portfolio_value = cash
+        for ticker, pos in positions.items():
+            price = current_prices.get(ticker, pos.get("avg_price", 0))
+            portfolio_value += pos["shares"] * price
+
+        # Build state dicts
+        current_weights = {}
+        avg_entry_price = {}
+        unrealized_pnl = {}
+
+        for ticker, pos in positions.items():
+            shares = pos["shares"]
+            entry_price = pos.get("avg_price", 0)
+            current_price = current_prices.get(ticker, entry_price)
+
+            position_value = shares * current_price
+            current_weights[ticker] = position_value / portfolio_value if portfolio_value > 0 else 0
+            avg_entry_price[ticker] = entry_price
+            unrealized_pnl[ticker] = (current_price / entry_price - 1) if entry_price > 0 else 0
+
+        # Calculate holding_days from trade history
+        holding_days = self._calculate_holding_days(session_id, tickers, current_date, conn)
+
+        return {
+            "current_weights": current_weights,
+            "holding_days": holding_days,
+            "avg_entry_price": avg_entry_price,
+            "unrealized_pnl": unrealized_pnl,
+        }
+
+    def _calculate_holding_days(
+        self,
+        session_id: str,
+        tickers: list[str],
+        current_date: date,
+        conn,
+    ) -> dict[str, int]:
+        """Calculate holding days for each ticker from trade history.
+
+        Returns dict[ticker -> days_held]
+        """
+        # Get all daily snapshots up to current_date
+        rows = conn.execute(
+            """SELECT date, trades_json FROM paper_trading_daily
+               WHERE session_id = ? AND date <= ?
+               ORDER BY date""",
+            [session_id, current_date],
+        ).fetchall()
+
+        # Track first buy date for each ticker
+        first_buy: dict[str, date] = {}
+        last_sell: dict[str, date] = {}
+
+        for row in rows:
+            trade_date = row[0] if isinstance(row[0], date) else date.fromisoformat(str(row[0]))
+            trades = json.loads(row[1]) if isinstance(row[1], str) else (row[1] or [])
+
+            for t in trades:
+                ticker = t.get("ticker")
+                action = t.get("action")
+
+                if action == "buy":
+                    if ticker not in first_buy or ticker in last_sell:
+                        # New position or re-entry after sell
+                        first_buy[ticker] = trade_date
+                        if ticker in last_sell:
+                            del last_sell[ticker]
+                elif action == "sell":
+                    # Check if fully closed
+                    last_sell[ticker] = trade_date
+
+        # Calculate holding days
+        holding_days = {}
+        trading_days_list = get_trading_days(
+            min(first_buy.values()) if first_buy else current_date,
+            current_date
+        )
+
+        for ticker in tickers:
+            if ticker in first_buy and ticker not in last_sell:
+                # Count trading days from first buy to current
+                entry_date = first_buy[ticker]
+                days_held = len([d for d in trading_days_list if d >= entry_date and d <= current_date])
+                holding_days[ticker] = max(1, days_held)
+
+        return holding_days
         config_raw = row[4]
         if isinstance(config_raw, str):
             try:

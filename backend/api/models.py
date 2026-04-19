@@ -65,9 +65,23 @@ async def train_model(body: TrainModelRequest) -> dict:
     """Trigger async model training.
 
     Returns a task_id to poll for progress.
+    If a training task with the same name is already running, returns the existing task.
     """
     svc = _get_service()
     executor = _get_executor()
+
+    # Check for already running/queued task with same model name
+    existing = executor._store.find_active_by_type_and_name(
+        "model_train", "name", body.name,
+    )
+    if existing:
+        log.info("api.model.train_deduplicated", task_id=existing.id, name=body.name)
+        return {
+            "task_id": existing.id,
+            "status": existing.status.value,
+            "name": body.name,
+            "deduplicated": True,
+        }
 
     def _do_train(
         name: str,
@@ -138,24 +152,46 @@ async def delete_model(model_id: str) -> dict:
 
 @router.post("/models/{model_id}/predict")
 async def predict(model_id: str, body: PredictRequest) -> dict:
-    """Generate predictions for a given date and tickers."""
+    """Generate predictions for a given date and tickers.
+
+    For classification models, returns prob, label, and raw_score per ticker.
+    For regression models, returns prediction per ticker.
+    """
     svc = _get_service()
     try:
-        preds = svc.predict(
+        df = svc.predict_detailed(
             model_id=model_id,
-            feature_set_id=body.feature_set_id,
             tickers=body.tickers,
             date=body.date,
+            feature_set_id=body.feature_set_id,
         )
-        # Convert to JSON-friendly format
-        result = {
-            "model_id": model_id,
-            "date": body.date,
-            "predictions": {
-                str(k): round(float(v), 6) for k, v in preds.items()
-            },
-            "count": len(preds),
-        }
+        if "prob" in df.columns:
+            predictions = {}
+            for ticker in df.index:
+                row = df.loc[ticker]
+                predictions[str(ticker)] = {
+                    "prob": round(float(row["prob"]), 6),
+                    "label": int(row["label"]),
+                    "raw_score": round(float(row["raw_score"]), 6),
+                }
+            result = {
+                "model_id": model_id,
+                "date": body.date,
+                "task": "classification",
+                "predictions": predictions,
+                "count": len(predictions),
+            }
+        else:
+            result = {
+                "model_id": model_id,
+                "date": body.date,
+                "task": "regression",
+                "predictions": {
+                    str(k): round(float(v), 6)
+                    for k, v in df["prediction"].items()
+                },
+                "count": len(df),
+            }
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

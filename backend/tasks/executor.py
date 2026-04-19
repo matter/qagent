@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import traceback
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
@@ -156,15 +157,44 @@ class TaskExecutor:
             log.info("task.completed", task_id=task_id)
 
         except TimeoutError:
-            inner_future.cancel()
             completed = datetime.utcnow()
             self._store.update_status(
                 task_id,
                 TaskStatus.TIMEOUT,
                 completed_at=completed,
-                error_message=f"Task timed out after {timeout}s",
+                error_message=f"Task timed out after {timeout}s (still running in background)",
             )
             log.warning("task.timeout", task_id=task_id, timeout=timeout)
+
+            # The inner thread is still running (cancel() is a no-op for running threads).
+            # Spawn a lightweight watcher that updates status if/when the task completes.
+            def _watch_completion(fut: Future, tid: str, store: TaskStore) -> None:
+                try:
+                    result = fut.result()  # blocks until inner completes
+                    summary = result if isinstance(result, dict) else {"result": result}
+                    store.update_status(
+                        tid,
+                        TaskStatus.COMPLETED,
+                        completed_at=datetime.utcnow(),
+                        result_summary=summary,
+                    )
+                    log.info("task.late_completed", task_id=tid)
+                except Exception:
+                    tb = traceback.format_exc()
+                    store.update_status(
+                        tid,
+                        TaskStatus.FAILED,
+                        completed_at=datetime.utcnow(),
+                        error_message=tb,
+                    )
+                    log.error("task.late_failed", task_id=tid, error=tb)
+
+            watcher = threading.Thread(
+                target=_watch_completion,
+                args=(inner_future, task_id, self._store),
+                daemon=True,
+            )
+            watcher.start()
 
         except Exception:
             completed = datetime.utcnow()

@@ -21,6 +21,9 @@ class StrategyContext:
         holding_days: Number of consecutive trading days each ticker has been held.
         avg_entry_price: Volume-weighted average entry price per ticker.
         unrealized_pnl: Unrealised P&L fraction per ticker (price / entry - 1).
+        diagnostics: Optional dict strategies can populate to expose per-day
+            internal state (e.g. active_host, candidate_pool, gate results).
+            Captured by the backtest engine into rebalance_diagnostics.
     """
 
     prices: pd.DataFrame
@@ -31,6 +34,7 @@ class StrategyContext:
     holding_days: dict[str, int] = field(default_factory=dict)
     avg_entry_price: dict[str, float] = field(default_factory=dict)
     unrealized_pnl: dict[str, float] = field(default_factory=dict)
+    diagnostics: dict = field(default_factory=dict)
 
 
 class StrategyBase(ABC):

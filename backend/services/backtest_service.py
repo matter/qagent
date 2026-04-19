@@ -161,6 +161,7 @@ class BacktestService:
         )
 
         prev_weights = None
+        rebalance_diagnostics: list[dict] = []
         # Portfolio state tracking for StrategyContext
         port_weights: dict[str, float] = {}     # current weight per ticker
         port_holding_days: dict[str, int] = {}   # consecutive days held
@@ -220,6 +221,12 @@ class BacktestService:
                 if prev_weights is not None:
                     all_weights.loc[trade_ts] = prev_weights
                 continue
+
+            # Capture per-day diagnostics if strategy populated them
+            if context.diagnostics:
+                diag_entry = {"date": date_key}
+                diag_entry.update(context.diagnostics)
+                rebalance_diagnostics.append(diag_entry)
 
             if raw_signals.empty:
                 # No signals -- go to cash (all zeros)
@@ -293,6 +300,20 @@ class BacktestService:
         result_dict["strategy_name"] = strategy_def["name"]
         result_dict["result_level"] = result_level
         result_dict["universe_group_id"] = universe_group_id
+        if rebalance_diagnostics:
+            result_dict["rebalance_diagnostics"] = rebalance_diagnostics
+            # Persist diagnostics into stored summary
+            conn = get_connection()
+            row = conn.execute(
+                "SELECT summary FROM backtest_results WHERE id = ?", [bt_id]
+            ).fetchone()
+            if row:
+                summary_data = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
+                summary_data["rebalance_diagnostics"] = rebalance_diagnostics
+                conn.execute(
+                    "UPDATE backtest_results SET summary = ? WHERE id = ?",
+                    [json.dumps(summary_data, default=str), bt_id],
+                )
 
         # ---- 11. Check for data leakage ----
         leakage_warnings = self._check_data_leakage(
@@ -610,6 +631,7 @@ class BacktestService:
         from backend.services.model_service import ModelService
 
         result: dict[str, dict[str, pd.Series]] = {}
+        failed_models: list[tuple[str, str]] = []
 
         for model_id in model_ids:
             try:
@@ -678,6 +700,13 @@ class BacktestService:
                     model_id=model_id,
                     error=str(exc),
                 )
+                failed_models.append((model_id, str(exc)))
+
+        if failed_models:
+            details = "; ".join(f"{mid}: {err}" for mid, err in failed_models)
+            raise ValueError(
+                f"Model prediction failed for {len(failed_models)} model(s): {details}"
+            )
 
         return result
 
@@ -974,7 +1003,7 @@ def _compute_stock_pnl(trades: list[dict]) -> list[dict]:
     """Compute per-stock P&L statistics from a trade log.
 
     Groups trades by ticker and computes realized P&L using FIFO matching
-    of buy/sell pairs.
+    of buy/sell pairs with support for partial fills.
 
     Returns a list sorted by realized_pnl descending.
     """
@@ -1000,28 +1029,65 @@ def _compute_stock_pnl(trades: list[dict]) -> list[dict]:
         loss_count = 0
         realized_pnl = 0.0
 
-        # FIFO queue for open buy positions
+        # FIFO queue for open buy positions: [(shares_remaining, price, cost)]
         open_buys: list[dict] = []
 
         for trade in ticker_trades:
-            value = trade["shares"] * trade["price"]
+            shares = trade["shares"]
+            price = trade["price"]
+            cost = trade.get("cost", 0)
+            value = shares * price
+
             if trade["action"] == "buy":
                 buy_count += 1
                 total_buy_value += value
-                open_buys.append(trade)
+                # Add to open positions with full shares
+                open_buys.append({
+                    "shares": shares,
+                    "price": price,
+                    "cost": cost,
+                })
             elif trade["action"] == "sell":
                 sell_count += 1
                 total_sell_value += value
-                # Match against earliest open buy (FIFO)
-                if open_buys:
-                    buy_trade = open_buys.pop(0)
-                    pnl = (trade["price"] - buy_trade["price"]) * trade["shares"]
-                    pnl -= trade.get("cost", 0) + buy_trade.get("cost", 0)
+
+                # Match against open buys using FIFO with partial fill support
+                shares_to_sell = shares
+                sell_cost_allocated = 0.0
+
+                while shares_to_sell > 0 and open_buys:
+                    buy_position = open_buys[0]
+                    buy_shares = buy_position["shares"]
+                    buy_price = buy_position["price"]
+                    buy_cost = buy_position["cost"]
+
+                    # Determine how many shares to match from this buy
+                    matched_shares = min(shares_to_sell, buy_shares)
+
+                    # Calculate P&L for this matched portion
+                    # Allocate costs proportionally
+                    buy_cost_portion = (matched_shares / shares) * cost if shares > 0 else 0
+                    sell_cost_portion = (matched_shares / buy_shares) * buy_cost if buy_shares > 0 else 0
+
+                    pnl = (price - buy_price) * matched_shares
+                    pnl -= (buy_cost_portion + sell_cost_portion)
+
                     realized_pnl += pnl
+                    sell_cost_allocated += buy_cost_portion
+
+                    # Track win/loss per round-trip
                     if pnl > 0:
                         win_count += 1
-                    else:
+                    elif pnl < 0:
                         loss_count += 1
+
+                    # Update remaining shares
+                    shares_to_sell -= matched_shares
+                    buy_position["shares"] -= matched_shares
+
+                    # Remove buy position if fully consumed
+                    if buy_position["shares"] <= 0:
+                        open_buys.pop(0)
 
         pnl_pct = (realized_pnl / total_buy_value * 100) if total_buy_value > 0 else 0.0
 

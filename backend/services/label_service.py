@@ -131,7 +131,7 @@ _PRESET_LABELS = [
         "target_type": "return",
         "horizon": 5,
         "benchmark": None,
-        "config": None,
+        "config": {"vol_adjust": True, "vol_window": 20},
     },
 
     # ---- Classification presets ----
@@ -241,14 +241,14 @@ class LabelService:
     # ------------------------------------------------------------------
 
     def ensure_presets(self) -> None:
-        """Create preset label definitions if they do not already exist."""
+        """Create or update preset label definitions."""
         conn = get_connection()
         for preset in _PRESET_LABELS:
+            config_json = json.dumps(preset["config"]) if preset.get("config") else None
             row = conn.execute(
-                "SELECT id FROM label_definitions WHERE id = ?", [preset["id"]]
+                "SELECT id, config FROM label_definitions WHERE id = ?", [preset["id"]]
             ).fetchone()
             if row is None:
-                config_json = json.dumps(preset["config"]) if preset.get("config") else None
                 conn.execute(
                     """INSERT INTO label_definitions
                        (id, name, description, target_type, horizon, benchmark, config, status)
@@ -264,6 +264,24 @@ class LabelService:
                     ],
                 )
                 log.info("label.preset_created", name=preset["name"])
+            else:
+                existing_config = row[1]
+                if existing_config != config_json:
+                    conn.execute(
+                        """UPDATE label_definitions
+                           SET description = ?, target_type = ?, horizon = ?,
+                               benchmark = ?, config = ?
+                           WHERE id = ?""",
+                        [
+                            preset["description"],
+                            preset["target_type"],
+                            preset["horizon"],
+                            preset["benchmark"],
+                            config_json,
+                            preset["id"],
+                        ],
+                    )
+                    log.info("label.preset_updated", name=preset["name"])
 
     def create_label(
         self,
@@ -403,14 +421,18 @@ class LabelService:
         conn = get_connection()
 
         # Build query for daily bars
+        # Fetch extra horizon days beyond end_date so shift(-horizon) doesn't produce NaN at the tail
         where_parts = ["ticker IN (" + ",".join(f"'{t}'" for t in tickers) + ")"]
         params: list = []
         if start_date:
             where_parts.append("date >= ?")
             params.append(start_date)
         if end_date:
+            # Extend data fetch by horizon * 2 calendar days to ensure enough trading days
+            from datetime import timedelta
+            data_end = (pd.Timestamp(end_date) + timedelta(days=horizon * 2 + 10)).strftime("%Y-%m-%d")
             where_parts.append("date <= ?")
-            params.append(end_date)
+            params.append(data_end)
 
         where_clause = " AND ".join(where_parts)
         bars_df = conn.execute(
@@ -442,7 +464,26 @@ class LabelService:
 
         # ---- Dispatch by target_type ----
         if target_type == "return":
-            combined["label_value"] = combined["fwd_return"]
+            vol_adjust = config.get("vol_adjust", False)
+            if vol_adjust:
+                vol_window = config.get("vol_window", 20)
+                # Compute realized volatility per ticker and divide fwd_return by it
+                for ticker, grp_idx in combined.groupby("ticker").groups.items():
+                    sub = combined.loc[grp_idx].sort_values("date")
+                    # Need daily returns to compute realized vol; re-derive from bars
+                    ticker_bars = bars_df[bars_df["ticker"] == ticker].sort_values("date")
+                    daily_ret = ticker_bars["close"].pct_change()
+                    realized_vol = daily_ret.rolling(vol_window).std()
+                    # Align realized_vol with combined index via date
+                    vol_map = dict(zip(ticker_bars["date"], realized_vol))
+                    vol_series = sub["date"].map(vol_map)
+                    # Avoid division by zero: replace 0/NaN vol with NaN
+                    vol_series = vol_series.replace(0, np.nan)
+                    combined.loc[grp_idx, "label_value"] = (
+                        combined.loc[grp_idx, "fwd_return"] / vol_series.values
+                    )
+            else:
+                combined["label_value"] = combined["fwd_return"]
 
         elif target_type == "binary":
             combined["label_value"] = (combined["fwd_return"] > 0).astype(float)
@@ -494,6 +535,12 @@ class LabelService:
             raise ValueError(f"Unsupported target_type: {target_type}")
 
         combined.drop(columns=["fwd_return"], inplace=True)
+
+        # Trim labels back to the originally requested end_date
+        # (we fetched extra bars to compute forward returns at the tail)
+        if end_date:
+            combined = combined[combined["date"] <= pd.Timestamp(end_date)]
+
         return combined
 
     # ------------------------------------------------------------------

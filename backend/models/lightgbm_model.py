@@ -80,6 +80,21 @@ class LightGBMModel(ModelBase):
         preds = self._model.predict(X)
         return pd.Series(preds, index=X.index, name="prediction")
 
+    def predict_proba(self, X: pd.DataFrame):
+        """Return class probabilities (n_samples, n_classes) for classifiers."""
+        if self.task != "classification":
+            raise NotImplementedError("predict_proba only available for classification")
+        return self._model.predict_proba(X)
+
+    def predict_raw(self, X: pd.DataFrame) -> pd.Series:
+        """Return raw leaf/margin values before sigmoid transform."""
+        raw = self._model.predict(X, raw_score=True)
+        return pd.Series(raw, index=X.index, name="raw_score")
+
+    @property
+    def is_classifier(self) -> bool:
+        return self.task == "classification"
+
     def get_params(self) -> dict:
         return {
             "task": self.task,

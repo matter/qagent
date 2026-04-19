@@ -7,12 +7,14 @@ from pydantic import BaseModel
 
 from backend.logger import get_logger
 from backend.services.paper_trading_service import PaperTradingService
+from backend.tasks.executor import TaskExecutor
 
 log = get_logger(__name__)
 
 router = APIRouter(prefix="/api", tags=["paper-trading"])
 
 _svc: PaperTradingService | None = None
+_executor: TaskExecutor | None = None
 
 
 def _get_svc() -> PaperTradingService:
@@ -20,6 +22,13 @@ def _get_svc() -> PaperTradingService:
     if _svc is None:
         _svc = PaperTradingService()
     return _svc
+
+
+def _get_executor() -> TaskExecutor:
+    global _executor
+    if _executor is None:
+        _executor = TaskExecutor()
+    return _executor
 
 
 # ---- Request models ----
@@ -96,7 +105,17 @@ async def advance_session(session_id: str, body: AdvanceRequest | None = None) -
     try:
         target = body.target_date if body else None
         steps = body.steps if body else 0
-        return _get_svc().advance(session_id, target, steps)
+
+        # Submit as async task with extended timeout
+        executor = _get_executor()
+        svc = _get_svc()
+        task_id = executor.submit(
+            task_type="paper_trading_advance",
+            fn=svc.advance,
+            params={"session_id": session_id, "target_date": target, "steps": steps},
+            timeout=1800,  # 30 minutes for multi-day advance
+        )
+        return {"task_id": task_id, "status": "running"}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -130,7 +149,16 @@ async def get_summary(session_id: str) -> dict:
 @router.get("/paper-trading/sessions/{session_id}/signals")
 async def get_latest_signals(session_id: str) -> dict:
     try:
-        return _get_svc().get_latest_signals(session_id)
+        # Submit as async task with extended timeout for large universes
+        executor = _get_executor()
+        svc = _get_svc()
+        task_id = executor.submit(
+            task_type="paper_trading_signals",
+            fn=svc.get_latest_signals,
+            params={"session_id": session_id},
+            timeout=900,  # 15 minutes for large universes with many models
+        )
+        return {"task_id": task_id, "status": "running"}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
