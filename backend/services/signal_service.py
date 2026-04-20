@@ -16,6 +16,7 @@ import pandas as pd
 from backend.db import get_connection
 from backend.logger import get_logger
 from backend.services.factor_engine import FactorEngine
+from backend.services.feature_service import FeatureService
 from backend.services.group_service import GroupService
 from backend.services.model_service import ModelService
 from backend.services.strategy_service import StrategyService
@@ -31,6 +32,7 @@ class SignalService:
     def __init__(self) -> None:
         self._strategy_service = StrategyService()
         self._factor_engine = FactorEngine()
+        self._feature_service = FeatureService()
         self._model_service = ModelService()
         self._group_service = GroupService()
 
@@ -106,13 +108,42 @@ class SignalService:
         if prices_close.empty:
             raise ValueError("No price data available for the given tickers and date range")
 
-        # ---- 5. Compute required factors ----
+        # ---- 5. Bulk-load all factor data (strategy + model features) ----
         required_factors = strategy_def.get("required_factors", [])
-        factor_data: dict[str, pd.DataFrame] = {}
+        required_models = strategy_def.get("required_models", [])
 
-        if required_factors:
-            factor_id_map = self._resolve_factor_ids(required_factors)
-            for factor_name, factor_id in factor_id_map.items():
+        # Resolve strategy factor IDs
+        strategy_factor_map = self._resolve_factor_ids(required_factors) if required_factors else {}
+        all_factor_ids = set(strategy_factor_map.values())
+
+        # Resolve model feature sets and collect all factor IDs
+        model_fs_map: dict[str, tuple[str, dict[str, str], dict]] = {}
+        for model_id in required_models:
+            try:
+                model_record = self._model_service.get_model(model_id)
+                fs_id = model_record["feature_set_id"]
+                fs = self._feature_service.get_feature_set(fs_id)
+                fs_id_to_name: dict[str, str] = {}
+                for ref in fs["factor_refs"]:
+                    fid = ref["factor_id"]
+                    fname = ref.get("factor_name", fid)
+                    fs_id_to_name[fid] = fname
+                    all_factor_ids.add(fid)
+                model_fs_map[model_id] = (fs_id, fs_id_to_name, fs["preprocessing"])
+            except Exception as exc:
+                log.warning("signal_service.model_fs_failed", model_id=model_id, error=str(exc))
+
+        # Bulk load all cached factor values in ONE query
+        cached_by_id = self._factor_engine.load_cached_factors_bulk(
+            list(all_factor_ids), tickers, start_date, target_date
+        )
+
+        # Build strategy factor_data from cache, fallback to compute
+        factor_data: dict[str, pd.DataFrame] = {}
+        for factor_name, factor_id in strategy_factor_map.items():
+            if factor_id in cached_by_id and not cached_by_id[factor_id].empty:
+                factor_data[factor_name] = cached_by_id[factor_id]
+            else:
                 try:
                     df = self._factor_engine.compute_factor(
                         factor_id, tickers, start_date, target_date
@@ -126,14 +157,36 @@ class SignalService:
                         error=str(exc),
                     )
 
-        # ---- 6. Run model predictions ----
-        required_models = strategy_def.get("required_models", [])
+        # ---- 6. Run model predictions using pre-computed features ----
         model_predictions: dict[str, pd.Series] = {}
 
         for model_id in required_models:
+            if model_id not in model_fs_map:
+                continue
             try:
-                preds = self._model_service.predict(
+                fs_id, fs_id_to_name, preprocessing = model_fs_map[model_id]
+
+                # Assemble feature data from bulk cache
+                feature_data_local: dict[str, pd.DataFrame] = {}
+                for fid, fname in fs_id_to_name.items():
+                    if fid in cached_by_id and not cached_by_id[fid].empty:
+                        feature_data_local[fname] = cached_by_id[fid]
+                    else:
+                        try:
+                            df = self._factor_engine.compute_factor(fid, tickers, start_date, target_date)
+                            if not df.empty:
+                                feature_data_local[fname] = df
+                        except Exception:
+                            pass
+
+                # Apply preprocessing
+                processed: dict[str, pd.DataFrame] = {}
+                for fname, df in feature_data_local.items():
+                    processed[fname] = self._feature_service._apply_preprocessing(df, preprocessing)
+
+                preds = self._model_service.predict_with_features(
                     model_id=model_id,
+                    feature_data=processed,
                     tickers=tickers,
                     date=target_date,
                 )
@@ -275,42 +328,88 @@ class SignalService:
             row_data = prices_close.loc[trade_ts]
             has_price = {t for t in tickers if t in row_data.index and pd.notna(row_data[t])}
 
-        # ---- 4. Compute required factors ----
+        # ---- 4. Bulk-load all factor data (strategy + model features) ----
         required_factors = strategy_def.get("required_factors", [])
+        required_models = strategy_def.get("required_models", [])
+
+        strategy_factor_map = self._resolve_factor_ids(required_factors) if required_factors else {}
+        all_factor_ids = set(strategy_factor_map.values())
+
+        model_fs_map: dict[str, tuple[str, dict[str, str], dict]] = {}
+        for model_id in required_models:
+            try:
+                model_record = self._model_service.get_model(model_id)
+                fs_id = model_record["feature_set_id"]
+                fs = self._feature_service.get_feature_set(fs_id)
+                fs_id_to_name: dict[str, str] = {}
+                for ref in fs["factor_refs"]:
+                    fid = ref["factor_id"]
+                    fname = ref.get("factor_name", fid)
+                    fs_id_to_name[fid] = fname
+                    all_factor_ids.add(fid)
+                model_fs_map[model_id] = (fs_id, fs_id_to_name, fs["preprocessing"])
+            except Exception as exc:
+                log.warning("signal_service.diagnose_model_fs_failed", model_id=model_id, error=str(exc))
+
+        cached_by_id = self._factor_engine.load_cached_factors_bulk(
+            list(all_factor_ids), tickers, start_date, target_date
+        )
+
         factor_data: dict[str, pd.DataFrame] = {}
         factor_snapshot: dict[str, dict] = {}
 
-        if required_factors:
-            factor_id_map = self._resolve_factor_ids(required_factors)
-            for factor_name, factor_id in factor_id_map.items():
-                try:
+        for factor_name, factor_id in strategy_factor_map.items():
+            try:
+                if factor_id in cached_by_id and not cached_by_id[factor_id].empty:
+                    df = cached_by_id[factor_id]
+                else:
                     df = self._factor_engine.compute_factor(
                         factor_id, tickers, start_date, target_date
                     )
-                    if not df.empty:
-                        factor_data[factor_name] = df
-                        # Extract target_date snapshot
-                        if trade_ts in df.index:
-                            vals = df.loc[trade_ts].dropna()
-                            factor_snapshot[factor_name] = {
-                                "coverage": len(vals),
-                                "mean": round(float(vals.mean()), 6) if len(vals) > 0 else None,
-                                "std": round(float(vals.std()), 6) if len(vals) > 1 else None,
-                                "top5": {t: round(float(v), 6) for t, v in vals.nlargest(5).items()},
-                                "bottom5": {t: round(float(v), 6) for t, v in vals.nsmallest(5).items()},
-                            }
-                except Exception as exc:
-                    factor_snapshot[factor_name] = {"error": str(exc)}
+                if not df.empty:
+                    factor_data[factor_name] = df
+                    if trade_ts in df.index:
+                        vals = df.loc[trade_ts].dropna()
+                        factor_snapshot[factor_name] = {
+                            "coverage": len(vals),
+                            "mean": round(float(vals.mean()), 6) if len(vals) > 0 else None,
+                            "std": round(float(vals.std()), 6) if len(vals) > 1 else None,
+                            "top5": {t: round(float(v), 6) for t, v in vals.nlargest(5).items()},
+                            "bottom5": {t: round(float(v), 6) for t, v in vals.nsmallest(5).items()},
+                        }
+            except Exception as exc:
+                factor_snapshot[factor_name] = {"error": str(exc)}
 
-        # ---- 5. Run model predictions ----
-        required_models = strategy_def.get("required_models", [])
+        # ---- 5. Run model predictions using pre-computed features ----
         model_predictions: dict[str, pd.Series] = {}
         model_snapshot: dict[str, dict] = {}
 
         for model_id in required_models:
+            if model_id not in model_fs_map:
+                model_snapshot[model_id] = {"error": "feature set not resolved"}
+                continue
             try:
-                preds = self._model_service.predict(
+                fs_id, fs_id_to_name, preprocessing = model_fs_map[model_id]
+
+                feature_data_local: dict[str, pd.DataFrame] = {}
+                for fid, fname in fs_id_to_name.items():
+                    if fid in cached_by_id and not cached_by_id[fid].empty:
+                        feature_data_local[fname] = cached_by_id[fid]
+                    else:
+                        try:
+                            df = self._factor_engine.compute_factor(fid, tickers, start_date, target_date)
+                            if not df.empty:
+                                feature_data_local[fname] = df
+                        except Exception:
+                            pass
+
+                processed: dict[str, pd.DataFrame] = {}
+                for fname, df in feature_data_local.items():
+                    processed[fname] = self._feature_service._apply_preprocessing(df, preprocessing)
+
+                preds = self._model_service.predict_with_features(
                     model_id=model_id,
+                    feature_data=processed,
                     tickers=tickers,
                     date=target_date,
                 )
@@ -856,20 +955,23 @@ class SignalService:
     # ------------------------------------------------------------------
 
     def _resolve_factor_ids(self, factor_names: list[str]) -> dict[str, str]:
-        """Resolve factor names to factor IDs (latest version)."""
+        """Resolve factor names to factor IDs (latest version) in a single query."""
+        if not factor_names:
+            return {}
         conn = get_connection()
+        placeholders = ",".join("?" for _ in factor_names)
+        rows = conn.execute(
+            f"""SELECT name, id, version FROM factors
+                WHERE name IN ({placeholders})
+                ORDER BY version DESC""",
+            factor_names,
+        ).fetchall()
         result: dict[str, str] = {}
+        for name, fid, _version in rows:
+            if name not in result:
+                result[name] = fid
         for name in factor_names:
-            row = conn.execute(
-                """SELECT id FROM factors
-                   WHERE name = ?
-                   ORDER BY version DESC
-                   LIMIT 1""",
-                [name],
-            ).fetchone()
-            if row:
-                result[name] = row[0]
-            else:
+            if name not in result:
                 log.warning("signal_service.factor_not_found", name=name)
         return result
 

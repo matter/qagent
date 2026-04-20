@@ -488,16 +488,10 @@ class FeatureService:
             upper = median + scale
             return df.clip(lower=lower, upper=upper, axis=0)
         elif method == "winsorize":
-            # Winsorize at 1st and 99th percentile per date (row)
-            def _winsorize_row(row: pd.Series) -> pd.Series:
-                valid = row.dropna()
-                if len(valid) < 5:
-                    return row
-                p01 = valid.quantile(0.01)
-                p99 = valid.quantile(0.99)
-                return row.clip(lower=p01, upper=p99)
-
-            return df.apply(_winsorize_row, axis=1)
+            # Winsorize at 1st and 99th percentile per date (row) — vectorized
+            lower = df.quantile(0.01, axis=1)
+            upper = df.quantile(0.99, axis=1)
+            return df.clip(lower=lower, upper=upper, axis=0)
         else:
             return df
 
@@ -512,11 +506,8 @@ class FeatureService:
             row_std = row_std.replace(0, np.nan)
             return df.sub(row_mean, axis=0).div(row_std, axis=0)
         elif method == "rank":
-            # Cross-sectional rank per date, scaled to 0~1
-            def _rank_row(row: pd.Series) -> pd.Series:
-                return row.rank(pct=True)
-
-            return df.apply(_rank_row, axis=1)
+            # Cross-sectional rank per date, scaled to 0~1 — vectorized
+            return df.rank(axis=1, pct=True)
         else:
             return df
 

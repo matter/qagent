@@ -439,6 +439,39 @@ class PaperTradingService:
     # Latest signals / T+1 action plan
     # ------------------------------------------------------------------
 
+    def get_cached_signals(self, session_id: str) -> dict | None:
+        """Return cached signal result for current T+1 date, or None."""
+        session = self.get_session(session_id)
+        current = session.get("current_date")
+        if not current:
+            return None
+        if isinstance(current, str):
+            current_d = date.fromisoformat(current)
+        else:
+            current_d = current
+        next_days = get_trading_days(current_d + timedelta(days=1), current_d + timedelta(days=10))
+        if not next_days:
+            return None
+        signal_date = next_days[0]
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT result_json FROM paper_trading_signal_cache "
+            "WHERE session_id = ? AND signal_date = ?",
+            [session_id, str(signal_date)],
+        ).fetchone()
+        if row:
+            return json.loads(row[0])
+        return None
+
+    def _save_signal_cache(self, session_id: str, signal_date: date, result: dict) -> None:
+        """Persist signal result to cache."""
+        conn = get_connection()
+        conn.execute(
+            "INSERT OR REPLACE INTO paper_trading_signal_cache "
+            "(session_id, signal_date, result_json) VALUES (?, ?, ?)",
+            [session_id, str(signal_date), json.dumps(result, default=str)],
+        )
+
     def get_latest_signals(self, session_id: str) -> dict:
         """Generate signals for the next trading day (T+1 action plan).
 
@@ -459,6 +492,12 @@ class PaperTradingService:
         if not next_days:
             return {"signals": [], "action_plan": [], "target_date": None}
         target_date = next_days[0]
+
+        # Check signal cache first
+        cached = self.get_cached_signals(session_id)
+        if cached:
+            log.info("paper_trading.signals_cache_hit", session_id=session_id, target_date=str(target_date))
+            return cached
 
         # Load current portfolio state for stateful strategies
         positions, cash = self._load_latest_state(session_id, session["initial_capital"])
@@ -545,11 +584,20 @@ class PaperTradingService:
                 "target_weight": round(target_w, 4),
             })
 
-        return {
+        result = {
             "signals": signals,
             "action_plan": action_plan,
             "target_date": str(target_date),
         }
+
+        # Cache for future requests
+        try:
+            self._save_signal_cache(session_id, target_date, result)
+            log.info("paper_trading.signals_cached", session_id=session_id, target_date=str(target_date))
+        except Exception as exc:
+            log.warning("paper_trading.signal_cache_save_error", error=str(exc))
+
+        return result
 
     def _generate_signals_lightweight(
         self,
@@ -1114,19 +1162,21 @@ class PaperTradingService:
         return load_strategy_from_code(strategy_def["source_code"])
 
     def _resolve_factor_ids(self, factor_names: list[str]) -> dict[str, str]:
-        """Resolve factor names to factor IDs (latest version)."""
+        """Resolve factor names to factor IDs (latest version) in a single query."""
+        if not factor_names:
+            return {}
         conn = get_connection()
+        placeholders = ",".join("?" for _ in factor_names)
+        rows = conn.execute(
+            f"""SELECT name, id, version FROM factors
+                WHERE name IN ({placeholders})
+                ORDER BY version DESC""",
+            factor_names,
+        ).fetchall()
         result: dict[str, str] = {}
-        for name in factor_names:
-            row = conn.execute(
-                """SELECT id FROM factors
-                   WHERE name = ?
-                   ORDER BY version DESC
-                   LIMIT 1""",
-                [name],
-            ).fetchone()
-            if row:
-                result[name] = row[0]
+        for name, fid, _version in rows:
+            if name not in result:
+                result[name] = fid
         return result
 
     @staticmethod

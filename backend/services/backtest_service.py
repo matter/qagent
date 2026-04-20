@@ -105,26 +105,32 @@ class BacktestService:
         if prices_close.empty:
             raise ValueError("No price data available for the given tickers and date range")
 
-        # ---- 5. Compute required factors ----
+        # ---- 5. Bulk-load required factors ----
         required_factors = strategy_def.get("required_factors", [])
         factor_data: dict[str, pd.DataFrame] = {}
 
         if required_factors:
-            # We need to resolve factor IDs from names
             factor_id_map = self._resolve_factor_ids(required_factors)
+            all_factor_ids = list(factor_id_map.values())
+            cached_by_id = self._factor_engine.load_cached_factors_bulk(
+                all_factor_ids, tickers, start_str, end_str
+            )
             for factor_name, factor_id in factor_id_map.items():
-                try:
-                    df = self._factor_engine.compute_factor(
-                        factor_id, tickers, start_str, end_str
-                    )
-                    if not df.empty:
-                        factor_data[factor_name] = df
-                except Exception as exc:
-                    log.warning(
-                        "backtest_service.factor_failed",
-                        factor_name=factor_name,
-                        error=str(exc),
-                    )
+                if factor_id in cached_by_id and not cached_by_id[factor_id].empty:
+                    factor_data[factor_name] = cached_by_id[factor_id]
+                else:
+                    try:
+                        df = self._factor_engine.compute_factor(
+                            factor_id, tickers, start_str, end_str
+                        )
+                        if not df.empty:
+                            factor_data[factor_name] = df
+                    except Exception as exc:
+                        log.warning(
+                            "backtest_service.factor_failed",
+                            factor_name=factor_name,
+                            error=str(exc),
+                        )
 
         # ---- 6. Build signals for each trading day ----
         required_models = strategy_def.get("required_models", [])
@@ -162,6 +168,7 @@ class BacktestService:
 
         prev_weights = None
         rebalance_diagnostics: list[dict] = []
+        signal_errors: list[dict] = []
         # Portfolio state tracking for StrategyContext
         port_weights: dict[str, float] = {}     # current weight per ticker
         port_holding_days: dict[str, int] = {}   # consecutive days held
@@ -217,6 +224,10 @@ class BacktestService:
                     date=date_key,
                     error=str(exc),
                 )
+                signal_errors.append({
+                    "date": date_key,
+                    "error": str(exc)[:200],
+                })
                 # Carry forward previous weights
                 if prev_weights is not None:
                     all_weights.loc[trade_ts] = prev_weights
@@ -276,7 +287,18 @@ class BacktestService:
             # Update weights for all held tickers
             port_weights = {t: w for t, w in weights.items() if w > 1e-8}
 
-        # ---- 7. Run BacktestEngine ----
+        # ---- 7. Check for pervasive signal errors ----
+        num_rebalance = len(rebalance_dates)
+        if signal_errors and num_rebalance > 0:
+            error_ratio = len(signal_errors) / num_rebalance
+            if error_ratio > 0.5:
+                raise ValueError(
+                    f"Signal generation failed on {len(signal_errors)}/{num_rebalance} "
+                    f"rebalance days ({error_ratio:.0%}). "
+                    f"First error ({signal_errors[0]['date']}): {signal_errors[0]['error']}"
+                )
+
+        # ---- 8. Run BacktestEngine ----
         result = self._backtest_engine.run(all_weights, bt_config)
 
         # ---- 8. Determine result_level ----
@@ -300,6 +322,9 @@ class BacktestService:
         result_dict["strategy_name"] = strategy_def["name"]
         result_dict["result_level"] = result_level
         result_dict["universe_group_id"] = universe_group_id
+        if signal_errors:
+            result_dict["signal_error_count"] = len(signal_errors)
+            result_dict["signal_error_samples"] = signal_errors[:5]
         if rebalance_diagnostics:
             result_dict["rebalance_diagnostics"] = rebalance_diagnostics
             # Persist diagnostics into stored summary
@@ -639,8 +664,8 @@ class BacktestService:
                 model_instance = self._model_service.load_model(model_id)
                 fs_id = record["feature_set_id"]
 
-                # Compute features for full date range (one DB + factor pass)
-                feature_data = self._model_service._feature_service.compute_features(
+                # Compute features for full date range (use bulk cache path)
+                feature_data = self._model_service._feature_service.compute_features_from_cache(
                     fs_id, tickers, start_date, end_date
                 )
 
@@ -735,27 +760,24 @@ class BacktestService:
         return X
 
     def _resolve_factor_ids(self, factor_names: list[str]) -> dict[str, str]:
-        """Resolve factor names to factor IDs.
-
-        Returns dict mapping factor_name -> factor_id.
-        Looks up the latest version of each factor by name.
-        """
+        """Resolve factor names to factor IDs (latest version) in a single query."""
+        if not factor_names:
+            return {}
         conn = get_connection()
+        placeholders = ",".join("?" for _ in factor_names)
+        rows = conn.execute(
+            f"""SELECT name, id, version FROM factors
+                WHERE name IN ({placeholders})
+                ORDER BY version DESC""",
+            factor_names,
+        ).fetchall()
         result: dict[str, str] = {}
-
+        for name, fid, _version in rows:
+            if name not in result:
+                result[name] = fid
         for name in factor_names:
-            row = conn.execute(
-                """SELECT id FROM factors
-                   WHERE name = ?
-                   ORDER BY version DESC
-                   LIMIT 1""",
-                [name],
-            ).fetchone()
-            if row:
-                result[name] = row[0]
-            else:
+            if name not in result:
                 log.warning("backtest_service.factor_not_found", name=name)
-
         return result
 
     @staticmethod
@@ -1061,32 +1083,30 @@ def _compute_stock_pnl(trades: list[dict]) -> list[dict]:
                     buy_price = buy_position["price"]
                     buy_cost = buy_position["cost"]
 
-                    # Determine how many shares to match from this buy
                     matched_shares = min(shares_to_sell, buy_shares)
 
-                    # Calculate P&L for this matched portion
-                    # Allocate costs proportionally
-                    buy_cost_portion = (matched_shares / shares) * cost if shares > 0 else 0
-                    sell_cost_portion = (matched_shares / buy_shares) * buy_cost if buy_shares > 0 else 0
+                    # Prorate costs: sell cost by fraction of sell, buy cost by fraction of buy lot
+                    sell_cost_for_match = (matched_shares / shares) * cost if shares > 0 else 0
+                    buy_cost_for_match = (matched_shares / buy_shares) * buy_cost if buy_shares > 0 else 0
 
                     pnl = (price - buy_price) * matched_shares
-                    pnl -= (buy_cost_portion + sell_cost_portion)
+                    pnl -= (sell_cost_for_match + buy_cost_for_match)
 
                     realized_pnl += pnl
-                    sell_cost_allocated += buy_cost_portion
+                    sell_cost_allocated += sell_cost_for_match
 
-                    # Track win/loss per round-trip
                     if pnl > 0:
                         win_count += 1
                     elif pnl < 0:
                         loss_count += 1
 
-                    # Update remaining shares
+                    # Update remaining shares and cost
                     shares_to_sell -= matched_shares
                     buy_position["shares"] -= matched_shares
+                    buy_position["cost"] -= buy_cost_for_match
 
                     # Remove buy position if fully consumed
-                    if buy_position["shares"] <= 0:
+                    if buy_position["shares"] <= 1e-8:
                         open_buys.pop(0)
 
         pnl_pct = (realized_pnl / total_buy_value * 100) if total_buy_value > 0 else 0.0

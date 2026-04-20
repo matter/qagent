@@ -353,11 +353,29 @@ class ModelService:
         log.info("model.deleted", model_id=model_id)
 
     def load_model(self, model_id: str) -> ModelBase:
-        """Load a trained model from disk."""
+        """Load a trained model from disk. Backfills task_type if missing."""
         model_path = settings.models_dir / model_id / "model.joblib"
         if not model_path.exists():
             raise ValueError(f"Model file not found for {model_id}")
-        return joblib.load(str(model_path))
+        model_instance = joblib.load(str(model_path))
+
+        # Backfill task_type for old models missing it
+        try:
+            record = self.get_model(model_id)
+            if not record.get("task_type"):
+                task = _infer_task_from_model(model_instance)
+                eval_metrics = record.get("eval_metrics") or {}
+                eval_metrics["task_type"] = task
+                conn = get_connection()
+                conn.execute(
+                    "UPDATE models SET eval_metrics = ? WHERE id = ?",
+                    [json.dumps(eval_metrics, default=str), model_id],
+                )
+                log.info("model.backfill_task_type", model_id=model_id, task_type=task)
+        except Exception:
+            pass
+
+        return model_instance
 
     def predict(
         self,
@@ -456,7 +474,8 @@ class ModelService:
             raw_score = prob_series.copy()
             if hasattr(model_instance, "predict_raw"):
                 try:
-                    raw_score = model_instance.predict_raw(X)
+                    raw_series = model_instance.predict_raw(X)
+                    raw_score = raw_series.values if isinstance(raw_series, pd.Series) else raw_series
                 except Exception:
                     pass
 

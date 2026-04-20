@@ -17,7 +17,7 @@ log = get_logger(__name__)
 
 # Default timeout in seconds if none specified.
 DEFAULT_TIMEOUT = 300
-MAX_WORKERS = 4
+MAX_WORKERS = 6
 
 
 class TaskExecutor:

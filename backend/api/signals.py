@@ -109,18 +109,49 @@ async def generate_signals(body: GenerateSignalsRequest) -> dict:
 
 @router.post("/diagnose")
 async def diagnose_signals(body: DiagnoseSignalsRequest) -> dict:
-    """Lightweight signal diagnosis: returns model scores, factor snapshots,
+    """Async signal diagnosis: returns model scores, factor snapshots,
     candidate pool, final signals, and eliminated tickers without DB persistence."""
     svc = _get_service()
-    try:
+    executor = _get_executor()
+
+    def _do_diagnose(
+        strategy_id: str,
+        target_date: str,
+        universe_group_id: str,
+        max_tickers: int,
+    ) -> dict:
         return svc.diagnose_signals(
-            strategy_id=body.strategy_id,
-            target_date=body.target_date,
-            universe_group_id=body.universe_group_id,
-            max_tickers=body.max_tickers,
+            strategy_id=strategy_id,
+            target_date=target_date,
+            universe_group_id=universe_group_id,
+            max_tickers=max_tickers,
         )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+
+    task_id = executor.submit(
+        task_type="signal_diagnose",
+        fn=_do_diagnose,
+        params={
+            "strategy_id": body.strategy_id,
+            "target_date": body.target_date,
+            "universe_group_id": body.universe_group_id,
+            "max_tickers": body.max_tickers,
+        },
+        timeout=3600,
+        source=TaskSource.UI,
+    )
+
+    log.info(
+        "api.signals.diagnose_triggered",
+        task_id=task_id,
+        strategy_id=body.strategy_id,
+        target_date=body.target_date,
+    )
+    return {
+        "task_id": task_id,
+        "status": "queued",
+        "strategy_id": body.strategy_id,
+        "target_date": body.target_date,
+    }
 
 
 @router.get("")

@@ -197,14 +197,14 @@ function SessionTable({
           const status = await getTaskStatus(task_id);
           if (status.status === "completed") {
             clearInterval(pollInterval);
-            const result = status.result_summary || {};
-            if (result.days_processed > 0) {
+            const result = (status.result_summary || {}) as Record<string, unknown>;
+            if ((result.days_processed as number) > 0) {
               const msg = result.message
-                ? result.message
+                ? String(result.message)
                 : `推进了 ${result.days_processed} 个交易日，${result.new_trades ?? 0} 笔交易`;
               messageApi.success(msg);
             } else {
-              messageApi.info(result.message ?? "已是最新");
+              messageApi.info(String(result.message ?? "已是最新"));
             }
             onRefresh();
             setAdvancing(null);
@@ -460,17 +460,26 @@ function SessionDetail({
   const fetchSignals = useCallback(async () => {
     setSignalsLoading(true);
     try {
-      const { task_id } = await getPaperLatestSignals(sessionId);
+      const resp = await getPaperLatestSignals(sessionId);
+
+      // Cached result returned directly (has action_plan, no task_id)
+      if ("action_plan" in resp) {
+        setActionPlan(resp.action_plan || []);
+        setSignalTargetDate(resp.target_date || null);
+        setSignalsLoading(false);
+        return;
+      }
 
       // Poll task status
+      const { task_id } = resp;
       const pollInterval = setInterval(async () => {
         try {
           const status = await getTaskStatus(task_id);
           if (status.status === "completed") {
             clearInterval(pollInterval);
-            const result = status.result_summary || {};
-            setActionPlan(result.action_plan || []);
-            setSignalTargetDate(result.target_date || null);
+            const result = (status.result_summary || {}) as Record<string, unknown>;
+            setActionPlan((result.action_plan || []) as PaperActionPlan[]);
+            setSignalTargetDate((result.target_date as string) || null);
             setSignalsLoading(false);
           } else if (status.status === "failed") {
             clearInterval(pollInterval);

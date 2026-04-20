@@ -219,6 +219,7 @@ export interface TaskStatus {
   status: string;
   params: Record<string, unknown> | null;
   result: Record<string, unknown> | null;
+  result_summary: Record<string, unknown> | null;
   error: string | null;
   created_at: string | null;
   started_at: string | null;
@@ -812,7 +813,7 @@ export interface PaperSignalsResult {
   error?: string;
 }
 
-export async function getPaperLatestSignals(sessionId: string): Promise<{ task_id: string; status: string }> {
+export async function getPaperLatestSignals(sessionId: string): Promise<PaperSignalsResult | { task_id: string; status: string }> {
   const { data } = await client.get(`/paper-trading/sessions/${sessionId}/signals`);
   return data;
 }

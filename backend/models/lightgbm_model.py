@@ -89,6 +89,9 @@ class LightGBMModel(ModelBase):
     def predict_raw(self, X: pd.DataFrame) -> pd.Series:
         """Return raw leaf/margin values before sigmoid transform."""
         raw = self._model.predict(X, raw_score=True)
+        import numpy as np
+        if isinstance(raw, np.ndarray) and raw.ndim == 2:
+            raw = raw[:, 1] if raw.shape[1] > 1 else raw[:, 0]
         return pd.Series(raw, index=X.index, name="raw_score")
 
     @property

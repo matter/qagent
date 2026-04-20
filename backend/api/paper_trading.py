@@ -149,14 +149,19 @@ async def get_summary(session_id: str) -> dict:
 @router.get("/paper-trading/sessions/{session_id}/signals")
 async def get_latest_signals(session_id: str) -> dict:
     try:
+        svc = _get_svc()
+        # Return cached result immediately if available
+        cached = svc.get_cached_signals(session_id)
+        if cached:
+            return cached
+
         # Submit as async task with extended timeout for large universes
         executor = _get_executor()
-        svc = _get_svc()
         task_id = executor.submit(
             task_type="paper_trading_signals",
             fn=svc.get_latest_signals,
             params={"session_id": session_id},
-            timeout=900,  # 15 minutes for large universes with many models
+            timeout=900,
         )
         return {"task_id": task_id, "status": "running"}
     except ValueError as e:
