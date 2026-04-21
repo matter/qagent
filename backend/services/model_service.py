@@ -335,6 +335,26 @@ class ModelService:
                 if "feature_names" in metadata:
                     row["feature_names"] = metadata["feature_names"]
 
+        # Lazy backfill task_type for old models
+        if not row.get("task_type"):
+            model_path = settings.models_dir / model_id / "model.joblib"
+            if model_path.exists():
+                try:
+                    model_instance = joblib.load(str(model_path))
+                    task = _infer_task_from_model(model_instance)
+                    eval_metrics = row.get("eval_metrics") or {}
+                    eval_metrics["task_type"] = task
+                    conn = get_connection()
+                    conn.execute(
+                        "UPDATE models SET eval_metrics = ? WHERE id = ?",
+                        [json.dumps(eval_metrics, default=str), model_id],
+                    )
+                    row["task_type"] = task
+                    row["eval_metrics"] = eval_metrics
+                    log.info("model.backfill_task_type", model_id=model_id, task_type=task)
+                except Exception:
+                    pass
+
         return row
 
     def delete_model(self, model_id: str) -> None:

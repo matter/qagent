@@ -274,6 +274,7 @@ class SignalService:
         target_date: str,
         universe_group_id: str,
         max_tickers: int = 0,
+        focus_tickers: list[str] | None = None,
     ) -> dict:
         """Lightweight signal diagnosis for a given date.
 
@@ -283,6 +284,10 @@ class SignalService:
           candidate pool, final signals, and elimination reasons.
 
         Args:
+            max_tickers: If > 0, randomly sample the universe to this size.
+            focus_tickers: If provided, always include these tickers in the
+                universe (even when sampling) and append a per-ticker
+                diagnostic snapshot to the result.
             max_tickers: If > 0, randomly sample the universe to this size
                 to keep computation fast on large pools.
         """
@@ -299,8 +304,18 @@ class SignalService:
         sampled = False
         if max_tickers > 0 and len(tickers) > max_tickers:
             import random
-            tickers = sorted(random.sample(tickers, max_tickers))
+            sample_set = set(random.sample(tickers, max_tickers))
+            # Always include focus_tickers in the universe
+            if focus_tickers:
+                sample_set.update(t for t in focus_tickers if t in set(tickers))
+            tickers = sorted(sample_set)
             sampled = True
+        elif focus_tickers:
+            # Ensure focus_tickers are in the universe even without sampling
+            ticker_set = set(tickers)
+            for t in focus_tickers:
+                if t not in ticker_set:
+                    focus_tickers = [ft for ft in focus_tickers if ft in ticker_set]
 
         # ---- 3. Load OHLCV data up to target_date ----
         conn = get_connection()
@@ -516,6 +531,78 @@ class SignalService:
                         rank = (preds < preds[ticker]).sum() / max(len(preds) - 1, 1)
                         snap.setdefault("quantiles", {})[ticker] = round(float(rank), 4)
 
+        # Build per-ticker focus snapshot for targeted diagnosis
+        focus_snapshot: list[dict] = []
+        if focus_tickers:
+            candidate_set = set(candidate_pool) if isinstance(candidate_pool, (list, set)) else set()
+            for ft in focus_tickers:
+                snap: dict = {"ticker": ft}
+
+                # Price availability
+                snap["has_price"] = ft in has_price
+
+                # Elimination reason
+                if ft in signal_tickers:
+                    snap["status"] = "in_signal"
+                elif ft not in has_price:
+                    snap["status"] = "no_price_data"
+                elif ft in no_model_coverage:
+                    snap["status"] = "no_model_coverage"
+                elif ft in candidate_set:
+                    snap["status"] = "in_candidate_but_filtered"
+                else:
+                    snap["status"] = "strategy_filtered"
+
+                # In candidate pool?
+                snap["in_candidate_pool"] = ft in candidate_set
+
+                # Signal weight if selected
+                for sig in signals_list:
+                    if sig["ticker"] == ft:
+                        snap["signal"] = sig
+                        break
+
+                # Model scores + percentile rank in full pool
+                snap["model_scores"] = {}
+                for mid, preds in model_predictions.items():
+                    if ft in preds.index:
+                        score = float(preds[ft])
+                        rank_pct = float((preds <= score).sum()) / max(len(preds), 1)
+                        snap["model_scores"][mid] = {
+                            "score": round(score, 6),
+                            "percentile": round(rank_pct, 4),
+                            "rank": int((preds > score).sum()) + 1,
+                            "total": len(preds),
+                        }
+                    else:
+                        snap["model_scores"][mid] = {"error": "no_coverage"}
+
+                # Factor values + cross-sectional rank
+                snap["factor_values"] = {}
+                for fname, df in factor_data.items():
+                    if trade_ts in df.index and ft in df.columns:
+                        val = df.loc[trade_ts, ft]
+                        if pd.notna(val):
+                            row_vals = df.loc[trade_ts].dropna()
+                            rank_pct = float((row_vals <= val).sum()) / max(len(row_vals), 1)
+                            snap["factor_values"][fname] = {
+                                "value": round(float(val), 6),
+                                "percentile": round(rank_pct, 4),
+                                "rank": int((row_vals > val).sum()) + 1,
+                                "total": len(row_vals),
+                            }
+                        else:
+                            snap["factor_values"][fname] = {"error": "nan"}
+                    else:
+                        snap["factor_values"][fname] = {"error": "no_data"}
+
+                # Gates detail from strategy diagnostics
+                per_ticker_gates = gates.get("per_ticker", {}) if isinstance(gates, dict) else {}
+                if ft in per_ticker_gates:
+                    snap["gates"] = per_ticker_gates[ft]
+
+                focus_snapshot.append(snap)
+
         return {
             "strategy_id": strategy_id,
             "strategy_name": strategy_def["name"],
@@ -538,6 +625,7 @@ class SignalService:
                 k: v for k, v in strategy_diagnostics.items()
                 if k not in ("candidate_pool", "gates")
             },
+            "focus_ticker_snapshots": focus_snapshot if focus_snapshot else None,
         }
 
 

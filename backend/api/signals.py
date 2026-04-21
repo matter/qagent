@@ -54,6 +54,7 @@ class DiagnoseSignalsRequest(BaseModel):
     target_date: str
     universe_group_id: str
     max_tickers: int = 0
+    focus_tickers: list[str] | None = None
 
 
 # ------------------------------------------------------------------
@@ -119,12 +120,14 @@ async def diagnose_signals(body: DiagnoseSignalsRequest) -> dict:
         target_date: str,
         universe_group_id: str,
         max_tickers: int,
+        focus_tickers: list[str] | None,
     ) -> dict:
         return svc.diagnose_signals(
             strategy_id=strategy_id,
             target_date=target_date,
             universe_group_id=universe_group_id,
             max_tickers=max_tickers,
+            focus_tickers=focus_tickers,
         )
 
     task_id = executor.submit(
@@ -135,6 +138,7 @@ async def diagnose_signals(body: DiagnoseSignalsRequest) -> dict:
             "target_date": body.target_date,
             "universe_group_id": body.universe_group_id,
             "max_tickers": body.max_tickers,
+            "focus_tickers": body.focus_tickers,
         },
         timeout=3600,
         source=TaskSource.UI,
