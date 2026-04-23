@@ -18,7 +18,7 @@ log = get_logger(__name__)
 # Regression types  → model trains with LGBMRegressor
 # Classification types → model trains with LGBMClassifier
 
-_REGRESSION_TARGET_TYPES = {"return", "rank", "excess_return", "path_return"}
+_REGRESSION_TARGET_TYPES = {"return", "rank", "excess_return", "path_return", "composite"}
 _CLASSIFICATION_TARGET_TYPES = {"binary", "top_quantile", "bottom_quantile", "large_move", "excess_binary", "path_quality"}
 
 _VALID_TARGET_TYPES = _REGRESSION_TARGET_TYPES | _CLASSIFICATION_TARGET_TYPES
@@ -469,6 +469,10 @@ class LabelService:
         benchmark = label.get("benchmark")
         config = label.get("config") or {}
 
+        # ---- Composite label: combine multiple sub-labels ----
+        if target_type == "composite":
+            return self._compute_composite_label(config, tickers, start_date, end_date)
+
         conn = get_connection()
 
         # Build query for daily bars
@@ -486,10 +490,17 @@ class LabelService:
             params.append(data_end)
 
         where_clause = " AND ".join(where_parts)
-        bars_df = conn.execute(
-            f"SELECT ticker, date, close FROM daily_bars WHERE {where_clause} ORDER BY ticker, date",
-            params,
-        ).fetchdf()
+        # For path-aware types, load OHLC; otherwise only close
+        if target_type in ("path_return", "path_quality"):
+            bars_df = conn.execute(
+                f"SELECT ticker, date, open, high, low, close FROM daily_bars WHERE {where_clause} ORDER BY ticker, date",
+                params,
+            ).fetchdf()
+        else:
+            bars_df = conn.execute(
+                f"SELECT ticker, date, close FROM daily_bars WHERE {where_clause} ORDER BY ticker, date",
+                params,
+            ).fetchdf()
 
         if bars_df.empty:
             return pd.DataFrame(columns=["ticker", "date", "label_value"])
@@ -592,21 +603,31 @@ class LabelService:
             )
 
             if target_type == "path_return":
-                # Penalized forward return:
-                # label = fwd_return - dd_penalty * max_drawdown - shock_penalty * shock_ratio
-                dd_pen = config.get("drawdown_penalty", 1.0)
-                shock_pen = config.get("shock_penalty", 0.5)
-                combined["label_value"] = (
-                    combined["fwd_return"]
-                    - dd_pen * combined["max_drawdown"]
-                    - shock_pen * combined["shock_ratio"]
-                )
+                # Penalized forward return via generic penalties map:
+                # label = fwd_return - sum(penalty_i * stat_i)
+                # Legacy keys drawdown_penalty/shock_penalty still supported
+                penalties = config.get("penalties", {})
+                if not penalties:
+                    # Fallback to legacy config keys
+                    dd_pen = config.get("drawdown_penalty", 0.0)
+                    shock_pen = config.get("shock_penalty", 0.0)
+                    if dd_pen:
+                        penalties["max_drawdown"] = dd_pen
+                    if shock_pen:
+                        penalties["shock_ratio"] = shock_pen
+                label_val = combined["fwd_return"].copy()
+                for stat_name, penalty in penalties.items():
+                    if stat_name in combined.columns and penalty != 0:
+                        label_val = label_val - penalty * combined[stat_name]
+                combined["label_value"] = label_val
             else:  # path_quality
-                # Binary: 1 if return >= min, DD <= max, shock <= max
+                # Binary: 1 if all constraints are met
                 min_ret = config.get("min_return", 0.05)
                 max_dd = config.get("max_drawdown", 0.10)
                 max_shock = config.get("max_shock_ratio", 0.3)
                 max_single = config.get("max_single_day_return")
+                max_gap = config.get("max_gap_dependency")
+                min_cl = config.get("min_close_location")
                 quality = (
                     (combined["fwd_return"] >= min_ret)
                     & (combined["max_drawdown"] <= max_dd)
@@ -614,6 +635,10 @@ class LabelService:
                 )
                 if max_single is not None:
                     quality = quality & (combined["max_single_day"] <= max_single)
+                if max_gap is not None:
+                    quality = quality & (combined["gap_dependency"] <= max_gap)
+                if min_cl is not None:
+                    quality = quality & (combined["close_location"] >= min_cl)
                 combined["label_value"] = quality.astype(float)
                 combined.loc[combined["fwd_return"].isna(), "label_value"] = np.nan
 
@@ -683,24 +708,30 @@ class LabelService:
     ) -> pd.DataFrame:
         """Compute future-path statistics for each (ticker, date).
 
+        Expects bars_df with columns: ticker, date, open, high, low, close.
+
         For each observation day, look at the next ``horizon`` trading days
         and compute:
         - ``fwd_return``: endpoint return (close[t+h] / close[t] - 1)
         - ``max_drawdown``: worst peak-to-trough in the forward window
         - ``max_single_day``: largest absolute single-day return
         - ``shock_ratio``: fraction of days with |daily_return| > 2 std of window
-        - ``gap_dependency``: fraction of total return contributed by gap moves
+        - ``gap_dependency``: abs sum of overnight gaps / abs total return
         - ``close_location``: mean of (close - low) / (high - low) in window
 
         Returns a DataFrame with columns:
             ticker, date, fwd_return, max_drawdown, max_single_day,
             shock_ratio, gap_dependency, close_location
         """
+        has_ohlc = all(c in bars_df.columns for c in ("open", "high", "low"))
         records = []
         for ticker, grp in bars_df.groupby("ticker"):
             grp = grp.sort_values("date").reset_index(drop=True)
             closes = grp["close"].values
             dates = grp["date"].values
+            opens = grp["open"].values if has_ohlc else None
+            highs = grp["high"].values if has_ohlc else None
+            lows = grp["low"].values if has_ohlc else None
             n = len(closes)
 
             for i in range(n - horizon):
@@ -734,19 +765,34 @@ class LabelService:
                 else:
                     shock_ratio = 0.0
 
-                # Gap dependency: fraction of total move from overnight gaps
-                # gap = open[t+1] - close[t], approximated as portion not from intraday
-                total_move = abs(window[-1] - entry_price)
-                if total_move > 1e-10 and len(daily_rets) > 0:
-                    # Approximate gap as close-to-close vs intraday-only
-                    # Simple approach: biggest single-day contribution / total return
-                    gap_dep = max_single / (abs(fwd_return) + 1e-10) if abs(fwd_return) > 1e-10 else 0.0
-                    gap_dep = min(gap_dep, 1.0)
+                # Gap dependency: overnight gap contribution
+                if has_ohlc and abs(fwd_return) > 1e-10:
+                    # gap[j] = open[i+j+1] - close[i+j] for j in 0..horizon-1
+                    gap_sum = 0.0
+                    for j in range(horizon):
+                        idx = i + j
+                        if idx + 1 < n:
+                            gap_sum += abs(opens[idx + 1] - closes[idx])
+                    total_abs_move = abs(window[-1] - entry_price)
+                    gap_dep = min(gap_sum / (total_abs_move + 1e-10), 1.0) if total_abs_move > 1e-10 else 0.0
                 else:
                     gap_dep = 0.0
 
-                # Close location: not available without high/low, default to 0.5
-                close_loc = 0.5
+                # Close location: mean of (close - low) / (high - low)
+                if has_ohlc:
+                    cl_vals = []
+                    for j in range(1, horizon + 1):
+                        idx = i + j
+                        if idx < n:
+                            h = highs[idx]
+                            l = lows[idx]
+                            c = closes[idx]
+                            rng = h - l
+                            if rng > 1e-10:
+                                cl_vals.append((c - l) / rng)
+                    close_loc = float(np.mean(cl_vals)) if cl_vals else 0.5
+                else:
+                    close_loc = 0.5
 
                 records.append({
                     "ticker": ticker,
@@ -766,6 +812,65 @@ class LabelService:
             ])
 
         return pd.DataFrame(records)
+
+    def _compute_composite_label(
+        self,
+        config: dict,
+        tickers: list[str],
+        start_date: str | None,
+        end_date: str | None,
+    ) -> pd.DataFrame:
+        """Compute a composite label as weighted sum of sub-labels.
+
+        Config format::
+
+            {
+                "components": [
+                    {"label_id": "preset_fwd_rank_10d", "weight": 0.6},
+                    {"label_id": "preset_fwd_rank_20d", "weight": 0.4},
+                ],
+                "normalize": true   // optional, rank-normalize final value
+            }
+        """
+        components = config.get("components", [])
+        if not components:
+            raise ValueError("composite label requires 'components' in config")
+
+        merged: pd.DataFrame | None = None
+
+        for i, comp in enumerate(components):
+            sub_label_id = comp.get("label_id")
+            weight = comp.get("weight", 1.0)
+            if not sub_label_id:
+                raise ValueError(f"component {i} missing 'label_id'")
+
+            sub_df = self.compute_label_values(
+                sub_label_id, tickers, start_date, end_date
+            )
+            if sub_df.empty:
+                continue
+
+            sub_df = sub_df.rename(columns={"label_value": f"sub_{i}"})
+            sub_df[f"sub_{i}"] = sub_df[f"sub_{i}"] * weight
+
+            if merged is None:
+                merged = sub_df
+            else:
+                merged = merged.merge(sub_df, on=["ticker", "date"], how="outer")
+
+        if merged is None or merged.empty:
+            return pd.DataFrame(columns=["ticker", "date", "label_value"])
+
+        # Sum all weighted sub-labels
+        sub_cols = [c for c in merged.columns if c.startswith("sub_")]
+        merged["label_value"] = merged[sub_cols].sum(axis=1, min_count=1)
+        merged.drop(columns=sub_cols, inplace=True)
+
+        # Optional rank normalization
+        if config.get("normalize"):
+            merged["label_value"] = merged.groupby("date")["label_value"].rank(pct=True)
+
+        return merged
 
     @staticmethod
     def _validate_config(target_type: str, config: dict | None) -> None:
@@ -790,6 +895,12 @@ class LabelService:
                 max_dd = config.get("max_drawdown")
                 if max_dd is not None and max_dd <= 0:
                     raise ValueError("max_drawdown must be positive")
+        elif target_type == "composite":
+            if not config or not config.get("components"):
+                raise ValueError("composite label requires 'components' list in config")
+            for i, comp in enumerate(config["components"]):
+                if not comp.get("label_id"):
+                    raise ValueError(f"component {i} missing 'label_id'")
 
     def _fetch_row(self, label_id: str) -> dict | None:
         conn = get_connection()
