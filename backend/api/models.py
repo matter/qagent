@@ -47,6 +47,7 @@ class TrainModelRequest(BaseModel):
     model_params: Optional[dict[str, Any]] = None
     train_config: Optional[dict[str, Any]] = None
     universe_group_id: str
+    sample_weight_config: Optional[dict[str, Any]] = None
 
 
 class PredictRequest(BaseModel):
@@ -97,6 +98,7 @@ async def train_model(body: TrainModelRequest) -> dict:
         model_params: dict | None,
         train_config: dict | None,
         universe_group_id: str,
+        sample_weight_config: dict | None,
     ) -> dict:
         return svc.train_model(
             name=name,
@@ -106,6 +108,7 @@ async def train_model(body: TrainModelRequest) -> dict:
             model_params=model_params,
             train_config=train_config,
             universe_group_id=universe_group_id,
+            sample_weight_config=sample_weight_config,
         )
 
     task_id = executor.submit(
@@ -119,6 +122,7 @@ async def train_model(body: TrainModelRequest) -> dict:
             "model_params": body.model_params,
             "train_config": body.train_config,
             "universe_group_id": body.universe_group_id,
+            "sample_weight_config": body.sample_weight_config,
         },
         timeout=7200,  # 2 hours max
         source=TaskSource.UI,

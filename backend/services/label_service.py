@@ -18,8 +18,8 @@ log = get_logger(__name__)
 # Regression types  → model trains with LGBMRegressor
 # Classification types → model trains with LGBMClassifier
 
-_REGRESSION_TARGET_TYPES = {"return", "rank", "excess_return"}
-_CLASSIFICATION_TARGET_TYPES = {"binary", "top_quantile", "bottom_quantile", "large_move", "excess_binary"}
+_REGRESSION_TARGET_TYPES = {"return", "rank", "excess_return", "path_return"}
+_CLASSIFICATION_TARGET_TYPES = {"binary", "top_quantile", "bottom_quantile", "large_move", "excess_binary", "path_quality"}
 
 _VALID_TARGET_TYPES = _REGRESSION_TARGET_TYPES | _CLASSIFICATION_TARGET_TYPES
 
@@ -229,6 +229,57 @@ _PRESET_LABELS = [
         "horizon": 20,
         "benchmark": "SPY",
         "config": None,
+    },
+    # ---- Path-aware presets ----
+    {
+        "id": "preset_path_return_10d",
+        "name": "path_return_10d",
+        "description": "10-day forward return penalized by max drawdown and shock ratio",
+        "target_type": "path_return",
+        "horizon": 10,
+        "benchmark": None,
+        "config": {
+            "drawdown_penalty": 1.0,
+            "shock_penalty": 0.5,
+        },
+    },
+    {
+        "id": "preset_path_return_20d",
+        "name": "path_return_20d",
+        "description": "20-day forward return penalized by max drawdown and shock ratio",
+        "target_type": "path_return",
+        "horizon": 20,
+        "benchmark": None,
+        "config": {
+            "drawdown_penalty": 1.0,
+            "shock_penalty": 0.5,
+        },
+    },
+    {
+        "id": "preset_path_quality_10d",
+        "name": "path_quality_10d",
+        "description": "10-day path quality: up >5%, max DD <8%, shock ratio <0.3",
+        "target_type": "path_quality",
+        "horizon": 10,
+        "benchmark": None,
+        "config": {
+            "min_return": 0.05,
+            "max_drawdown": 0.08,
+            "max_shock_ratio": 0.3,
+        },
+    },
+    {
+        "id": "preset_path_quality_20d",
+        "name": "path_quality_20d",
+        "description": "20-day path quality: up >8%, max DD <12%, shock ratio <0.3",
+        "target_type": "path_quality",
+        "horizon": 20,
+        "benchmark": None,
+        "config": {
+            "min_return": 0.08,
+            "max_drawdown": 0.12,
+            "max_shock_ratio": 0.3,
+        },
     },
 ]
 
@@ -531,6 +582,50 @@ class LabelService:
             combined.loc[excess.isna(), "label_value"] = np.nan
             combined.drop(columns=["bench_return"], inplace=True)
 
+        elif target_type in ("path_return", "path_quality"):
+            # Compute future-path statistics from daily close data
+            path_stats = self._compute_path_stats(bars_df, horizon)
+            # path_stats: DataFrame[ticker, date, fwd_return, max_drawdown,
+            #   max_single_day, shock_ratio, gap_dependency, close_location]
+            combined = combined.merge(
+                path_stats, on=["ticker", "date"], how="left", suffixes=("", "_path"),
+            )
+
+            if target_type == "path_return":
+                # Penalized forward return:
+                # label = fwd_return - dd_penalty * max_drawdown - shock_penalty * shock_ratio
+                dd_pen = config.get("drawdown_penalty", 1.0)
+                shock_pen = config.get("shock_penalty", 0.5)
+                combined["label_value"] = (
+                    combined["fwd_return"]
+                    - dd_pen * combined["max_drawdown"]
+                    - shock_pen * combined["shock_ratio"]
+                )
+            else:  # path_quality
+                # Binary: 1 if return >= min, DD <= max, shock <= max
+                min_ret = config.get("min_return", 0.05)
+                max_dd = config.get("max_drawdown", 0.10)
+                max_shock = config.get("max_shock_ratio", 0.3)
+                max_single = config.get("max_single_day_return")
+                quality = (
+                    (combined["fwd_return"] >= min_ret)
+                    & (combined["max_drawdown"] <= max_dd)
+                    & (combined["shock_ratio"] <= max_shock)
+                )
+                if max_single is not None:
+                    quality = quality & (combined["max_single_day"] <= max_single)
+                combined["label_value"] = quality.astype(float)
+                combined.loc[combined["fwd_return"].isna(), "label_value"] = np.nan
+
+            # Drop intermediate path columns
+            for col in ["max_drawdown", "max_single_day", "shock_ratio",
+                        "gap_dependency", "close_location"]:
+                if col in combined.columns:
+                    combined.drop(columns=[col], inplace=True)
+            # Drop duplicate fwd_return_path if present
+            if "fwd_return_path" in combined.columns:
+                combined.drop(columns=["fwd_return_path"], inplace=True)
+
         else:
             raise ValueError(f"Unsupported target_type: {target_type}")
 
@@ -583,6 +678,96 @@ class LabelService:
         return dict(zip(bench_df["date"], bench_return))
 
     @staticmethod
+    def _compute_path_stats(
+        bars_df: pd.DataFrame, horizon: int,
+    ) -> pd.DataFrame:
+        """Compute future-path statistics for each (ticker, date).
+
+        For each observation day, look at the next ``horizon`` trading days
+        and compute:
+        - ``fwd_return``: endpoint return (close[t+h] / close[t] - 1)
+        - ``max_drawdown``: worst peak-to-trough in the forward window
+        - ``max_single_day``: largest absolute single-day return
+        - ``shock_ratio``: fraction of days with |daily_return| > 2 std of window
+        - ``gap_dependency``: fraction of total return contributed by gap moves
+        - ``close_location``: mean of (close - low) / (high - low) in window
+
+        Returns a DataFrame with columns:
+            ticker, date, fwd_return, max_drawdown, max_single_day,
+            shock_ratio, gap_dependency, close_location
+        """
+        records = []
+        for ticker, grp in bars_df.groupby("ticker"):
+            grp = grp.sort_values("date").reset_index(drop=True)
+            closes = grp["close"].values
+            dates = grp["date"].values
+            n = len(closes)
+
+            for i in range(n - horizon):
+                window = closes[i: i + horizon + 1]  # t to t+h inclusive
+                entry_price = window[0]
+                if entry_price == 0 or np.isnan(entry_price):
+                    continue
+
+                fwd_return = (window[-1] - entry_price) / entry_price
+
+                # Daily returns within the forward window
+                daily_rets = np.diff(window) / window[:-1]
+
+                # Max drawdown
+                cumulative = np.cumprod(1 + daily_rets)
+                running_max = np.maximum.accumulate(cumulative)
+                drawdowns = (running_max - cumulative) / running_max
+                max_dd = float(np.nanmax(drawdowns)) if len(drawdowns) > 0 else 0.0
+
+                # Max single-day absolute return
+                max_single = float(np.nanmax(np.abs(daily_rets))) if len(daily_rets) > 0 else 0.0
+
+                # Shock ratio: days with |ret| > 2*std
+                if len(daily_rets) > 1:
+                    std = np.nanstd(daily_rets)
+                    if std > 0:
+                        shock_days = np.sum(np.abs(daily_rets) > 2 * std)
+                        shock_ratio = float(shock_days) / len(daily_rets)
+                    else:
+                        shock_ratio = 0.0
+                else:
+                    shock_ratio = 0.0
+
+                # Gap dependency: fraction of total move from overnight gaps
+                # gap = open[t+1] - close[t], approximated as portion not from intraday
+                total_move = abs(window[-1] - entry_price)
+                if total_move > 1e-10 and len(daily_rets) > 0:
+                    # Approximate gap as close-to-close vs intraday-only
+                    # Simple approach: biggest single-day contribution / total return
+                    gap_dep = max_single / (abs(fwd_return) + 1e-10) if abs(fwd_return) > 1e-10 else 0.0
+                    gap_dep = min(gap_dep, 1.0)
+                else:
+                    gap_dep = 0.0
+
+                # Close location: not available without high/low, default to 0.5
+                close_loc = 0.5
+
+                records.append({
+                    "ticker": ticker,
+                    "date": dates[i],
+                    "fwd_return": fwd_return,
+                    "max_drawdown": max_dd,
+                    "max_single_day": max_single,
+                    "shock_ratio": shock_ratio,
+                    "gap_dependency": gap_dep,
+                    "close_location": close_loc,
+                })
+
+        if not records:
+            return pd.DataFrame(columns=[
+                "ticker", "date", "fwd_return", "max_drawdown",
+                "max_single_day", "shock_ratio", "gap_dependency", "close_location",
+            ])
+
+        return pd.DataFrame(records)
+
+    @staticmethod
     def _validate_config(target_type: str, config: dict | None) -> None:
         """Validate config dict for target types that require extra parameters."""
         if target_type in ("top_quantile", "bottom_quantile"):
@@ -595,6 +780,16 @@ class LabelService:
                 t = config.get("threshold")
                 if t is not None and t <= 0:
                     raise ValueError("threshold must be positive")
+        elif target_type == "path_return":
+            if config:
+                dd = config.get("drawdown_penalty")
+                if dd is not None and dd < 0:
+                    raise ValueError("drawdown_penalty must be >= 0")
+        elif target_type == "path_quality":
+            if config:
+                max_dd = config.get("max_drawdown")
+                if max_dd is not None and max_dd <= 0:
+                    raise ValueError("max_drawdown must be positive")
 
     def _fetch_row(self, label_id: str) -> dict | None:
         conn = get_connection()

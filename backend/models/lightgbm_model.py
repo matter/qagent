@@ -73,6 +73,10 @@ class LightGBMModel(ModelBase):
                 _log_evaluation_callback(100),
             ]
 
+        # Pass sample_weight if provided
+        if "sample_weight" in kwargs:
+            fit_kwargs["sample_weight"] = kwargs["sample_weight"]
+
         self._model.fit(X, y, **fit_kwargs)
         return self
 

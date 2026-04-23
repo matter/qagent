@@ -79,6 +79,7 @@ class ModelService:
         model_params: dict[str, Any] | None = None,
         train_config: dict[str, Any] | None = None,
         universe_group_id: str | None = None,
+        sample_weight_config: dict[str, Any] | None = None,
     ) -> dict:
         """End-to-end model training pipeline.
 
@@ -207,6 +208,17 @@ class ModelService:
         if len(X_valid) > 0:
             fit_kwargs["eval_set"] = [(X_valid, y_valid)]
 
+        # ---- 6a. Build sample weights if configured ----
+        if sample_weight_config:
+            weights = self._build_sample_weights(X_train, y_train, sample_weight_config, feature_data)
+            if weights is not None:
+                fit_kwargs["sample_weight"] = weights
+                log.info("model.train.sample_weights",
+                         weight_mean=round(float(weights.mean()), 4),
+                         weight_std=round(float(weights.std()), 4),
+                         weight_min=round(float(weights.min()), 4),
+                         weight_max=round(float(weights.max()), 4))
+
         model_instance.fit(X_train, y_train, **fit_kwargs)
 
         # ---- 7. Predict on valid and test sets ----
@@ -271,6 +283,7 @@ class ModelService:
             "eval_metrics": eval_metrics,
             "feature_names": trained_features,
             "universe_group_id": universe_group_id,
+            "sample_weight_config": sample_weight_config,
             "created_at": datetime.utcnow().isoformat(),
         }
         with open(model_dir / "metadata.json", "w") as f:
@@ -723,6 +736,90 @@ class ModelService:
         y = y.loc[mask]
 
         return X, y
+
+    @staticmethod
+    def _build_sample_weights(
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        config: dict[str, Any],
+        feature_data: dict[str, pd.DataFrame],
+    ) -> np.ndarray | None:
+        """Build a sample weight vector from config.
+
+        Supported config keys:
+        - ``label_quantile_boost``: dict with ``quantile`` (0-1, top fraction to boost),
+          ``weight`` (multiplier for those samples, default 3.0)
+        - ``recency_half_life``: int, number of trading days for exponential decay.
+          Recent samples get higher weight.
+        - ``factor_boost``: dict with ``factor`` (factor name present in feature_data),
+          ``threshold`` (value above which to boost), ``weight`` (multiplier).
+          Useful for boosting breakout / near-52w-high / orderly-path samples.
+
+        Multiple keys can coexist; weights are multiplied together.
+        """
+        n = len(X_train)
+        if n == 0:
+            return None
+
+        weights = np.ones(n, dtype=np.float64)
+
+        # --- label_quantile_boost: boost top-quantile label samples ---
+        lqb = config.get("label_quantile_boost")
+        if lqb:
+            q = lqb.get("quantile", 0.2)
+            w = lqb.get("weight", 3.0)
+            threshold = y_train.quantile(1 - q)
+            weights[y_train.values >= threshold] *= w
+
+        # --- recency_half_life: exponential time decay ---
+        half_life = config.get("recency_half_life")
+        if half_life and half_life > 0:
+            dates = X_train.index.get_level_values("date")
+            unique_dates = np.sort(dates.unique())
+            date_rank = pd.Series(np.arange(len(unique_dates)), index=unique_dates)
+            ranks = dates.map(date_rank).values.astype(float)
+            max_rank = ranks.max()
+            # decay: weight = 2^((rank - max_rank) / half_life)
+            decay = np.power(2.0, (ranks - max_rank) / half_life)
+            weights *= decay
+
+        # --- factor_boost: boost samples where a factor exceeds threshold ---
+        fb = config.get("factor_boost")
+        if fb:
+            factor_name = fb.get("factor")
+            threshold = fb.get("threshold", 0.0)
+            w = fb.get("weight", 3.0)
+            direction = fb.get("direction", "above")  # "above" or "below"
+            if factor_name and factor_name in X_train.columns:
+                vals = X_train[factor_name].values
+                if direction == "above":
+                    mask = vals >= threshold
+                else:
+                    mask = vals <= threshold
+                weights[mask] *= w
+
+        # --- factor_boosts: list of factor_boost configs ---
+        fbs = config.get("factor_boosts")
+        if fbs and isinstance(fbs, list):
+            for fb_item in fbs:
+                factor_name = fb_item.get("factor")
+                threshold = fb_item.get("threshold", 0.0)
+                w = fb_item.get("weight", 3.0)
+                direction = fb_item.get("direction", "above")
+                if factor_name and factor_name in X_train.columns:
+                    vals = X_train[factor_name].values
+                    if direction == "above":
+                        mask = vals >= threshold
+                    else:
+                        mask = vals <= threshold
+                    weights[mask] *= w
+
+        # Normalize so mean weight = 1.0 for stable gradient scale
+        mean_w = weights.mean()
+        if mean_w > 0:
+            weights /= mean_w
+
+        return weights
 
     @staticmethod
     def _build_X_for_date(
