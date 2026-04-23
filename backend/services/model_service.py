@@ -571,6 +571,79 @@ class ModelService:
         preds.name = "prediction"
         return preds
 
+    def predict_batch(
+        self,
+        model_id: str,
+        tickers: list[str],
+        dates: list[str],
+        feature_set_id: str | None = None,
+    ) -> dict[str, dict[str, float]]:
+        """Batch predictions across multiple dates in a single call.
+
+        Loads the model and features once for the full date range, then
+        builds X per date and predicts.  Much faster than calling
+        predict() in a loop for each date.
+
+        Returns:
+            dict[date_str -> dict[ticker -> prediction_value]]
+        """
+        record = self.get_model(model_id)
+        model_instance = self.load_model(model_id)
+        fs_id = feature_set_id or record["feature_set_id"]
+
+        if not tickers:
+            raise ValueError("tickers must be provided")
+        if not dates:
+            raise ValueError("dates must be provided")
+
+        sorted_dates = sorted(dates)
+        start_date = sorted_dates[0]
+        end_date = sorted_dates[-1]
+
+        # Single bulk feature load for the entire date range
+        feature_data = self._feature_service.compute_features_from_cache(
+            fs_id, tickers, start_date, end_date
+        )
+
+        frozen = self._load_frozen_features(model_id)
+        task = record.get("task_type") or _infer_task_from_model(model_instance)
+
+        results: dict[str, dict[str, float]] = {}
+        for date in sorted_dates:
+            X = self._build_X_for_date(feature_data, tickers, date)
+            if X.empty:
+                results[date] = {}
+                continue
+
+            if frozen:
+                try:
+                    X = self._align_features_to_frozen(X, frozen, model_id)
+                except ValueError:
+                    results[date] = {}
+                    continue
+
+            if task == "classification" and hasattr(model_instance, "predict_proba"):
+                proba = model_instance.predict_proba(X)
+                preds = pd.Series(
+                    proba[:, 1] if proba.shape[1] > 1 else proba[:, 0],
+                    index=X.index,
+                )
+            else:
+                preds = model_instance.predict(X)
+
+            preds.index = (
+                X.index.get_level_values("ticker")
+                if "ticker" in X.index.names
+                else X.index
+            )
+            preds = self._break_prediction_ties(preds)
+
+            results[date] = {
+                str(t): round(float(v), 6) for t, v in preds.items()
+            }
+
+        return results
+
     def _load_frozen_features(self, model_id: str) -> list[str] | None:
         """Load the feature name list frozen at training time from metadata.json."""
         metadata_path = settings.models_dir / model_id / "metadata.json"

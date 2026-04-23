@@ -55,6 +55,12 @@ class PredictRequest(BaseModel):
     feature_set_id: Optional[str] = None
 
 
+class PredictBatchRequest(BaseModel):
+    tickers: list[str]
+    dates: list[str]
+    feature_set_id: Optional[str] = None
+
+
 # ------------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------------
@@ -198,3 +204,32 @@ async def predict(model_id: str, body: PredictRequest) -> dict:
     except Exception as e:
         log.error("api.model.predict_error", model_id=model_id, error=str(e))
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
+
+
+@router.post("/models/{model_id}/predict-batch")
+async def predict_batch(model_id: str, body: PredictBatchRequest) -> dict:
+    """Batch predictions across multiple dates in a single call.
+
+    Loads the model and features once for the full date range, then
+    predicts per date.  Much faster than calling predict() per date.
+    """
+    svc = _get_service()
+    try:
+        results = svc.predict_batch(
+            model_id=model_id,
+            tickers=body.tickers,
+            dates=body.dates,
+            feature_set_id=body.feature_set_id,
+        )
+        total = sum(len(v) for v in results.values())
+        return {
+            "model_id": model_id,
+            "dates": body.dates,
+            "predictions": results,
+            "total_predictions": total,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        log.error("api.model.predict_batch_error", model_id=model_id, error=str(e))
+        raise HTTPException(status_code=500, detail=f"Batch prediction failed: {e}")
