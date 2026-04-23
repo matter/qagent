@@ -435,6 +435,11 @@ class ModelService:
         if X.empty:
             return pd.Series(dtype=float, name="prediction")
 
+        # Align to frozen training features
+        frozen = self._load_frozen_features(model_id)
+        if frozen:
+            X = self._align_features_to_frozen(X, frozen, model_id)
+
         # Check if this is a classification model
         task = record.get("task_type") or _infer_task_from_model(model_instance)
         if task == "classification" and hasattr(model_instance, "predict_proba"):
@@ -481,6 +486,11 @@ class ModelService:
         X = self._build_X_for_date(feature_data, tickers, date)
         if X.empty:
             return pd.DataFrame()
+
+        # Align to frozen training features
+        frozen = self._load_frozen_features(model_id)
+        if frozen:
+            X = self._align_features_to_frozen(X, frozen, model_id)
 
         ticker_idx = X.index.get_level_values("ticker") if "ticker" in X.index.names else X.index
         task = record.get("task_type") or _infer_task_from_model(model_instance)
@@ -541,6 +551,11 @@ class ModelService:
         if X.empty:
             return pd.Series(dtype=float, name="prediction")
 
+        # Align to frozen training features
+        frozen = self._load_frozen_features(model_id)
+        if frozen:
+            X = self._align_features_to_frozen(X, frozen, model_id)
+
         # Check if this is a classification model
         task = record.get("task_type") or _infer_task_from_model(model_instance)
         if task == "classification" and hasattr(model_instance, "predict_proba"):
@@ -555,6 +570,32 @@ class ModelService:
         preds = self._break_prediction_ties(preds)
         preds.name = "prediction"
         return preds
+
+    def _load_frozen_features(self, model_id: str) -> list[str] | None:
+        """Load the feature name list frozen at training time from metadata.json."""
+        metadata_path = settings.models_dir / model_id / "metadata.json"
+        if metadata_path.exists():
+            with open(metadata_path) as f:
+                metadata = json.load(f)
+                return metadata.get("feature_names")
+        return None
+
+    @staticmethod
+    def _align_features_to_frozen(
+        X: pd.DataFrame, frozen: list[str], model_id: str
+    ) -> pd.DataFrame:
+        """Reorder/filter X columns to match frozen training features.
+
+        Raises ValueError if any frozen feature is completely missing from X.
+        """
+        missing = [f for f in frozen if f not in X.columns]
+        if missing:
+            raise ValueError(
+                f"Model {model_id} was trained on {len(frozen)} features but "
+                f"{len(missing)} are missing from the current feature set: "
+                f"{missing[:10]}{'...' if len(missing) > 10 else ''}"
+            )
+        return X[frozen]
 
     # ------------------------------------------------------------------
     # Data building helpers

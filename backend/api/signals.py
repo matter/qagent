@@ -55,6 +55,7 @@ class DiagnoseSignalsRequest(BaseModel):
     universe_group_id: str
     max_tickers: int = 0
     focus_tickers: list[str] | None = None
+    timeout: int = 600
 
 
 # ------------------------------------------------------------------
@@ -140,7 +141,7 @@ async def diagnose_signals(body: DiagnoseSignalsRequest) -> dict:
             "max_tickers": body.max_tickers,
             "focus_tickers": body.focus_tickers,
         },
-        timeout=3600,
+        timeout=body.timeout,
         source=TaskSource.UI,
     )
 

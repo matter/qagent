@@ -841,23 +841,50 @@ class PaperTradingService:
         ]
 
     def get_positions(self, session_id: str) -> list[dict]:
-        """Return current positions for the latest date."""
+        """Return current positions for the latest date with market values."""
         conn = get_connection()
         row = conn.execute(
-            """SELECT positions_json, date FROM paper_trading_daily
+            """SELECT positions_json, date, nav FROM paper_trading_daily
                WHERE session_id = ? ORDER BY date DESC LIMIT 1""",
             [session_id],
         ).fetchone()
         if not row or not row[0]:
             return []
         positions = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        pos_date = str(row[1])
+        nav = float(row[2]) if row[2] else 0.0
+
+        # Fetch latest prices for all position tickers
+        pos_tickers = list(positions.keys())
+        latest_prices: dict[str, float] = {}
+        if pos_tickers:
+            placeholders = ",".join("?" for _ in pos_tickers)
+            price_rows = conn.execute(
+                f"""SELECT ticker, close FROM daily_bars
+                    WHERE ticker IN ({placeholders}) AND date <= ?
+                    QUALIFY ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC) = 1""",
+                [*pos_tickers, pos_date],
+            ).fetchall()
+            for t, c in price_rows:
+                latest_prices[t] = float(c)
+
         result = []
         for ticker, pos in positions.items():
+            shares = pos.get("shares", 0)
+            avg_price = pos.get("avg_price", 0)
+            price = latest_prices.get(ticker)
+            market_value = round(shares * price, 2) if price is not None else None
+            unrealized_pnl = round((price - avg_price) * shares, 2) if price is not None else None
+            weight = round(market_value / nav, 6) if market_value is not None and nav > 0 else None
             result.append({
                 "ticker": ticker,
-                "shares": pos.get("shares", 0),
-                "avg_price": pos.get("avg_price", 0),
-                "date": str(row[1]),
+                "shares": shares,
+                "avg_price": avg_price,
+                "latest_price": price,
+                "market_value": market_value,
+                "unrealized_pnl": unrealized_pnl,
+                "weight": weight,
+                "date": pos_date,
             })
         return result
 

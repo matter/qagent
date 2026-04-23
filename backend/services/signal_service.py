@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime
 
 import numpy as np
@@ -398,6 +399,7 @@ class SignalService:
         # ---- 5. Run model predictions using pre-computed features ----
         model_predictions: dict[str, pd.Series] = {}
         model_snapshot: dict[str, dict] = {}
+        per_model_timeout = max(30, 600 // max(len(required_models), 1))
 
         for model_id in required_models:
             if model_id not in model_fs_map:
@@ -422,12 +424,27 @@ class SignalService:
                 for fname, df in feature_data_local.items():
                     processed[fname] = self._feature_service._apply_preprocessing(df, preprocessing)
 
-                preds = self._model_service.predict_with_features(
-                    model_id=model_id,
-                    feature_data=processed,
-                    tickers=tickers,
-                    date=target_date,
-                )
+                with ThreadPoolExecutor(max_workers=1) as _pool:
+                    fut = _pool.submit(
+                        self._model_service.predict_with_features,
+                        model_id=model_id,
+                        feature_data=processed,
+                        tickers=tickers,
+                        date=target_date,
+                    )
+                    try:
+                        preds = fut.result(timeout=per_model_timeout)
+                    except FuturesTimeoutError:
+                        model_snapshot[model_id] = {
+                            "error": f"predict timed out ({per_model_timeout}s)"
+                        }
+                        log.warning(
+                            "diagnose.model_timeout",
+                            model_id=model_id,
+                            timeout=per_model_timeout,
+                        )
+                        continue
+
                 if not preds.empty:
                     model_predictions[model_id] = preds
                     model_snapshot[model_id] = {
