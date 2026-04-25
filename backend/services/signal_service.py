@@ -303,13 +303,9 @@ class SignalService:
 
         full_universe_size = len(tickers)
         sampled = False
-        # Auto-sample when focus_tickers given to keep latency manageable
-        effective_max = max_tickers
-        if effective_max == 0 and focus_tickers:
-            effective_max = 150
-        if effective_max > 0 and len(tickers) > effective_max:
+        if max_tickers > 0 and len(tickers) > max_tickers:
             import random
-            sample_set = set(random.sample(tickers, effective_max))
+            sample_set = set(random.sample(tickers, max_tickers))
             # Always include focus_tickers in the universe
             if focus_tickers:
                 sample_set.update(t for t in focus_tickers if t in set(tickers))
