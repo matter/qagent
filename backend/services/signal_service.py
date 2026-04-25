@@ -303,9 +303,13 @@ class SignalService:
 
         full_universe_size = len(tickers)
         sampled = False
-        if max_tickers > 0 and len(tickers) > max_tickers:
+        # Auto-sample when focus_tickers given to keep latency manageable
+        effective_max = max_tickers
+        if effective_max == 0 and focus_tickers:
+            effective_max = 150
+        if effective_max > 0 and len(tickers) > effective_max:
             import random
-            sample_set = set(random.sample(tickers, max_tickers))
+            sample_set = set(random.sample(tickers, effective_max))
             # Always include focus_tickers in the universe
             if focus_tickers:
                 sample_set.update(t for t in focus_tickers if t in set(tickers))
@@ -379,9 +383,10 @@ class SignalService:
                 if factor_id in cached_by_id and not cached_by_id[factor_id].empty:
                     df = cached_by_id[factor_id]
                 else:
-                    df = self._factor_engine.compute_factor(
-                        factor_id, tickers, start_date, target_date
-                    )
+                    # Skip expensive compute — diagnose uses cache-only for speed
+                    log.info("signal_service.diagnose.factor_not_cached", factor=factor_name, factor_id=factor_id)
+                    factor_snapshot[factor_name] = {"error": "not_cached"}
+                    continue
                 if not df.empty:
                     factor_data[factor_name] = df
                     if trade_ts in df.index:
@@ -412,13 +417,7 @@ class SignalService:
                 for fid, fname in fs_id_to_name.items():
                     if fid in cached_by_id and not cached_by_id[fid].empty:
                         feature_data_local[fname] = cached_by_id[fid]
-                    else:
-                        try:
-                            df = self._factor_engine.compute_factor(fid, tickers, start_date, target_date)
-                            if not df.empty:
-                                feature_data_local[fname] = df
-                        except Exception:
-                            pass
+                    # Skip expensive compute — diagnose uses cache-only for speed
 
                 processed: dict[str, pd.DataFrame] = {}
                 for fname, df in feature_data_local.items():
