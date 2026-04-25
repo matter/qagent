@@ -66,6 +66,12 @@ class ModelService:
         self._label_service = LabelService()
         self._group_service = GroupService()
 
+        # Instance-level caches – models are immutable after training,
+        # so these are safe to keep for the lifetime of the service.
+        self._model_cache: dict[str, ModelBase] = {}
+        self._record_cache: dict[str, dict] = {}
+        self._frozen_cache: dict[str, list[str] | None] = {}
+
     # ------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------
@@ -336,6 +342,9 @@ class ModelService:
 
     def get_model(self, model_id: str) -> dict:
         """Return a single model record including eval_metrics and feature_names."""
+        if model_id in self._record_cache:
+            return self._record_cache[model_id]
+
         row = self._fetch_row(model_id)
         if row is None:
             raise ValueError(f"Model {model_id} not found")
@@ -368,6 +377,7 @@ class ModelService:
                 except Exception:
                     pass
 
+        self._record_cache[model_id] = row
         return row
 
     def delete_model(self, model_id: str) -> None:
@@ -383,10 +393,18 @@ class ModelService:
         if model_dir.exists():
             shutil.rmtree(model_dir)
 
+        # Invalidate caches
+        self._model_cache.pop(model_id, None)
+        self._record_cache.pop(model_id, None)
+        self._frozen_cache.pop(model_id, None)
+
         log.info("model.deleted", model_id=model_id)
 
     def load_model(self, model_id: str) -> ModelBase:
         """Load a trained model from disk. Backfills task_type if missing."""
+        if model_id in self._model_cache:
+            return self._model_cache[model_id]
+
         model_path = settings.models_dir / model_id / "model.joblib"
         if not model_path.exists():
             raise ValueError(f"Model file not found for {model_id}")
@@ -408,6 +426,7 @@ class ModelService:
         except Exception:
             pass
 
+        self._model_cache[model_id] = model_instance
         return model_instance
 
     def predict(
@@ -659,12 +678,17 @@ class ModelService:
 
     def _load_frozen_features(self, model_id: str) -> list[str] | None:
         """Load the feature name list frozen at training time from metadata.json."""
+        if model_id in self._frozen_cache:
+            return self._frozen_cache[model_id]
+
         metadata_path = settings.models_dir / model_id / "metadata.json"
+        result: list[str] | None = None
         if metadata_path.exists():
             with open(metadata_path) as f:
                 metadata = json.load(f)
-                return metadata.get("feature_names")
-        return None
+                result = metadata.get("feature_names")
+        self._frozen_cache[model_id] = result
+        return result
 
     @staticmethod
     def _align_features_to_frozen(

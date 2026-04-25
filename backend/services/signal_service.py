@@ -38,6 +38,17 @@ class SignalService:
         self._model_service = ModelService()
         self._group_service = GroupService()
 
+        # Instance-level caches for cross-call reuse
+        self._factor_id_cache: dict[tuple[str, ...], dict[str, str]] = {}
+        self._model_fs_cache: dict[str, tuple[str, dict[str, str], dict]] = {}
+        # Factors: (frozenset(factor_ids), frozenset(tickers)) -> (start, end, data)
+        self._factor_bulk_cache: dict[
+            tuple[frozenset[str], frozenset[str]],
+            tuple[str, str, dict[str, pd.DataFrame]],
+        ] = {}
+        # Preprocessed features: (fs_id, target_date) -> dict[fname -> DataFrame]
+        self._preprocessed_cache: dict[tuple[str, str], dict[str, pd.DataFrame]] = {}
+
     # ------------------------------------------------------------------
     # Signal generation
     # ------------------------------------------------------------------
@@ -376,8 +387,15 @@ class SignalService:
         strategy_factor_map = self._resolve_factor_ids(required_factors) if required_factors else {}
         all_factor_ids = set(strategy_factor_map.values())
 
+        # Resolve model -> feature_set mapping (cached at instance level)
         model_fs_map: dict[str, tuple[str, dict[str, str], dict]] = {}
         for model_id in required_models:
+            if model_id in self._model_fs_cache:
+                fs_id, fs_id_to_name, preprocessing = self._model_fs_cache[model_id]
+                for fid in fs_id_to_name:
+                    all_factor_ids.add(fid)
+                model_fs_map[model_id] = self._model_fs_cache[model_id]
+                continue
             try:
                 model_record = self._model_service.get_model(model_id)
                 fs_id = model_record["feature_set_id"]
@@ -388,13 +406,50 @@ class SignalService:
                     fname = ref.get("factor_name", fid)
                     fs_id_to_name[fid] = fname
                     all_factor_ids.add(fid)
-                model_fs_map[model_id] = (fs_id, fs_id_to_name, fs["preprocessing"])
+                entry = (fs_id, fs_id_to_name, fs["preprocessing"])
+                model_fs_map[model_id] = entry
+                self._model_fs_cache[model_id] = entry
             except Exception as exc:
                 log.warning("signal_service.diagnose_model_fs_failed", model_id=model_id, error=str(exc))
 
-        cached_by_id = self._factor_engine.load_cached_factors_bulk(
-            list(all_factor_ids), tickers, factor_start_date, target_date
-        )
+        # Load factor data with wide-window instance cache
+        tickers_fs = frozenset(tickers)
+        factor_ids_fs = frozenset(all_factor_ids)
+        cache_key = (factor_ids_fs, tickers_fs)
+
+        cached_by_id: dict[str, pd.DataFrame] = {}
+        if cache_key in self._factor_bulk_cache:
+            c_start, c_end, c_data = self._factor_bulk_cache[cache_key]
+            if c_start <= factor_start_date and c_end >= target_date:
+                # Slice from memory – no DB query needed
+                cached_by_id = {
+                    fid: df.loc[factor_start_date:target_date]
+                    for fid, df in c_data.items()
+                }
+            else:
+                cached_by_id = {}  # range mismatch, reload below
+
+        if not cached_by_id:
+            # Load a wider 30-day window to cover future calls with nearby dates
+            wide_lookback_query = """
+                SELECT MIN(date) FROM (
+                    SELECT DISTINCT date FROM daily_bars
+                    WHERE date <= ?
+                    ORDER BY date DESC
+                    LIMIT 30
+                )
+            """
+            wrow = conn.execute(wide_lookback_query, [target_date]).fetchone()
+            wide_start = str(wrow[0]) if wrow and wrow[0] else factor_start_date
+
+            full_data = self._factor_engine.load_cached_factors_bulk(
+                list(all_factor_ids), tickers, wide_start, target_date
+            )
+            self._factor_bulk_cache[cache_key] = (wide_start, target_date, full_data)
+            cached_by_id = {
+                fid: df.loc[factor_start_date:target_date]
+                for fid, df in full_data.items()
+            }
 
         factor_data: dict[str, pd.DataFrame] = {}
         factor_snapshot: dict[str, dict] = {}
@@ -432,14 +487,16 @@ class SignalService:
 
         # Pre-process features once per feature_set_id (avoid redundant work
         # when multiple models share the same feature set).
-        _processed_cache: dict[str, dict[str, pd.DataFrame]] = {}
+        # Uses instance-level cache keyed by (fs_id, target_date) so repeated
+        # diagnose calls with the same strategy + date skip preprocessing entirely.
 
         def _prepare_features(model_id: str) -> dict[str, pd.DataFrame] | None:
             if model_id not in model_fs_map:
                 return None
             fs_id, fs_id_to_name, preprocessing = model_fs_map[model_id]
-            if fs_id in _processed_cache:
-                return _processed_cache[fs_id]
+            pp_key = (fs_id, target_date)
+            if pp_key in self._preprocessed_cache:
+                return self._preprocessed_cache[pp_key]
             feature_data_local: dict[str, pd.DataFrame] = {}
             for fid, fname in fs_id_to_name.items():
                 if fid in cached_by_id and not cached_by_id[fid].empty:
@@ -447,7 +504,7 @@ class SignalService:
             processed: dict[str, pd.DataFrame] = {}
             for fname, df in feature_data_local.items():
                 processed[fname] = self._feature_service._apply_preprocessing(df, preprocessing)
-            _processed_cache[fs_id] = processed
+            self._preprocessed_cache[pp_key] = processed
             return processed
 
         def _predict_one(model_id: str) -> tuple[str, pd.Series | None, dict]:
@@ -1159,6 +1216,9 @@ class SignalService:
         """Resolve factor names to factor IDs (latest version) in a single query."""
         if not factor_names:
             return {}
+        cache_key = tuple(sorted(factor_names))
+        if cache_key in self._factor_id_cache:
+            return self._factor_id_cache[cache_key]
         conn = get_connection()
         placeholders = ",".join("?" for _ in factor_names)
         rows = conn.execute(
@@ -1174,6 +1234,7 @@ class SignalService:
         for name in factor_names:
             if name not in result:
                 log.warning("signal_service.factor_not_found", name=name)
+        self._factor_id_cache[cache_key] = result
         return result
 
     @staticmethod
