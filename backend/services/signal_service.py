@@ -7,6 +7,7 @@ Orchestrates:
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime
@@ -292,11 +293,16 @@ class SignalService:
             max_tickers: If > 0, randomly sample the universe to this size
                 to keep computation fast on large pools.
         """
+        t0 = time.time()
+        timings: dict[str, float] = {}
+
         # ---- 1. Load strategy ----
         strategy_def = self._strategy_service.get_strategy(strategy_id)
         strategy_instance = load_strategy_from_code(strategy_def["source_code"])
+        timings["1_load_strategy"] = time.time() - t0
 
         # ---- 2. Resolve universe tickers ----
+        t1 = time.time()
         tickers = self._group_service.get_group_tickers(universe_group_id)
         if not tickers:
             raise ValueError(f"Universe group '{universe_group_id}' has no members")
@@ -318,7 +324,10 @@ class SignalService:
                 if t not in ticker_set:
                     focus_tickers = [ft for ft in focus_tickers if ft in ticker_set]
 
+        timings["2_resolve_universe"] = time.time() - t1
+
         # ---- 3. Load OHLCV data up to target_date ----
+        t2 = time.time()
         conn = get_connection()
         lookback_query = """
             SELECT MIN(date) FROM (
@@ -344,7 +353,23 @@ class SignalService:
             row_data = prices_close.loc[trade_ts]
             has_price = {t for t in tickers if t in row_data.index and pd.notna(row_data[t])}
 
+        timings["3_load_prices"] = time.time() - t2
+
         # ---- 4. Bulk-load all factor data (strategy + model features) ----
+        # For diagnose, only load a narrow date window for factors (target ± small
+        # buffer for forward-fill), not the full 250-day price lookback.
+        t3 = time.time()
+        factor_lookback_query = """
+            SELECT MIN(date) FROM (
+                SELECT DISTINCT date FROM daily_bars
+                WHERE date <= ?
+                ORDER BY date DESC
+                LIMIT 10
+            )
+        """
+        frow = conn.execute(factor_lookback_query, [target_date]).fetchone()
+        factor_start_date = str(frow[0]) if frow and frow[0] else target_date
+
         required_factors = strategy_def.get("required_factors", [])
         required_models = strategy_def.get("required_models", [])
 
@@ -368,7 +393,7 @@ class SignalService:
                 log.warning("signal_service.diagnose_model_fs_failed", model_id=model_id, error=str(exc))
 
         cached_by_id = self._factor_engine.load_cached_factors_bulk(
-            list(all_factor_ids), tickers, start_date, target_date
+            list(all_factor_ids), tickers, factor_start_date, target_date
         )
 
         factor_data: dict[str, pd.DataFrame] = {}
@@ -397,64 +422,86 @@ class SignalService:
             except Exception as exc:
                 factor_snapshot[factor_name] = {"error": str(exc)}
 
+        timings["4_load_factors"] = time.time() - t3
+
         # ---- 5. Run model predictions using pre-computed features ----
+        t4 = time.time()
         model_predictions: dict[str, pd.Series] = {}
         model_snapshot: dict[str, dict] = {}
         per_model_timeout = max(30, 600 // max(len(required_models), 1))
 
-        for model_id in required_models:
+        # Pre-process features once per feature_set_id (avoid redundant work
+        # when multiple models share the same feature set).
+        _processed_cache: dict[str, dict[str, pd.DataFrame]] = {}
+
+        def _prepare_features(model_id: str) -> dict[str, pd.DataFrame] | None:
             if model_id not in model_fs_map:
-                model_snapshot[model_id] = {"error": "feature set not resolved"}
-                continue
+                return None
+            fs_id, fs_id_to_name, preprocessing = model_fs_map[model_id]
+            if fs_id in _processed_cache:
+                return _processed_cache[fs_id]
+            feature_data_local: dict[str, pd.DataFrame] = {}
+            for fid, fname in fs_id_to_name.items():
+                if fid in cached_by_id and not cached_by_id[fid].empty:
+                    feature_data_local[fname] = cached_by_id[fid]
+            processed: dict[str, pd.DataFrame] = {}
+            for fname, df in feature_data_local.items():
+                processed[fname] = self._feature_service._apply_preprocessing(df, preprocessing)
+            _processed_cache[fs_id] = processed
+            return processed
+
+        def _predict_one(model_id: str) -> tuple[str, pd.Series | None, dict]:
+            if model_id not in model_fs_map:
+                return model_id, None, {"error": "feature set not resolved"}
             try:
-                fs_id, fs_id_to_name, preprocessing = model_fs_map[model_id]
-
-                feature_data_local: dict[str, pd.DataFrame] = {}
-                for fid, fname in fs_id_to_name.items():
-                    if fid in cached_by_id and not cached_by_id[fid].empty:
-                        feature_data_local[fname] = cached_by_id[fid]
-                    # Skip expensive compute — diagnose uses cache-only for speed
-
-                processed: dict[str, pd.DataFrame] = {}
-                for fname, df in feature_data_local.items():
-                    processed[fname] = self._feature_service._apply_preprocessing(df, preprocessing)
-
-                with ThreadPoolExecutor(max_workers=1) as _pool:
-                    fut = _pool.submit(
-                        self._model_service.predict_with_features,
-                        model_id=model_id,
-                        feature_data=processed,
-                        tickers=tickers,
-                        date=target_date,
-                    )
-                    try:
-                        preds = fut.result(timeout=per_model_timeout)
-                    except FuturesTimeoutError:
-                        model_snapshot[model_id] = {
-                            "error": f"predict timed out ({per_model_timeout}s)"
-                        }
-                        log.warning(
-                            "diagnose.model_timeout",
-                            model_id=model_id,
-                            timeout=per_model_timeout,
-                        )
-                        continue
-
+                processed = _prepare_features(model_id)
+                if processed is None:
+                    return model_id, None, {"error": "feature set not resolved"}
+                preds = self._model_service.predict_with_features(
+                    model_id=model_id,
+                    feature_data=processed,
+                    tickers=tickers,
+                    date=target_date,
+                )
                 if not preds.empty:
-                    model_predictions[model_id] = preds
-                    model_snapshot[model_id] = {
+                    snap = {
                         "coverage": len(preds),
                         "mean": round(float(preds.mean()), 6),
                         "std": round(float(preds.std()), 6) if len(preds) > 1 else None,
                         "top10": {t: round(float(v), 6) for t, v in preds.nlargest(10).items()},
                         "bottom5": {t: round(float(v), 6) for t, v in preds.nsmallest(5).items()},
                     }
-                else:
-                    model_snapshot[model_id] = {"coverage": 0, "error": "empty predictions"}
+                    return model_id, preds, snap
+                return model_id, None, {"coverage": 0, "error": "empty predictions"}
             except Exception as exc:
-                model_snapshot[model_id] = {"error": str(exc)}
+                return model_id, None, {"error": str(exc)}
+
+        # Pre-compute all feature preprocessing (sequential, shares cache)
+        for model_id in required_models:
+            _prepare_features(model_id)
+        timings["5a_preprocess"] = time.time() - t4
+
+        # Run predictions in parallel across models
+        t4b = time.time()
+        with ThreadPoolExecutor(max_workers=min(len(required_models), 4)) as pool:
+            futures = {pool.submit(_predict_one, mid): mid for mid in required_models}
+            for fut in futures:
+                try:
+                    mid, preds, snap = fut.result(timeout=per_model_timeout)
+                    model_snapshot[mid] = snap
+                    if preds is not None:
+                        model_predictions[mid] = preds
+                except FuturesTimeoutError:
+                    mid = futures[fut]
+                    model_snapshot[mid] = {"error": f"predict timed out ({per_model_timeout}s)"}
+                    log.warning("diagnose.model_timeout", model_id=mid, timeout=per_model_timeout)
+
+        timings["5b_predict_parallel"] = time.time() - t4b
+
+        timings["5_model_predict"] = time.time() - t4
 
         # ---- 6. Build StrategyContext & generate signals ----
+        t5 = time.time()
         prices_multi = self._build_prices_multi(
             prices_close, prices_open, prices_high, prices_low, prices_volume, tickers,
         )
@@ -470,6 +517,8 @@ class SignalService:
             raw_signals = strategy_instance.generate_signals(context)
         except Exception as exc:
             raise ValueError(f"Strategy signal generation failed: {exc}") from exc
+
+        timings["6_strategy_signals"] = time.time() - t5
 
         # ---- 7. Build diagnostic output ----
         # Extract strategy-populated diagnostics (candidate_pool, gates, etc.)
@@ -688,6 +737,8 @@ class SignalService:
                 if k not in ("candidate_pool", "gates")
             },
             "focus_ticker_snapshots": focus_snapshot if focus_snapshot else None,
+            "timings": {k: round(v, 3) for k, v in timings.items()},
+            "total_seconds": round(time.time() - t0, 3),
         }
 
 
