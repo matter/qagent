@@ -552,6 +552,25 @@ class SignalService:
         focus_snapshot: list[dict] = []
         if focus_tickers:
             candidate_set = set(candidate_pool) if isinstance(candidate_pool, (list, set)) else set()
+            # Signal tickers were necessarily candidates (even if strategy didn't report them)
+            candidate_set_plus_signals = candidate_set | signal_tickers
+
+            # Pre-compute aggregate score across all models for candidate-pool ranking
+            agg_scores: dict[str, float] = {}
+            if model_predictions:
+                for mid, preds in model_predictions.items():
+                    for ticker in preds.index:
+                        agg_scores[ticker] = agg_scores.get(ticker, 0.0) + float(preds[ticker])
+
+            # Rank only within candidate pool + signals for score_rank / score_pct
+            pool_for_rank = candidate_set_plus_signals & set(agg_scores.keys())
+            pool_scores_sorted = sorted(
+                [(t, agg_scores[t]) for t in pool_for_rank],
+                key=lambda x: -x[1],
+            )
+            pool_rank_map: dict[str, int] = {t: i + 1 for i, (t, _) in enumerate(pool_scores_sorted)}
+            pool_size = len(pool_scores_sorted)
+
             for ft in focus_tickers:
                 snap: dict = {"ticker": ft}
 
@@ -571,7 +590,16 @@ class SignalService:
                     snap["status"] = "strategy_filtered"
 
                 # In candidate pool?
-                snap["in_candidate_pool"] = ft in candidate_set
+                snap["in_candidate_pool"] = ft in candidate_set_plus_signals
+
+                # Aggregate score rank within candidate pool
+                if ft in pool_rank_map:
+                    snap["score_rank"] = pool_rank_map[ft]
+                    snap["score_pct"] = round(1.0 - (pool_rank_map[ft] - 1) / max(pool_size - 1, 1), 4)
+                    snap["agg_score"] = round(agg_scores[ft], 6)
+                else:
+                    snap["score_rank"] = None
+                    snap["score_pct"] = None
 
                 # Signal weight if selected
                 for sig in signals_list:
@@ -617,6 +645,28 @@ class SignalService:
                 per_ticker_gates = gates.get("per_ticker", {}) if isinstance(gates, dict) else {}
                 if ft in per_ticker_gates:
                     snap["gates"] = per_ticker_gates[ft]
+
+                # Filtering reasons: why this ticker didn't make it to signals
+                reasons: list[str] = []
+                if snap["status"] == "no_price_data":
+                    reasons.append("no price data on target date")
+                elif snap["status"] == "no_model_coverage":
+                    missing = [mid for mid in required_models if mid not in model_predictions or ft not in model_predictions[mid].index]
+                    reasons.append(f"no model coverage: {', '.join(missing[:3])}")
+                elif snap["status"] == "in_candidate_but_filtered":
+                    if ft in per_ticker_gates:
+                        gate_info = per_ticker_gates[ft]
+                        if isinstance(gate_info, dict):
+                            failed = [k for k, v in gate_info.items() if v is False or v == "failed"]
+                            if failed:
+                                reasons.append(f"failed gates: {', '.join(failed)}")
+                        elif isinstance(gate_info, list):
+                            reasons.extend(str(g) for g in gate_info[:5])
+                    if not reasons:
+                        reasons.append("filtered by strategy selection logic")
+                elif snap["status"] == "strategy_filtered":
+                    reasons.append("not in candidate pool (pre-filter or score threshold)")
+                snap["reasons"] = reasons if reasons else None
 
                 focus_snapshot.append(snap)
 

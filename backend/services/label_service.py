@@ -350,7 +350,10 @@ class LabelService:
             )
         if target_type in ("excess_return", "excess_binary") and not benchmark:
             raise ValueError(f"benchmark is required for {target_type} target_type")
-        if horizon < 1:
+        if target_type == "composite":
+            if horizon < 0:
+                raise ValueError("horizon must be >= 0 for composite labels")
+        elif horizon < 1:
             raise ValueError("horizon must be >= 1")
         self._validate_config(target_type, config)
 
