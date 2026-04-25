@@ -288,6 +288,11 @@ class SignalService:
         universe_group_id: str,
         max_tickers: int = 0,
         focus_tickers: list[str] | None = None,
+        current_weights: dict[str, float] | None = None,
+        holding_days: dict[str, int] | None = None,
+        avg_entry_price: dict[str, float] | None = None,
+        unrealized_pnl: dict[str, float] | None = None,
+        backtest_id: str | None = None,
     ) -> dict:
         """Lightweight signal diagnosis for a given date.
 
@@ -301,8 +306,13 @@ class SignalService:
             focus_tickers: If provided, always include these tickers in the
                 universe (even when sampling) and append a per-ticker
                 diagnostic snapshot to the result.
-            max_tickers: If > 0, randomly sample the universe to this size
-                to keep computation fast on large pools.
+            current_weights: Explicit portfolio weights (方案 A).
+            holding_days: Explicit holding days per ticker.
+            avg_entry_price: Explicit average entry price per ticker.
+            unrealized_pnl: Explicit unrealised P&L per ticker.
+            backtest_id: If provided, reconstruct portfolio state from a
+                saved backtest as of target_date (方案 B). Overrides
+                any explicit state fields above.
         """
         t0 = time.time()
         timings: dict[str, float] = {}
@@ -563,11 +573,32 @@ class SignalService:
             prices_close, prices_open, prices_high, prices_low, prices_volume, tickers,
         )
 
+        # Resolve portfolio state: backtest replay (B) overrides explicit (A)
+        portfolio_state: dict = {}
+        replay_source: str | None = None
+        if backtest_id:
+            portfolio_state = self._reconstruct_portfolio_state(
+                backtest_id, target_date, prices_close,
+            )
+            replay_source = f"backtest:{backtest_id}"
+        else:
+            if current_weights is not None:
+                portfolio_state["current_weights"] = current_weights
+            if holding_days is not None:
+                portfolio_state["holding_days"] = holding_days
+            if avg_entry_price is not None:
+                portfolio_state["avg_entry_price"] = avg_entry_price
+            if unrealized_pnl is not None:
+                portfolio_state["unrealized_pnl"] = unrealized_pnl
+            if portfolio_state:
+                replay_source = "explicit"
+
         context = StrategyContext(
             prices=prices_multi.loc[:trade_ts],
             factor_values=factor_data,
             model_predictions=model_predictions,
             current_date=trade_ts,
+            **portfolio_state,
         )
 
         try:
@@ -794,6 +825,13 @@ class SignalService:
                 if k not in ("candidate_pool", "gates")
             },
             "focus_ticker_snapshots": focus_snapshot if focus_snapshot else None,
+            "portfolio_state": {
+                "source": replay_source,
+                "current_weights": portfolio_state.get("current_weights"),
+                "holding_days": portfolio_state.get("holding_days"),
+                "avg_entry_price": portfolio_state.get("avg_entry_price"),
+                "unrealized_pnl": portfolio_state.get("unrealized_pnl"),
+            } if replay_source else None,
             "timings": {k: round(v, 3) for k, v in timings.items()},
             "total_seconds": round(time.time() - t0, 3),
         }
@@ -1211,6 +1249,133 @@ class SignalService:
     # ------------------------------------------------------------------
     # Internal helpers (reused from BacktestService pattern)
     # ------------------------------------------------------------------
+
+    def _reconstruct_portfolio_state(
+        self,
+        backtest_id: str,
+        target_date: str,
+        prices_close: pd.DataFrame,
+    ) -> dict:
+        """Reconstruct portfolio state as of *target_date* from a saved backtest.
+
+        Replays the trade log up to (but not including) *target_date* to derive
+        the same ``current_weights / holding_days / avg_entry_price / unrealized_pnl``
+        that the backtest engine would have provided on that rebalance date.
+
+        Returns a dict suitable for ``**kwargs`` into :class:`StrategyContext`.
+        """
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT trades, config FROM backtest_results WHERE id = ?",
+            [backtest_id],
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Backtest {backtest_id} not found")
+
+        trades_raw = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or [])
+        config_raw = json.loads(row[1]) if isinstance(row[1], str) else (row[1] or {})
+        initial_capital = config_raw.get("initial_capital", 1_000_000)
+
+        # Build position state by replaying trades strictly before target_date
+        positions: dict[str, float] = {}   # ticker -> shares
+        entry_prices: dict[str, float] = {}  # ticker -> avg entry price
+        entry_dates: dict[str, str] = {}     # ticker -> date of last buy
+
+        for trade in trades_raw:
+            tdate = str(trade.get("date", ""))[:10]
+            if tdate >= target_date:
+                break
+            ticker = trade["ticker"]
+            action = trade.get("action", "buy")
+            shares = float(trade.get("shares", 0))
+            price = float(trade.get("price", 0))
+
+            if action == "buy":
+                prev_shares = positions.get(ticker, 0.0)
+                prev_cost = entry_prices.get(ticker, 0.0) * prev_shares
+                new_shares = prev_shares + shares
+                if new_shares > 0:
+                    entry_prices[ticker] = (prev_cost + price * shares) / new_shares
+                else:
+                    entry_prices[ticker] = price
+                positions[ticker] = new_shares
+                entry_dates[ticker] = tdate
+            elif action == "sell":
+                positions[ticker] = positions.get(ticker, 0.0) - shares
+                if positions.get(ticker, 0) <= 1e-8:
+                    positions.pop(ticker, None)
+                    entry_prices.pop(ticker, None)
+                    entry_dates.pop(ticker, None)
+
+        # Filter to held positions only
+        held = {t: s for t, s in positions.items() if s > 1e-8}
+
+        if not held:
+            return {
+                "current_weights": {},
+                "holding_days": {},
+                "avg_entry_price": {},
+                "unrealized_pnl": {},
+            }
+
+        # Compute current prices on target_date for weights + unrealized P&L
+        trade_ts = pd.Timestamp(target_date)
+        cur_prices: dict[str, float] = {}
+        if trade_ts in prices_close.index:
+            for ticker in held:
+                if ticker in prices_close.columns:
+                    p = prices_close.loc[trade_ts, ticker]
+                    if pd.notna(p):
+                        cur_prices[ticker] = float(p)
+
+        # Portfolio value for weight calculation
+        portfolio_value = 0.0
+        for ticker, shares in held.items():
+            portfolio_value += shares * cur_prices.get(ticker, entry_prices.get(ticker, 0))
+
+        if portfolio_value <= 0:
+            portfolio_value = initial_capital
+
+        current_weights: dict[str, float] = {}
+        holding_days_out: dict[str, int] = {}
+        unrealized_out: dict[str, float] = {}
+
+        # Count trading days between entry and target for holding_days
+        trading_dates = sorted(str(d.date()) for d in prices_close.index)
+
+        for ticker, shares in held.items():
+            pos_value = shares * cur_prices.get(ticker, entry_prices.get(ticker, 0))
+            current_weights[ticker] = pos_value / portfolio_value
+
+            # holding_days = trading days from entry date to target_date
+            edate = entry_dates.get(ticker)
+            if edate and trading_dates:
+                days = sum(1 for d in trading_dates if edate < d <= target_date)
+                holding_days_out[ticker] = max(days, 1)
+            else:
+                holding_days_out[ticker] = 1
+
+            # unrealized P&L
+            entry_p = entry_prices.get(ticker, 0)
+            cur_p = cur_prices.get(ticker, entry_p)
+            if entry_p > 0:
+                unrealized_out[ticker] = cur_p / entry_p - 1.0
+            else:
+                unrealized_out[ticker] = 0.0
+
+        log.info(
+            "signal_service.replay_state",
+            backtest_id=backtest_id,
+            target_date=target_date,
+            held_count=len(held),
+        )
+
+        return {
+            "current_weights": current_weights,
+            "holding_days": holding_days_out,
+            "avg_entry_price": {t: entry_prices[t] for t in held},
+            "unrealized_pnl": unrealized_out,
+        }
 
     def _resolve_factor_ids(self, factor_names: list[str]) -> dict[str, str]:
         """Resolve factor names to factor IDs (latest version) in a single query."""

@@ -56,6 +56,13 @@ class DiagnoseSignalsRequest(BaseModel):
     max_tickers: int = 0
     focus_tickers: list[str] | None = None
     timeout: int = 600
+    # Portfolio state injection (方案 A)
+    current_weights: dict[str, float] | None = None
+    holding_days: dict[str, int] | None = None
+    avg_entry_price: dict[str, float] | None = None
+    unrealized_pnl: dict[str, float] | None = None
+    # Backtest replay (方案 B) — overrides explicit state above
+    backtest_id: str | None = None
 
 
 # ------------------------------------------------------------------
@@ -122,6 +129,11 @@ async def diagnose_signals(body: DiagnoseSignalsRequest) -> dict:
         universe_group_id: str,
         max_tickers: int,
         focus_tickers: list[str] | None,
+        current_weights: dict[str, float] | None,
+        holding_days: dict[str, int] | None,
+        avg_entry_price: dict[str, float] | None,
+        unrealized_pnl: dict[str, float] | None,
+        backtest_id: str | None,
     ) -> dict:
         return svc.diagnose_signals(
             strategy_id=strategy_id,
@@ -129,6 +141,11 @@ async def diagnose_signals(body: DiagnoseSignalsRequest) -> dict:
             universe_group_id=universe_group_id,
             max_tickers=max_tickers,
             focus_tickers=focus_tickers,
+            current_weights=current_weights,
+            holding_days=holding_days,
+            avg_entry_price=avg_entry_price,
+            unrealized_pnl=unrealized_pnl,
+            backtest_id=backtest_id,
         )
 
     task_id = executor.submit(
@@ -140,6 +157,11 @@ async def diagnose_signals(body: DiagnoseSignalsRequest) -> dict:
             "universe_group_id": body.universe_group_id,
             "max_tickers": body.max_tickers,
             "focus_tickers": body.focus_tickers,
+            "current_weights": body.current_weights,
+            "holding_days": body.holding_days,
+            "avg_entry_price": body.avg_entry_price,
+            "unrealized_pnl": body.unrealized_pnl,
+            "backtest_id": body.backtest_id,
         },
         timeout=body.timeout,
         source=TaskSource.UI,
