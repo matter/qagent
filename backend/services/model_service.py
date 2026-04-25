@@ -52,7 +52,7 @@ _MODEL_REGISTRY: dict[str, type] = {
 }
 
 # Label target types that should be treated as classification
-_CLASSIFICATION_TARGETS = {"binary", "top_quantile", "bottom_quantile", "large_move", "excess_binary", "path_quality"}
+_CLASSIFICATION_TARGETS = {"binary", "top_quantile", "bottom_quantile", "large_move", "excess_binary", "path_quality", "triple_barrier"}
 
 # Parameters determined by the system, not user-configurable
 _RESERVED_MODEL_PARAMS = {"task", "objective", "metric", "verbosity", "n_jobs"}

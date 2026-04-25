@@ -18,8 +18,8 @@ log = get_logger(__name__)
 # Regression types  → model trains with LGBMRegressor
 # Classification types → model trains with LGBMClassifier
 
-_REGRESSION_TARGET_TYPES = {"return", "rank", "excess_return", "path_return", "composite"}
-_CLASSIFICATION_TARGET_TYPES = {"binary", "top_quantile", "bottom_quantile", "large_move", "excess_binary", "path_quality"}
+_REGRESSION_TARGET_TYPES = {"return", "rank", "excess_return", "path_return", "composite", "trend_continuation"}
+_CLASSIFICATION_TARGET_TYPES = {"binary", "top_quantile", "bottom_quantile", "large_move", "excess_binary", "path_quality", "triple_barrier"}
 
 _VALID_TARGET_TYPES = _REGRESSION_TARGET_TYPES | _CLASSIFICATION_TARGET_TYPES
 
@@ -494,7 +494,7 @@ class LabelService:
 
         where_clause = " AND ".join(where_parts)
         # For path-aware types, load OHLC; otherwise only close
-        if target_type in ("path_return", "path_quality"):
+        if target_type in ("path_return", "path_quality", "trend_continuation", "triple_barrier"):
             bars_df = conn.execute(
                 f"SELECT ticker, date, open, high, low, close FROM daily_bars WHERE {where_clause} ORDER BY ticker, date",
                 params,
@@ -653,6 +653,50 @@ class LabelService:
             # Drop duplicate fwd_return_path if present
             if "fwd_return_path" in combined.columns:
                 combined.drop(columns=["fwd_return_path"], inplace=True)
+
+        elif target_type == "trend_continuation":
+            # Regression: fwd_return scaled by path persistence.
+            # persistence = fraction of days where cumulative return keeps
+            # advancing (no new drawdown from running peak).
+            # label = fwd_return * persistence^exponent
+            # High for slow steady uptrends, low for erratic/climax moves.
+            path_stats = self._compute_path_stats(bars_df, horizon)
+            tc_stats = self._compute_trend_continuation_stats(bars_df, horizon)
+            combined = combined.merge(
+                path_stats, on=["ticker", "date"], how="left", suffixes=("", "_path"),
+            )
+            combined = combined.merge(
+                tc_stats, on=["ticker", "date"], how="left",
+            )
+            exponent = config.get("persistence_exponent", 1.0)
+            dd_penalty = config.get("drawdown_penalty", 0.0)
+            shock_penalty = config.get("shock_penalty", 0.0)
+            label_val = combined["fwd_return"] * (combined["persistence"] ** exponent)
+            if dd_penalty:
+                label_val = label_val - dd_penalty * combined["max_drawdown"]
+            if shock_penalty:
+                label_val = label_val - shock_penalty * combined["shock_ratio"]
+            combined["label_value"] = label_val
+            for col in ["persistence", "max_drawdown", "max_single_day",
+                        "shock_ratio", "gap_dependency", "close_location",
+                        "fwd_return_path"]:
+                if col in combined.columns:
+                    combined.drop(columns=[col], inplace=True)
+
+        elif target_type == "triple_barrier":
+            # Classification: 1 if profit target hit before stop loss within
+            # horizon, 0 otherwise.  Natural trap filter — climax/gap moves
+            # that reverse quickly get labelled 0.
+            tb_df = self._compute_triple_barrier(bars_df, horizon, config)
+            combined = combined.merge(
+                tb_df, on=["ticker", "date"], how="left",
+            )
+            combined["label_value"] = combined["tb_label"].astype(float)
+            combined.loc[combined["tb_label"].isna(), "label_value"] = np.nan
+            if "tb_label" in combined.columns:
+                combined.drop(columns=["tb_label"], inplace=True)
+            if "tb_duration" in combined.columns:
+                combined.drop(columns=["tb_duration"], inplace=True)
 
         else:
             raise ValueError(f"Unsupported target_type: {target_type}")
@@ -816,6 +860,116 @@ class LabelService:
 
         return pd.DataFrame(records)
 
+    @staticmethod
+    def _compute_trend_continuation_stats(
+        bars_df: pd.DataFrame, horizon: int,
+    ) -> pd.DataFrame:
+        """Compute trend persistence for each (ticker, date).
+
+        persistence = fraction of days in the forward window where the
+        cumulative return stays at or above the running peak drawdown
+        threshold.  A perfectly steady uptrend scores 1.0; an erratic
+        or climax-reversal path scores much lower.
+        """
+        records = []
+        for ticker, grp in bars_df.groupby("ticker"):
+            grp = grp.sort_values("date").reset_index(drop=True)
+            closes = grp["close"].values
+            dates = grp["date"].values
+            n = len(closes)
+
+            for i in range(n - horizon):
+                entry = closes[i]
+                if entry == 0 or np.isnan(entry):
+                    continue
+
+                window = closes[i + 1: i + horizon + 1]
+                cum_ret = window / entry
+                running_max = np.maximum.accumulate(cum_ret)
+                # A day "persists" if it hasn't drawn down >1% from peak
+                persist_days = int(np.sum((running_max - cum_ret) / running_max < 0.01))
+                persistence = persist_days / max(len(window), 1)
+
+                records.append({
+                    "ticker": ticker,
+                    "date": dates[i],
+                    "persistence": persistence,
+                })
+
+        if not records:
+            return pd.DataFrame(columns=["ticker", "date", "persistence"])
+        return pd.DataFrame(records)
+
+    @staticmethod
+    def _compute_triple_barrier(
+        bars_df: pd.DataFrame, horizon: int, config: dict,
+    ) -> pd.DataFrame:
+        """Compute triple-barrier label for each (ticker, date).
+
+        Three barriers:
+        - Upper: entry_price * (1 + take_profit)  → label = 1
+        - Lower: entry_price * (1 - stop_loss)    → label = 0
+        - Time:  horizon days expire               → label = 1 if fwd_return > 0, else 0
+
+        Uses intraday high/low when available for realistic barrier touches.
+
+        Returns DataFrame with columns: ticker, date, tb_label, tb_duration.
+        """
+        take_profit = config.get("take_profit", 0.10)
+        stop_loss = config.get("stop_loss", 0.05)
+
+        has_hl = all(c in bars_df.columns for c in ("high", "low"))
+        records = []
+
+        for ticker, grp in bars_df.groupby("ticker"):
+            grp = grp.sort_values("date").reset_index(drop=True)
+            closes = grp["close"].values
+            highs = grp["high"].values if has_hl else closes
+            lows = grp["low"].values if has_hl else closes
+            dates = grp["date"].values
+            n = len(closes)
+
+            for i in range(n - horizon):
+                entry = closes[i]
+                if entry == 0 or np.isnan(entry):
+                    continue
+
+                upper = entry * (1.0 + take_profit)
+                lower = entry * (1.0 - stop_loss)
+                label = None
+                duration = horizon
+
+                for j in range(1, horizon + 1):
+                    idx = i + j
+                    if idx >= n:
+                        break
+                    # Check barriers using intraday extremes
+                    if highs[idx] >= upper:
+                        label = 1
+                        duration = j
+                        break
+                    if lows[idx] <= lower:
+                        label = 0
+                        duration = j
+                        break
+
+                # Time barrier: horizon expired without hitting either
+                if label is None:
+                    end_idx = min(i + horizon, n - 1)
+                    fwd_ret = (closes[end_idx] - entry) / entry
+                    label = 1 if fwd_ret > 0 else 0
+
+                records.append({
+                    "ticker": ticker,
+                    "date": dates[i],
+                    "tb_label": label,
+                    "tb_duration": duration,
+                })
+
+        if not records:
+            return pd.DataFrame(columns=["ticker", "date", "tb_label", "tb_duration"])
+        return pd.DataFrame(records)
+
     def _compute_composite_label(
         self,
         config: dict,
@@ -904,6 +1058,19 @@ class LabelService:
             for i, comp in enumerate(config["components"]):
                 if not comp.get("label_id"):
                     raise ValueError(f"component {i} missing 'label_id'")
+        elif target_type == "trend_continuation":
+            if config:
+                exp = config.get("persistence_exponent")
+                if exp is not None and exp < 0:
+                    raise ValueError("persistence_exponent must be >= 0")
+        elif target_type == "triple_barrier":
+            if config:
+                tp = config.get("take_profit")
+                sl = config.get("stop_loss")
+                if tp is not None and tp <= 0:
+                    raise ValueError("take_profit must be positive")
+                if sl is not None and sl <= 0:
+                    raise ValueError("stop_loss must be positive")
 
     def _fetch_row(self, label_id: str) -> dict | None:
         conn = get_connection()
