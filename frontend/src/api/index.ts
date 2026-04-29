@@ -701,12 +701,18 @@ export interface PaperDailyRecord {
   date: string;
   nav: number;
   cash: number;
+  position_count?: number;
+  trade_count?: number;
 }
 
 export interface PaperPosition {
   ticker: string;
   shares: number;
   avg_price: number;
+  latest_price?: number | null;
+  market_value?: number | null;
+  unrealized_pnl?: number | null;
+  weight?: number | null;
   date: string;
 }
 
@@ -717,11 +723,48 @@ export interface PaperTrade {
   shares: number;
   price: number;
   cost: number;
+  trade_reason?: string;
+  position_state?: string;
+  holding_days?: number;
 }
 
 export interface PaperAdvanceResult {
   task_id: string;
   status: string;
+}
+
+export interface PaperBacktestComparisonDay {
+  date: string;
+  paper_nav: number | null;
+  paper_cash: number | null;
+  paper_position_count: number;
+  paper_positions: string[];
+  paper_trades: PaperTrade[];
+  backtest_nav?: number | null;
+  backtest_signal_date?: string | null;
+  backtest_rebalance?: Record<string, unknown> | null;
+  backtest_target_positions?: string[];
+  backtest_trades: PaperTrade[];
+  paper_trade_count: number;
+  backtest_trade_count: number;
+  missing_in_paper: string[];
+  extra_in_paper: string[];
+}
+
+export interface PaperBacktestComparison {
+  session_id: string;
+  backtest_id: string;
+  summary: {
+    paper_total_trades: number;
+    backtest_total_trades: number;
+    trade_delta: number;
+    dates_compared: number;
+    dates_with_trade_differences: number;
+    paper_final_nav?: number | null;
+    backtest_final_nav?: number | null;
+    final_nav_delta?: number | null;
+  };
+  daily: PaperBacktestComparisonDay[];
 }
 
 // ---- Paper Trading API ----
@@ -777,8 +820,20 @@ export async function getPaperDailySeries(sessionId: string): Promise<PaperDaily
   return data;
 }
 
-export async function getPaperPositions(sessionId: string): Promise<PaperPosition[]> {
-  const { data } = await client.get<PaperPosition[]>(`/paper-trading/sessions/${sessionId}/positions`);
+export async function getPaperPositions(sessionId: string, date?: string): Promise<PaperPosition[]> {
+  const { data } = await client.get<PaperPosition[]>(`/paper-trading/sessions/${sessionId}/positions`, {
+    params: { date },
+  });
+  return data;
+}
+
+export async function comparePaperWithBacktest(
+  sessionId: string,
+  backtestId: string,
+): Promise<PaperBacktestComparison> {
+  const { data } = await client.get<PaperBacktestComparison>(
+    `/paper-trading/sessions/${sessionId}/compare-backtest/${backtestId}`,
+  );
   return data;
 }
 

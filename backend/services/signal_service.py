@@ -124,7 +124,7 @@ class SignalService:
 
         # ---- 5. Bulk-load all factor data (strategy + model features) ----
         required_factors = strategy_def.get("required_factors", [])
-        required_models = strategy_def.get("required_models", [])
+        required_models = StrategyService.resolve_required_models(strategy_def)
 
         # Resolve strategy factor IDs
         strategy_factor_map = self._resolve_factor_ids(required_factors) if required_factors else {}
@@ -407,7 +407,7 @@ class SignalService:
         factor_start_date = str(frow[0]) if frow and frow[0] else analysis_date
 
         required_factors = strategy_def.get("required_factors", [])
-        required_models = strategy_def.get("required_models", [])
+        required_models = StrategyService.resolve_required_models(strategy_def)
 
         strategy_factor_map = self._resolve_factor_ids(required_factors) if required_factors else {}
         all_factor_ids = set(strategy_factor_map.values())
@@ -696,6 +696,13 @@ class SignalService:
                         rank = (preds < preds[ticker]).sum() / max(len(preds) - 1, 1)
                         snap.setdefault("quantiles", {})[ticker] = round(float(rank), 4)
 
+        selection_diagnostics = self._build_selection_diagnostics(
+            signals_list=signals_list,
+            candidate_pool=candidate_pool,
+            portfolio_state=portfolio_state,
+            strategy_diagnostics=strategy_diagnostics,
+        )
+
         # Build per-ticker focus snapshot for targeted diagnosis
         focus_snapshot: list[dict] = []
         if focus_tickers:
@@ -959,7 +966,7 @@ class SignalService:
             "strategy_diagnostics": {
                 k: v for k, v in strategy_diagnostics.items()
                 if k not in ("candidate_pool", "gates", "stage_trace")
-            },
+            } | selection_diagnostics,
             "stage_trace": strategy_diagnostics.get("stage_trace") or None,
             "auto_stage_trace": auto_trace,
             "focus_ticker_snapshots": focus_snapshot if focus_snapshot else None,
@@ -1129,7 +1136,7 @@ class SignalService:
                     )
 
         # -- Model status checks --
-        required_models = strategy_def.get("required_models", [])
+        required_models = StrategyService.resolve_required_models(strategy_def)
         model_statuses: dict[str, str] = {}
 
         for model_id in required_models:
@@ -1458,6 +1465,98 @@ class SignalService:
         )
         log.error("signal_service.missing_model_predictions", detail=detail)
         raise ValueError(detail)
+
+    @staticmethod
+    def _build_selection_diagnostics(
+        *,
+        signals_list: list[dict],
+        candidate_pool,
+        portfolio_state: dict,
+        strategy_diagnostics: dict,
+    ) -> dict:
+        """Build generic selection/blocking diagnostics from strategy output."""
+        current_weights = portfolio_state.get("current_weights") or {}
+        holding_days = portfolio_state.get("holding_days") or {}
+        avg_entry_price = portfolio_state.get("avg_entry_price") or {}
+        unrealized_pnl = portfolio_state.get("unrealized_pnl") or {}
+        current_tickers = set(current_weights.keys())
+
+        replacement_trace = strategy_diagnostics.get("replacement_trace", {})
+        selected_trace = replacement_trace.get("selected", []) if isinstance(replacement_trace, dict) else []
+        selected_by_ticker = {
+            str(item.get("ticker")): item
+            for item in selected_trace
+            if isinstance(item, dict) and item.get("ticker")
+        }
+
+        def meta_for(ticker: str, signal: dict | None = None, trace: dict | None = None) -> dict:
+            trace = trace or {}
+            is_current = ticker in current_tickers
+            meta = {
+                "ticker": ticker,
+                "target_weight": signal.get("target_weight") if signal else None,
+                "strength": signal.get("strength") if signal else None,
+                "selected_score": trace.get("selected_score", trace.get("score")),
+                "lane": trace.get("lane"),
+                "is_current": is_current,
+                "holding_days": holding_days.get(ticker),
+                "avg_entry_price": avg_entry_price.get(ticker),
+                "unrealized_pnl": unrealized_pnl.get(ticker),
+            }
+            return {k: v for k, v in meta.items() if v is not None}
+
+        selected_meta = [
+            meta_for(str(sig["ticker"]), sig, selected_by_ticker.get(str(sig["ticker"])))
+            for sig in signals_list
+            if sig.get("ticker")
+        ]
+        current_selected_meta = [m for m in selected_meta if m.get("is_current")]
+        selected_current_count = len(current_selected_meta)
+        selected_profitable_current_count = sum(
+            1 for m in current_selected_meta
+            if float(m.get("unrealized_pnl", 0.0)) > 0
+        )
+        replaceable_slots_available = max(len(signals_list) - len(selected_meta), 0)
+        blocked_by_full_current_book = (
+            bool(selected_meta)
+            and selected_current_count == len(selected_meta)
+            and replaceable_slots_available == 0
+        )
+        blocked_by_nonreplaceable_current_holdings = (
+            blocked_by_full_current_book
+            and selected_profitable_current_count == selected_current_count
+        )
+
+        top_conversion_detail = []
+        if isinstance(replacement_trace, dict):
+            raw_top = replacement_trace.get("top_conversion", [])
+            if isinstance(raw_top, dict):
+                raw_top = [raw_top]
+            candidate_set = set(candidate_pool) if isinstance(candidate_pool, (list, set, tuple)) else set()
+            for item in raw_top or []:
+                if not isinstance(item, dict) or not item.get("ticker"):
+                    continue
+                detail = dict(item)
+                detail["ticker"] = str(detail["ticker"])
+                detail["in_candidate_pool"] = detail["ticker"] in candidate_set
+                detail["blocked_by_full_current_book"] = blocked_by_full_current_book
+                detail["blocked_by_nonreplaceable_current_holdings"] = (
+                    blocked_by_nonreplaceable_current_holdings
+                )
+                detail["blocked_by_margin"] = bool(item.get("blocked_by_margin", False))
+                detail["blocked_by_append_limit"] = bool(item.get("blocked_by_append_limit", False))
+                top_conversion_detail.append(detail)
+
+        return {
+            "selected_meta": selected_meta,
+            "current_selected_meta": current_selected_meta,
+            "top_conversion_detail": top_conversion_detail,
+            "selected_current_count": selected_current_count,
+            "selected_profitable_current_count": selected_profitable_current_count,
+            "replaceable_slots_available": replaceable_slots_available,
+            "blocked_by_full_current_book": blocked_by_full_current_book,
+            "blocked_by_nonreplaceable_current_holdings": blocked_by_nonreplaceable_current_holdings,
+        }
 
     def _predict_diagnose_models(
         self,

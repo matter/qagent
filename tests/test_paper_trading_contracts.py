@@ -37,6 +37,141 @@ class PaperTradingApiContractTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PaperTradingServiceContractTests(unittest.TestCase):
+    def test_daily_series_includes_position_and_trade_counts(self):
+        class FakeResult:
+            def fetchall(self):
+                return [
+                    (
+                        date(2026, 4, 10),
+                        1100.0,
+                        100.0,
+                        json.dumps({"AAA": {"shares": 10}}),
+                        json.dumps([{"ticker": "AAA", "action": "buy"}]),
+                    )
+                ]
+
+        class FakeConnection:
+            def execute(self, query, params=None):
+                self.query = query
+                self.params = params
+                return FakeResult()
+
+        svc = PaperTradingService.__new__(PaperTradingService)
+        fake_conn = FakeConnection()
+
+        with patch("backend.services.paper_trading_service.get_connection", return_value=fake_conn):
+            rows = svc.get_daily_series("session-1")
+
+        self.assertIn("FROM paper_trading_daily", fake_conn.query)
+        self.assertEqual(fake_conn.params, ["session-1"])
+        self.assertEqual(rows[0]["position_count"], 1)
+        self.assertEqual(rows[0]["trade_count"], 1)
+
+    def test_get_positions_can_return_historical_snapshot_by_date(self):
+        class FakeResult:
+            def __init__(self, row=None, rows=None):
+                self.row = row
+                self.rows = rows or []
+
+            def fetchone(self):
+                return self.row
+
+            def fetchall(self):
+                return self.rows
+
+        class FakeConnection:
+            def execute(self, query, params=None):
+                if "FROM paper_trading_daily" in query:
+                    self.snapshot_params = params
+                    return FakeResult(row=(
+                        json.dumps({"AAA": {"shares": 10, "avg_price": 9.5}}),
+                        date(2026, 4, 10),
+                        1100.0,
+                    ))
+                if "FROM daily_bars" in query:
+                    self.price_params = params
+                    return FakeResult(rows=[("AAA", 11.0)])
+                return FakeResult()
+
+        svc = PaperTradingService.__new__(PaperTradingService)
+        fake_conn = FakeConnection()
+
+        with patch("backend.services.paper_trading_service.get_connection", return_value=fake_conn):
+            positions = svc.get_positions("session-1", as_of_date="2026-04-10")
+
+        self.assertEqual(fake_conn.snapshot_params, ["session-1", "2026-04-10"])
+        self.assertEqual(positions[0]["ticker"], "AAA")
+        self.assertEqual(positions[0]["date"], "2026-04-10")
+        self.assertEqual(positions[0]["latest_price"], 11.0)
+
+    def test_compare_with_backtest_returns_daily_trade_deltas(self):
+        class FakeResult:
+            def __init__(self, rows=None):
+                self.rows = rows or []
+
+            def fetchall(self):
+                return self.rows
+
+        class FakeConnection:
+            def execute(self, query, params=None):
+                if "FROM paper_trading_daily" in query:
+                    return FakeResult(rows=[
+                        (
+                            date(2026, 4, 7),
+                            1010.0,
+                            100.0,
+                            json.dumps({"AAA": {"shares": 10, "avg_price": 10.0}}),
+                            json.dumps([{"ticker": "AAA", "action": "buy"}]),
+                        ),
+                        (
+                            date(2026, 4, 8),
+                            1020.0,
+                            100.0,
+                            json.dumps({"AAA": {"shares": 10, "avg_price": 10.0}}),
+                            json.dumps([]),
+                        ),
+                    ])
+                return FakeResult()
+
+        svc = PaperTradingService.__new__(PaperTradingService)
+        svc._backtest_service = Mock()
+        svc._backtest_service.get_backtest.return_value = {
+            "id": "bt-1",
+            "summary": {
+                "total_trades": 2,
+                "rebalance_diagnostics": [
+                    {
+                        "date": "2026-04-07",
+                        "positions_after": {"AAA": 1.0},
+                        "turnover": 1.0,
+                    }
+                ],
+            },
+            "nav_series": {
+                "dates": ["2026-04-07", "2026-04-08"],
+                "values": [1015.0, 1030.0],
+            },
+            "trades": [
+                {"date": "2026-04-07", "ticker": "AAA", "action": "buy"},
+                {"date": "2026-04-08", "ticker": "BBB", "action": "buy"},
+            ],
+        }
+
+        with patch("backend.services.paper_trading_service.get_connection", return_value=FakeConnection()):
+            comparison = svc.compare_with_backtest("session-1", "bt-1")
+
+        self.assertEqual(comparison["summary"]["paper_total_trades"], 1)
+        self.assertEqual(comparison["summary"]["backtest_total_trades"], 2)
+        self.assertEqual(comparison["summary"]["trade_delta"], -1)
+        self.assertEqual(comparison["summary"]["paper_final_nav"], 1020.0)
+        self.assertEqual(comparison["summary"]["backtest_final_nav"], 1030.0)
+        self.assertEqual(comparison["summary"]["final_nav_delta"], -10.0)
+        self.assertEqual(comparison["daily"][0]["backtest_nav"], 1015.0)
+        self.assertEqual(comparison["daily"][1]["backtest_signal_date"], "2026-04-07")
+        self.assertEqual(comparison["daily"][1]["backtest_target_positions"], ["AAA"])
+        self.assertEqual(comparison["daily"][0]["missing_in_paper"], [])
+        self.assertEqual(comparison["daily"][1]["missing_in_paper"], ["BBB:buy"])
+
     def test_new_session_target_before_start_is_not_reported_up_to_date(self):
         svc = PaperTradingService.__new__(PaperTradingService)
         session = {
@@ -105,7 +240,7 @@ class PaperTradingServiceContractTests(unittest.TestCase):
             "config": {"initial_capital": 1000.0},
         }
 
-        def execute_trades(positions, cash, target_weights, trade_date, cost_rate, price_cache):
+        def execute_trades(positions, cash, target_weights, trade_date, cost_rate, price_cache, **kwargs):
             return {
                 "trades": [{"ticker": "AAA", "action": "buy"}],
                 "positions_after": {"AAA": {"shares": 100.0, "avg_price": 10.0}},
@@ -222,7 +357,7 @@ class PaperTradingServiceContractTests(unittest.TestCase):
             "config": {"initial_capital": 1000.0, "rebalance_freq": "weekly"},
         }
 
-        def execute_trades(positions, cash, target_weights, trade_date, cost_rate, price_cache):
+        def execute_trades(positions, cash, target_weights, trade_date, cost_rate, price_cache, **kwargs):
             return {
                 "trades": [{"ticker": "AAA", "action": "buy"}],
                 "positions_after": {"AAA": {"shares": 100.0, "avg_price": 10.0}},
@@ -278,6 +413,232 @@ class PaperTradingServiceContractTests(unittest.TestCase):
         execute.assert_called_once()
         self.assertEqual(execute.call_args.args[3], date(2026, 4, 13))
         self.assertEqual(len(fake_conn.snapshots), len(trading_days))
+
+    def test_advance_uses_strategy_target_state_for_next_signal_context(self):
+        class FakeResult:
+            def __init__(self, row=None, rows=None):
+                self.row = row
+                self.rows = rows or []
+
+            def fetchone(self):
+                return self.row
+
+            def fetchall(self):
+                return self.rows
+
+        class FakeConnection:
+            def __init__(self):
+                self.snapshots = []
+
+            def execute(self, query, params=None):
+                if "SELECT MAX(date) FROM daily_bars" in query:
+                    return FakeResult(row=(date(2026, 4, 8),))
+                if "SELECT date FROM paper_trading_daily" in query:
+                    return FakeResult(rows=[])
+                return FakeResult()
+
+            def executemany(self, query, rows):
+                self.snapshots = list(rows)
+
+        svc = PaperTradingService.__new__(PaperTradingService)
+        svc._strategy_service = Mock()
+        svc._strategy_service.get_strategy.return_value = {
+            "source_code": "",
+            "position_sizing": "equal_weight",
+        }
+        svc._group_service = Mock()
+        svc._group_service.get_group_tickers.return_value = ["AAA", "BBB"]
+
+        trading_days = [
+            date(2026, 4, 6),
+            date(2026, 4, 7),
+            date(2026, 4, 8),
+        ]
+        fake_conn = FakeConnection()
+        session = {
+            "id": "session-1",
+            "status": "active",
+            "current_date": None,
+            "start_date": str(trading_days[0]),
+            "strategy_id": "strategy-1",
+            "universe_group_id": "group-1",
+            "initial_capital": 1000.0,
+            "config": {
+                "initial_capital": 1000.0,
+                "rebalance_freq": "daily",
+            },
+        }
+
+        captured_states = []
+
+        def generate_signal(batch_ctx, signal_date, portfolio_state):
+            captured_states.append((signal_date, portfolio_state))
+            if signal_date == trading_days[0]:
+                return [{"ticker": "AAA", "signal": 1, "target_weight": 1.0, "strength": 1.0}]
+            return [{"ticker": "BBB", "signal": 1, "target_weight": 1.0, "strength": 1.0}]
+
+        def apply_position_sizing(signals, *args, **kwargs):
+            return {s["ticker"]: 1.0 for s in signals if s["signal"] == 1}
+
+        def execute_trades(positions, cash, target_weights, trade_date, cost_rate, price_cache, **kwargs):
+            ticker = next(iter(target_weights))
+            return {
+                "trades": [{"ticker": ticker, "action": "buy"}],
+                "positions_after": {ticker: {"shares": 60.0, "avg_price": 10.0}},
+                "cash_after": 400.0,
+            }
+
+        with (
+            patch("backend.services.paper_trading_service.get_connection", return_value=fake_conn),
+            patch.object(svc, "get_session", return_value=session),
+            patch.object(svc, "_resolve_advance_trading_days", return_value=trading_days),
+            patch.object(
+                svc,
+                "_prev_trading_day",
+                side_effect=lambda d: trading_days[trading_days.index(d) - 1],
+            ),
+            patch.object(svc, "_prepare_signal_context", return_value={"ctx": True}),
+            patch.object(
+                svc,
+                "_preload_prices",
+                return_value={d: {"AAA": (10.0, 10.0), "BBB": (10.0, 10.0)} for d in trading_days},
+            ),
+            patch.object(svc, "_load_latest_state", return_value=({}, 1000.0)),
+            patch.object(
+                svc,
+                "_build_portfolio_state_from_memory",
+                return_value={"current_weights": {"AAA": 0.6}},
+            ),
+            patch.object(svc, "_generate_signal_single_day", side_effect=generate_signal),
+            patch.object(svc, "_apply_position_sizing_from_signals", side_effect=apply_position_sizing),
+            patch.object(svc, "_execute_trades_cached", side_effect=execute_trades),
+            patch.object(svc, "_value_portfolio_cached", return_value=1000.0),
+        ):
+            svc.advance("session-1", target_date=str(trading_days[-1]), steps=0)
+
+        self.assertEqual(len(captured_states), 2)
+        self.assertEqual(captured_states[0][1]["current_weights"], {})
+        self.assertEqual(captured_states[1][1]["current_weights"], {"AAA": 1.0})
+        self.assertEqual(captured_states[1][1]["holding_days"], {"AAA": 1})
+
+    def test_advance_skips_execution_when_target_weight_is_unchanged(self):
+        class FakeResult:
+            def __init__(self, row=None, rows=None):
+                self.row = row
+                self.rows = rows or []
+
+            def fetchone(self):
+                return self.row
+
+            def fetchall(self):
+                return self.rows
+
+        class FakeConnection:
+            def execute(self, query, params=None):
+                if "SELECT MAX(date) FROM daily_bars" in query:
+                    return FakeResult(row=(date(2026, 4, 8),))
+                if "SELECT date FROM paper_trading_daily" in query:
+                    return FakeResult(rows=[])
+                return FakeResult()
+
+            def executemany(self, query, rows):
+                self.snapshots = list(rows)
+
+        svc = PaperTradingService.__new__(PaperTradingService)
+        svc._strategy_service = Mock()
+        svc._strategy_service.get_strategy.return_value = {
+            "source_code": "",
+            "position_sizing": "equal_weight",
+        }
+        svc._group_service = Mock()
+        svc._group_service.get_group_tickers.return_value = ["AAA"]
+
+        trading_days = [
+            date(2026, 4, 6),
+            date(2026, 4, 7),
+            date(2026, 4, 8),
+        ]
+        session = {
+            "id": "session-1",
+            "status": "active",
+            "current_date": None,
+            "start_date": str(trading_days[0]),
+            "strategy_id": "strategy-1",
+            "universe_group_id": "group-1",
+            "initial_capital": 1000.0,
+            "config": {
+                "initial_capital": 1000.0,
+                "rebalance_freq": "daily",
+                "rebalance_buffer": 0.03,
+            },
+        }
+
+        execute_kwargs = []
+
+        def execute_trades(positions, cash, target_weights, trade_date, cost_rate, price_cache, **kwargs):
+            execute_kwargs.append(kwargs)
+            if not positions:
+                return {
+                    "trades": [{"ticker": "AAA", "action": "buy"}],
+                    "positions_after": {"AAA": {"shares": 100.0, "avg_price": 10.0}},
+                    "cash_after": 0.0,
+                }
+            return {
+                "trades": [],
+                "positions_after": positions,
+                "cash_after": cash,
+            }
+
+        with (
+            patch("backend.services.paper_trading_service.get_connection", return_value=FakeConnection()),
+            patch.object(svc, "get_session", return_value=session),
+            patch.object(svc, "_resolve_advance_trading_days", return_value=trading_days),
+            patch.object(
+                svc,
+                "_prev_trading_day",
+                side_effect=lambda d: trading_days[trading_days.index(d) - 1],
+            ),
+            patch.object(svc, "_prepare_signal_context", return_value={"ctx": True}),
+            patch.object(
+                svc,
+                "_preload_prices",
+                return_value={d: {"AAA": (10.0, 12.0)} for d in trading_days},
+            ),
+            patch.object(svc, "_load_latest_state", return_value=({}, 1000.0)),
+            patch.object(
+                svc,
+                "_build_portfolio_state_from_memory",
+                return_value={"current_weights": {"AAA": 0.98}},
+            ),
+            patch.object(
+                svc,
+                "_generate_signal_single_day",
+                return_value=[{"ticker": "AAA", "signal": 1, "target_weight": 1.0, "strength": 1.0}],
+            ),
+            patch.object(svc, "_apply_position_sizing_from_signals", return_value={"AAA": 1.0}),
+            patch.object(svc, "_execute_trades_cached", side_effect=execute_trades),
+            patch.object(svc, "_value_portfolio_cached", return_value=1000.0),
+        ):
+            svc.advance("session-1", target_date=str(trading_days[-1]), steps=0)
+
+        self.assertEqual(len(execute_kwargs), 2)
+        self.assertEqual(execute_kwargs[1]["no_trade_tickers"], {"AAA"})
+
+    def test_execute_trades_can_skip_buffered_tickers_without_rebalancing_shares(self):
+        positions = {"AAA": {"shares": 10.0, "avg_price": 10.0}}
+        result = PaperTradingService._execute_trades_cached(
+            positions=positions,
+            cash=100.0,
+            target_weights={"AAA": 0.5},
+            trade_date=date(2026, 4, 10),
+            cost_rate=0.002,
+            price_cache={date(2026, 4, 10): {"AAA": (12.0, 12.0)}},
+            no_trade_tickers={"AAA"},
+        )
+
+        self.assertEqual(result["trades"], [])
+        self.assertEqual(result["positions_after"], positions)
+        self.assertEqual(result["cash_after"], 100.0)
 
 
 if __name__ == "__main__":

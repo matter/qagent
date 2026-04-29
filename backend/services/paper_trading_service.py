@@ -393,6 +393,20 @@ class PaperTradingService:
                 trading_days[0] if trading_days else date.today(), conn,
             )
             ticker_holding_days.update(existing_holding)
+        execution_weights: dict[str, float] = {}
+        strategy_weights: dict[str, float] = {}
+        strategy_holding_days: dict[str, int] = dict(ticker_holding_days)
+        strategy_entry_price: dict[str, float] = {}
+        if positions and trading_days:
+            initial_portfolio_state = self._build_portfolio_state_from_memory(
+                positions, cash, trading_days[0], price_cache, ticker_holding_days
+            )
+            execution_weights = dict(initial_portfolio_state.get("current_weights", {}))
+            strategy_weights = dict(execution_weights)
+            strategy_holding_days = dict(
+                initial_portfolio_state.get("holding_days", ticker_holding_days)
+            )
+            strategy_entry_price = dict(initial_portfolio_state.get("avg_entry_price", {}))
 
         log.info(
             "paper_trading.advance_start",
@@ -417,6 +431,9 @@ class PaperTradingService:
                 baseline_days += 1
                 continue
 
+            for ticker in list(strategy_holding_days):
+                strategy_holding_days[ticker] = strategy_holding_days.get(ticker, 0) + 1
+
             if trade_date not in rebalance_execution_day_set:
                 for ticker in positions:
                     ticker_holding_days[ticker] = ticker_holding_days.get(ticker, 0) + 1
@@ -437,10 +454,17 @@ class PaperTradingService:
                 positions, cash, trade_date, price_cache,
                 ticker_holding_days,
             )
+            strategy_portfolio_state = self._build_strategy_portfolio_state(
+                strategy_weights,
+                strategy_holding_days,
+                strategy_entry_price,
+                signal_date,
+                price_cache,
+            )
 
             # Generate signals for this single day using pre-loaded context
             signals = self._generate_signal_single_day(
-                batch_ctx, signal_date, portfolio_state,
+                batch_ctx, signal_date, strategy_portfolio_state,
             )
 
             if not signals:
@@ -450,11 +474,20 @@ class PaperTradingService:
             target_weights = self._apply_position_sizing_from_signals(
                 signals, position_sizing, max_positions, max_position_pct,
             )
+            self._update_strategy_state_from_targets(
+                target_weights,
+                signal_date,
+                price_cache,
+                strategy_weights,
+                strategy_holding_days,
+                strategy_entry_price,
+            )
+
+            current_execution_weights = execution_weights or portfolio_state.get("current_weights", {})
 
             # Apply execution constraints (aligned with backtest_engine)
             if rebalance_buffer > 0 or min_holding_days > 0 or reentry_cooldown_days > 0:
-                # Calculate current weights from positions
-                current_weights = portfolio_state.get("current_weights", {})
+                current_weights = current_execution_weights
                 effective_targets = dict(target_weights)
 
                 all_involved = set(current_weights.keys()) | set(target_weights.keys())
@@ -490,10 +523,18 @@ class PaperTradingService:
                 else:
                     target_weights = {}
 
+            no_trade_tickers = {
+                ticker
+                for ticker in set(current_execution_weights) | set(target_weights)
+                if abs(target_weights.get(ticker, 0.0) - current_execution_weights.get(ticker, 0.0)) < 1e-8
+            }
+
             day_trades = self._execute_trades_cached(
                 positions, cash, target_weights,
                 trade_date, cost_rate, price_cache,
+                no_trade_tickers=no_trade_tickers,
             )
+            execution_weights = dict(target_weights)
 
             # Track exits and holding days for execution constraints
             old_positions = set(positions.keys())
@@ -774,7 +815,7 @@ class PaperTradingService:
 
         # --- Bulk load ALL factor data (strategy + model features) ---
         required_factors = strategy_def.get("required_factors", [])
-        required_models = strategy_def.get("required_models", [])
+        required_models = StrategyService.resolve_required_models(strategy_def)
 
         strategy_factor_map = self._resolve_factor_ids(required_factors) if required_factors else {}
         all_factor_ids = set(strategy_factor_map.values())
@@ -967,30 +1008,47 @@ class PaperTradingService:
         """Return daily NAV series for charting."""
         conn = get_connection()
         rows = conn.execute(
-            """SELECT date, nav, cash FROM paper_trading_daily
+            """SELECT date, nav, cash, positions_json, trades_json
+               FROM paper_trading_daily
                WHERE session_id = ? ORDER BY date""",
             [session_id],
         ).fetchall()
-        return [
-            {"date": str(r[0]), "nav": r[1], "cash": r[2]}
-            for r in rows
-        ]
+        result = []
+        for r in rows:
+            positions = json.loads(r[3]) if isinstance(r[3], str) else (r[3] or {})
+            trades = json.loads(r[4]) if isinstance(r[4], str) else (r[4] or [])
+            result.append({
+                "date": str(r[0]),
+                "nav": r[1],
+                "cash": r[2],
+                "position_count": len(positions),
+                "trade_count": len(trades),
+            })
+        return result
 
-    def get_positions(self, session_id: str) -> list[dict]:
-        """Return current positions for the latest date with market values."""
+    def get_positions(self, session_id: str, as_of_date: str | None = None) -> list[dict]:
+        """Return positions for the latest or requested historical snapshot."""
         conn = get_connection()
-        row = conn.execute(
-            """SELECT positions_json, date, nav FROM paper_trading_daily
-               WHERE session_id = ? ORDER BY date DESC LIMIT 1""",
-            [session_id],
-        ).fetchone()
+        if as_of_date:
+            row = conn.execute(
+                """SELECT positions_json, date, nav FROM paper_trading_daily
+                   WHERE session_id = ? AND date <= ?
+                   ORDER BY date DESC LIMIT 1""",
+                [session_id, as_of_date],
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """SELECT positions_json, date, nav FROM paper_trading_daily
+                   WHERE session_id = ? ORDER BY date DESC LIMIT 1""",
+                [session_id],
+            ).fetchone()
         if not row or not row[0]:
             return []
         positions = json.loads(row[0]) if isinstance(row[0], str) else row[0]
         pos_date = str(row[1])
         nav = float(row[2]) if row[2] else 0.0
 
-        # Fetch latest prices for all position tickers
+        # Fetch latest prices for all position tickers as of the snapshot date.
         pos_tickers = list(positions.keys())
         latest_prices: dict[str, float] = {}
         if pos_tickers:
@@ -1023,6 +1081,143 @@ class PaperTradingService:
                 "date": pos_date,
             })
         return result
+
+    def compare_with_backtest(self, session_id: str, backtest_id: str) -> dict:
+        """Return a minimal daily trade/position reconciliation against a backtest."""
+        from backend.services.backtest_service import BacktestService
+
+        conn = get_connection()
+        rows = conn.execute(
+            """SELECT date, nav, cash, positions_json, trades_json
+               FROM paper_trading_daily
+               WHERE session_id = ? ORDER BY date""",
+            [session_id],
+        ).fetchall()
+
+        backtest_service = getattr(self, "_backtest_service", None) or BacktestService()
+        backtest = backtest_service.get_backtest(backtest_id)
+        backtest_trades = [
+            t for t in backtest.get("trades", [])
+            if isinstance(t, dict) and t.get("date")
+        ]
+        nav_series = backtest.get("nav_series")
+        if isinstance(nav_series, dict):
+            backtest_dates = [str(d) for d in nav_series.get("dates", [])]
+            backtest_nav = nav_series.get("values", [])
+        else:
+            backtest_dates = [str(d) for d in backtest.get("dates", [])]
+            backtest_nav = backtest.get("nav", [])
+        bt_nav_by_date = {
+            date_key: backtest_nav[idx]
+            for idx, date_key in enumerate(backtest_dates)
+            if idx < len(backtest_nav)
+        }
+        bt_prev_date = {
+            date_key: backtest_dates[idx - 1]
+            for idx, date_key in enumerate(backtest_dates)
+            if idx > 0
+        }
+        backtest_summary = backtest.get("summary") or {}
+        rebalance_diagnostics = (
+            backtest_summary.get("rebalance_diagnostics")
+            or backtest.get("rebalance_diagnostics")
+            or []
+        )
+        rebalance_by_date = {
+            str(row.get("date")): row
+            for row in rebalance_diagnostics
+            if isinstance(row, dict) and row.get("date")
+        }
+
+        bt_by_date: dict[str, list[dict]] = {}
+        for trade in backtest_trades:
+            bt_by_date.setdefault(str(trade["date"]), []).append(trade)
+
+        paper_by_date: dict[str, dict] = {}
+        paper_total_trades = 0
+        for row in rows:
+            positions = json.loads(row[3]) if isinstance(row[3], str) else (row[3] or {})
+            trades = json.loads(row[4]) if isinstance(row[4], str) else (row[4] or [])
+            date_key = str(row[0])
+            paper_total_trades += len(trades)
+            paper_by_date[date_key] = {
+                "date": date_key,
+                "paper_nav": row[1],
+                "paper_cash": row[2],
+                "paper_position_count": len(positions),
+                "paper_positions": sorted(positions.keys()),
+                "paper_trades": trades,
+            }
+
+        def trade_keys(trades: list[dict]) -> list[str]:
+            return sorted(
+                f"{t.get('ticker')}:{t.get('action')}"
+                for t in trades
+                if isinstance(t, dict)
+            )
+
+        daily = []
+        all_dates = sorted(set(paper_by_date) | set(bt_by_date))
+        for date_key in all_dates:
+            paper_day = paper_by_date.get(date_key, {
+                "date": date_key,
+                "paper_nav": None,
+                "paper_cash": None,
+                "paper_position_count": 0,
+                "paper_positions": [],
+                "paper_trades": [],
+            })
+            bt_trades = bt_by_date.get(date_key, [])
+            paper_keys = trade_keys(paper_day["paper_trades"])
+            bt_keys = trade_keys(bt_trades)
+            signal_date = bt_prev_date.get(date_key)
+            rebalance_diag = rebalance_by_date.get(signal_date) if signal_date else None
+            backtest_target_positions = []
+            if rebalance_diag:
+                target_positions = rebalance_diag.get("positions_after") or {}
+                if isinstance(target_positions, dict):
+                    backtest_target_positions = sorted(target_positions.keys())
+            daily.append({
+                **paper_day,
+                "backtest_nav": bt_nav_by_date.get(date_key),
+                "backtest_signal_date": signal_date,
+                "backtest_rebalance": rebalance_diag,
+                "backtest_target_positions": backtest_target_positions,
+                "backtest_trades": bt_trades,
+                "paper_trade_count": len(paper_day["paper_trades"]),
+                "backtest_trade_count": len(bt_trades),
+                "missing_in_paper": sorted(set(bt_keys) - set(paper_keys)),
+                "extra_in_paper": sorted(set(paper_keys) - set(bt_keys)),
+            })
+
+        bt_total_trades = len(backtest_trades)
+        final_date = all_dates[-1] if all_dates else None
+        paper_final_nav = paper_by_date.get(final_date, {}).get("paper_nav") if final_date else None
+        backtest_final_nav = bt_nav_by_date.get(final_date) if final_date else None
+        return {
+            "session_id": session_id,
+            "backtest_id": backtest_id,
+            "summary": {
+                "paper_total_trades": paper_total_trades,
+                "backtest_total_trades": bt_total_trades,
+                "trade_delta": paper_total_trades - bt_total_trades,
+                "dates_compared": len(all_dates),
+                "dates_with_trade_differences": sum(
+                    1 for row in daily
+                    if row["missing_in_paper"]
+                    or row["extra_in_paper"]
+                    or row["paper_trade_count"] != row["backtest_trade_count"]
+                ),
+                "paper_final_nav": paper_final_nav,
+                "backtest_final_nav": backtest_final_nav,
+                "final_nav_delta": (
+                    paper_final_nav - backtest_final_nav
+                    if paper_final_nav is not None and backtest_final_nav is not None
+                    else None
+                ),
+            },
+            "daily": daily,
+        }
 
     def get_trades(self, session_id: str, limit: int = 200) -> list[dict]:
         """Return recent trades across all days."""
@@ -1106,7 +1301,7 @@ class PaperTradingService:
         strategy_instance = self._load_strategy_instance(strategy_def)
 
         required_factors = strategy_def.get("required_factors", [])
-        required_models = strategy_def.get("required_models", [])
+        required_models = StrategyService.resolve_required_models(strategy_def)
 
         start_lookback = min(signal_dates) - timedelta(days=250)
         end_date = max(signal_dates)
@@ -1358,6 +1553,72 @@ class PaperTradingService:
         }
 
     @staticmethod
+    def _build_strategy_portfolio_state(
+        current_weights: dict[str, float],
+        holding_days: dict[str, int],
+        avg_entry_price: dict[str, float],
+        signal_date: date,
+        price_cache: dict[date, dict[str, tuple[float, float]]],
+    ) -> dict:
+        """Build the strategy-facing state from prior signal targets.
+
+        Backtests feed stateful strategies the prior rebalance target state
+        while trade execution separately applies buffers/cooldowns.  Paper
+        trading mirrors that contract so stateful selection logic sees the
+        same book as backtests.
+        """
+        day_prices = price_cache.get(signal_date, {})
+        unrealized_pnl: dict[str, float] = {}
+        for ticker, entry_price in avg_entry_price.items():
+            close_price = entry_price
+            prices = day_prices.get(ticker)
+            if prices and prices[1] > 0:
+                close_price = prices[1]
+            unrealized_pnl[ticker] = (
+                close_price / entry_price - 1.0
+                if entry_price and entry_price > 0
+                else 0.0
+            )
+
+        return {
+            "current_weights": dict(current_weights),
+            "holding_days": dict(holding_days),
+            "avg_entry_price": dict(avg_entry_price),
+            "unrealized_pnl": unrealized_pnl,
+        }
+
+    @staticmethod
+    def _update_strategy_state_from_targets(
+        target_weights: dict[str, float],
+        signal_date: date,
+        price_cache: dict[date, dict[str, tuple[float, float]]],
+        current_weights: dict[str, float],
+        holding_days: dict[str, int],
+        avg_entry_price: dict[str, float],
+    ) -> None:
+        """Advance strategy-facing holdings to the current signal targets."""
+        filtered_targets = {
+            ticker: float(weight)
+            for ticker, weight in target_weights.items()
+            if abs(float(weight)) > 1e-8
+        }
+        old_held = set(current_weights)
+        new_held = set(filtered_targets)
+
+        for ticker in old_held - new_held:
+            holding_days.pop(ticker, None)
+            avg_entry_price.pop(ticker, None)
+
+        day_prices = price_cache.get(signal_date, {})
+        for ticker in new_held - old_held:
+            prices = day_prices.get(ticker)
+            avg_entry_price[ticker] = float(prices[1]) if prices and prices[1] > 0 else 0.0
+            holding_days[ticker] = 0
+
+        current_weights.clear()
+        current_weights.update(filtered_targets)
+
+    @staticmethod
     def _apply_position_sizing_from_signals(
         signals: list[dict],
         method: str,
@@ -1462,7 +1723,7 @@ class PaperTradingService:
         strategy_instance = self._load_strategy_instance(strategy_def)
 
         required_factors = strategy_def.get("required_factors", [])
-        required_models = strategy_def.get("required_models", [])
+        required_models = StrategyService.resolve_required_models(strategy_def)
 
         start_lookback = min(signal_dates) - timedelta(days=250)
         end_date = max(signal_dates)
@@ -1804,10 +2065,12 @@ class PaperTradingService:
         trade_date: date,
         cost_rate: float,
         price_cache: dict[date, dict[str, tuple[float, float]]],
+        no_trade_tickers: set[str] | None = None,
     ) -> dict:
         """Simulate trade execution using cached prices."""
         day_prices = price_cache.get(trade_date, {})
         all_tickers = set(positions.keys()) | set(target_weights.keys())
+        no_trade_tickers = no_trade_tickers or set()
 
         # Calculate current portfolio value at open
         portfolio_value = cash
@@ -1823,6 +2086,8 @@ class PaperTradingService:
         new_positions = dict(positions)
 
         for ticker in all_tickers:
+            if ticker in no_trade_tickers:
+                continue
             old_shares = positions.get(ticker, {}).get("shares", 0.0)
             target_w = target_weights.get(ticker, 0.0)
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
+import ast
 from datetime import datetime
 
 from backend.db import get_connection
@@ -54,7 +55,10 @@ class StrategyService:
 
         # Extract required_factors / required_models from the instance
         required_factors = instance.required_factors()
-        required_models = instance.required_models()
+        required_models = self._merge_required_models(
+            instance.required_models(),
+            self._extract_model_references(source_code),
+        )
 
         # Static validation: check source code model references vs declaration
         model_warnings = self._validate_model_references(source_code, required_models)
@@ -129,7 +133,10 @@ class StrategyService:
             now = datetime.utcnow()
 
             required_factors = instance.required_factors()
-            required_models = instance.required_models()
+            required_models = self._merge_required_models(
+                instance.required_models(),
+                self._extract_model_references(source_code),
+            )
 
             # Static validation: check source code model references vs declaration
             model_warnings = self._validate_model_references(source_code, required_models)
@@ -230,6 +237,94 @@ class StrategyService:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _merge_required_models(
+        declared_models: list[str] | None,
+        source_models: set[str] | None,
+    ) -> list[str]:
+        """Return deterministic union of explicit and statically referenced models."""
+        merged = set(declared_models or [])
+        merged.update(source_models or set())
+        return sorted(merged)
+
+    @staticmethod
+    def resolve_required_models(strategy_def: dict) -> list[str]:
+        """Resolve all models a strategy may use, including source-code references."""
+        return StrategyService._merge_required_models(
+            strategy_def.get("required_models", []),
+            StrategyService._extract_model_references(strategy_def.get("source_code", "")),
+        )
+
+    @staticmethod
+    def _extract_model_references(source_code: str) -> set[str]:
+        """Extract model IDs used as ``model_predictions`` keys.
+
+        Handles direct literals and simple constants such as
+        ``AUX_MODEL_ID = "..."`` followed by
+        ``context.model_predictions.get(AUX_MODEL_ID)`` or
+        ``context.model_predictions.get(self.AUX_MODEL_ID)``.
+        """
+        if not source_code:
+            return set()
+
+        try:
+            tree = ast.parse(source_code)
+        except SyntaxError:
+            return set()
+
+        constants: dict[str, str] = {}
+        for node in ast.walk(tree):
+            targets: list[ast.expr] = []
+            value = None
+            if isinstance(node, ast.Assign):
+                targets = list(node.targets)
+                value = node.value
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+                value = node.value
+            if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    constants[target.id] = value.value
+                elif isinstance(target, ast.Attribute):
+                    constants[target.attr] = value.value
+
+        def is_model_predictions(expr: ast.AST) -> bool:
+            if isinstance(expr, ast.Name):
+                return expr.id == "model_predictions"
+            if isinstance(expr, ast.Attribute):
+                return expr.attr == "model_predictions"
+            return False
+
+        def resolve_key(expr: ast.AST | None) -> str | None:
+            if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+                return expr.value
+            if isinstance(expr, ast.Name):
+                return constants.get(expr.id)
+            if isinstance(expr, ast.Attribute):
+                return constants.get(expr.attr)
+            return None
+
+        referenced: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Subscript) and is_model_predictions(node.value):
+                key = resolve_key(node.slice)
+                if key:
+                    referenced.add(key)
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get"
+                and is_model_predictions(node.func.value)
+                and node.args
+            ):
+                key = resolve_key(node.args[0])
+                if key:
+                    referenced.add(key)
+
+        return referenced
+
+    @staticmethod
     def _validate_model_references(source_code: str, declared_models: list[str]) -> list[str]:
         """Scan strategy source code for model_predictions references and warn on mismatch.
 
@@ -250,6 +345,7 @@ class StrategyService:
             r"""model_predictions\s*(?:\[|\.get\s*\()\s*['"]([a-zA-Z0-9_]+)['"]""",
         )
         referenced_ids = set(pattern.findall(source_code))
+        referenced_ids.update(StrategyService._extract_model_references(source_code))
 
         declared_set = set(declared_models)
 

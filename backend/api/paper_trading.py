@@ -128,8 +128,16 @@ async def get_daily_series(session_id: str) -> list[dict]:
 
 
 @router.get("/paper-trading/sessions/{session_id}/positions")
-async def get_positions(session_id: str) -> list[dict]:
-    return _get_svc().get_positions(session_id)
+async def get_positions(
+    session_id: str,
+    as_of_date: str | None = Query(None, alias="date"),
+) -> list[dict]:
+    return _get_svc().get_positions(session_id, as_of_date=as_of_date)
+
+
+@router.get("/paper-trading/sessions/{session_id}/compare-backtest/{backtest_id}")
+async def compare_with_backtest(session_id: str, backtest_id: str) -> dict:
+    return _get_svc().compare_with_backtest(session_id, backtest_id)
 
 
 @router.get("/paper-trading/sessions/{session_id}/trades")

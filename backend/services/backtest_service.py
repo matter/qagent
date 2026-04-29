@@ -140,7 +140,7 @@ class BacktestService:
                         )
 
         # ---- 6. Build signals for each trading day ----
-        required_models = strategy_def.get("required_models", [])
+        required_models = StrategyService.resolve_required_models(strategy_def)
         all_trading_days = sorted(prices_close.index)
         rebalance_dates = self._backtest_engine._get_rebalance_dates(
             all_trading_days, bt_config.rebalance_freq

@@ -70,6 +70,43 @@ class SignalServiceContractTests(unittest.TestCase):
         self.assertFalse(membership["in_candidate_union_post_filter"])
         self.assertIn("structured_reason", detail)
 
+    def test_selection_diagnostics_explain_current_book_blocking(self):
+        svc = SignalService.__new__(SignalService)
+
+        diagnostics = svc._build_selection_diagnostics(
+            signals_list=[
+                {"ticker": "AAA", "target_weight": 0.5, "strength": 1.0},
+                {"ticker": "BBB", "target_weight": 0.5, "strength": 0.9},
+            ],
+            candidate_pool=["AAA", "BBB", "CCC"],
+            portfolio_state={
+                "current_weights": {"AAA": 0.5, "BBB": 0.5},
+                "holding_days": {"AAA": 7, "BBB": 5},
+                "avg_entry_price": {"AAA": 10.0, "BBB": 20.0},
+                "unrealized_pnl": {"AAA": 0.12, "BBB": 0.08},
+            },
+            strategy_diagnostics={
+                "replacement_trace": {
+                    "selected": [
+                        {"ticker": "AAA", "selected_score": 0.7, "lane": "current"},
+                        {"ticker": "BBB", "selected_score": 0.6, "lane": "current"},
+                    ],
+                    "top_conversion": [
+                        {"ticker": "CCC", "selected_score": 0.8, "lane": "conversion"},
+                    ],
+                }
+            },
+        )
+
+        self.assertEqual(diagnostics["selected_current_count"], 2)
+        self.assertEqual(diagnostics["selected_profitable_current_count"], 2)
+        self.assertEqual(diagnostics["replaceable_slots_available"], 0)
+        self.assertTrue(diagnostics["blocked_by_full_current_book"])
+        self.assertTrue(diagnostics["blocked_by_nonreplaceable_current_holdings"])
+        self.assertEqual(diagnostics["current_selected_meta"][0]["ticker"], "AAA")
+        self.assertEqual(diagnostics["top_conversion_detail"][0]["ticker"], "CCC")
+        self.assertTrue(diagnostics["top_conversion_detail"][0]["blocked_by_full_current_book"])
+
 
 if __name__ == "__main__":
     unittest.main()

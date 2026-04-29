@@ -181,7 +181,7 @@ class BacktestEngine:
         rebalance_dates = self._get_rebalance_dates(all_trading_days, config.rebalance_freq)
 
         # 4. Run the simulation
-        capital = config.initial_capital
+        cash = config.initial_capital
         cost_rate = config.commission_rate + config.slippage_rate
 
         # Current holdings: {ticker: num_shares}
@@ -238,11 +238,11 @@ class BacktestEngine:
                         }
 
                     # Calculate portfolio value BEFORE rebalance (at today's open)
-                    portfolio_value = self._calc_portfolio_value_at_open(
+                    portfolio_value = cash + self._calc_portfolio_value_at_open(
                         holdings, prices_open, trade_date_ts
                     )
                     if portfolio_value <= 0:
-                        portfolio_value = capital
+                        portfolio_value = cash
 
                     # Compute trades: current weights vs target weights
                     # Apply low-turnover constraints before executing trades
@@ -317,8 +317,10 @@ class BacktestEngine:
                         trade_value = abs(share_change * exec_price)
                         trade_cost = trade_value * cost_rate
                         total_cost += trade_cost
-                        portfolio_value -= trade_cost
-                        capital -= trade_cost
+                        if share_change > 0:
+                            cash -= trade_value + trade_cost
+                        else:
+                            cash += trade_value - trade_cost
 
                         # Determine trade reason and position state
                         was_held = old_shares > 1e-8
@@ -375,7 +377,8 @@ class BacktestEngine:
                     current_weights = dict(effective_targets)
 
             # --- Value portfolio at today's close ---
-            portfolio_value = 0.0
+            portfolio_value = cash
+            valued_positions = 0
             for ticker, shares in holdings.items():
                 if (
                     trade_date_ts in prices_close.index
@@ -384,13 +387,11 @@ class BacktestEngine:
                     close_price = prices_close.loc[trade_date_ts, ticker]
                     if pd.notna(close_price) and close_price > 0:
                         portfolio_value += shares * close_price
+                        valued_positions += 1
 
-            if portfolio_value <= 0 and holdings:
+            if holdings and valued_positions == 0:
                 # If we can't value, carry forward the last known NAV
                 portfolio_value = nav_series[-1] if nav_series else config.initial_capital
-
-            if not holdings:
-                portfolio_value = config.initial_capital
 
             nav_series.append(round(portfolio_value, 2))
             date_series.append(
