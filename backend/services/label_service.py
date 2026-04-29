@@ -11,6 +11,12 @@ import pandas as pd
 
 from backend.db import get_connection
 from backend.logger import get_logger
+from backend.services.market_context import (
+    get_default_benchmark,
+    infer_ticker_market,
+    normalize_market,
+    normalize_ticker,
+)
 
 log = get_logger(__name__)
 
@@ -291,21 +297,30 @@ class LabelService:
     # Public API
     # ------------------------------------------------------------------
 
-    def ensure_presets(self) -> None:
+    def ensure_presets(self, market: str | None = None) -> None:
         """Create or update preset label definitions."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
-        for preset in _PRESET_LABELS:
+        for raw_preset in _PRESET_LABELS:
+            preset = dict(raw_preset)
+            if resolved_market != "US":
+                preset["id"] = f"{resolved_market.lower()}_{preset['id']}"
+                preset["name"] = f"{resolved_market.lower()}_{preset['name']}"
+                if preset.get("benchmark"):
+                    preset["benchmark"] = get_default_benchmark(resolved_market)
             config_json = json.dumps(preset["config"]) if preset.get("config") else None
             row = conn.execute(
-                "SELECT id, config FROM label_definitions WHERE id = ?", [preset["id"]]
+                "SELECT id, config FROM label_definitions WHERE id = ? AND market = ?",
+                [preset["id"], resolved_market],
             ).fetchone()
             if row is None:
                 conn.execute(
                     """INSERT INTO label_definitions
-                       (id, name, description, target_type, horizon, benchmark, config, status)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, 'active')""",
+                       (id, market, name, description, target_type, horizon, benchmark, config, status)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')""",
                     [
                         preset["id"],
+                        resolved_market,
                         preset["name"],
                         preset["description"],
                         preset["target_type"],
@@ -314,7 +329,7 @@ class LabelService:
                         config_json,
                     ],
                 )
-                log.info("label.preset_created", name=preset["name"])
+                log.info("label.preset_created", market=resolved_market, name=preset["name"])
             else:
                 existing_config = row[1]
                 if existing_config != config_json:
@@ -322,7 +337,7 @@ class LabelService:
                         """UPDATE label_definitions
                            SET description = ?, target_type = ?, horizon = ?,
                                benchmark = ?, config = ?
-                           WHERE id = ?""",
+                           WHERE id = ? AND market = ?""",
                         [
                             preset["description"],
                             preset["target_type"],
@@ -330,9 +345,10 @@ class LabelService:
                             preset["benchmark"],
                             config_json,
                             preset["id"],
+                            resolved_market,
                         ],
                     )
-                    log.info("label.preset_updated", name=preset["name"])
+                    log.info("label.preset_updated", market=resolved_market, name=preset["name"])
 
     def create_label(
         self,
@@ -342,8 +358,11 @@ class LabelService:
         horizon: int = 5,
         benchmark: str | None = None,
         config: dict | None = None,
+        market: str | None = None,
     ) -> dict:
         """Create a new label definition."""
+        resolved_market = normalize_market(market)
+        benchmark = self._normalize_and_validate_benchmark(benchmark, resolved_market)
         if target_type not in _VALID_TARGET_TYPES:
             raise ValueError(
                 f"target_type must be one of {_VALID_TARGET_TYPES}, got '{target_type}'"
@@ -364,12 +383,12 @@ class LabelService:
 
         conn.execute(
             """INSERT INTO label_definitions
-               (id, name, description, target_type, horizon, benchmark, config, status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)""",
-            [label_id, name, description, target_type, horizon, benchmark, config_json, now, now],
+               (id, market, name, description, target_type, horizon, benchmark, config, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)""",
+            [label_id, resolved_market, name, description, target_type, horizon, benchmark, config_json, now, now],
         )
-        log.info("label.created", id=label_id, name=name)
-        return self.get_label(label_id)
+        log.info("label.created", id=label_id, market=resolved_market, name=name)
+        return self.get_label(label_id, market=resolved_market)
 
     def update_label(
         self,
@@ -381,17 +400,27 @@ class LabelService:
         benchmark: str | None = None,
         config: dict | None = None,
         status: str | None = None,
+        market: str | None = None,
     ) -> dict:
         """Update an existing label definition."""
         conn = get_connection()
-        existing = self._fetch_row(label_id)
+        existing = self._fetch_row(label_id, market)
         if existing is None:
             raise ValueError(f"Label {label_id} not found")
+
+        resolved_market = existing["market"]
+        effective_target_type = target_type or existing["target_type"]
+        effective_benchmark = benchmark if benchmark is not None else existing.get("benchmark")
 
         if target_type is not None and target_type not in _VALID_TARGET_TYPES:
             raise ValueError(
                 f"target_type must be one of {_VALID_TARGET_TYPES}, got '{target_type}'"
             )
+        effective_benchmark = self._normalize_and_validate_benchmark(
+            effective_benchmark, resolved_market
+        )
+        if effective_target_type in ("excess_return", "excess_binary") and not effective_benchmark:
+            raise ValueError(f"benchmark is required for {effective_target_type} target_type")
 
         now = datetime.utcnow()
         sets: list[str] = ["updated_at = ?"]
@@ -402,7 +431,7 @@ class LabelService:
             ("description", description),
             ("target_type", target_type),
             ("horizon", horizon),
-            ("benchmark", benchmark),
+            ("benchmark", effective_benchmark if benchmark is not None else None),
             ("status", status),
         ]:
             if val is not None:
@@ -414,37 +443,44 @@ class LabelService:
             params.append(json.dumps(config))
 
         params.append(label_id)
+        params.append(resolved_market)
         conn.execute(
-            f"UPDATE label_definitions SET {', '.join(sets)} WHERE id = ?", params
+            f"UPDATE label_definitions SET {', '.join(sets)} WHERE id = ? AND market = ?", params
         )
-        log.info("label.updated", id=label_id)
-        return self.get_label(label_id)
+        log.info("label.updated", id=label_id, market=resolved_market)
+        return self.get_label(label_id, market=resolved_market)
 
-    def delete_label(self, label_id: str) -> None:
+    def delete_label(self, label_id: str, market: str | None = None) -> None:
         """Delete a label definition."""
         conn = get_connection()
-        existing = self._fetch_row(label_id)
+        existing = self._fetch_row(label_id, market)
         if existing is None:
             raise ValueError(f"Label {label_id} not found")
 
-        conn.execute("DELETE FROM label_definitions WHERE id = ?", [label_id])
-        log.info("label.deleted", id=label_id)
+        conn.execute(
+            "DELETE FROM label_definitions WHERE id = ? AND market = ?",
+            [label_id, existing["market"]],
+        )
+        log.info("label.deleted", id=label_id, market=existing["market"])
 
-    def get_label(self, label_id: str) -> dict:
+    def get_label(self, label_id: str, market: str | None = None) -> dict:
         """Return a single label definition."""
-        row = self._fetch_row(label_id)
+        row = self._fetch_row(label_id, market)
         if row is None:
             raise ValueError(f"Label {label_id} not found")
         return row
 
-    def list_labels(self) -> list[dict]:
+    def list_labels(self, market: str | None = None) -> list[dict]:
         """List all label definitions."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         rows = conn.execute(
-            """SELECT id, name, description, target_type, horizon,
+            """SELECT id, market, name, description, target_type, horizon,
                       benchmark, config, status, created_at, updated_at
                FROM label_definitions
-               ORDER BY created_at"""
+               WHERE market = ?
+               ORDER BY created_at""",
+            [resolved_market],
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
@@ -461,12 +497,15 @@ class LabelService:
         tickers: list[str],
         start_date: str | None = None,
         end_date: str | None = None,
+        market: str | None = None,
     ) -> pd.DataFrame:
         """Compute label values for given tickers and date range.
 
         Returns a DataFrame with columns: ticker, date, label_value.
         """
-        label = self.get_label(label_id)
+        label = self.get_label(label_id, market=market)
+        resolved_market = label["market"]
+        tickers = [normalize_ticker(t, resolved_market) for t in tickers if str(t).strip()]
         target_type = label["target_type"]
         horizon = label["horizon"]
         benchmark = label.get("benchmark")
@@ -474,14 +513,19 @@ class LabelService:
 
         # ---- Composite label: combine multiple sub-labels ----
         if target_type == "composite":
-            return self._compute_composite_label(config, tickers, start_date, end_date)
+            return self._compute_composite_label(
+                config, tickers, start_date, end_date, market=resolved_market
+            )
 
         conn = get_connection()
 
         # Build query for daily bars
         # Fetch extra horizon days beyond end_date so shift(-horizon) doesn't produce NaN at the tail
-        where_parts = ["ticker IN (" + ",".join(f"'{t}'" for t in tickers) + ")"]
-        params: list = []
+        if not tickers:
+            return pd.DataFrame(columns=["ticker", "date", "label_value"])
+        placeholders = ",".join("?" for _ in tickers)
+        where_parts = [f"market = ? AND ticker IN ({placeholders})"]
+        params: list = [resolved_market, *tickers]
         if start_date:
             where_parts.append("date >= ?")
             params.append(start_date)
@@ -559,7 +603,7 @@ class LabelService:
 
         elif target_type == "excess_return":
             bench_return_map = self._load_benchmark_returns(
-                benchmark, horizon, start_date, end_date, conn
+                benchmark, horizon, start_date, end_date, conn, market=resolved_market
             )
             combined["bench_return"] = combined["date"].map(bench_return_map)
             combined["label_value"] = combined["fwd_return"] - combined["bench_return"]
@@ -588,7 +632,7 @@ class LabelService:
 
         elif target_type == "excess_binary":
             bench_return_map = self._load_benchmark_returns(
-                benchmark, horizon, start_date, end_date, conn
+                benchmark, horizon, start_date, end_date, conn, market=resolved_market
             )
             combined["bench_return"] = combined["date"].map(bench_return_map)
             excess = combined["fwd_return"] - combined["bench_return"]
@@ -721,13 +765,16 @@ class LabelService:
         start_date: str | None,
         end_date: str | None,
         conn,
+        market: str | None = None,
     ) -> dict:
         """Load benchmark forward returns as a date -> float mapping."""
         if not benchmark:
             raise ValueError("benchmark is required for excess_return / excess_binary")
+        resolved_market = normalize_market(market)
+        benchmark = self._normalize_and_validate_benchmark(benchmark, resolved_market)
 
-        bench_where = ["symbol = ?"]
-        bench_params: list = [benchmark]
+        bench_where = ["market = ?", "symbol = ?"]
+        bench_params: list = [resolved_market, benchmark]
         if start_date:
             bench_where.append("date >= ?")
             bench_params.append(start_date)
@@ -741,7 +788,7 @@ class LabelService:
         ).fetchdf()
 
         if bench_df.empty:
-            log.warning("label.no_benchmark_data", benchmark=benchmark)
+            log.warning("label.no_benchmark_data", market=resolved_market, benchmark=benchmark)
             return {}
 
         bench_df = bench_df.sort_values("date").reset_index(drop=True)
@@ -976,6 +1023,7 @@ class LabelService:
         tickers: list[str],
         start_date: str | None,
         end_date: str | None,
+        market: str | None = None,
     ) -> pd.DataFrame:
         """Compute a composite label as weighted sum of sub-labels.
 
@@ -1002,7 +1050,7 @@ class LabelService:
                 raise ValueError(f"component {i} missing 'label_id'")
 
             sub_df = self.compute_label_values(
-                sub_label_id, tickers, start_date, end_date
+                sub_label_id, tickers, start_date, end_date, market=market
             )
             if sub_df.empty:
                 continue
@@ -1072,21 +1120,31 @@ class LabelService:
                 if sl is not None and sl <= 0:
                     raise ValueError("stop_loss must be positive")
 
-    def _fetch_row(self, label_id: str) -> dict | None:
+    def _fetch_row(self, label_id: str, market: str | None = None) -> dict | None:
+        resolved_market = normalize_market(market)
         conn = get_connection()
         row = conn.execute(
-            """SELECT id, name, description, target_type, horizon,
+            """SELECT id, market, name, description, target_type, horizon,
                       benchmark, config, status, created_at, updated_at
-               FROM label_definitions WHERE id = ?""",
-            [label_id],
+               FROM label_definitions WHERE id = ? AND market = ?""",
+            [label_id, resolved_market],
         ).fetchone()
         if row is None:
             return None
         return self._row_to_dict(row)
 
+    def _normalize_and_validate_benchmark(self, benchmark: str | None, market: str) -> str | None:
+        if benchmark is None:
+            return None
+        normalized = normalize_ticker(benchmark, market)
+        hinted_market = infer_ticker_market(normalized)
+        if hinted_market is not None and hinted_market != market:
+            raise ValueError(f"benchmark {benchmark} is not valid for market {market}")
+        return normalized
+
     @staticmethod
     def _row_to_dict(row) -> dict:
-        config_raw = row[6]
+        config_raw = row[7]
         if isinstance(config_raw, str):
             try:
                 config_parsed = json.loads(config_raw)
@@ -1097,13 +1155,14 @@ class LabelService:
 
         return {
             "id": row[0],
-            "name": row[1],
-            "description": row[2],
-            "target_type": row[3],
-            "horizon": row[4],
-            "benchmark": row[5],
+            "market": row[1],
+            "name": row[2],
+            "description": row[3],
+            "target_type": row[4],
+            "horizon": row[5],
+            "benchmark": row[6],
             "config": config_parsed,
-            "status": row[7],
-            "created_at": str(row[8]) if row[8] else None,
-            "updated_at": str(row[9]) if row[9] else None,
+            "status": row[8],
+            "created_at": str(row[9]) if row[9] else None,
+            "updated_at": str(row[10]) if row[10] else None,
         }

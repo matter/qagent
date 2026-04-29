@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from backend.logger import get_logger
@@ -30,6 +30,7 @@ def _get_service() -> LabelService:
 
 
 class CreateLabelRequest(BaseModel):
+    market: Optional[str] = None
     name: str
     description: Optional[str] = None
     target_type: str = "return"
@@ -39,6 +40,7 @@ class CreateLabelRequest(BaseModel):
 
 
 class UpdateLabelRequest(BaseModel):
+    market: Optional[str] = None
     name: Optional[str] = None
     description: Optional[str] = None
     target_type: Optional[str] = None
@@ -65,24 +67,29 @@ async def create_label(body: CreateLabelRequest) -> dict:
             horizon=body.horizon,
             benchmark=body.benchmark,
             config=body.config,
+            market=body.market,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/labels")
-async def list_labels() -> list[dict]:
+async def list_labels(market: Optional[str] = Query(None)) -> list[dict]:
     """List all label definitions."""
     svc = _get_service()
-    return svc.list_labels()
+    try:
+        svc.ensure_presets(market)
+        return svc.list_labels(market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/labels/{label_id}")
-async def get_label(label_id: str) -> dict:
+async def get_label(label_id: str, market: Optional[str] = Query(None)) -> dict:
     """Get label definition detail."""
     svc = _get_service()
     try:
-        return svc.get_label(label_id)
+        return svc.get_label(label_id, market=market)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -101,17 +108,18 @@ async def update_label(label_id: str, body: UpdateLabelRequest) -> dict:
             benchmark=body.benchmark,
             config=body.config,
             status=body.status,
+            market=body.market,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.delete("/labels/{label_id}")
-async def delete_label(label_id: str) -> dict:
+async def delete_label(label_id: str, market: Optional[str] = Query(None)) -> dict:
     """Delete a label definition."""
     svc = _get_service()
     try:
-        svc.delete_label(label_id)
+        svc.delete_label(label_id, market=market)
         return {"status": "deleted", "id": label_id}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

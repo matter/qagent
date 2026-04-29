@@ -77,3 +77,22 @@ This file records milestone evidence for the V2.0 A-share and ranking upgrade.
   - `uv run python scripts/e2e_demo.py` passed after CN rows were added.
   - `uv run python -m unittest discover tests` passed: `41` tests.
   - `cd frontend && pnpm build` passed. Vite reported the existing large-chunk and dynamic-import warnings.
+
+## P3 Research Asset Isolation
+
+- Label scope completed:
+  - Label definitions now carry `market`; old requests default to `US`.
+  - Label list/detail/update/delete and create APIs accept `market`.
+  - Label computation reads `daily_bars` and `index_bars` within the label market only.
+  - CN excess-return labels reject US benchmarks such as `SPY`.
+  - CN presets use `cn_` id/name prefixes to avoid legacy single-column `name` unique constraints in upgraded databases.
+  - Verification:
+    - `uv run python -m unittest tests.test_label_market_scope` passed.
+    - `GET /api/labels?market=CN` returned `26` CN presets.
+    - `POST /api/labels` with `market=CN`, `target_type=excess_return`, `benchmark=SPY` returned HTTP `400`.
+    - `uv run python scripts/e2e_demo.py` passed through the old US label-dependent factor evaluation and model-training flow.
+    - `uv run python -m unittest discover tests` passed: `46` tests.
+    - `cd frontend && pnpm build` passed with the existing Vite warnings.
+- Remaining P3 work:
+  - Factor records/cache/evaluation market scope.
+  - Feature set records and dependency validation market scope.
