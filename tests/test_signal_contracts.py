@@ -4,7 +4,38 @@ from unittest.mock import patch
 from backend.services.signal_service import SignalService
 
 
+class _FakeSignalValidationConnection:
+    def execute(self, query, params=None):
+        return self
+
+    def fetchone(self):
+        return ("2026-04-03",)
+
+
 class SignalServiceContractTests(unittest.TestCase):
+    def test_dependency_validation_uses_imported_strategy_service(self):
+        svc = SignalService.__new__(SignalService)
+        strategy_def = {
+            "name": "NoDeps",
+            "status": "published",
+            "required_factors": [],
+            "required_models": [],
+            "source_code": "class NoDeps: pass",
+        }
+
+        with patch(
+            "backend.services.signal_service.get_connection",
+            return_value=_FakeSignalValidationConnection(),
+        ):
+            validation = svc._validate_dependency_chain(
+                strategy_def,
+                target_date="2026-04-02",
+                universe_group_id=None,
+            )
+
+        self.assertFalse(validation["blocked"])
+        self.assertEqual(validation["model_statuses"], {})
+
     def test_diagnose_model_prediction_skips_executor_when_no_required_models(self):
         svc = SignalService.__new__(SignalService)
 

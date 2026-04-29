@@ -1162,7 +1162,6 @@ class SignalService:
         # -- Source code vs required_models cross-check --
         source_code = strategy_def.get("source_code", "")
         if source_code:
-            from backend.services.strategy_service import StrategyService
             model_ref_warnings = StrategyService._validate_model_references(
                 source_code, required_models
             )
