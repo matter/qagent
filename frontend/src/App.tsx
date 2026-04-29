@@ -25,6 +25,7 @@ import SignalGeneration from "./pages/SignalGeneration";
 import PaperTrading from "./pages/PaperTrading";
 import SystemSettings from "./pages/SystemSettings";
 import TaskManagement from "./pages/TaskManagement";
+import MarketScopeSelector from "./components/MarketScopeSelector";
 
 const { Sider, Content, Header } = Layout;
 const { Title } = Typography;
@@ -46,6 +47,9 @@ export default function App() {
   const [collapsed, setCollapsed] = useState(false);
   const navigate = useNavigate();
   const location = useLocation();
+  const currentMenuItem = menuItems?.find(
+    (i) => i && "key" in i && i.key === location.pathname,
+  );
 
   const onMenuClick: MenuProps["onClick"] = ({ key }) => {
     navigate(key);
@@ -99,14 +103,17 @@ export default function App() {
               background: "transparent",
               display: "flex",
               alignItems: "center",
+              justifyContent: "space-between",
+              gap: 16,
             }}
           >
             <Title level={5} style={{ margin: 0, color: "rgba(255,255,255,0.85)" }}>
-              {menuItems?.find((i) => i && "key" in i && i.key === location.pathname)
+              {currentMenuItem
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                ? (menuItems.find((i) => i && "key" in i && i.key === location.pathname) as any).label
+                ? (currentMenuItem as any).label
                 : "QAgent"}
             </Title>
+            <MarketScopeSelector />
           </Header>
           <Content style={{ margin: 16, padding: 24, background: "rgba(255,255,255,0.04)", borderRadius: 8 }}>
             <Routes>

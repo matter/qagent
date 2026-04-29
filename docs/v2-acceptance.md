@@ -170,6 +170,32 @@ This file records milestone evidence for the V2.0 A-share and ranking upgrade.
     - Temporary CN smoke assets were deleted after the check.
   - Old system regression:
     - `uv run python scripts/e2e_demo.py` passed through US factor evaluation, feature set reuse, model training, strategy backtest, and signal generation.
+
+- Task 13 frontend API market scope and global selector completed:
+  - Added shared frontend `Market = "US" | "CN"` type and market helper exports.
+  - Added API client market state with `qagent.market` localStorage persistence, first-load default `US`, and request interceptor injection for market-scoped REST paths.
+  - Added `MarketScopeSelector` to the global header using the existing Ant Design dark layout.
+  - Preserved explicit per-call market override support for data, group, label, factor, feature, model, strategy, signal, and paper-trading API helpers.
+  - Logged existing AntD deprecation warnings from `/market` to `docs/backlog.md` for Task 14 cleanup.
+- Task 13 verification:
+  - Red/green contract check:
+    - `uv run python -m unittest tests.test_frontend_market_scope_contracts` failed before implementation because the shared frontend market contract was missing.
+    - The same command passed after implementation: `1` test.
+  - `cd frontend && pnpm build` passed. Vite reported the existing large-chunk and dynamic-import warnings.
+  - `uv run python -m unittest discover tests` passed: `77` tests.
+  - API smoke with backend on `127.0.0.1:8000`:
+    - `GET /api/health` returned `{"status":"ok"}`.
+    - `GET /api/data/status` returned `market="US"` through the old no-market path.
+    - `GET /api/stocks/search?q=AAPL&limit=1` returned AAPL with `market="US"`.
+  - Browser smoke with backend and Vite dev server:
+    - Opened `http://127.0.0.1:5173/market`.
+    - Header selector displayed `Market`, `US`, and `CN`.
+    - First load used `US` default and the initial chart request included `market=US`.
+    - Switching to `CN` saved `qagent.market="CN"` in localStorage and showed the `A股` tag.
+    - Searching `600000` after switching sent `/api/stocks/search` with `market=CN`.
+    - Screenshot saved at `logs/v2-task13-market-selector.png`.
+  - Old system regression:
+    - `uv run python scripts/e2e_demo.py` passed through US factor evaluation, feature set reuse, model training, strategy backtest, and signal generation.
     - `cd frontend && pnpm build` passed. Vite reported the existing large-chunk and dynamic-import warnings.
 
 - Task 11 signal and paper-trading scope completed:

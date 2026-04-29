@@ -1,8 +1,19 @@
 import client from "./client";
+export {
+  DEFAULT_MARKET,
+  MARKET_STORAGE_KEY,
+  getActiveMarket,
+  normalizeMarketScope,
+  setActiveMarket,
+  subscribeActiveMarket,
+} from "./client";
 
 // ---- Types ----
 
+export type Market = "US" | "CN";
+
 export interface StockSearchResult {
+  market: Market;
   ticker: string;
   name: string;
   exchange: string;
@@ -11,6 +22,8 @@ export interface StockSearchResult {
 }
 
 export interface DailyBar {
+  market?: Market;
+  ticker?: string;
   date: string;
   open: number;
   high: number;
@@ -21,6 +34,7 @@ export interface DailyBar {
 }
 
 export interface DataStatus {
+  market?: Market;
   stock_count: number;
   tickers_with_bars: number;
   date_range: { min: string | null; max: string | null };
@@ -46,6 +60,7 @@ export interface UpdateProgress {
 
 export interface StockGroup {
   id: string;
+  market: Market;
   name: string;
   description: string | null;
   group_type: string;
@@ -58,9 +73,9 @@ export interface StockGroup {
 
 // ---- Data API ----
 
-export async function searchStocks(q: string, limit = 20): Promise<StockSearchResult[]> {
+export async function searchStocks(q: string, limit = 20, market?: Market): Promise<StockSearchResult[]> {
   const { data } = await client.get<StockSearchResult[]>("/stocks/search", {
-    params: { q, limit },
+    params: { q, limit, market: market || undefined },
   });
   return data;
 }
@@ -69,30 +84,39 @@ export async function getDailyBars(
   ticker: string,
   start?: string,
   end?: string,
+  market?: Market,
 ): Promise<DailyBar[]> {
   const { data } = await client.get<DailyBar[]>(`/stocks/${ticker}/daily`, {
-    params: { start, end },
+    params: { start, end, market: market || undefined },
   });
   return data;
 }
 
-export async function getDataStatus(): Promise<DataStatus> {
-  const { data } = await client.get<DataStatus>("/data/status");
+export async function getDataStatus(market?: Market): Promise<DataStatus> {
+  const { data } = await client.get<DataStatus>("/data/status", {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
-export async function triggerUpdate(mode: "incremental" | "full") {
-  const { data } = await client.post("/data/update", { mode });
+export async function triggerUpdate(mode: "incremental" | "full", market?: Market) {
+  const { data } = await client.post("/data/update", { mode, market: market || undefined });
   return data;
 }
 
-export async function updateTickers(tickers: string[]): Promise<{ task_id: string; status: string; tickers: number }> {
-  const { data } = await client.post("/data/update/tickers", { tickers });
+export async function updateTickers(
+  tickers: string[],
+  market?: Market,
+): Promise<{ task_id: string; status: string; market?: Market; tickers: number }> {
+  const { data } = await client.post("/data/update/tickers", { tickers, market: market || undefined });
   return data;
 }
 
-export async function updateGroupData(groupId: string): Promise<{ task_id: string; status: string; tickers: number }> {
-  const { data } = await client.post("/data/update/group", { group_id: groupId });
+export async function updateGroupData(
+  groupId: string,
+  market?: Market,
+): Promise<{ task_id: string; status: string; market?: Market; tickers: number }> {
+  const { data } = await client.post("/data/update/group", { group_id: groupId, market: market || undefined });
   return data;
 }
 
@@ -103,17 +127,22 @@ export async function getUpdateProgress(): Promise<UpdateProgress> {
 
 // ---- Groups API ----
 
-export async function listGroups(): Promise<StockGroup[]> {
-  const { data } = await client.get<StockGroup[]>("/groups");
+export async function listGroups(market?: Market): Promise<StockGroup[]> {
+  const { data } = await client.get<StockGroup[]>("/groups", {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
-export async function getGroup(groupId: string): Promise<StockGroup> {
-  const { data } = await client.get<StockGroup>(`/groups/${groupId}`);
+export async function getGroup(groupId: string, market?: Market): Promise<StockGroup> {
+  const { data } = await client.get<StockGroup>(`/groups/${groupId}`, {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
 export async function createGroup(params: {
+  market?: Market;
   name: string;
   description?: string;
   group_type?: string;
@@ -127,6 +156,7 @@ export async function createGroup(params: {
 export async function updateGroup(
   groupId: string,
   params: {
+    market?: Market;
     name?: string;
     description?: string;
     tickers?: string[];
@@ -137,18 +167,28 @@ export async function updateGroup(
   return data;
 }
 
-export async function deleteGroup(groupId: string) {
-  const { data } = await client.delete(`/groups/${groupId}`);
+export async function deleteGroup(groupId: string, market?: Market) {
+  const { data } = await client.delete(`/groups/${groupId}`, {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
-export async function refreshGroup(groupId: string): Promise<StockGroup> {
-  const { data } = await client.post<StockGroup>(`/groups/${groupId}/refresh`);
+export async function refreshGroup(groupId: string, market?: Market): Promise<StockGroup> {
+  const { data } = await client.post<StockGroup>(
+    `/groups/${groupId}/refresh`,
+    undefined,
+    { params: { market: market || undefined } },
+  );
   return data;
 }
 
-export async function refreshIndexGroups() {
-  const { data } = await client.post('/groups/refresh-indices');
+export async function refreshIndexGroups(market?: Market) {
+  const { data } = await client.post(
+    "/groups/refresh-indices",
+    undefined,
+    { params: { market: market || undefined } },
+  );
   return data;
 }
 
@@ -332,8 +372,10 @@ export async function getEvaluation(evalId: string, market?: string): Promise<Fa
 
 // ---- Label API ----
 
-export async function listLabels(): Promise<LabelDefinition[]> {
-  const { data } = await client.get<LabelDefinition[]>("/labels");
+export async function listLabels(market?: Market): Promise<LabelDefinition[]> {
+  const { data } = await client.get<LabelDefinition[]>("/labels", {
+    params: { market: market || undefined },
+  });
   return data;
 }
 

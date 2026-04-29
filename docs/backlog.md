@@ -58,7 +58,28 @@
 
 ## Deferred
 
-暂无。
+### [2026-04-30] P3 UI：Ant Design 废弃属性警告
+
+- **状态**：Deferred
+- **来源**：UI 验收
+- **影响范围**：`frontend/src/pages/MarketPage.tsx` 及可能复用旧 AntD 写法的页面
+- **复现入口**：
+  - UI：`http://127.0.0.1:5173/market`
+  - API / MCP：无
+  - 资产 ID：无
+- **当前证据**：
+  - 实际结果：页面可正常渲染，但 Vite console 输出 AntD deprecation warnings。
+  - 日志 / 错误：`[antd: Card] bodyStyle is deprecated. Please use styles.body instead.`；`[antd: Spin] tip is deprecated. Please use description instead.`
+  - 相关指标：不影响 Task 13 build/e2e。
+- **期望行为**：页面不使用 AntD 已废弃 props，dev console 保持低噪音。
+- **验收标准**：
+  - 可量化指标：打开 `/market` 不再出现上述两个 warning。
+  - UI 验收点：行情页加载、图表 loading、卡片样式保持一致。
+  - 命令 / API 复验：`cd frontend && pnpm build`；浏览器打开 `/market`。
+- **修复记录**：
+  - commit：待处理
+  - 验证命令：待处理
+  - 复验结论：计划在 Task 14 页面体验整理时处理。
 
 ## Done
 
