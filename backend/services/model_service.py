@@ -22,6 +22,7 @@ from backend.services.calendar_service import snap_to_trading_day
 from backend.services.feature_service import FeatureService
 from backend.services.group_service import GroupService
 from backend.services.label_service import LabelService
+from backend.services.market_context import normalize_market, normalize_ticker
 
 log = get_logger(__name__)
 
@@ -69,7 +70,7 @@ class ModelService:
         # Instance-level caches – models are immutable after training,
         # so these are safe to keep for the lifetime of the service.
         self._model_cache: dict[str, ModelBase] = {}
-        self._record_cache: dict[str, dict] = {}
+        self._record_cache: dict[tuple[str, str], dict] = {}
         self._frozen_cache: dict[str, list[str] | None] = {}
 
     # ------------------------------------------------------------------
@@ -86,6 +87,7 @@ class ModelService:
         train_config: dict[str, Any] | None = None,
         universe_group_id: str | None = None,
         sample_weight_config: dict[str, Any] | None = None,
+        market: str | None = None,
     ) -> dict:
         """End-to-end model training pipeline.
 
@@ -111,6 +113,7 @@ class ModelService:
 
         train_config = train_config or {}
         model_params = model_params or {}
+        resolved_market = normalize_market(market)
 
         # ---- Strip reserved params that are set by the system ----
         stripped = [k for k in model_params if k in _RESERVED_MODEL_PARAMS]
@@ -121,11 +124,11 @@ class ModelService:
         # ---- Normalize train_config from frontend nested format ----
         # Frontend sends: { train_period: {start, end}, valid_period: ..., test_period: ... }
         # Backend expects: { train_start, train_end, valid_start, valid_end, test_start, test_end }
-        train_config = self._normalize_train_config(train_config)
+        train_config = self._normalize_train_config(train_config, market=resolved_market)
 
         # ---- 1. Resolve tickers ----
         if universe_group_id:
-            tickers = self._group_service.get_group_tickers(universe_group_id)
+            tickers = self._group_service.get_group_tickers(universe_group_id, market=resolved_market)
             if not tickers:
                 raise ValueError(f"Universe group '{universe_group_id}' has no members")
         else:
@@ -143,6 +146,7 @@ class ModelService:
         log.info(
             "model.train.start",
             name=name,
+            market=resolved_market,
             model_type=model_type,
             tickers=len(tickers),
             date_range=f"{overall_start} ~ {overall_end}",
@@ -150,14 +154,14 @@ class ModelService:
 
         # ---- 2. Compute features ----
         feature_data = self._feature_service.compute_features(
-            feature_set_id, tickers, overall_start, overall_end
+            feature_set_id, tickers, overall_start, overall_end, market=resolved_market
         )
         # feature_data: dict[factor_name -> DataFrame(dates x tickers)]
 
         # ---- 3. Compute labels ----
-        label_def = self._label_service.get_label(label_id)
+        label_def = self._label_service.get_label(label_id, market=resolved_market)
         label_df = self._label_service.compute_label_values(
-            label_id, tickers, overall_start, overall_end
+            label_id, tickers, overall_start, overall_end, market=resolved_market
         )
         # label_df: DataFrame with columns [ticker, date, label_value]
 
@@ -253,7 +257,7 @@ class ModelService:
         trained_feature_count = len(trained_features)
 
         # Get expected features from feature set
-        fs_record = self._feature_service.get_feature_set(feature_set_id)
+        fs_record = self._feature_service.get_feature_set(feature_set_id, market=resolved_market)
         expected_features = [ref["factor_id"] for ref in fs_record["factor_refs"]]
         expected_feature_count = len(expected_features)
 
@@ -279,6 +283,7 @@ class ModelService:
 
         metadata = {
             "model_id": model_id,
+            "market": resolved_market,
             "name": name,
             "model_type": model_type,
             "task": task,
@@ -298,6 +303,7 @@ class ModelService:
         # ---- 11. Save record to DuckDB ----
         self._insert_model_record(
             model_id=model_id,
+            market=resolved_market,
             name=name,
             feature_set_id=feature_set_id,
             label_id=label_id,
@@ -310,6 +316,7 @@ class ModelService:
         # ---- 12. Return summary ----
         summary = {
             "model_id": model_id,
+            "market": resolved_market,
             "name": name,
             "model_type": model_type,
             "task": task,
@@ -321,31 +328,36 @@ class ModelService:
             "eval_metrics": eval_metrics,
             "label_summary": label_summary,
         }
-        log.info("model.train.done", model_id=model_id, features=trained_feature_count)
+        log.info("model.train.done", model_id=model_id, market=resolved_market, features=trained_feature_count)
         return summary
 
     # ------------------------------------------------------------------
     # CRUD
     # ------------------------------------------------------------------
 
-    def list_models(self) -> list[dict]:
+    def list_models(self, market: str | None = None) -> list[dict]:
         """List all model records."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         rows = conn.execute(
-            """SELECT id, name, feature_set_id, label_id, model_type,
+            """SELECT id, market, name, feature_set_id, label_id, model_type,
                       model_params, train_config, eval_metrics,
                       status, created_at, updated_at
                FROM models
-               ORDER BY created_at DESC"""
+               WHERE market = ?
+               ORDER BY created_at DESC""",
+            [resolved_market],
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
-    def get_model(self, model_id: str) -> dict:
+    def get_model(self, model_id: str, market: str | None = None) -> dict:
         """Return a single model record including eval_metrics and feature_names."""
-        if model_id in self._record_cache:
-            return self._record_cache[model_id]
+        resolved_market = normalize_market(market)
+        cache_key = (resolved_market, model_id)
+        if cache_key in self._record_cache:
+            return self._record_cache[cache_key]
 
-        row = self._fetch_row(model_id)
+        row = self._fetch_row(model_id, market=resolved_market)
         if row is None:
             raise ValueError(f"Model {model_id} not found")
 
@@ -356,6 +368,14 @@ class ModelService:
                 metadata = json.load(f)
                 if "feature_names" in metadata:
                     row["feature_names"] = metadata["feature_names"]
+            if "market" not in metadata:
+                try:
+                    metadata["market"] = row["market"]
+                    with open(metadata_path, "w") as f:
+                        json.dump(metadata, f, indent=2, default=str)
+                    log.info("model.backfill_metadata_market", model_id=model_id, market=row["market"])
+                except Exception as exc:
+                    log.warning("model.backfill_metadata_market_failed", model_id=model_id, error=str(exc))
 
         # Lazy backfill task_type for old models
         if not row.get("task_type"):
@@ -368,8 +388,8 @@ class ModelService:
                     eval_metrics["task_type"] = task
                     conn = get_connection()
                     conn.execute(
-                        "UPDATE models SET eval_metrics = ? WHERE id = ?",
-                        [json.dumps(eval_metrics, default=str), model_id],
+                        "UPDATE models SET eval_metrics = ? WHERE id = ? AND market = ?",
+                        [json.dumps(eval_metrics, default=str), model_id, row["market"]],
                     )
                     row["task_type"] = task
                     row["eval_metrics"] = eval_metrics
@@ -377,17 +397,17 @@ class ModelService:
                 except Exception:
                     pass
 
-        self._record_cache[model_id] = row
+        self._record_cache[cache_key] = row
         return row
 
-    def delete_model(self, model_id: str) -> None:
+    def delete_model(self, model_id: str, market: str | None = None) -> None:
         """Delete a model record and its files on disk."""
-        row = self._fetch_row(model_id)
+        row = self._fetch_row(model_id, market)
         if row is None:
             raise ValueError(f"Model {model_id} not found")
 
         conn = get_connection()
-        conn.execute("DELETE FROM models WHERE id = ?", [model_id])
+        conn.execute("DELETE FROM models WHERE id = ? AND market = ?", [model_id, row["market"]])
 
         model_dir = settings.models_dir / model_id
         if model_dir.exists():
@@ -395,14 +415,15 @@ class ModelService:
 
         # Invalidate caches
         self._model_cache.pop(model_id, None)
-        self._record_cache.pop(model_id, None)
+        self._record_cache.pop((row["market"], model_id), None)
         self._frozen_cache.pop(model_id, None)
 
-        log.info("model.deleted", model_id=model_id)
+        log.info("model.deleted", model_id=model_id, market=row["market"])
 
-    def load_model(self, model_id: str) -> ModelBase:
+    def load_model(self, model_id: str, market: str | None = None) -> ModelBase:
         """Load a trained model from disk. Backfills task_type if missing."""
         if model_id in self._model_cache:
+            self.get_model(model_id, market=market)
             return self._model_cache[model_id]
 
         model_path = settings.models_dir / model_id / "model.joblib"
@@ -412,15 +433,15 @@ class ModelService:
 
         # Backfill task_type for old models missing it
         try:
-            record = self.get_model(model_id)
+            record = self.get_model(model_id, market=market)
             if not record.get("task_type"):
                 task = _infer_task_from_model(model_instance)
                 eval_metrics = record.get("eval_metrics") or {}
                 eval_metrics["task_type"] = task
                 conn = get_connection()
                 conn.execute(
-                    "UPDATE models SET eval_metrics = ? WHERE id = ?",
-                    [json.dumps(eval_metrics, default=str), model_id],
+                    "UPDATE models SET eval_metrics = ? WHERE id = ? AND market = ?",
+                    [json.dumps(eval_metrics, default=str), model_id, record["market"]],
                 )
                 log.info("model.backfill_task_type", model_id=model_id, task_type=task)
         except Exception:
@@ -435,6 +456,7 @@ class ModelService:
         feature_set_id: str | None = None,
         tickers: list[str] | None = None,
         date: str | None = None,
+        market: str | None = None,
     ) -> pd.Series:
         """Generate predictions for a given date and set of tickers.
 
@@ -448,18 +470,20 @@ class ModelService:
             Series indexed by ticker with prediction values.
             For classification models, returns probability of positive class.
         """
-        record = self.get_model(model_id)
-        model_instance = self.load_model(model_id)
+        record = self.get_model(model_id, market=market)
+        resolved_market = record["market"]
+        model_instance = self.load_model(model_id, market=resolved_market)
 
         fs_id = feature_set_id or record["feature_set_id"]
         if not tickers:
             raise ValueError("tickers must be provided")
         if not date:
             raise ValueError("date must be provided")
+        tickers = [normalize_ticker(t, resolved_market) for t in tickers]
 
         # Compute features for the given date (use a small window around it)
         feature_data = self._feature_service.compute_features(
-            fs_id, tickers, date, date
+            fs_id, tickers, date, date, market=resolved_market
         )
 
         # Build X for the single date
@@ -494,6 +518,7 @@ class ModelService:
         tickers: list[str],
         date: str,
         feature_set_id: str | None = None,
+        market: str | None = None,
     ) -> pd.DataFrame:
         """Generate detailed predictions including prob, label, raw_score.
 
@@ -505,16 +530,18 @@ class ModelService:
         For regression models returns DataFrame with column:
             prediction – raw prediction value
         """
-        record = self.get_model(model_id)
-        model_instance = self.load_model(model_id)
+        record = self.get_model(model_id, market=market)
+        resolved_market = record["market"]
+        model_instance = self.load_model(model_id, market=resolved_market)
 
         fs_id = feature_set_id or record["feature_set_id"]
         if not tickers:
             raise ValueError("tickers must be provided")
         if not date:
             raise ValueError("date must be provided")
+        tickers = [normalize_ticker(t, resolved_market) for t in tickers]
 
-        feature_data = self._feature_service.compute_features(fs_id, tickers, date, date)
+        feature_data = self._feature_service.compute_features(fs_id, tickers, date, date, market=resolved_market)
         X = self._build_X_for_date(feature_data, tickers, date)
         if X.empty:
             return pd.DataFrame()
@@ -560,6 +587,7 @@ class ModelService:
         feature_data: dict[str, pd.DataFrame],
         tickers: list[str],
         date: str,
+        market: str | None = None,
     ) -> pd.Series:
         """Generate predictions using pre-computed feature data.
 
@@ -576,8 +604,10 @@ class ModelService:
             Series indexed by ticker with prediction values.
             For classification models, returns probability of positive class.
         """
-        record = self.get_model(model_id)
-        model_instance = self.load_model(model_id)
+        record = self.get_model(model_id, market=market)
+        resolved_market = record["market"]
+        model_instance = self.load_model(model_id, market=resolved_market)
+        tickers = [normalize_ticker(t, resolved_market) for t in tickers]
 
         X = self._build_X_for_date(feature_data, tickers, date)
         if X.empty:
@@ -609,6 +639,7 @@ class ModelService:
         tickers: list[str],
         dates: list[str],
         feature_set_id: str | None = None,
+        market: str | None = None,
     ) -> dict[str, dict[str, float]]:
         """Batch predictions across multiple dates in a single call.
 
@@ -619,14 +650,16 @@ class ModelService:
         Returns:
             dict[date_str -> dict[ticker -> prediction_value]]
         """
-        record = self.get_model(model_id)
-        model_instance = self.load_model(model_id)
+        record = self.get_model(model_id, market=market)
+        resolved_market = record["market"]
+        model_instance = self.load_model(model_id, market=resolved_market)
         fs_id = feature_set_id or record["feature_set_id"]
 
         if not tickers:
             raise ValueError("tickers must be provided")
         if not dates:
             raise ValueError("dates must be provided")
+        tickers = [normalize_ticker(t, resolved_market) for t in tickers]
 
         sorted_dates = sorted(dates)
         start_date = sorted_dates[0]
@@ -634,7 +667,7 @@ class ModelService:
 
         # Single bulk feature load for the entire date range
         feature_data = self._feature_service.compute_features_from_cache(
-            fs_id, tickers, start_date, end_date
+            fs_id, tickers, start_date, end_date, market=resolved_market
         )
 
         frozen = self._load_frozen_features(model_id)
@@ -917,7 +950,7 @@ class ModelService:
         return adjusted
 
     @staticmethod
-    def _normalize_train_config(train_config: dict) -> dict:
+    def _normalize_train_config(train_config: dict, market: str | None = None) -> dict:
         """Normalize train_config from various frontend formats to flat keys.
 
         Handles the nested format from the frontend:
@@ -951,7 +984,7 @@ class ModelService:
                 try:
                     dt = _date.fromisoformat(str(result[key]))
                     direction = "forward" if key in date_keys_forward else "backward"
-                    result[key] = str(snap_to_trading_day(dt, direction=direction))
+                    result[key] = str(snap_to_trading_day(dt, direction=direction, market=market))
                 except (ValueError, TypeError):
                     pass  # leave as-is, will fail downstream with a clear error
 
@@ -1176,6 +1209,7 @@ class ModelService:
     def _insert_model_record(
         self,
         model_id: str,
+        market: str,
         name: str,
         feature_set_id: str,
         label_id: str,
@@ -1188,12 +1222,13 @@ class ModelService:
         now = datetime.utcnow()
         conn.execute(
             """INSERT INTO models
-               (id, name, feature_set_id, label_id, model_type,
+               (id, market, name, feature_set_id, label_id, model_type,
                 model_params, train_config, eval_metrics,
                 status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'trained', ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'trained', ?, ?)""",
             [
                 model_id,
+                market,
                 name,
                 feature_set_id,
                 label_id,
@@ -1205,16 +1240,17 @@ class ModelService:
                 now,
             ],
         )
-        log.info("model.record_saved", model_id=model_id)
+        log.info("model.record_saved", model_id=model_id, market=market)
 
-    def _fetch_row(self, model_id: str) -> dict | None:
+    def _fetch_row(self, model_id: str, market: str | None = None) -> dict | None:
+        resolved_market = normalize_market(market)
         conn = get_connection()
         row = conn.execute(
-            """SELECT id, name, feature_set_id, label_id, model_type,
+            """SELECT id, market, name, feature_set_id, label_id, model_type,
                       model_params, train_config, eval_metrics,
                       status, created_at, updated_at
-               FROM models WHERE id = ?""",
-            [model_id],
+               FROM models WHERE id = ? AND market = ?""",
+            [model_id, resolved_market],
         ).fetchone()
         if row is None:
             return None
@@ -1230,20 +1266,21 @@ class ModelService:
                     return {}
             return raw if raw else {}
 
-        eval_metrics = _parse_json(row[7])
+        eval_metrics = _parse_json(row[8])
         return {
             "id": row[0],
-            "name": row[1],
-            "feature_set_id": row[2],
-            "label_id": row[3],
-            "model_type": row[4],
-            "model_params": _parse_json(row[5]),
-            "train_config": _parse_json(row[6]),
+            "market": row[1],
+            "name": row[2],
+            "feature_set_id": row[3],
+            "label_id": row[4],
+            "model_type": row[5],
+            "model_params": _parse_json(row[6]),
+            "train_config": _parse_json(row[7]),
             "eval_metrics": eval_metrics,
             "task_type": eval_metrics.get("task_type"),
-            "status": row[8],
-            "created_at": str(row[9]) if row[9] else None,
-            "updated_at": str(row[10]) if row[10] else None,
+            "status": row[9],
+            "created_at": str(row[10]) if row[10] else None,
+            "updated_at": str(row[11]) if row[11] else None,
         }
 
 

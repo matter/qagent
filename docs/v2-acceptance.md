@@ -115,3 +115,22 @@ This file records milestone evidence for the V2.0 A-share and ranking upgrade.
   - Old system regression:
     - `uv run python scripts/e2e_demo.py` passed through factor evaluation, feature set creation, model training, backtest, and signal generation.
     - `cd frontend && pnpm build` passed. Vite reported the existing large-chunk and dynamic-import warnings.
+
+## P4 Model Foundation And Ranking Objectives
+
+- Model market scope completed:
+  - Model records and metadata now carry `market`; old train/list/detail requests default to `US`.
+  - Training resolves universe groups, feature sets, labels, factor features, and label values in one market.
+  - Training date snapping uses the selected market calendar.
+  - Prediction paths use the model record market and market-scoped feature computation.
+  - Frontend model API types include market-aware train/list/detail/delete fields.
+  - Regression coverage added in `tests/test_model_market_scope.py`.
+- Task 8 verification:
+  - `uv run python -m unittest tests.test_model_market_scope` passed: `2` tests.
+  - `uv run python -m unittest discover tests` passed: `55` tests.
+  - `GET /api/models?market=US` returned `222` US models.
+  - `GET /api/models/ae5e994c4195?market=US` returned `market="US"`.
+  - `uv run python scripts/e2e_demo.py` passed through old US model training, backtest, and signal generation.
+  - `cd frontend && pnpm build` passed with the existing Vite warnings.
+- Remaining P4 work:
+  - Add ranking, pairwise, and listwise training objectives.

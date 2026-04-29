@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from backend.logger import get_logger
+from backend.services.market_context import normalize_market
 from backend.services.model_service import ModelService
 from backend.tasks.executor import TaskExecutor, get_task_executor
 from backend.tasks.models import TaskSource
@@ -36,6 +37,7 @@ def _get_executor() -> TaskExecutor:
 
 
 class TrainModelRequest(BaseModel):
+    market: Optional[str] = None
     name: str
     feature_set_id: str
     label_id: str
@@ -47,12 +49,14 @@ class TrainModelRequest(BaseModel):
 
 
 class PredictRequest(BaseModel):
+    market: Optional[str] = None
     tickers: list[str]
     date: str
     feature_set_id: Optional[str] = None
 
 
 class PredictBatchRequest(BaseModel):
+    market: Optional[str] = None
     tickers: list[str]
     dates: list[str]
     feature_set_id: Optional[str] = None
@@ -72,17 +76,22 @@ async def train_model(body: TrainModelRequest) -> dict:
     """
     svc = _get_service()
     executor = _get_executor()
+    try:
+        resolved_market = normalize_market(body.market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     # Check for already running/queued task with same model name
     existing = executor._store.find_active_by_type_and_name(
         "model_train", "name", body.name,
     )
-    if existing:
+    if existing and normalize_market((existing.params or {}).get("market")) == resolved_market:
         log.info("api.model.train_deduplicated", task_id=existing.id, name=body.name)
         return {
             "task_id": existing.id,
             "status": existing.status.value,
             "name": body.name,
+            "market": resolved_market,
             "deduplicated": True,
         }
 
@@ -95,6 +104,7 @@ async def train_model(body: TrainModelRequest) -> dict:
         train_config: dict | None,
         universe_group_id: str,
         sample_weight_config: dict | None,
+        market: str | None,
     ) -> dict:
         return svc.train_model(
             name=name,
@@ -105,6 +115,7 @@ async def train_model(body: TrainModelRequest) -> dict:
             train_config=train_config,
             universe_group_id=universe_group_id,
             sample_weight_config=sample_weight_config,
+            market=market,
         )
 
     task_id = executor.submit(
@@ -119,38 +130,42 @@ async def train_model(body: TrainModelRequest) -> dict:
             "train_config": body.train_config,
             "universe_group_id": body.universe_group_id,
             "sample_weight_config": body.sample_weight_config,
+            "market": resolved_market,
         },
         timeout=7200,  # 2 hours max
         source=TaskSource.UI,
     )
 
-    log.info("api.model.train_triggered", task_id=task_id, name=body.name)
-    return {"task_id": task_id, "status": "queued", "name": body.name}
+    log.info("api.model.train_triggered", task_id=task_id, name=body.name, market=resolved_market)
+    return {"task_id": task_id, "status": "queued", "name": body.name, "market": resolved_market}
 
 
 @router.get("/models")
-async def list_models() -> list[dict]:
+async def list_models(market: Optional[str] = Query(None)) -> list[dict]:
     """List all trained models."""
     svc = _get_service()
-    return svc.list_models()
+    try:
+        return svc.list_models(market=market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/models/{model_id}")
-async def get_model(model_id: str) -> dict:
+async def get_model(model_id: str, market: Optional[str] = Query(None)) -> dict:
     """Get model detail including eval_metrics."""
     svc = _get_service()
     try:
-        return svc.get_model(model_id)
+        return svc.get_model(model_id, market=market)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.delete("/models/{model_id}")
-async def delete_model(model_id: str) -> dict:
+async def delete_model(model_id: str, market: Optional[str] = Query(None)) -> dict:
     """Delete a model and its files."""
     svc = _get_service()
     try:
-        svc.delete_model(model_id)
+        svc.delete_model(model_id, market=market)
         return {"status": "deleted", "id": model_id}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -165,11 +180,13 @@ async def predict(model_id: str, body: PredictRequest) -> dict:
     """
     svc = _get_service()
     try:
+        resolved_market = normalize_market(body.market)
         df = svc.predict_detailed(
             model_id=model_id,
             tickers=body.tickers,
             date=body.date,
             feature_set_id=body.feature_set_id,
+            market=resolved_market,
         )
         if "prob" in df.columns:
             predictions = {}
@@ -182,6 +199,7 @@ async def predict(model_id: str, body: PredictRequest) -> dict:
                 }
             result = {
                 "model_id": model_id,
+                "market": resolved_market,
                 "date": body.date,
                 "task": "classification",
                 "predictions": predictions,
@@ -190,6 +208,7 @@ async def predict(model_id: str, body: PredictRequest) -> dict:
         else:
             result = {
                 "model_id": model_id,
+                "market": resolved_market,
                 "date": body.date,
                 "task": "regression",
                 "predictions": {
@@ -215,15 +234,18 @@ async def predict_batch(model_id: str, body: PredictBatchRequest) -> dict:
     """
     svc = _get_service()
     try:
+        resolved_market = normalize_market(body.market)
         results = svc.predict_batch(
             model_id=model_id,
             tickers=body.tickers,
             dates=body.dates,
             feature_set_id=body.feature_set_id,
+            market=resolved_market,
         )
         total = sum(len(v) for v in results.values())
         return {
             "model_id": model_id,
+            "market": resolved_market,
             "dates": body.dates,
             "predictions": results,
             "total_predictions": total,

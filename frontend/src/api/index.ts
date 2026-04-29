@@ -422,6 +422,7 @@ export async function getCorrelationMatrix(
 
 export interface Model {
   id: string;
+  market: string;
   name: string;
   feature_set_id: string;
   label_id: string;
@@ -436,6 +437,7 @@ export interface Model {
 // ---- Model API ----
 
 export async function trainModel(params: {
+  market?: string;
   name: string;
   feature_set_id: string;
   label_id: string;
@@ -443,23 +445,29 @@ export async function trainModel(params: {
   model_params?: Record<string, unknown>;
   train_config?: Record<string, unknown>;
   universe_group_id: string;
-}): Promise<{ task_id: string }> {
-  const { data } = await client.post<{ task_id: string }>("/models/train", params);
+}): Promise<{ task_id: string; market?: string }> {
+  const { data } = await client.post<{ task_id: string; market?: string }>("/models/train", params);
   return data;
 }
 
-export async function listModels(): Promise<Model[]> {
-  const { data } = await client.get<Model[]>("/models");
+export async function listModels(market?: string): Promise<Model[]> {
+  const { data } = await client.get<Model[]>("/models", {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
-export async function getModel(modelId: string): Promise<Model> {
-  const { data } = await client.get<Model>(`/models/${modelId}`);
+export async function getModel(modelId: string, market?: string): Promise<Model> {
+  const { data } = await client.get<Model>(`/models/${modelId}`, {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
-export async function deleteModel(modelId: string) {
-  const { data } = await client.delete(`/models/${modelId}`);
+export async function deleteModel(modelId: string, market?: string) {
+  const { data } = await client.delete(`/models/${modelId}`, {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
