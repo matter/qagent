@@ -235,6 +235,8 @@ class BacktestService:
             date_key = str(trade_ts.date()) if hasattr(trade_ts, "date") else str(trade_ts)[:10]
             model_predictions = model_preds_by_date.get(date_key, {})
 
+            positions_before = dict(port_weights)
+
             # Build context with portfolio state
             context = StrategyContext(
                 prices=prices_multi,
@@ -265,16 +267,17 @@ class BacktestService:
                     all_weights.loc[trade_ts] = prev_weights
                 continue
 
-            # Capture per-day diagnostics if strategy populated them
-            if context.diagnostics:
-                diag_entry = {"date": date_key}
-                diag_entry.update(context.diagnostics)
-                rebalance_diagnostics.append(diag_entry)
-
             if raw_signals.empty:
                 # No signals -- go to cash (all zeros)
                 all_weights.loc[trade_ts] = 0.0
                 prev_weights = all_weights.loc[trade_ts].values
+                diag_entry = self._build_rebalance_diagnostics(
+                    date_key=date_key,
+                    positions_before=positions_before,
+                    positions_after={},
+                    strategy_diagnostics=context.diagnostics,
+                )
+                rebalance_diagnostics.append(diag_entry)
                 port_weights.clear()
                 port_holding_days.clear()
                 port_entry_price.clear()
@@ -318,6 +321,14 @@ class BacktestService:
 
             # Update weights for all held tickers
             port_weights = {t: w for t, w in weights.items() if w > 1e-8}
+
+            diag_entry = self._build_rebalance_diagnostics(
+                date_key=date_key,
+                positions_before=positions_before,
+                positions_after=port_weights,
+                strategy_diagnostics=context.diagnostics,
+            )
+            rebalance_diagnostics.append(diag_entry)
 
         # ---- 7. Check for pervasive signal errors ----
         num_rebalance = len(rebalance_dates)
@@ -595,6 +606,68 @@ class BacktestService:
     # ------------------------------------------------------------------
     # Position sizing
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _round_weight_map(weights: dict[str, float]) -> dict[str, float]:
+        return {
+            str(ticker): round(float(weight), 6)
+            for ticker, weight in sorted(weights.items())
+            if abs(float(weight)) > 1e-8
+        }
+
+    @classmethod
+    def _build_rebalance_diagnostics(
+        cls,
+        *,
+        date_key: str,
+        positions_before: dict[str, float],
+        positions_after: dict[str, float],
+        strategy_diagnostics: dict | None = None,
+    ) -> dict:
+        """Build a structured per-rebalance position delta snapshot."""
+        before = {
+            str(t): float(w)
+            for t, w in positions_before.items()
+            if abs(float(w)) > 1e-8
+        }
+        after = {
+            str(t): float(w)
+            for t, w in positions_after.items()
+            if abs(float(w)) > 1e-8
+        }
+
+        before_tickers = set(before)
+        after_tickers = set(after)
+        shared = before_tickers & after_tickers
+
+        added = sorted(after_tickers - before_tickers)
+        removed = sorted(before_tickers - after_tickers)
+        increased = sorted(
+            ticker for ticker in shared
+            if after[ticker] - before[ticker] > 1e-8
+        )
+        decreased = sorted(
+            ticker for ticker in shared
+            if before[ticker] - after[ticker] > 1e-8
+        )
+        turnover = sum(
+            abs(after.get(ticker, 0.0) - before.get(ticker, 0.0))
+            for ticker in before_tickers | after_tickers
+        )
+
+        diag = {
+            "date": date_key,
+            "positions_before": cls._round_weight_map(before),
+            "positions_after": cls._round_weight_map(after),
+            "added": added,
+            "removed": removed,
+            "increased": increased,
+            "decreased": decreased,
+            "turnover": round(float(turnover), 6),
+        }
+        if strategy_diagnostics:
+            diag.update(strategy_diagnostics)
+        return diag
 
     @staticmethod
     def _apply_position_sizing(
