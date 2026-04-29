@@ -13,6 +13,7 @@ from backend.factors.loader import load_factor_from_code
 from backend.logger import get_logger
 from backend.services.calendar_service import snap_to_trading_day
 from backend.services.factor_service import FactorService
+from backend.services.market_context import normalize_market, normalize_ticker
 
 log = get_logger(__name__)
 
@@ -36,6 +37,7 @@ class FactorEngine:
         universe_tickers: list[str],
         start_date: str,
         end_date: str,
+        market: str | None = None,
     ) -> pd.DataFrame:
         """Compute factor values and return DataFrame (index=dates, columns=tickers).
 
@@ -44,12 +46,14 @@ class FactorEngine:
         """
         if not universe_tickers:
             return pd.DataFrame()
+        resolved_market = normalize_market(market)
+        universe_tickers = [normalize_ticker(t, resolved_market) for t in universe_tickers]
 
         # Snap user-provided dates to nearest trading days
         _start = date_type.fromisoformat(start_date)
         _end = date_type.fromisoformat(end_date)
-        _start = snap_to_trading_day(_start, direction="forward")
-        _end = snap_to_trading_day(_end, direction="backward")
+        _start = snap_to_trading_day(_start, direction="forward", market=resolved_market)
+        _end = snap_to_trading_day(_end, direction="backward", market=resolved_market)
         start_date = str(_start)
         end_date = str(_end)
 
@@ -58,13 +62,14 @@ class FactorEngine:
             return pd.DataFrame()
 
         # 1. Load factor definition and compile
-        factor_def = self._factor_service.get_factor(factor_id)
+        factor_def = self._factor_service.get_factor(factor_id, market=resolved_market)
         source_code = factor_def["source_code"]
         factor_instance = load_factor_from_code(source_code)
 
         log.info(
             "factor_engine.compute.start",
             factor_id=factor_id,
+            market=resolved_market,
             factor_name=factor_def["name"],
             tickers=len(universe_tickers),
             start=start_date,
@@ -73,7 +78,7 @@ class FactorEngine:
 
         # 2. Lightweight cache coverage check (metadata only, no full data load)
         tickers_to_compute = self._find_uncovered_tickers(
-            factor_id, universe_tickers, start_date, end_date
+            factor_id, universe_tickers, start_date, end_date, market=resolved_market
         )
         cached_tickers = [t for t in universe_tickers if t not in set(tickers_to_compute)]
 
@@ -86,7 +91,9 @@ class FactorEngine:
         # 3. Load cached data only for covered tickers (skip if none)
         cached_df = pd.DataFrame()
         if cached_tickers:
-            cached_df = self._load_cached_values(factor_id, cached_tickers, start_date, end_date)
+            cached_df = self._load_cached_values(
+                factor_id, cached_tickers, start_date, end_date, market=resolved_market
+            )
 
         # 4. Compute missing values in batches
         new_values_frames: list[pd.DataFrame] = []
@@ -103,7 +110,7 @@ class FactorEngine:
             )
 
             batch_result = self._compute_batch(
-                factor_instance, batch_tickers, start_date, end_date
+                factor_instance, batch_tickers, start_date, end_date, market=resolved_market
             )
             if not batch_result.empty:
                 new_values_frames.append(batch_result)
@@ -117,7 +124,7 @@ class FactorEngine:
             all_frames.append(new_df)
 
             # 6. Write new values to cache
-            self._write_cache(factor_id, new_df)
+            self._write_cache(factor_id, new_df, market=resolved_market)
 
         if not all_frames:
             log.warning("factor_engine.compute.no_data", factor_id=factor_id)
@@ -133,6 +140,7 @@ class FactorEngine:
         log.info(
             "factor_engine.compute.done",
             factor_id=factor_id,
+            market=resolved_market,
             shape=result.shape,
         )
         return result
@@ -143,6 +151,7 @@ class FactorEngine:
         tickers: list[str],
         start_date: str,
         end_date: str,
+        market: str | None = None,
     ) -> dict[str, pd.DataFrame]:
         """Load cached values for multiple factors in a single DB query.
 
@@ -151,20 +160,26 @@ class FactorEngine:
         """
         if not factor_ids or not tickers:
             return {}
+        resolved_market = normalize_market(market)
+        tickers = [normalize_ticker(t, resolved_market) for t in tickers]
 
         conn = get_connection()
-        fid_placeholders = ",".join(f"'{fid}'" for fid in factor_ids)
-        tk_placeholders = ",".join(f"'{t}'" for t in tickers)
+        fid_placeholders = ",".join("?" for _ in factor_ids)
+        tk_placeholders = ",".join("?" for _ in tickers)
 
         query = f"""
             SELECT factor_id, ticker, date, value
             FROM factor_values_cache
-            WHERE factor_id IN ({fid_placeholders})
+            WHERE market = ?
+              AND factor_id IN ({fid_placeholders})
               AND ticker IN ({tk_placeholders})
               AND date >= ? AND date <= ?
             ORDER BY factor_id, date, ticker
         """
-        df = conn.execute(query, [start_date, end_date]).fetchdf()
+        df = conn.execute(
+            query,
+            [resolved_market, *factor_ids, *tickers, start_date, end_date],
+        ).fetchdf()
         if df.empty:
             return {}
 
@@ -176,6 +191,7 @@ class FactorEngine:
 
         log.info(
             "factor_engine.bulk_cache.loaded",
+            market=resolved_market,
             requested=len(factor_ids),
             loaded=len(result),
             rows=len(df),
@@ -192,6 +208,7 @@ class FactorEngine:
         tickers: list[str],
         start_date: str,
         end_date: str,
+        market: str | None = None,
     ) -> list[str]:
         """Fast metadata-only check: which tickers lack sufficient cache coverage?
 
@@ -199,6 +216,7 @@ class FactorEngine:
         table — never loads the actual values.  This is O(index scan) even for
         very large universes.
         """
+        resolved_market = normalize_market(market)
         conn = get_connection()
 
         # Single aggregate query — DuckDB handles the GROUP BY efficiently
@@ -207,10 +225,11 @@ class FactorEngine:
             """SELECT ticker, MIN(date) AS min_d, MAX(date) AS max_d,
                       COUNT(*) AS cnt
                FROM factor_values_cache
-               WHERE factor_id = ?
+               WHERE market = ?
+                 AND factor_id = ?
                  AND date >= ? AND date <= ?
                GROUP BY ticker""",
-            [factor_id, start_date, end_date],
+            [resolved_market, factor_id, start_date, end_date],
         ).fetchall()
 
         # Build lookup: ticker -> (min_date, max_date, count)
@@ -248,26 +267,33 @@ class FactorEngine:
         tickers: list[str],
         start_date: str,
         end_date: str,
+        market: str | None = None,
     ) -> pd.DataFrame:
         """Load cached factor values from factor_values_cache table.
 
         Returns a DataFrame with DatetimeIndex and ticker columns.
         Only called for tickers known to have coverage.
         """
+        resolved_market = normalize_market(market)
+        tickers = [normalize_ticker(t, resolved_market) for t in tickers]
         conn = get_connection()
 
         # Build IN clause for tickers
-        placeholders = ",".join(f"'{t}'" for t in tickers)
+        placeholders = ",".join("?" for _ in tickers)
         query = f"""
             SELECT ticker, date, value
             FROM factor_values_cache
-            WHERE factor_id = ?
+            WHERE market = ?
+              AND factor_id = ?
               AND ticker IN ({placeholders})
               AND date >= ?
               AND date <= ?
             ORDER BY date, ticker
         """
-        rows = conn.execute(query, [factor_id, start_date, end_date]).fetchdf()
+        rows = conn.execute(
+            query,
+            [resolved_market, factor_id, *tickers, start_date, end_date],
+        ).fetchdf()
 
         if rows.empty:
             return pd.DataFrame()
@@ -277,10 +303,11 @@ class FactorEngine:
         pivot.index = pd.to_datetime(pivot.index)
         return pivot
 
-    def _write_cache(self, factor_id: str, df: pd.DataFrame) -> None:
+    def _write_cache(self, factor_id: str, df: pd.DataFrame, market: str | None = None) -> None:
         """Write computed factor values to the cache table using vectorized ops."""
         if df.empty:
             return
+        resolved_market = normalize_market(market)
 
         conn = get_connection()
 
@@ -290,10 +317,12 @@ class FactorEngine:
         long = df.stack().reset_index()
         long.columns = ["date", "ticker", "value"]
         long = long.dropna(subset=["value"])
+        long["market"] = resolved_market
         long["factor_id"] = factor_id
         long["date"] = pd.to_datetime(long["date"]).dt.strftime("%Y-%m-%d")
+        long["ticker"] = long["ticker"].map(lambda t: normalize_ticker(t, resolved_market))
         long["value"] = long["value"].astype(float)
-        long = long[["factor_id", "ticker", "date", "value"]]
+        long = long[["market", "factor_id", "ticker", "date", "value"]]
 
         if long.empty:
             return
@@ -302,14 +331,15 @@ class FactorEngine:
         conn.execute("CREATE OR REPLACE TEMP TABLE _tmp_fv AS SELECT * FROM long")
         conn.execute(
             """INSERT OR REPLACE INTO factor_values_cache
-               (factor_id, ticker, date, value)
-               SELECT factor_id, ticker, date, value FROM _tmp_fv"""
+               (market, factor_id, ticker, date, value)
+               SELECT market, factor_id, ticker, date, value FROM _tmp_fv"""
         )
         conn.execute("DROP TABLE IF EXISTS _tmp_fv")
 
         log.info(
             "factor_engine.cache.written",
             factor_id=factor_id,
+            market=resolved_market,
             records=len(long),
         )
 
@@ -323,12 +353,15 @@ class FactorEngine:
         tickers: list[str],
         start_date: str,
         end_date: str,
+        market: str | None = None,
     ) -> pd.DataFrame:
         """Compute factor values for a batch of tickers.
 
         Returns a DataFrame with DatetimeIndex and ticker columns.
         Skips tickers that fail and logs warnings.
         """
+        resolved_market = normalize_market(market)
+        tickers = [normalize_ticker(t, resolved_market) for t in tickers]
         conn = get_connection()
 
         # Load OHLCV data for all tickers in this batch.
@@ -337,17 +370,21 @@ class FactorEngine:
         sd = date_type.fromisoformat(str(start_date))
         ed = date_type.fromisoformat(str(end_date))
         warm_start = sd - timedelta(days=400)
-        placeholders = ",".join(f"'{t}'" for t in tickers)
+        placeholders = ",".join("?" for _ in tickers)
         warm_up_query = f"""
             SELECT ticker, date, open, high, low, close, volume
             FROM daily_bars
-            WHERE ticker IN ({placeholders})
+            WHERE market = ?
+              AND ticker IN ({placeholders})
               AND date >= ?
               AND date <= ?
             ORDER BY ticker, date
         """
         try:
-            all_bars = conn.execute(warm_up_query, [warm_start, ed]).fetchdf()
+            all_bars = conn.execute(
+                warm_up_query,
+                [resolved_market, *tickers, warm_start, ed],
+            ).fetchdf()
         except Exception as exc:
             log.error("factor_engine.compute.query_failed", error=str(exc))
             return pd.DataFrame()

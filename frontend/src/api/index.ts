@@ -156,6 +156,7 @@ export async function refreshIndexGroups() {
 
 export interface Factor {
   id: string;
+  market: string;
   name: string;
   version: number;
   description: string | null;
@@ -175,6 +176,7 @@ export interface FactorTemplate {
 
 export interface LabelDefinition {
   id: string;
+  market: string;
   name: string;
   description: string | null;
   target_type: string;
@@ -196,6 +198,7 @@ export interface FactorEvalSummary {
 
 export interface FactorEvalRecord {
   id: string;
+  market: string;
   factor_id: string;
   label_id: string;
   universe_group_id: string;
@@ -228,19 +231,22 @@ export interface TaskStatus {
 
 // ---- Factor API ----
 
-export async function listFactors(category?: string, status?: string): Promise<Factor[]> {
+export async function listFactors(category?: string, status?: string, market?: string): Promise<Factor[]> {
   const { data } = await client.get<Factor[]>("/factors", {
-    params: { category: category || undefined, status: status || undefined },
+    params: { category: category || undefined, status: status || undefined, market: market || undefined },
   });
   return data;
 }
 
-export async function getFactor(factorId: string): Promise<Factor> {
-  const { data } = await client.get<Factor>(`/factors/${factorId}`);
+export async function getFactor(factorId: string, market?: string): Promise<Factor> {
+  const { data } = await client.get<Factor>(`/factors/${factorId}`, {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
 export async function createFactor(params: {
+  market?: string;
   name: string;
   source_code: string;
   description?: string;
@@ -254,6 +260,7 @@ export async function createFactor(params: {
 export async function updateFactor(
   factorId: string,
   params: {
+    market?: string;
     source_code?: string;
     description?: string;
     category?: string;
@@ -265,8 +272,10 @@ export async function updateFactor(
   return data;
 }
 
-export async function deleteFactor(factorId: string) {
-  const { data } = await client.delete(`/factors/${factorId}`);
+export async function deleteFactor(factorId: string, market?: string) {
+  const { data } = await client.delete(`/factors/${factorId}`, {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
@@ -282,22 +291,24 @@ export async function getTemplate(name: string): Promise<FactorTemplate> {
 
 export async function computeFactor(
   factorId: string,
-  body: { universe_group_id: string; start_date: string; end_date: string },
-): Promise<{ task_id: string }> {
-  const { data } = await client.post<{ task_id: string }>(`/factors/${factorId}/compute`, body);
+  body: { market?: string; universe_group_id: string; start_date: string; end_date: string },
+): Promise<{ task_id: string; market?: string }> {
+  const { data } = await client.post<{ task_id: string; market?: string }>(`/factors/${factorId}/compute`, body);
   return data;
 }
 
 export async function evaluateFactor(
   factorId: string,
-  body: { label_id: string; universe_group_id: string; start_date: string; end_date: string },
-): Promise<{ task_id: string }> {
-  const { data } = await client.post<{ task_id: string }>(`/factors/${factorId}/evaluate`, body);
+  body: { market?: string; label_id: string; universe_group_id: string; start_date: string; end_date: string },
+): Promise<{ task_id: string; market?: string }> {
+  const { data } = await client.post<{ task_id: string; market?: string }>(`/factors/${factorId}/evaluate`, body);
   return data;
 }
 
-export async function listEvaluations(factorId: string): Promise<FactorEvalRecord[]> {
-  const { data } = await client.get<FactorEvalRecord[]>(`/factors/${factorId}/evaluations`);
+export async function listEvaluations(factorId: string, market?: string): Promise<FactorEvalRecord[]> {
+  const { data } = await client.get<FactorEvalRecord[]>(`/factors/${factorId}/evaluations`, {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
@@ -305,13 +316,17 @@ export interface FactorEvalRecordWithName extends FactorEvalRecord {
   factor_name: string;
 }
 
-export async function listAllEvaluations(): Promise<FactorEvalRecordWithName[]> {
-  const { data } = await client.get<FactorEvalRecordWithName[]>("/factors/evaluations");
+export async function listAllEvaluations(market?: string): Promise<FactorEvalRecordWithName[]> {
+  const { data } = await client.get<FactorEvalRecordWithName[]>("/factors/evaluations", {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
-export async function getEvaluation(evalId: string): Promise<FactorEvalDetail> {
-  const { data } = await client.get<FactorEvalDetail>(`/factors/evaluations/${evalId}`);
+export async function getEvaluation(evalId: string, market?: string): Promise<FactorEvalDetail> {
+  const { data } = await client.get<FactorEvalDetail>(`/factors/evaluations/${evalId}`, {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
@@ -347,6 +362,7 @@ export async function cancelTask(taskId: string): Promise<{ task_id: string; sta
 
 export interface FeatureSet {
   id: string;
+  market: string;
   name: string;
   description: string | null;
   factor_refs: Array<{ factor_id: string; factor_name: string; version: number }>;
@@ -362,17 +378,22 @@ export interface CorrelationMatrix {
 
 // ---- Feature Set API ----
 
-export async function listFeatureSets(): Promise<FeatureSet[]> {
-  const { data } = await client.get<FeatureSet[]>("/feature-sets");
+export async function listFeatureSets(market?: string): Promise<FeatureSet[]> {
+  const { data } = await client.get<FeatureSet[]>("/feature-sets", {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
-export async function getFeatureSet(fsId: string): Promise<FeatureSet> {
-  const { data } = await client.get<FeatureSet>(`/feature-sets/${fsId}`);
+export async function getFeatureSet(fsId: string, market?: string): Promise<FeatureSet> {
+  const { data } = await client.get<FeatureSet>(`/feature-sets/${fsId}`, {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
 export async function createFeatureSet(params: {
+  market?: string;
   name: string;
   description?: string;
   factor_refs: Array<{ factor_id: string; factor_name: string; version: number }>;
@@ -382,14 +403,16 @@ export async function createFeatureSet(params: {
   return data;
 }
 
-export async function deleteFeatureSet(fsId: string) {
-  const { data } = await client.delete(`/feature-sets/${fsId}`);
+export async function deleteFeatureSet(fsId: string, market?: string) {
+  const { data } = await client.delete(`/feature-sets/${fsId}`, {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
 export async function getCorrelationMatrix(
   fsId: string,
-  body: { universe_group_id: string; start_date: string; end_date: string },
+  body: { market?: string; universe_group_id: string; start_date: string; end_date: string },
 ): Promise<CorrelationMatrix> {
   const { data } = await client.post<CorrelationMatrix>(`/feature-sets/${fsId}/correlation`, body);
   return data;

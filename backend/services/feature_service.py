@@ -13,6 +13,7 @@ from scipy.stats import spearmanr
 from backend.db import get_connection
 from backend.logger import get_logger
 from backend.services.factor_engine import FactorEngine
+from backend.services.market_context import normalize_market, normalize_ticker
 
 log = get_logger(__name__)
 
@@ -76,12 +77,15 @@ class FeatureService:
         description: str | None = None,
         factor_refs: list[dict] | None = None,
         preprocessing: dict | None = None,
+        market: str | None = None,
     ) -> dict:
         """Create a new feature set."""
+        resolved_market = normalize_market(market)
         if not name or not name.strip():
             raise ValueError("name must not be empty")
         if not factor_refs:
             raise ValueError("factor_refs must contain at least one factor reference")
+        self._validate_factor_refs(factor_refs, resolved_market)
 
         preprocessing = self._validate_preprocessing(preprocessing)
 
@@ -91,10 +95,11 @@ class FeatureService:
 
         conn.execute(
             """INSERT INTO feature_sets
-               (id, name, description, factor_refs, preprocessing, status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, 'draft', ?, ?)""",
+               (id, market, name, description, factor_refs, preprocessing, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?)""",
             [
                 fs_id,
+                resolved_market,
                 name.strip(),
                 description,
                 json.dumps(factor_refs),
@@ -103,8 +108,8 @@ class FeatureService:
                 now,
             ],
         )
-        log.info("feature_set.created", id=fs_id, name=name)
-        return self.get_feature_set(fs_id)
+        log.info("feature_set.created", id=fs_id, market=resolved_market, name=name)
+        return self.get_feature_set(fs_id, market=resolved_market)
 
     def update_feature_set(
         self,
@@ -114,12 +119,14 @@ class FeatureService:
         factor_refs: list[dict] | None = None,
         preprocessing: dict | None = None,
         status: str | None = None,
+        market: str | None = None,
     ) -> dict:
         """Update an existing feature set."""
         conn = get_connection()
-        existing = self._fetch_row(fs_id)
+        existing = self._fetch_row(fs_id, market)
         if existing is None:
             raise ValueError(f"Feature set {fs_id} not found")
+        resolved_market = existing["market"]
 
         now = datetime.utcnow()
         sets: list[str] = ["updated_at = ?"]
@@ -134,6 +141,7 @@ class FeatureService:
         if factor_refs is not None:
             if not factor_refs:
                 raise ValueError("factor_refs must contain at least one factor reference")
+            self._validate_factor_refs(factor_refs, resolved_market)
             sets.append("factor_refs = ?")
             params.append(json.dumps(factor_refs))
         if preprocessing is not None:
@@ -145,37 +153,41 @@ class FeatureService:
             params.append(status)
 
         params.append(fs_id)
+        params.append(resolved_market)
         conn.execute(
-            f"UPDATE feature_sets SET {', '.join(sets)} WHERE id = ?", params
+            f"UPDATE feature_sets SET {', '.join(sets)} WHERE id = ? AND market = ?", params
         )
-        log.info("feature_set.updated", id=fs_id)
-        return self.get_feature_set(fs_id)
+        log.info("feature_set.updated", id=fs_id, market=resolved_market)
+        return self.get_feature_set(fs_id, market=resolved_market)
 
-    def delete_feature_set(self, fs_id: str) -> None:
+    def delete_feature_set(self, fs_id: str, market: str | None = None) -> None:
         """Delete a feature set."""
         conn = get_connection()
-        existing = self._fetch_row(fs_id)
+        existing = self._fetch_row(fs_id, market)
         if existing is None:
             raise ValueError(f"Feature set {fs_id} not found")
 
-        conn.execute("DELETE FROM feature_sets WHERE id = ?", [fs_id])
-        log.info("feature_set.deleted", id=fs_id)
+        conn.execute("DELETE FROM feature_sets WHERE id = ? AND market = ?", [fs_id, existing["market"]])
+        log.info("feature_set.deleted", id=fs_id, market=existing["market"])
 
-    def get_feature_set(self, fs_id: str) -> dict:
+    def get_feature_set(self, fs_id: str, market: str | None = None) -> dict:
         """Return a single feature set."""
-        row = self._fetch_row(fs_id)
+        row = self._fetch_row(fs_id, market)
         if row is None:
             raise ValueError(f"Feature set {fs_id} not found")
         return row
 
-    def list_feature_sets(self) -> list[dict]:
+    def list_feature_sets(self, market: str | None = None) -> list[dict]:
         """List all feature sets."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         rows = conn.execute(
-            """SELECT id, name, description, factor_refs, preprocessing,
+            """SELECT id, market, name, description, factor_refs, preprocessing,
                       status, created_at, updated_at
                FROM feature_sets
-               ORDER BY created_at"""
+               WHERE market = ?
+               ORDER BY created_at""",
+            [resolved_market],
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
@@ -189,13 +201,16 @@ class FeatureService:
         tickers: list[str],
         start_date: str,
         end_date: str,
+        market: str | None = None,
     ) -> dict[str, pd.DataFrame]:
         """Compute preprocessed feature values for a feature set.
 
         Returns:
             dict mapping factor_name -> DataFrame(dates x tickers).
         """
-        fs = self.get_feature_set(fs_id)
+        fs = self.get_feature_set(fs_id, market=market)
+        resolved_market = fs["market"]
+        tickers = [normalize_ticker(t, resolved_market) for t in tickers]
         factor_refs = fs["factor_refs"]
         preprocessing = fs["preprocessing"]
 
@@ -213,7 +228,7 @@ class FeatureService:
             factor_name = ref.get("factor_name", factor_id)
             try:
                 df = self._factor_engine.compute_factor(
-                    factor_id, tickers, start_date, end_date
+                    factor_id, tickers, start_date, end_date, market=resolved_market
                 )
                 if not df.empty:
                     raw_data[factor_name] = df
@@ -252,13 +267,16 @@ class FeatureService:
         tickers: list[str],
         start_date: str,
         end_date: str,
+        market: str | None = None,
     ) -> dict[str, pd.DataFrame]:
         """Load preprocessed features using bulk cache read (single DB query).
 
         Falls back to the standard per-factor path for any factors missing
         from the cache.  Much faster when most factors are already cached.
         """
-        fs = self.get_feature_set(fs_id)
+        fs = self.get_feature_set(fs_id, market=market)
+        resolved_market = fs["market"]
+        tickers = [normalize_ticker(t, resolved_market) for t in tickers]
         factor_refs = fs["factor_refs"]
         preprocessing = fs["preprocessing"]
 
@@ -280,7 +298,7 @@ class FeatureService:
 
         # Bulk load all cached factor values in one query
         cached = self._factor_engine.load_cached_factors_bulk(
-            factor_ids, tickers, start_date, end_date
+            factor_ids, tickers, start_date, end_date, market=resolved_market
         )
 
         # Map factor_id results to factor_name keys
@@ -305,7 +323,7 @@ class FeatureService:
                 fname = ref.get("factor_name", fid)
                 try:
                     df = self._factor_engine.compute_factor(
-                        fid, tickers, start_date, end_date
+                        fid, tickers, start_date, end_date, market=resolved_market
                     )
                     if not df.empty:
                         raw_data[fname] = df
@@ -341,13 +359,14 @@ class FeatureService:
         tickers: list[str],
         start_date: str,
         end_date: str,
+        market: str | None = None,
     ) -> dict:
         """Compute pairwise correlation between all factors in the set.
 
         Returns:
             {factor_names: [...], matrix: [[...]]}
         """
-        feature_data = self.compute_features(fs_id, tickers, start_date, end_date)
+        feature_data = self.compute_features(fs_id, tickers, start_date, end_date, market=market)
 
         factor_names = sorted(feature_data.keys())
         n = len(factor_names)
@@ -569,13 +588,14 @@ class FeatureService:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _fetch_row(self, fs_id: str) -> dict | None:
+    def _fetch_row(self, fs_id: str, market: str | None = None) -> dict | None:
+        resolved_market = normalize_market(market)
         conn = get_connection()
         row = conn.execute(
-            """SELECT id, name, description, factor_refs, preprocessing,
+            """SELECT id, market, name, description, factor_refs, preprocessing,
                       status, created_at, updated_at
-               FROM feature_sets WHERE id = ?""",
-            [fs_id],
+               FROM feature_sets WHERE id = ? AND market = ?""",
+            [fs_id, resolved_market],
         ).fetchone()
         if row is None:
             return None
@@ -593,11 +613,29 @@ class FeatureService:
 
         return {
             "id": row[0],
-            "name": row[1],
-            "description": row[2],
-            "factor_refs": _parse_json(row[3]),
-            "preprocessing": _parse_json(row[4]),
-            "status": row[5],
-            "created_at": str(row[6]) if row[6] else None,
-            "updated_at": str(row[7]) if row[7] else None,
+            "market": row[1],
+            "name": row[2],
+            "description": row[3],
+            "factor_refs": _parse_json(row[4]),
+            "preprocessing": _parse_json(row[5]),
+            "status": row[6],
+            "created_at": str(row[7]) if row[7] else None,
+            "updated_at": str(row[8]) if row[8] else None,
         }
+
+    def _validate_factor_refs(self, factor_refs: list[dict], market: str) -> None:
+        conn = get_connection()
+        for ref in factor_refs:
+            factor_id = ref.get("factor_id")
+            if not factor_id:
+                raise ValueError("factor_refs entries must include factor_id")
+            row = conn.execute(
+                "SELECT market FROM factors WHERE id = ?",
+                [factor_id],
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Factor {factor_id} not found")
+            if row[0] != market:
+                raise ValueError(
+                    f"Factor {factor_id} belongs to market {row[0]}, not {market}"
+                )

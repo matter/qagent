@@ -183,17 +183,19 @@ def update_data(mode: str = "incremental") -> dict:
 
 
 @mcp.tool()
-def list_factors(category: str | None = None) -> list[dict]:
+def list_factors(category: str | None = None, market: str | None = None) -> list[dict]:
     """List all available factors in the factor library.
 
     Args:
         category: Optional category filter (e.g. "momentum", "value", "custom").
+        market: Market scope. Defaults to "US" for compatibility.
 
     Returns:
         List of factor definitions with id, name, version, category, status.
     """
     svc = _factor_service()
-    return svc.list_factors(category=category)
+    svc.ensure_builtin_templates(market)
+    return svc.list_factors(category=category, market=market)
 
 
 @mcp.tool()
@@ -203,6 +205,7 @@ def evaluate_factor(
     universe_group_id: str,
     start_date: str,
     end_date: str,
+    market: str | None = None,
 ) -> dict:
     """Trigger factor evaluation against a label definition.
 
@@ -214,6 +217,7 @@ def evaluate_factor(
         universe_group_id: ID of the stock group for the universe.
         start_date: Evaluation start date (YYYY-MM-DD).
         end_date: Evaluation end date (YYYY-MM-DD).
+        market: Market scope. Defaults to "US" for compatibility.
 
     Returns:
         Dict with task_id for tracking the background evaluation task.
@@ -230,6 +234,7 @@ def evaluate_factor(
         universe_group_id: str,
         start_date: str,
         end_date: str,
+        market: str | None,
     ) -> dict:
         return eval_svc.evaluate_factor(
             factor_id=factor_id,
@@ -237,6 +242,7 @@ def evaluate_factor(
             universe_group_id=universe_group_id,
             start_date=start_date,
             end_date=end_date,
+            market=market,
         )
 
     task_id = executor.submit(
@@ -248,12 +254,13 @@ def evaluate_factor(
             "universe_group_id": universe_group_id,
             "start_date": start_date,
             "end_date": end_date,
+            "market": market,
         },
         timeout=3600,
         source=TaskSource.AGENT,
     )
 
-    return {"task_id": task_id, "status": "queued", "factor_id": factor_id}
+    return {"task_id": task_id, "status": "queued", "factor_id": factor_id, "market": market or "US"}
 
 
 @mcp.tool()
@@ -262,6 +269,7 @@ def create_factor(
     description: str,
     category: str,
     source_code: str,
+    market: str | None = None,
 ) -> dict:
     """Create a new factor definition in the factor library.
 
@@ -273,6 +281,7 @@ def create_factor(
         description: Human-readable description of the factor logic.
         category: Factor category (e.g. "momentum", "value", "volatility", "custom").
         source_code: Python source code implementing the factor.
+        market: Market scope. Defaults to "US" for compatibility.
 
     Returns:
         The created factor record with id, name, version, status.
@@ -283,6 +292,7 @@ def create_factor(
         source_code=source_code,
         description=description,
         category=category,
+        market=market,
     )
 
 

@@ -64,6 +64,7 @@ def _get_group_service() -> GroupService:
 
 
 class CreateFactorRequest(BaseModel):
+    market: Optional[str] = None
     name: str
     source_code: str
     description: Optional[str] = None
@@ -72,6 +73,7 @@ class CreateFactorRequest(BaseModel):
 
 
 class UpdateFactorRequest(BaseModel):
+    market: Optional[str] = None
     source_code: Optional[str] = None
     description: Optional[str] = None
     category: Optional[str] = None
@@ -80,12 +82,14 @@ class UpdateFactorRequest(BaseModel):
 
 
 class ComputeFactorRequest(BaseModel):
+    market: Optional[str] = None
     universe_group_id: str
     start_date: str
     end_date: str
 
 
 class EvaluateFactorRequest(BaseModel):
+    market: Optional[str] = None
     label_id: str
     universe_group_id: str
     start_date: str
@@ -108,6 +112,7 @@ async def create_factor(body: CreateFactorRequest) -> dict:
             description=body.description,
             category=body.category,
             params=body.params,
+            market=body.market,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -117,10 +122,15 @@ async def create_factor(body: CreateFactorRequest) -> dict:
 async def list_factors(
     category: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
+    market: Optional[str] = Query(None),
 ) -> list[dict]:
     """List all factors, optionally filtered by category or status."""
     svc = _get_service()
-    return svc.list_factors(category=category, status=status)
+    try:
+        svc.ensure_builtin_templates(market)
+        return svc.list_factors(category=category, status=status, market=market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/factors/templates")
@@ -144,28 +154,31 @@ async def get_template(template_name: str) -> dict:
 
 
 @router.get("/factors/evaluations")
-async def list_all_evaluations() -> list[dict]:
+async def list_all_evaluations(market: Optional[str] = Query(None)) -> list[dict]:
     """List all evaluation results across all factors (single JOIN query)."""
     svc = _get_eval_service()
-    return svc.list_all_evaluations()
+    try:
+        return svc.list_all_evaluations(market=market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/factors/evaluations/{eval_id}")
-async def get_evaluation_detail(eval_id: str) -> dict:
+async def get_evaluation_detail(eval_id: str, market: Optional[str] = Query(None)) -> dict:
     """Get a specific evaluation result with full detail (ic_series, group_returns)."""
     svc = _get_eval_service()
     try:
-        return svc.get_evaluation(eval_id)
+        return svc.get_evaluation(eval_id, market=market)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.get("/factors/{factor_id}")
-async def get_factor(factor_id: str) -> dict:
+async def get_factor(factor_id: str, market: Optional[str] = Query(None)) -> dict:
     """Get factor definition detail including source code."""
     svc = _get_service()
     try:
-        return svc.get_factor(factor_id)
+        return svc.get_factor(factor_id, market=market)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -182,17 +195,18 @@ async def update_factor(factor_id: str, body: UpdateFactorRequest) -> dict:
             category=body.category,
             params=body.params,
             status=body.status,
+            market=body.market,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.delete("/factors/{factor_id}")
-async def delete_factor(factor_id: str) -> dict:
+async def delete_factor(factor_id: str, market: Optional[str] = Query(None)) -> dict:
     """Delete a factor definition."""
     svc = _get_service()
     try:
-        svc.delete_factor(factor_id)
+        svc.delete_factor(factor_id, market=market)
         return {"status": "deleted", "id": factor_id}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -212,14 +226,14 @@ async def compute_factor(factor_id: str, body: ComputeFactorRequest) -> dict:
     # Validate factor exists
     svc = _get_service()
     try:
-        svc.get_factor(factor_id)
+        svc.get_factor(factor_id, market=body.market)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
     # Resolve tickers
     gsvc = _get_group_service()
     try:
-        tickers = gsvc.get_group_tickers(body.universe_group_id)
+        tickers = gsvc.get_group_tickers(body.universe_group_id, market=body.market)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if not tickers:
@@ -233,10 +247,18 @@ async def compute_factor(factor_id: str, body: ComputeFactorRequest) -> dict:
         universe_tickers: list,
         start_date: str,
         end_date: str,
+        market: str | None,
     ) -> dict:
-        result_df = engine.compute_factor(factor_id, universe_tickers, start_date, end_date)
+        result_df = engine.compute_factor(
+            factor_id,
+            universe_tickers,
+            start_date,
+            end_date,
+            market=market,
+        )
         return {
             "factor_id": factor_id,
+            "market": market or "US",
             "shape": list(result_df.shape),
             "tickers_computed": len(result_df.columns),
             "dates": len(result_df.index),
@@ -250,6 +272,7 @@ async def compute_factor(factor_id: str, body: ComputeFactorRequest) -> dict:
             "universe_tickers": tickers,
             "start_date": body.start_date,
             "end_date": body.end_date,
+            "market": body.market,
         },
         timeout=3600,  # 1 hour max
         source=TaskSource.UI,
@@ -259,9 +282,10 @@ async def compute_factor(factor_id: str, body: ComputeFactorRequest) -> dict:
         "api.factor.compute_triggered",
         task_id=task_id,
         factor_id=factor_id,
+        market=body.market or "US",
         tickers=len(tickers),
     )
-    return {"task_id": task_id, "status": "queued", "factor_id": factor_id}
+    return {"task_id": task_id, "status": "queued", "factor_id": factor_id, "market": body.market or "US"}
 
 
 @router.post("/factors/{factor_id}/evaluate")
@@ -273,7 +297,7 @@ async def evaluate_factor(factor_id: str, body: EvaluateFactorRequest) -> dict:
     # Validate factor exists
     svc = _get_service()
     try:
-        svc.get_factor(factor_id)
+        svc.get_factor(factor_id, market=body.market)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -286,6 +310,7 @@ async def evaluate_factor(factor_id: str, body: EvaluateFactorRequest) -> dict:
         universe_group_id: str,
         start_date: str,
         end_date: str,
+        market: str | None,
     ) -> dict:
         return eval_svc.evaluate_factor(
             factor_id=factor_id,
@@ -293,6 +318,7 @@ async def evaluate_factor(factor_id: str, body: EvaluateFactorRequest) -> dict:
             universe_group_id=universe_group_id,
             start_date=start_date,
             end_date=end_date,
+            market=market,
         )
 
     task_id = executor.submit(
@@ -304,6 +330,7 @@ async def evaluate_factor(factor_id: str, body: EvaluateFactorRequest) -> dict:
             "universe_group_id": body.universe_group_id,
             "start_date": body.start_date,
             "end_date": body.end_date,
+            "market": body.market,
         },
         timeout=3600,  # 1 hour max
         source=TaskSource.UI,
@@ -314,12 +341,16 @@ async def evaluate_factor(factor_id: str, body: EvaluateFactorRequest) -> dict:
         task_id=task_id,
         factor_id=factor_id,
         label_id=body.label_id,
+        market=body.market or "US",
     )
-    return {"task_id": task_id, "status": "queued", "factor_id": factor_id}
+    return {"task_id": task_id, "status": "queued", "factor_id": factor_id, "market": body.market or "US"}
 
 
 @router.get("/factors/{factor_id}/evaluations")
-async def list_evaluations(factor_id: str) -> list[dict]:
+async def list_evaluations(factor_id: str, market: Optional[str] = Query(None)) -> list[dict]:
     """List all evaluation results for a factor."""
     eval_svc = _get_eval_service()
-    return eval_svc.list_evaluations(factor_id)
+    try:
+        return eval_svc.list_evaluations(factor_id, market=market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))

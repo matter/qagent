@@ -93,6 +93,25 @@ This file records milestone evidence for the V2.0 A-share and ranking upgrade.
     - `uv run python scripts/e2e_demo.py` passed through the old US label-dependent factor evaluation and model-training flow.
     - `uv run python -m unittest discover tests` passed: `46` tests.
     - `cd frontend && pnpm build` passed with the existing Vite warnings.
-- Remaining P3 work:
-  - Factor records/cache/evaluation market scope.
-  - Feature set records and dependency validation market scope.
+- Factor and feature scope completed:
+  - Factor definitions, factor cache rows, factor evaluation results, and feature sets now carry `market`; old no-market calls default to `US`.
+  - Factor compute and bulk-cache reads filter `daily_bars` and `factor_values_cache` by market.
+  - Feature sets validate that all referenced factors belong to the same market.
+  - Factor evaluation resolves groups, factors, labels, and persisted results within one market.
+  - REST factor/feature endpoints accept `market`; factor MCP list/create/evaluate tools accept `market` for the same service-layer path.
+  - Frontend API types and clients expose the new factor/feature market fields without changing existing UI defaults.
+  - Regression coverage added in `tests/test_factor_feature_market_scope.py`.
+- P3 verification:
+  - `uv run python -m unittest tests.test_data_group_market_scope tests.test_label_market_scope tests.test_factor_feature_market_scope` passed: `17` tests.
+  - `uv run python -m unittest discover tests` passed: `53` tests.
+  - Real API smoke with backend on `127.0.0.1:8000`:
+    - `GET /api/health` returned `{"status":"ok"}`.
+    - `GET /api/factors?market=US` returned `377` US factors.
+    - `GET /api/factors?market=CN` returned `119` CN factors.
+    - CN feature set creation with a US factor returned HTTP `400`.
+    - CN feature set creation with a CN factor returned `market="CN"` and was deleted successfully.
+    - CN custom factor compute for `cn_all_a`, `2024-01-02` to `2024-01-10`, completed task `fd7401d00d2f49d68fad202bf516c2e5` with shape `[7, 1]`.
+    - Direct cache check for factor `f400ffff09bb` returned `[("CN", 7)]` from `factor_values_cache`.
+  - Old system regression:
+    - `uv run python scripts/e2e_demo.py` passed through factor evaluation, feature set creation, model training, backtest, and signal generation.
+    - `cd frontend && pnpm build` passed. Vite reported the existing large-chunk and dynamic-import warnings.

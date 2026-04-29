@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from backend.logger import get_logger
@@ -39,6 +39,7 @@ def _get_group_service() -> GroupService:
 
 
 class CreateFeatureSetRequest(BaseModel):
+    market: Optional[str] = None
     name: str
     description: Optional[str] = None
     factor_refs: list[dict]         # [{factor_id, factor_name, version}]
@@ -46,6 +47,7 @@ class CreateFeatureSetRequest(BaseModel):
 
 
 class UpdateFeatureSetRequest(BaseModel):
+    market: Optional[str] = None
     name: Optional[str] = None
     description: Optional[str] = None
     factor_refs: Optional[list[dict]] = None
@@ -54,6 +56,7 @@ class UpdateFeatureSetRequest(BaseModel):
 
 
 class CorrelationRequest(BaseModel):
+    market: Optional[str] = None
     universe_group_id: str
     start_date: str
     end_date: str
@@ -74,24 +77,28 @@ async def create_feature_set(body: CreateFeatureSetRequest) -> dict:
             description=body.description,
             factor_refs=body.factor_refs,
             preprocessing=body.preprocessing,
+            market=body.market,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/feature-sets")
-async def list_feature_sets() -> list[dict]:
+async def list_feature_sets(market: Optional[str] = Query(None)) -> list[dict]:
     """List all feature sets."""
     svc = _get_service()
-    return svc.list_feature_sets()
+    try:
+        return svc.list_feature_sets(market=market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/feature-sets/{fs_id}")
-async def get_feature_set(fs_id: str) -> dict:
+async def get_feature_set(fs_id: str, market: Optional[str] = Query(None)) -> dict:
     """Get feature set detail."""
     svc = _get_service()
     try:
-        return svc.get_feature_set(fs_id)
+        return svc.get_feature_set(fs_id, market=market)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -108,17 +115,18 @@ async def update_feature_set(fs_id: str, body: UpdateFeatureSetRequest) -> dict:
             factor_refs=body.factor_refs,
             preprocessing=body.preprocessing,
             status=body.status,
+            market=body.market,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.delete("/feature-sets/{fs_id}")
-async def delete_feature_set(fs_id: str) -> dict:
+async def delete_feature_set(fs_id: str, market: Optional[str] = Query(None)) -> dict:
     """Delete a feature set."""
     svc = _get_service()
     try:
-        svc.delete_feature_set(fs_id)
+        svc.delete_feature_set(fs_id, market=market)
         return {"status": "deleted", "id": fs_id}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -139,12 +147,12 @@ async def compute_correlation(fs_id: str, body: CorrelationRequest) -> dict:
     gsvc = _get_group_service()
 
     try:
-        svc.get_feature_set(fs_id)
+        svc.get_feature_set(fs_id, market=body.market)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
     try:
-        tickers = gsvc.get_group_tickers(body.universe_group_id)
+        tickers = gsvc.get_group_tickers(body.universe_group_id, market=body.market)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -157,6 +165,7 @@ async def compute_correlation(fs_id: str, body: CorrelationRequest) -> dict:
             tickers=tickers,
             start_date=body.start_date,
             end_date=body.end_date,
+            market=body.market,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

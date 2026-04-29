@@ -16,6 +16,7 @@ from backend.services.factor_engine import FactorEngine
 from backend.services.factor_service import FactorService
 from backend.services.group_service import GroupService
 from backend.services.label_service import LabelService
+from backend.services.market_context import normalize_market
 
 log = get_logger(__name__)
 
@@ -43,6 +44,7 @@ class FactorEvalService:
         universe_group_id: str,
         start_date: str,
         end_date: str,
+        market: str | None = None,
     ) -> dict:
         """Run a full factor evaluation and persist the results.
 
@@ -57,8 +59,10 @@ class FactorEvalService:
         Returns:
             Full evaluation result dict.
         """
+        resolved_market = normalize_market(market)
         log.info(
             "factor_eval.start",
+            market=resolved_market,
             factor_id=factor_id,
             label_id=label_id,
             universe=universe_group_id,
@@ -67,17 +71,17 @@ class FactorEvalService:
         )
 
         # --- 1. Resolve universe ---
-        tickers = self._group_service.get_group_tickers(universe_group_id)
+        tickers = self._group_service.get_group_tickers(universe_group_id, market=resolved_market)
         if not tickers:
             raise ValueError(
                 f"Universe group '{universe_group_id}' has no members"
             )
-        group_info = self._group_service.get_group(universe_group_id)
+        group_info = self._group_service.get_group(universe_group_id, market=resolved_market)
         universe_name = group_info.get("name", universe_group_id)
 
         # --- 2. Compute factor values ---
         factor_df = self._factor_engine.compute_factor(
-            factor_id, tickers, start_date, end_date
+            factor_id, tickers, start_date, end_date, market=resolved_market
         )
         if factor_df.empty:
             tickers_with_data = 0
@@ -103,11 +107,11 @@ class FactorEvalService:
                 dates=len(factor_df),
             )
 
-        factor_def = self._factor_service.get_factor(factor_id)
+        factor_def = self._factor_service.get_factor(factor_id, market=resolved_market)
 
         # --- 3. Compute label values ---
         label_long = self._label_service.compute_label_values(
-            label_id, tickers, start_date, end_date
+            label_id, tickers, start_date, end_date, market=resolved_market
         )
         if label_long.empty:
             raise ValueError(
@@ -115,7 +119,7 @@ class FactorEvalService:
                 f"Universe had {len(tickers)} tickers, date range {start_date} to {end_date}."
             )
 
-        label_def = self._label_service.get_label(label_id)
+        label_def = self._label_service.get_label(label_id, market=resolved_market)
 
         # Pivot label to wide format (date x ticker)
         label_df = label_long.pivot(index="date", columns="ticker", values="label_value")
@@ -185,6 +189,7 @@ class FactorEvalService:
         # --- Build result dict ---
         result = {
             "factor_id": factor_id,
+            "market": resolved_market,
             "factor_name": factor_def["name"],
             "label_id": label_id,
             "label_name": label_def["name"],
@@ -208,59 +213,23 @@ class FactorEvalService:
             summary=summary,
             ic_series=ic_series,
             group_returns=group_returns,
+            market=resolved_market,
         )
 
         log.info("factor_eval.done", eval_id=eval_id, ic_mean=summary["ic_mean"])
         return result
 
-    def list_evaluations(self, factor_id: str) -> list[dict]:
+    def list_evaluations(self, factor_id: str, market: str | None = None) -> list[dict]:
         """List all evaluation results for a factor."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         rows = conn.execute(
-            """SELECT id, factor_id, label_id, universe_group_id,
+            """SELECT id, market, factor_id, label_id, universe_group_id,
                       start_date, end_date, summary, created_at
                FROM factor_eval_results
-               WHERE factor_id = ?
+               WHERE market = ? AND factor_id = ?
                ORDER BY created_at DESC""",
-            [factor_id],
-        ).fetchall()
-
-        results = []
-        for r in rows:
-            summary_raw = r[6]
-            if isinstance(summary_raw, str):
-                try:
-                    summary_parsed = json.loads(summary_raw)
-                except (json.JSONDecodeError, TypeError):
-                    summary_parsed = {}
-            else:
-                summary_parsed = summary_raw if summary_raw else {}
-
-            results.append({
-                "id": r[0],
-                "factor_id": r[1],
-                "label_id": r[2],
-                "universe_group_id": r[3],
-                "start_date": str(r[4]) if r[4] else None,
-                "end_date": str(r[5]) if r[5] else None,
-                "summary": summary_parsed,
-                "created_at": str(r[7]) if r[7] else None,
-            })
-        return results
-
-    def list_all_evaluations(self) -> list[dict]:
-        """List all evaluation results across all factors with factor names.
-
-        Uses a single JOIN query instead of N per-factor queries.
-        """
-        conn = get_connection()
-        rows = conn.execute(
-            """SELECT e.id, e.factor_id, f.name AS factor_name,
-                      e.label_id, e.universe_group_id,
-                      e.start_date, e.end_date, e.summary, e.created_at
-               FROM factor_eval_results e
-               JOIN factors f ON f.id = e.factor_id
-               ORDER BY e.created_at DESC""",
+            [resolved_market, factor_id],
         ).fetchall()
 
         results = []
@@ -276,8 +245,8 @@ class FactorEvalService:
 
             results.append({
                 "id": r[0],
-                "factor_id": r[1],
-                "factor_name": r[2],
+                "market": r[1],
+                "factor_id": r[2],
                 "label_id": r[3],
                 "universe_group_id": r[4],
                 "start_date": str(r[5]) if r[5] else None,
@@ -287,16 +256,60 @@ class FactorEvalService:
             })
         return results
 
-    def get_evaluation(self, eval_id: str) -> dict:
+    def list_all_evaluations(self, market: str | None = None) -> list[dict]:
+        """List all evaluation results across all factors with factor names.
+
+        Uses a single JOIN query instead of N per-factor queries.
+        """
+        resolved_market = normalize_market(market)
+        conn = get_connection()
+        rows = conn.execute(
+            """SELECT e.id, e.market, e.factor_id, f.name AS factor_name,
+                      e.label_id, e.universe_group_id,
+                      e.start_date, e.end_date, e.summary, e.created_at
+               FROM factor_eval_results e
+               JOIN factors f ON f.market = e.market AND f.id = e.factor_id
+               WHERE e.market = ?
+               ORDER BY e.created_at DESC""",
+            [resolved_market],
+        ).fetchall()
+
+        results = []
+        for r in rows:
+            summary_raw = r[8]
+            if isinstance(summary_raw, str):
+                try:
+                    summary_parsed = json.loads(summary_raw)
+                except (json.JSONDecodeError, TypeError):
+                    summary_parsed = {}
+            else:
+                summary_parsed = summary_raw if summary_raw else {}
+
+            results.append({
+                "id": r[0],
+                "market": r[1],
+                "factor_id": r[2],
+                "factor_name": r[3],
+                "label_id": r[4],
+                "universe_group_id": r[5],
+                "start_date": str(r[6]) if r[6] else None,
+                "end_date": str(r[7]) if r[7] else None,
+                "summary": summary_parsed,
+                "created_at": str(r[9]) if r[9] else None,
+            })
+        return results
+
+    def get_evaluation(self, eval_id: str, market: str | None = None) -> dict:
         """Get a specific evaluation result with full detail."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         row = conn.execute(
-            """SELECT id, factor_id, label_id, universe_group_id,
+            """SELECT id, market, factor_id, label_id, universe_group_id,
                       start_date, end_date, summary, ic_series,
                       group_returns, created_at
                FROM factor_eval_results
-               WHERE id = ?""",
-            [eval_id],
+               WHERE id = ? AND market = ?""",
+            [eval_id, resolved_market],
         ).fetchone()
 
         if row is None:
@@ -312,15 +325,16 @@ class FactorEvalService:
 
         return {
             "id": row[0],
-            "factor_id": row[1],
-            "label_id": row[2],
-            "universe_group_id": row[3],
-            "start_date": str(row[4]) if row[4] else None,
-            "end_date": str(row[5]) if row[5] else None,
-            "summary": _parse_json(row[6]),
-            "ic_series": _parse_json(row[7]),
-            "group_returns": _parse_json(row[8]),
-            "created_at": str(row[9]) if row[9] else None,
+            "market": row[1],
+            "factor_id": row[2],
+            "label_id": row[3],
+            "universe_group_id": row[4],
+            "start_date": str(row[5]) if row[5] else None,
+            "end_date": str(row[6]) if row[6] else None,
+            "summary": _parse_json(row[7]),
+            "ic_series": _parse_json(row[8]),
+            "group_returns": _parse_json(row[9]),
+            "created_at": str(row[10]) if row[10] else None,
         }
 
     # ------------------------------------------------------------------
@@ -515,16 +529,19 @@ class FactorEvalService:
         summary: dict,
         ic_series: list,
         group_returns: dict,
+        market: str | None = None,
     ) -> None:
         """Persist evaluation result to the factor_eval_results table."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         conn.execute(
             """INSERT INTO factor_eval_results
-               (id, factor_id, label_id, universe_group_id,
+               (id, market, factor_id, label_id, universe_group_id,
                 start_date, end_date, summary, ic_series, group_returns, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 eval_id,
+                resolved_market,
                 factor_id,
                 label_id,
                 universe_group_id,
