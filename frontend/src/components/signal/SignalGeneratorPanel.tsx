@@ -146,9 +146,9 @@ export default function SignalGeneratorPanel({ onSignalComplete, restoreConfig }
   return (
     <>
       {contextHolder}
-      <Space direction="vertical" style={{ width: "100%" }} size="middle">
+      <Space orientation="vertical" style={{ width: "100%" }} size="middle">
         <Card title="信号配置" size="small">
-          <Space direction="vertical" style={{ width: "100%" }} size="small">
+          <Space orientation="vertical" style={{ width: "100%" }} size="small">
             <Row gutter={12}>
               <Col span={8}>
                 <Text type="secondary" style={{ fontSize: 12 }}>策略</Text>
@@ -229,7 +229,7 @@ export default function SignalGeneratorPanel({ onSignalComplete, restoreConfig }
         )}
 
         {result && (
-          <Space direction="vertical" style={{ width: "100%" }} size="middle">
+          <Space orientation="vertical" style={{ width: "100%" }} size="middle">
             {/* Result Level Badge */}
             <Card size="small">
               <Space size="middle">

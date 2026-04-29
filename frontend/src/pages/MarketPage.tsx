@@ -1,11 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { AutoComplete, Space, Button, Card, Spin, Typography, Empty, message, Tooltip } from "antd";
+import { AutoComplete, Space, Button, Card, Spin, Typography, Empty, message, Tooltip, Tag } from "antd";
 import { SearchOutlined, SyncOutlined } from "@ant-design/icons";
 import ReactECharts from "echarts-for-react";
 import type { EChartsOption } from "echarts";
 import dayjs from "dayjs";
 import { searchStocks, getDailyBars, updateTickers, getUpdateProgress } from "../api";
-import type { DailyBar, StockSearchResult } from "../api";
+import { getActiveMarket } from "../api/client";
+import type { DailyBar, Market, StockSearchResult } from "../api";
 
 const { Text } = Typography;
 
@@ -17,6 +18,11 @@ const RANGE_OPTIONS = [
   { label: "3Y", months: 36 },
   { label: "ALL", months: 0 },
 ] as const;
+
+const DEFAULT_TICKER_BY_MARKET: Record<Market, string> = {
+  US: "SPY",
+  CN: "sh.600000",
+};
 
 // ---- MA calculation ----
 function calcMA(data: number[], period: number): (number | null)[] {
@@ -272,8 +278,10 @@ function buildChartOption(bars: DailyBar[]): EChartsOption {
 }
 
 export default function MarketPage() {
-  const [ticker, setTicker] = useState("SPY");
-  const [searchValue, setSearchValue] = useState("SPY");
+  const market = getActiveMarket();
+  const defaultTicker = DEFAULT_TICKER_BY_MARKET[market];
+  const [ticker, setTicker] = useState(defaultTicker);
+  const [searchValue, setSearchValue] = useState(defaultTicker);
   const [options, setOptions] = useState<{ value: string; label: React.ReactNode }[]>([]);
   const [bars, setBars] = useState<DailyBar[]>([]);
   const [loading, setLoading] = useState(false);
@@ -291,7 +299,7 @@ export default function MarketPage() {
         const end = dayjs().format("YYYY-MM-DD");
         const opt = RANGE_OPTIONS.find((r) => r.label === rangeKey)!;
         const start = opt.months > 0 ? dayjs().subtract(opt.months, "month").format("YYYY-MM-DD") : undefined;
-        const data = await getDailyBars(t, start, end);
+        const data = await getDailyBars(t, start, end, market);
         setBars(data);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : "加载失败";
@@ -301,7 +309,7 @@ export default function MarketPage() {
         setLoading(false);
       }
     },
-    [],
+    [market],
   );
 
   useEffect(() => {
@@ -311,7 +319,7 @@ export default function MarketPage() {
   const handleUpdateTicker = async () => {
     setUpdating(true);
     try {
-      await updateTickers([ticker]);
+      await updateTickers([ticker], market);
       messageApi.success(`${ticker} 数据更新已提交`);
       // Poll for completion then refresh chart
       const poll = setInterval(async () => {
@@ -347,13 +355,16 @@ export default function MarketPage() {
     }
     searchTimer.current = setTimeout(async () => {
       try {
-        const results: StockSearchResult[] = await searchStocks(value, 10);
+        const results: StockSearchResult[] = await searchStocks(value, 10, market);
         setOptions(
           results.map((r) => ({
             value: r.ticker,
             label: (
               <Space>
                 <Text strong>{r.ticker}</Text>
+                <Tag color={r.market === "CN" ? "red" : "blue"} style={{ marginInlineEnd: 0 }}>
+                  {r.market}
+                </Tag>
                 <Text type="secondary">{r.name}</Text>
                 <Text type="secondary" style={{ fontSize: 11 }}>
                   {r.exchange}
@@ -406,6 +417,7 @@ export default function MarketPage() {
         <Text strong style={{ fontSize: 16, marginLeft: 8 }}>
           {ticker}
         </Text>
+        <Tag color={market === "CN" ? "red" : "blue"}>{market}</Tag>
         <Tooltip title={`更新 ${ticker} 行情数据`}>
           <Button
             icon={<SyncOutlined spin={updating} />}
@@ -420,13 +432,12 @@ export default function MarketPage() {
 
       {/* Chart */}
       <Card
-        bodyStyle={{ padding: 8 }}
         styles={{ body: { padding: 8 } }}
         style={{ background: "rgba(0,0,0,0.2)" }}
       >
         {loading ? (
           <div style={{ display: "flex", justifyContent: "center", alignItems: "center", height: 560 }}>
-            <Spin size="large" tip="加载数据中..." />
+            <Spin size="large" description="加载数据中..." />
           </div>
         ) : error ? (
           <div style={{ display: "flex", justifyContent: "center", alignItems: "center", height: 560 }}>
@@ -434,7 +445,7 @@ export default function MarketPage() {
           </div>
         ) : bars.length === 0 ? (
           <div style={{ display: "flex", justifyContent: "center", alignItems: "center", height: 560 }}>
-            <Empty description="暂无数据" />
+            <Empty description={`${market} 暂无 ${ticker} 数据`} />
           </div>
         ) : (
           <ReactECharts

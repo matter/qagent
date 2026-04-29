@@ -30,6 +30,34 @@ class FrontendMarketScopeContractsTests(unittest.TestCase):
 
         self.assertIn("MarketScopeSelector", app)
 
+    def test_market_aware_pages_expose_human_validation_cues(self):
+        app = (FRONTEND_SRC / "App.tsx").read_text()
+        market_page = (FRONTEND_SRC / "pages" / "MarketPage.tsx").read_text()
+        data_page = (FRONTEND_SRC / "pages" / "DataManagePage.tsx").read_text()
+        train_panel = (FRONTEND_SRC / "components" / "model" / "TrainConfigPanel.tsx").read_text()
+        model_list = (FRONTEND_SRC / "components" / "model" / "ModelList.tsx").read_text()
+
+        self.assertIn("subscribeActiveMarket", app)
+        self.assertIn("key={marketScope}", app)
+
+        self.assertIn("DEFAULT_TICKER_BY_MARKET", market_page)
+        self.assertIn("getActiveMarket", market_page)
+        self.assertIn("sh.600000", market_page)
+
+        self.assertIn("status.market", data_page)
+        self.assertIn("latest_trading_day", data_page)
+        self.assertIn('dataIndex: "market"', data_page)
+
+        self.assertIn("objectiveType", train_panel)
+        for objective in ("regression", "classification", "ranking", "pairwise", "listwise"):
+            self.assertIn(objective, train_panel)
+        self.assertIn("ranking_config", train_panel)
+        self.assertIn("objective_type", train_panel)
+
+        for metric in ("ndcg@", "rank_ic", "top_k"):
+            self.assertIn(metric, model_list)
+        self.assertIn('dataIndex: "market"', model_list)
+
 
 if __name__ == "__main__":
     unittest.main()

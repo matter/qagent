@@ -162,7 +162,7 @@ export default function FeatureSetCreator({ onCreated, restoreConfig }: FeatureS
     <>
       {contextHolder}
       <Card title="创建特征集" size="small">
-        <Space direction="vertical" style={{ width: "100%" }} size="middle">
+        <Space orientation="vertical" style={{ width: "100%" }} size="middle">
           <div>
             <Text type="secondary" style={{ fontSize: 12 }}>选择因子</Text>
             <Select
@@ -255,20 +255,24 @@ export default function FeatureSetCreator({ onCreated, restoreConfig }: FeatureS
 
           <Row gutter={12}>
             <Col span={12}>
-              <Input
-                placeholder="特征集名称"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                addonBefore="名称"
-              />
+              <Space.Compact style={{ width: "100%" }}>
+                <Button disabled>名称</Button>
+                <Input
+                  placeholder="特征集名称"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                />
+              </Space.Compact>
             </Col>
             <Col span={12}>
-              <Input
-                placeholder="描述 (可选)"
-                value={description}
-                onChange={(e) => setDescription(e.target.value)}
-                addonBefore="描述"
-              />
+              <Space.Compact style={{ width: "100%" }}>
+                <Button disabled>描述</Button>
+                <Input
+                  placeholder="描述 (可选)"
+                  value={description}
+                  onChange={(e) => setDescription(e.target.value)}
+                />
+              </Space.Compact>
             </Col>
           </Row>
 

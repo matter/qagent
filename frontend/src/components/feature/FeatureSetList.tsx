@@ -12,7 +12,7 @@ import {
 } from "antd";
 import { ReloadOutlined, DeleteOutlined, RollbackOutlined } from "@ant-design/icons";
 import { listFeatureSets, deleteFeatureSet } from "../../api";
-import type { FeatureSet } from "../../api";
+import type { FeatureSet, Market } from "../../api";
 
 const { Text } = Typography;
 
@@ -54,9 +54,9 @@ export default function FeatureSetList({ refreshKey, onRestoreConfig }: FeatureS
     fetchData();
   }, [fetchData, refreshKey]);
 
-  const handleDelete = async (id: string) => {
+  const handleDelete = async (id: string, market?: string) => {
     try {
-      await deleteFeatureSet(id);
+      await deleteFeatureSet(id, market);
       messageApi.success("特征集已删除");
       fetchData();
     } catch {
@@ -74,6 +74,13 @@ export default function FeatureSetList({ refreshKey, onRestoreConfig }: FeatureS
   };
 
   const columns = [
+    {
+      title: "Market",
+      dataIndex: "market",
+      key: "market",
+      width: 80,
+      render: (m: Market) => <Tag color={m === "CN" ? "red" : "blue"}>{m}</Tag>,
+    },
     {
       title: "名称",
       dataIndex: "name",
@@ -145,7 +152,7 @@ export default function FeatureSetList({ refreshKey, onRestoreConfig }: FeatureS
               disabled={!onRestoreConfig}
             />
           </Tooltip>
-          <Popconfirm title="确定删除此特征集?" onConfirm={() => handleDelete(record.id)}>
+          <Popconfirm title="确定删除此特征集?" onConfirm={() => handleDelete(record.id, record.market)}>
             <Button size="small" danger icon={<DeleteOutlined />} />
           </Popconfirm>
         </Space>
@@ -171,6 +178,7 @@ export default function FeatureSetList({ refreshKey, onRestoreConfig }: FeatureS
           loading={loading}
           size="small"
           pagination={{ pageSize: 15 }}
+          scroll={{ x: 900 }}
         />
       </Card>
     </>

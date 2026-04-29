@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Routes, Route, useNavigate, useLocation } from "react-router-dom";
 import { ConfigProvider, Layout, Menu, theme, Typography } from "antd";
 import {
@@ -26,6 +26,8 @@ import PaperTrading from "./pages/PaperTrading";
 import SystemSettings from "./pages/SystemSettings";
 import TaskManagement from "./pages/TaskManagement";
 import MarketScopeSelector from "./components/MarketScopeSelector";
+import { getActiveMarket, subscribeActiveMarket } from "./api/client";
+import type { Market } from "./api";
 
 const { Sider, Content, Header } = Layout;
 const { Title } = Typography;
@@ -45,6 +47,7 @@ const menuItems: MenuProps["items"] = [
 
 export default function App() {
   const [collapsed, setCollapsed] = useState(false);
+  const [marketScope, setMarketScope] = useState<Market>(() => getActiveMarket());
   const navigate = useNavigate();
   const location = useLocation();
   const currentMenuItem = menuItems?.find(
@@ -54,6 +57,8 @@ export default function App() {
   const onMenuClick: MenuProps["onClick"] = ({ key }) => {
     navigate(key);
   };
+
+  useEffect(() => subscribeActiveMarket(setMarketScope), []);
 
   return (
     <ConfigProvider
@@ -115,7 +120,10 @@ export default function App() {
             </Title>
             <MarketScopeSelector />
           </Header>
-          <Content style={{ margin: 16, padding: 24, background: "rgba(255,255,255,0.04)", borderRadius: 8 }}>
+          <Content
+            key={marketScope}
+            style={{ margin: 16, padding: 24, background: "rgba(255,255,255,0.04)", borderRadius: 8 }}
+          >
             <Routes>
               <Route path="/" element={<MarketBrowser />} />
               <Route path="/market" element={<MarketBrowser />} />

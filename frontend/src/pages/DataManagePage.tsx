@@ -42,7 +42,8 @@ import {
   getGroup,
   refreshIndexGroups,
 } from "../api";
-import type { DataStatus, UpdateProgress, StockGroup } from "../api";
+import { getActiveMarket } from "../api/client";
+import type { DataStatus, Market, UpdateProgress, StockGroup } from "../api";
 
 const { Text, Paragraph } = Typography;
 const { TextArea } = Input;
@@ -50,13 +51,15 @@ const { TextArea } = Input;
 // ---- Data Status Section ----
 
 function DataStatusSection() {
+  const market = getActiveMarket();
   const [status, setStatus] = useState<DataStatus | null>(null);
   const [loading, setLoading] = useState(false);
+  const displayedMarket = status ? status.market ?? market : market;
 
   const fetchStatus = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await getDataStatus();
+      const data = await getDataStatus(market);
       setStatus(data);
     } catch {
       /* noop */
@@ -71,7 +74,12 @@ function DataStatusSection() {
 
   return (
     <Card
-      title="数据概览"
+      title={
+        <Space size={8}>
+          <span>数据概览</span>
+          <Tag color={displayedMarket === "CN" ? "red" : "blue"}>{displayedMarket}</Tag>
+        </Space>
+      }
       extra={
         <Button icon={<ReloadOutlined />} size="small" onClick={fetchStatus} loading={loading}>
           刷新
@@ -92,6 +100,13 @@ function DataStatusSection() {
           <Col xs={12} sm={8} md={4}>
             <Statistic title="过期股票" value={status.stale_tickers} />
           </Col>
+          <Col xs={12} sm={8} md={4}>
+            <Statistic
+              title="最近交易日"
+              value={status.latest_trading_day ?? "-"}
+              styles={{ content: { fontSize: 14 } }}
+            />
+          </Col>
           <Col xs={12} sm={8} md={6}>
             <Statistic
               title="日期范围"
@@ -100,14 +115,14 @@ function DataStatusSection() {
                   ? `${status.date_range.min} ~ ${status.date_range.max}`
                   : "无数据"
               }
-              valueStyle={{ fontSize: 14 }}
+              styles={{ content: { fontSize: 14 } }}
             />
           </Col>
           <Col xs={12} sm={8} md={6}>
             <Statistic
               title="最近更新"
               value={status.last_update.completed_at ?? "从未更新"}
-              valueStyle={{ fontSize: 14 }}
+              styles={{ content: { fontSize: 14 } }}
             />
           </Col>
         </Row>
@@ -132,6 +147,7 @@ function formatElapsed(startedAt: string): string {
 }
 
 function DataUpdateSection() {
+  const market = getActiveMarket();
   const [status, setStatus] = useState<DataStatus | null>(null);
   const [progress, setProgress] = useState<UpdateProgress | null>(null);
   const [triggering, setTriggering] = useState(false);
@@ -145,7 +161,7 @@ function DataUpdateSection() {
   // Fetch data status for confirmation dialog
   const fetchStatus = useCallback(async () => {
     try {
-      const data = await getDataStatus();
+      const data = await getDataStatus(market);
       setStatus(data);
     } catch {
       /* noop */
@@ -212,9 +228,12 @@ function DataUpdateSection() {
       title: "确认数据更新",
       icon: <ExclamationCircleOutlined />,
       content: (
-        <Space direction="vertical" style={{ width: "100%", marginTop: 8 }}>
+        <Space orientation="vertical" style={{ width: "100%", marginTop: 8 }}>
           <Descriptions size="small" column={1} bordered>
             <Descriptions.Item label="最近更新">{lastUpdate}</Descriptions.Item>
+            <Descriptions.Item label="Market">
+              <Tag color={market === "CN" ? "red" : "blue"}>{market}</Tag>
+            </Descriptions.Item>
             <Descriptions.Item label="股票总数">{stockCount}</Descriptions.Item>
             <Descriptions.Item label="更新模式">
               <Tag color={mode === "incremental" ? "blue" : "orange"}>
@@ -234,7 +253,7 @@ function DataUpdateSection() {
   const handleUpdate = async (mode: "incremental" | "full") => {
     setTriggering(true);
     try {
-      await triggerUpdate(mode);
+      await triggerUpdate(mode, market);
       messageApi.success(`${mode === "incremental" ? "增量" : "全量"}更新已提交`);
       startPoll();
       // immediate poll
@@ -267,9 +286,9 @@ function DataUpdateSection() {
           : "normal";
 
   return (
-    <Card title="数据更新">
+    <Card title={<Space size={8}><span>数据更新</span><Tag color={market === "CN" ? "red" : "blue"}>{market}</Tag></Space>}>
       {contextHolder}
-      <Space direction="vertical" style={{ width: "100%" }} size="middle">
+      <Space orientation="vertical" style={{ width: "100%" }} size="middle">
         <Space wrap>
           <Button
             type="primary"
@@ -363,6 +382,7 @@ interface GroupFormValues {
 }
 
 function StockGroupsSection() {
+  const market = getActiveMarket();
   const [groups, setGroups] = useState<StockGroup[]>([]);
   const [loading, setLoading] = useState(false);
   const [modalOpen, setModalOpen] = useState(false);
@@ -378,7 +398,7 @@ function StockGroupsSection() {
   const fetchGroups = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await listGroups();
+      const data = await listGroups(market);
       setGroups(data);
     } catch {
       /* noop */
@@ -409,7 +429,7 @@ function StockGroupsSection() {
     });
     // Load tickers if manual
     if (record.group_type === "manual") {
-      getGroup(record.id).then((g) => {
+      getGroup(record.id, market).then((g) => {
         form.setFieldsValue({ tickers_text: (g.tickers ?? []).join(", ") });
       });
     }
@@ -418,7 +438,7 @@ function StockGroupsSection() {
 
   const handleDelete = async (id: string) => {
     try {
-      await deleteGroup(id);
+      await deleteGroup(id, market);
       messageApi.success("分组已删除");
       fetchGroups();
     } catch {
@@ -434,12 +454,13 @@ function StockGroupsSection() {
       const tickers = values.tickers_text
         ? values.tickers_text
             .split(/[,\s\n]+/)
-            .map((t: string) => t.trim().toUpperCase())
+            .map((t: string) => market === "CN" ? t.trim().toLowerCase() : t.trim().toUpperCase())
             .filter(Boolean)
         : undefined;
 
       if (editingGroup) {
         await updateGroup(editingGroup.id, {
+          market,
           name: values.name,
           description: values.description,
           tickers: values.group_type === "manual" ? tickers : undefined,
@@ -448,6 +469,7 @@ function StockGroupsSection() {
         messageApi.success("分组已更新");
       } else {
         await createGroup({
+          market,
           name: values.name,
           description: values.description,
           group_type: values.group_type,
@@ -468,7 +490,7 @@ function StockGroupsSection() {
 
   const showDetail = async (record: StockGroup) => {
     try {
-      const data = await getGroup(record.id);
+      const data = await getGroup(record.id, market);
       setDetailGroup(data);
       setDetailOpen(true);
     } catch {
@@ -479,7 +501,7 @@ function StockGroupsSection() {
   const handleRefreshIndices = async () => {
     setRefreshingIndices(true);
     try {
-      await refreshIndexGroups();
+      await refreshIndexGroups(market);
       messageApi.success("指数成分刷新成功");
       fetchGroups();
     } catch {
@@ -492,7 +514,7 @@ function StockGroupsSection() {
   const handleUpdateGroupData = async (groupId: string, groupName: string) => {
     setUpdatingGroupId(groupId);
     try {
-      await updateGroupData(groupId);
+      await updateGroupData(groupId, market);
       messageApi.success(`${groupName} 数据更新已提交`);
       // Poll for completion
       const poll = setInterval(async () => {
@@ -525,6 +547,13 @@ function StockGroupsSection() {
   const groupType = Form.useWatch("group_type", form);
 
   const columns = [
+    {
+      title: "Market",
+      dataIndex: "market",
+      key: "market",
+      width: 80,
+      render: (m: Market) => <Tag color={m === "CN" ? "red" : "blue"}>{m}</Tag>,
+    },
     {
       title: "名称",
       dataIndex: "name",
@@ -595,7 +624,12 @@ function StockGroupsSection() {
     <>
       {contextHolder}
       <Card
-        title="股票分组"
+        title={
+          <Space size={8}>
+            <span>股票分组</span>
+            <Tag color={market === "CN" ? "red" : "blue"}>{market}</Tag>
+          </Space>
+        }
         extra={
           <Space>
             <Button
@@ -632,7 +666,7 @@ function StockGroupsSection() {
         onOk={handleSubmit}
         onCancel={() => setModalOpen(false)}
         confirmLoading={submitting}
-        destroyOnClose
+        destroyOnHidden
       >
         <Form form={form} layout="vertical" initialValues={{ group_type: "manual" }}>
           <Form.Item name="name" label="名称" rules={[{ required: true, message: "请输入分组名称" }]}>
@@ -653,7 +687,7 @@ function StockGroupsSection() {
           )}
           {(groupType === "manual" || editingGroup?.group_type === "manual") && (
             <Form.Item name="tickers_text" label="股票列表" help="用逗号或空格分隔股票代码">
-              <TextArea rows={3} placeholder="AAPL, MSFT, GOOG" />
+              <TextArea rows={3} placeholder={market === "CN" ? "sh.600000, sz.000001" : "AAPL, MSFT, GOOG"} />
             </Form.Item>
           )}
           {(groupType === "filter" || editingGroup?.group_type === "filter") && (
@@ -698,9 +732,12 @@ function StockGroupsSection() {
         width={600}
       >
         {detailGroup && (
-          <Space direction="vertical" style={{ width: "100%" }} size="middle">
+          <Space orientation="vertical" style={{ width: "100%" }} size="middle">
             <Descriptions size="small" column={2} bordered>
               <Descriptions.Item label="名称">{detailGroup.name}</Descriptions.Item>
+              <Descriptions.Item label="Market">
+                <Tag color={detailGroup.market === "CN" ? "red" : "blue"}>{detailGroup.market}</Tag>
+              </Descriptions.Item>
               <Descriptions.Item label="类型">
                 <Tag>{detailGroup.group_type}</Tag>
               </Descriptions.Item>
@@ -737,7 +774,7 @@ function StockGroupsSection() {
 
 export default function DataManagePage() {
   return (
-    <Space direction="vertical" style={{ width: "100%" }} size="middle">
+    <Space orientation="vertical" style={{ width: "100%" }} size="middle">
       <DataStatusSection />
       <DataUpdateSection />
       <StockGroupsSection />

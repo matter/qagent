@@ -203,7 +203,7 @@ export default function StockTradeChart({
       onCancel={onClose}
       footer={null}
       width={1100}
-      destroyOnClose
+      destroyOnHidden
     >
       {loading && (
         <div style={{ textAlign: "center", padding: 48 }}>

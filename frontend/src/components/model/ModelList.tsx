@@ -38,6 +38,21 @@ function metricVal(r: Model, key: string): number | undefined {
   return v ?? undefined;
 }
 
+function firstMetricVal(r: Model, matcher: (key: string) => boolean): number | undefined {
+  const em = r.eval_metrics as Record<string, unknown> | null;
+  if (!em) return undefined;
+  const key = Object.keys(em).find(matcher);
+  if (!key) return undefined;
+  const value = em[key];
+  return typeof value === "number" ? value : undefined;
+}
+
+function objectiveLabel(r: Model): string {
+  const em = r.eval_metrics as Record<string, unknown> | null;
+  const objective = em?.objective_type ?? em?.task_type ?? r.model_type;
+  return String(objective);
+}
+
 export interface ModelRestoreConfig {
   featureSetId: string;
   labelId: string;
@@ -140,6 +155,13 @@ export default function ModelList({ refreshKey, onRestoreConfig }: ModelListProp
       ),
     },
     {
+      title: "Market",
+      dataIndex: "market",
+      key: "market",
+      width: 80,
+      render: (m: string) => <Tag color={m === "CN" ? "red" : "blue"}>{m}</Tag>,
+    },
+    {
       title: "名称",
       dataIndex: "name",
       key: "name",
@@ -149,10 +171,9 @@ export default function ModelList({ refreshKey, onRestoreConfig }: ModelListProp
     },
     {
       title: "类型",
-      dataIndex: "model_type",
-      key: "model_type",
-      width: 90,
-      render: (v: string) => <Tag color="blue">{v}</Tag>,
+      key: "objective_type",
+      width: 110,
+      render: (_: unknown, record: Model) => <Tag color="blue">{objectiveLabel(record)}</Tag>,
     },
     {
       title: "状态",
@@ -162,6 +183,30 @@ export default function ModelList({ refreshKey, onRestoreConfig }: ModelListProp
       render: (s: string) => {
         const cfg = STATUS_TAG[s] ?? { color: "default", label: s };
         return <Tag color={cfg.color}>{cfg.label}</Tag>;
+      },
+    },
+    {
+      title: "NDCG@5",
+      key: "ndcg@5",
+      width: 90,
+      sorter: (a: Model, b: Model) =>
+        (metricVal(a, "test_ndcg@5") ?? firstMetricVal(a, (key) => key.startsWith("test_ndcg@")) ?? 0)
+        - (metricVal(b, "test_ndcg@5") ?? firstMetricVal(b, (key) => key.startsWith("test_ndcg@")) ?? 0),
+      render: (_: unknown, r: Model) => {
+        const v = metricVal(r, "test_ndcg@5") ?? firstMetricVal(r, (key) => key.startsWith("test_ndcg@"));
+        return v === undefined ? <Text type="secondary">-</Text> : <Text>{v.toFixed(4)}</Text>;
+      },
+    },
+    {
+      title: "Rank IC",
+      key: "rank_ic",
+      width: 90,
+      sorter: (a: Model, b: Model) =>
+        (metricVal(a, "test_rank_ic_mean") ?? 0) - (metricVal(b, "test_rank_ic_mean") ?? 0),
+      render: (_: unknown, r: Model) => {
+        const v = metricVal(r, "test_rank_ic_mean");
+        if (v === undefined) return <Text type="secondary">-</Text>;
+        return <Text style={{ color: v > 0 ? "#52c41a" : "#ff4d4f" }}>{v.toFixed(4)}</Text>;
       },
     },
     {
@@ -308,6 +353,26 @@ export default function ModelList({ refreshKey, onRestoreConfig }: ModelListProp
     { key: "test_rmse", title: "测试RMSE", precision: 4 },
   ];
 
+  const rankingMetricCards = metrics
+    ? Object.entries(metrics)
+        .filter(([key, value]) =>
+          typeof value === "number"
+          && (
+            key.includes("ndcg@")
+            || key.includes("rank_ic")
+            || (key.includes("top_") && key.includes("_mean_label"))
+            || key.includes("pairwise_accuracy")
+          ),
+        )
+        .map(([key, value]) => ({
+          key,
+          title: key.includes("top_") && key.includes("_mean_label")
+            ? key.replace(/top_(\d+)_mean_label/, "top_k label@$1")
+            : key,
+          value: value as number,
+        }))
+    : [];
+
   return (
     <>
       {contextHolder}
@@ -336,7 +401,7 @@ export default function ModelList({ refreshKey, onRestoreConfig }: ModelListProp
           loading={loading}
           size="small"
           pagination={{ pageSize: 15 }}
-          scroll={{ x: 1100 }}
+          scroll={{ x: 1300 }}
           onRow={(record) => ({
             onClick: () => handleRowClick(record),
             style: { cursor: "pointer" },
@@ -350,14 +415,14 @@ export default function ModelList({ refreshKey, onRestoreConfig }: ModelListProp
         onCancel={() => setDetailOpen(false)}
         footer={null}
         width={960}
-        destroyOnClose
+        destroyOnHidden
       >
         {detailLoading ? (
           <div style={{ textAlign: "center", padding: 48 }}>
             <Text type="secondary">加载中...</Text>
           </div>
         ) : detailModel ? (
-          <Space direction="vertical" style={{ width: "100%" }} size="middle">
+          <Space orientation="vertical" style={{ width: "100%" }} size="middle">
             {/* Evaluation metrics cards */}
             {metrics && (
               <Row gutter={[12, 12]}>
@@ -374,13 +439,29 @@ export default function ModelList({ refreshKey, onRestoreConfig }: ModelListProp
                           value={v}
                           precision={item.precision}
                           suffix={item.suffix}
-                          valueStyle={{ fontSize: 18, color }}
+                          styles={{ content: { fontSize: 18, color } }}
                         />
                       </Card>
                     </Col>
                   );
                 })}
               </Row>
+            )}
+
+            {rankingMetricCards.length > 0 && (
+              <Card title="Ranking / Listwise 指标" size="small">
+                <Row gutter={[12, 12]}>
+                  {rankingMetricCards.map((item) => (
+                    <Col xs={12} sm={8} md={6} lg={4} key={item.key}>
+                      <Statistic
+                        title={item.title}
+                        value={item.value}
+                        precision={4}
+                      />
+                    </Col>
+                  ))}
+                </Row>
+              </Card>
             )}
 
             {/* Train config + model params */}

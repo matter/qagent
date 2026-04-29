@@ -17,7 +17,7 @@ export default function FeatureEngineering() {
   }, []);
 
   return (
-    <Space direction="vertical" style={{ width: "100%" }} size="middle">
+    <Space orientation="vertical" style={{ width: "100%" }} size="middle">
       <FeatureSetCreator onCreated={handleCreated} restoreConfig={restoreConfig} />
       <FeatureSetList refreshKey={listRefreshKey} onRestoreConfig={handleRestoreConfig} />
     </Space>

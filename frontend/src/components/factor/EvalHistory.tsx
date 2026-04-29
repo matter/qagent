@@ -6,6 +6,7 @@ import {
   Modal,
   Space,
   Table,
+  Tag,
   Tooltip,
   Typography,
 } from "antd";
@@ -14,7 +15,7 @@ import {
   listAllEvaluations,
   getEvaluation,
 } from "../../api";
-import type { FactorEvalRecordWithName, FactorEvalDetail } from "../../api";
+import type { FactorEvalRecordWithName, FactorEvalDetail, Market } from "../../api";
 import { EvalSummaryCards, ICSeriesChart, GroupReturnsChart } from "./EvalCharts";
 
 const { Text } = Typography;
@@ -61,7 +62,7 @@ export default function EvalHistory({ onRestoreConfig }: EvalHistoryProps) {
     setDetailLoading(true);
     setDetail(null);
     try {
-      const d = await getEvaluation(record.id);
+      const d = await getEvaluation(record.id, record.market);
       setDetail(d);
     } catch {
       messageApi.error("加载评价详情失败");
@@ -86,6 +87,13 @@ export default function EvalHistory({ onRestoreConfig }: EvalHistoryProps) {
   };
 
   const columns = [
+    {
+      title: "Market",
+      dataIndex: "market",
+      key: "market",
+      width: 80,
+      render: (m: Market) => <Tag color={m === "CN" ? "red" : "blue"}>{m}</Tag>,
+    },
     {
       title: "因子",
       dataIndex: "factor_name",
@@ -206,6 +214,7 @@ export default function EvalHistory({ onRestoreConfig }: EvalHistoryProps) {
           loading={loading}
           size="small"
           pagination={{ pageSize: 20 }}
+          scroll={{ x: 1000 }}
           onRow={(record) => ({
             onClick: () => handleRowClick(record),
             style: { cursor: "pointer" },
@@ -219,14 +228,14 @@ export default function EvalHistory({ onRestoreConfig }: EvalHistoryProps) {
         onCancel={() => setDetailOpen(false)}
         footer={null}
         width={900}
-        destroyOnClose
+        destroyOnHidden
       >
         {detailLoading ? (
           <div style={{ textAlign: "center", padding: 48 }}>
             <Text type="secondary">加载中...</Text>
           </div>
         ) : detail ? (
-          <Space direction="vertical" style={{ width: "100%" }} size="middle">
+          <Space orientation="vertical" style={{ width: "100%" }} size="middle">
             <EvalSummaryCards summary={detail.summary} />
             <ICSeriesChart icSeries={detail.ic_series} />
             <GroupReturnsChart groupReturns={detail.group_returns} />

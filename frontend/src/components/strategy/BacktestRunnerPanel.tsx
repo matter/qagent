@@ -170,9 +170,9 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
   return (
     <>
       {contextHolder}
-      <Space direction="vertical" style={{ width: "100%" }} size="middle">
+      <Space orientation="vertical" style={{ width: "100%" }} size="middle">
         <Card title="回测配置" size="small">
-          <Space direction="vertical" style={{ width: "100%" }} size="small">
+          <Space orientation="vertical" style={{ width: "100%" }} size="small">
             <Row gutter={12}>
               <Col span={12}>
                 <Text type="secondary" style={{ fontSize: 12 }}>策略</Text>
@@ -377,7 +377,7 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
         )}
 
         {result && result.summary && (
-          <Space direction="vertical" style={{ width: "100%" }} size="middle">
+          <Space orientation="vertical" style={{ width: "100%" }} size="middle">
             <BacktestSummaryCards summary={result.summary} />
             <NavCurveChart navSeries={result.nav_series} benchmarkNav={result.benchmark_nav} />
             <DrawdownChart drawdownSeries={result.drawdown_series} />

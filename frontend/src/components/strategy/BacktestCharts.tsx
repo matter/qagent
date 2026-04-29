@@ -131,7 +131,7 @@ export function BacktestSummaryCards({ summary }: BacktestSummaryCardsProps) {
                 value={v}
                 precision={item.precision}
                 suffix={item.suffix}
-                valueStyle={{ fontSize: 18, color }}
+                styles={{ content: { fontSize: 18, color } }}
               />
             </Card>
           </Col>

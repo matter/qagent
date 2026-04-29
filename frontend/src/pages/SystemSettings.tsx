@@ -49,7 +49,7 @@ export default function SystemSettings() {
   }
 
   return (
-    <Space direction="vertical" style={{ width: "100%" }} size="middle">
+    <Space orientation="vertical" style={{ width: "100%" }} size="middle">
       {/* System Info */}
       <Card
         title={
@@ -161,7 +161,7 @@ export default function SystemSettings() {
           </span>
         }
       >
-        <Space direction="vertical">
+        <Space orientation="vertical">
           <Text>FastAPI 自动生成的交互式 API 文档:</Text>
           <Link href="http://localhost:8000/docs" target="_blank">
             http://localhost:8000/docs

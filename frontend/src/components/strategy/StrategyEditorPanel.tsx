@@ -182,7 +182,7 @@ export default function StrategyEditorPanel({
       {contextHolder}
       <Row gutter={16}>
         <Col span={14}>
-          <Space direction="vertical" style={{ width: "100%" }} size="small">
+          <Space orientation="vertical" style={{ width: "100%" }} size="small">
             <Select
               placeholder="选择策略模板..."
               style={{ width: "100%" }}
@@ -218,9 +218,9 @@ export default function StrategyEditorPanel({
         </Col>
 
         <Col span={10}>
-          <Space direction="vertical" style={{ width: "100%" }} size="small">
+          <Space orientation="vertical" style={{ width: "100%" }} size="small">
             <Card title="策略元信息" size="small">
-              <Space direction="vertical" style={{ width: "100%" }} size="small">
+              <Space orientation="vertical" style={{ width: "100%" }} size="small">
                 <div>
                   <Text type="secondary" style={{ fontSize: 12 }}>名称</Text>
                   <Input

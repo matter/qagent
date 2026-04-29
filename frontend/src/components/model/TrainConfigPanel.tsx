@@ -40,6 +40,18 @@ function taskTypeForLabel(targetType: string): "classification" | "regression" {
   return _CLASSIFICATION_TYPES.has(targetType) ? "classification" : "regression";
 }
 
+type ModelObjective = "regression" | "classification" | "ranking" | "pairwise" | "listwise";
+
+const RANKING_OBJECTIVES = new Set<ModelObjective>(["ranking", "pairwise", "listwise"]);
+
+function parseEvalAt(value: string): number[] {
+  const parsed = value
+    .split(",")
+    .map((item) => Number(item.trim()))
+    .filter((item) => Number.isInteger(item) && item > 0);
+  return parsed.length > 0 ? parsed : [5, 10, 20];
+}
+
 import type { ModelRestoreConfig } from "./ModelList";
 
 interface TrainConfigPanelProps {
@@ -64,6 +76,9 @@ export default function TrainConfigPanel({ onTrainComplete, restoreConfig }: Tra
   const [testStart, setTestStart] = useState<Dayjs>(dayjs("2023-01-01"));
   const [testEnd, setTestEnd] = useState<Dayjs>(dayjs("2023-12-31"));
   const [purgeGap, setPurgeGap] = useState<number>(5);
+  const [objectiveType, setObjectiveType] = useState<ModelObjective>("regression");
+  const [rankingEvalAt, setRankingEvalAt] = useState("5,10,20");
+  const [rankingMinGroupSize, setRankingMinGroupSize] = useState<number>(5);
 
   // LightGBM model parameters
   const [nEstimators, setNEstimators] = useState<number>(200);
@@ -152,6 +167,14 @@ export default function TrainConfigPanel({ onTrainComplete, restoreConfig }: Tra
           reg_alpha: regAlpha,
           reg_lambda: regLambda,
         },
+        objective_type: objectiveType,
+        ranking_config: RANKING_OBJECTIVES.has(objectiveType)
+          ? {
+              query_group: "date",
+              eval_at: parseEvalAt(rankingEvalAt),
+              min_group_size: rankingMinGroupSize,
+            }
+          : undefined,
         train_config: {
           method: "single_split",
           train_period: {
@@ -202,7 +225,7 @@ export default function TrainConfigPanel({ onTrainComplete, restoreConfig }: Tra
   return (
     <>
       {contextHolder}
-      <Space direction="vertical" style={{ width: "100%" }} size="middle">
+      <Space orientation="vertical" style={{ width: "100%" }} size="middle">
         <Card title="数据配置" size="small">
           <Row gutter={[12, 12]}>
             <Col span={8}>
@@ -274,9 +297,9 @@ export default function TrainConfigPanel({ onTrainComplete, restoreConfig }: Tra
         </Card>
 
         <Card title="训练配置" size="small">
-          <Space direction="vertical" style={{ width: "100%" }} size="small">
+          <Space orientation="vertical" style={{ width: "100%" }} size="small">
             <Row gutter={12}>
-              <Col span={8}>
+              <Col span={6}>
                 <Text type="secondary" style={{ fontSize: 12 }}>模型类型</Text>
                 <Select
                   style={{ width: "100%" }}
@@ -285,7 +308,7 @@ export default function TrainConfigPanel({ onTrainComplete, restoreConfig }: Tra
                   options={[{ value: "lightgbm", label: "LightGBM" }]}
                 />
               </Col>
-              <Col span={8}>
+              <Col span={6}>
                 <Text type="secondary" style={{ fontSize: 12 }}>划分方法</Text>
                 <Select
                   style={{ width: "100%" }}
@@ -294,7 +317,22 @@ export default function TrainConfigPanel({ onTrainComplete, restoreConfig }: Tra
                   options={[{ value: "single_split", label: "单次划分 (Single Split)" }]}
                 />
               </Col>
-              <Col span={8}>
+              <Col span={6}>
+                <Text type="secondary" style={{ fontSize: 12 }}>学习目标</Text>
+                <Select
+                  style={{ width: "100%" }}
+                  value={objectiveType}
+                  onChange={setObjectiveType}
+                  options={[
+                    { value: "regression", label: "regression 回归" },
+                    { value: "classification", label: "classification 分类" },
+                    { value: "ranking", label: "ranking 同日排序" },
+                    { value: "pairwise", label: "pairwise 候选竞争" },
+                    { value: "listwise", label: "listwise 列表排序" },
+                  ]}
+                />
+              </Col>
+              <Col span={6}>
                 <Text type="secondary" style={{ fontSize: 12 }}>Purge Gap</Text>
                 <InputNumber
                   style={{ width: "100%" }}
@@ -305,6 +343,47 @@ export default function TrainConfigPanel({ onTrainComplete, restoreConfig }: Tra
                 />
               </Col>
             </Row>
+
+            {RANKING_OBJECTIVES.has(objectiveType) && (
+              <Row gutter={12}>
+                <Col span={8}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>Ranking query group</Text>
+                  <Select
+                    style={{ width: "100%" }}
+                    value="date"
+                    disabled
+                    options={[{ value: "date", label: "date 同一交易日候选" }]}
+                  />
+                </Col>
+                <Col span={8}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>NDCG@k</Text>
+                  <Input
+                    value={rankingEvalAt}
+                    onChange={(e) => setRankingEvalAt(e.target.value)}
+                    placeholder="5,10,20"
+                  />
+                </Col>
+                <Col span={8}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>最小同日样本数</Text>
+                  <InputNumber
+                    style={{ width: "100%" }}
+                    value={rankingMinGroupSize}
+                    onChange={(v) => setRankingMinGroupSize(v ?? 5)}
+                    min={2}
+                    max={200}
+                  />
+                </Col>
+                {objectiveType === "pairwise" && (
+                  <Col span={24}>
+                    <Alert
+                      type="info"
+                      showIcon
+                      message="V2.0 pairwise 使用 LambdaRank 作为候选竞争目标，不是独立 pair-sampling learner。"
+                    />
+                  </Col>
+                )}
+              </Row>
+            )}
 
             <Row gutter={12}>
               <Col span={8}>
@@ -363,7 +442,7 @@ export default function TrainConfigPanel({ onTrainComplete, restoreConfig }: Tra
               key: "model_params",
               label: "模型参数 (LightGBM)",
               children: (
-                <Space direction="vertical" style={{ width: "100%" }} size="small">
+                <Space orientation="vertical" style={{ width: "100%" }} size="small">
                   <Row gutter={12}>
                     <Col span={8}>
                       <Text type="secondary" style={{ fontSize: 12 }}>n_estimators</Text>
@@ -474,12 +553,14 @@ export default function TrainConfigPanel({ onTrainComplete, restoreConfig }: Tra
         <Card size="small">
           <Row gutter={12} align="middle">
             <Col flex="auto">
-              <Input
-                placeholder="模型名称"
-                value={modelName}
-                onChange={(e) => setModelName(e.target.value)}
-                addonBefore="名称"
-              />
+              <Space.Compact style={{ width: "100%" }}>
+                <Button disabled>名称</Button>
+                <Input
+                  placeholder="模型名称"
+                  value={modelName}
+                  onChange={(e) => setModelName(e.target.value)}
+                />
+              </Space.Compact>
             </Col>
             <Col>
               <Button

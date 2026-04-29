@@ -171,6 +171,30 @@ This file records milestone evidence for the V2.0 A-share and ranking upgrade.
   - Old system regression:
     - `uv run python scripts/e2e_demo.py` passed through US factor evaluation, feature set reuse, model training, strategy backtest, and signal generation.
 
+- Task 14 frontend page workflows completed:
+  - Human validation pages now remount on global market switch, so CN/US page state does not leak across the selected market scope.
+  - Market Browser defaults to `SPY` for `US` and `sh.600000` for `CN`, passes `market` through search, daily-bar, and update calls, and labels the selected market in the UI.
+  - Data Management shows market badges, latest trading day, scoped data status, scoped group actions, and CN ticker placeholders.
+  - Factor, feature, model, strategy, backtest, signal, and paper-trading lists show market badges and call detail/delete/export APIs with the row's market.
+  - Model training exposes `regression`, `classification`, `ranking`, `pairwise`, and `listwise` objectives; ranking objectives send `ranking_config` with date query groups, `eval_at`, and minimum group size.
+  - Model list/detail views expose `NDCG@5`, `Rank IC`, `ndcg@*`, `rank_ic`, `top_*_mean_label`, and `pairwise_accuracy` metrics for ranking/listwise acceptance.
+  - Removed Ant Design deprecated `bodyStyle`, `Spin tip`, `Space direction`, `Modal destroyOnClose`, `Statistic valueStyle`, and `Input addonBefore` usage from frontend source to keep browser validation logs actionable.
+- Task 14 verification:
+  - `uv run python -m unittest tests.test_frontend_market_scope_contracts` passed: `2` tests.
+  - `cd frontend && pnpm build` passed. Vite still reports the existing dynamic-import and large-chunk warnings.
+  - `uv run python -m unittest discover tests` passed: `78` tests.
+  - `uv run python scripts/e2e_demo.py` passed through the old US flow while backend/frontend servers were running.
+  - Browser smoke with backend and Vite dev server:
+    - First load of `/market` requested `/api/stocks/SPY/daily?...market=US`.
+    - Switching to `CN` requested `/api/stocks/sh.600000/daily?...market=CN`.
+    - `/data` requested `/api/data/status?market=CN` and displayed `数据概览` plus `最近交易日`.
+    - `/models` displayed `学习目标`, `regression 回归`, `NDCG@5`, and `Rank IC`.
+    - Playwright console capture found `0` Ant Design warnings.
+    - Screenshots saved at `logs/v2-task14-market-cn.png`, `logs/v2-task14-data-cn.png`, and `logs/v2-task14-models-cn.png`.
+  - Old system regression:
+    - `GET /api/health` remained available through the old server path.
+    - `uv run python scripts/e2e_demo.py` passed with no explicit `market` arguments, confirming `US` default compatibility.
+
 - Task 13 frontend API market scope and global selector completed:
   - Added shared frontend `Market = "US" | "CN"` type and market helper exports.
   - Added API client market state with `qagent.market` localStorage persistence, first-load default `US`, and request interceptor injection for market-scoped REST paths.

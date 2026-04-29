@@ -281,7 +281,7 @@ export default function FactorEditor({ editingFactor, evalConfig, onFactorSaved 
       <Row gutter={16} style={{ height: "100%" }}>
         {/* Left: Editor Panel */}
         <Col span={10}>
-          <Space direction="vertical" style={{ width: "100%" }} size="small">
+          <Space orientation="vertical" style={{ width: "100%" }} size="small">
             <Select
               placeholder="选择模板..."
               style={{ width: "100%" }}
@@ -311,18 +311,22 @@ export default function FactorEditor({ editingFactor, evalConfig, onFactorSaved 
                 }}
               />
             </Card>
-            <Input
-              placeholder="因子名称"
-              value={factorName}
-              onChange={(e) => setFactorName(e.target.value)}
-              addonBefore="名称"
-            />
-            <Input
-              placeholder="描述 (可选)"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              addonBefore="描述"
-            />
+            <Space.Compact style={{ width: "100%" }}>
+              <Button disabled>名称</Button>
+              <Input
+                placeholder="因子名称"
+                value={factorName}
+                onChange={(e) => setFactorName(e.target.value)}
+              />
+            </Space.Compact>
+            <Space.Compact style={{ width: "100%" }}>
+              <Button disabled>描述</Button>
+              <Input
+                placeholder="描述 (可选)"
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+              />
+            </Space.Compact>
             <Select
               style={{ width: "100%" }}
               value={category}
@@ -344,9 +348,9 @@ export default function FactorEditor({ editingFactor, evalConfig, onFactorSaved 
 
         {/* Right: Eval Config + Results */}
         <Col span={14}>
-          <Space direction="vertical" style={{ width: "100%" }} size="small">
+          <Space orientation="vertical" style={{ width: "100%" }} size="small">
             <Card title="评价配置" size="small">
-              <Space direction="vertical" style={{ width: "100%" }} size="small">
+              <Space orientation="vertical" style={{ width: "100%" }} size="small">
                 <Row gutter={8}>
                   <Col span={12}>
                     <Text type="secondary" style={{ fontSize: 12 }}>标签</Text>
@@ -434,7 +438,7 @@ export default function FactorEditor({ editingFactor, evalConfig, onFactorSaved 
 
             {/* Evaluation results */}
             {evalResult && (
-              <Space direction="vertical" style={{ width: "100%" }} size="small">
+              <Space orientation="vertical" style={{ width: "100%" }} size="small">
                 <EvalSummaryCards summary={evalResult.summary} />
                 <ICSeriesChart icSeries={evalResult.ic_series} />
                 <GroupReturnsChart groupReturns={evalResult.group_returns} />

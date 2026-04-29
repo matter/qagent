@@ -54,6 +54,7 @@ import type {
   Strategy,
   StockGroup,
   StockChartData,
+  Market,
   PaperTradingSession,
   PaperDailyRecord,
   PaperPosition,
@@ -117,7 +118,7 @@ export default function PaperTrading() {
   return (
     <>
       {contextHolder}
-      <Space direction="vertical" style={{ width: "100%" }} size="middle">
+      <Space orientation="vertical" style={{ width: "100%" }} size="middle">
         <Card
           title="模拟交易"
           extra={
@@ -227,9 +228,9 @@ function SessionTable({
     }
   };
 
-  const handleDelete = async (id: string) => {
+  const handleDelete = async (id: string, market?: Market) => {
     try {
-      await deletePaperSession(id);
+      await deletePaperSession(id, market);
       messageApi.success("已删除");
       onRefresh();
     } catch {
@@ -237,18 +238,18 @@ function SessionTable({
     }
   };
 
-  const handlePause = async (id: string) => {
+  const handlePause = async (id: string, market?: Market) => {
     try {
-      await pausePaperSession(id);
+      await pausePaperSession(id, market);
       onRefresh();
     } catch {
       messageApi.error("暂停失败");
     }
   };
 
-  const handleResume = async (id: string) => {
+  const handleResume = async (id: string, market?: Market) => {
     try {
-      await resumePaperSession(id);
+      await resumePaperSession(id, market);
       onRefresh();
     } catch {
       messageApi.error("恢复失败");
@@ -256,6 +257,13 @@ function SessionTable({
   };
 
   const columns = [
+    {
+      title: "Market",
+      dataIndex: "market",
+      key: "market",
+      width: 80,
+      render: (m: Market) => <Tag color={m === "CN" ? "red" : "blue"}>{m}</Tag>,
+    },
     {
       title: "名称",
       dataIndex: "name",
@@ -361,7 +369,7 @@ function SessionTable({
               icon={<PauseCircleOutlined />}
               onClick={(e) => {
                 e.stopPropagation();
-                handlePause(r.id);
+                handlePause(r.id, r.market);
               }}
             />
           ) : r.status === "paused" ? (
@@ -370,7 +378,7 @@ function SessionTable({
               icon={<CaretRightOutlined />}
               onClick={(e) => {
                 e.stopPropagation();
-                handleResume(r.id);
+                handleResume(r.id, r.market);
               }}
             />
           ) : null}
@@ -378,7 +386,7 @@ function SessionTable({
             title="确定删除？"
             onConfirm={(e) => {
               e?.stopPropagation();
-              handleDelete(r.id);
+              handleDelete(r.id, r.market);
             }}
             onCancel={(e) => e?.stopPropagation()}
           >
@@ -402,6 +410,7 @@ function SessionTable({
       loading={loading}
       size="small"
       pagination={false}
+      scroll={{ x: 1100 }}
       onRow={(r) => ({
         onClick: () => onSelect(r.id),
         style: { cursor: "pointer" },
@@ -581,7 +590,7 @@ function SessionDetail({
             value={totalReturn * 100}
             precision={2}
             suffix="%"
-            valueStyle={{ color: totalReturn >= 0 ? "#52c41a" : "#ff4d4f" }}
+            styles={{ content: { color: totalReturn >= 0 ? "#52c41a" : "#ff4d4f" } }}
           />
         </Col>
         <Col span={6}>
@@ -590,7 +599,7 @@ function SessionDetail({
             value={maxDD * 100}
             precision={2}
             suffix="%"
-            valueStyle={{ color: "#ff4d4f" }}
+            styles={{ content: { color: "#ff4d4f" } }}
           />
         </Col>
         <Col span={6}>
@@ -1028,7 +1037,7 @@ function StockChartModal({
       onCancel={onClose}
       footer={null}
       width={1100}
-      destroyOnClose
+      destroyOnHidden
     >
       {loading && (
         <div style={{ textAlign: "center", padding: 48 }}>
@@ -1134,9 +1143,9 @@ function CreateSessionModal({
       confirmLoading={creating}
       okText="创建"
       width={600}
-      destroyOnClose
+      destroyOnHidden
     >
-      <Space direction="vertical" style={{ width: "100%" }} size="middle">
+      <Space orientation="vertical" style={{ width: "100%" }} size="middle">
         <div>
           <Text type="secondary" style={{ fontSize: 12 }}>会话名称</Text>
           <Input

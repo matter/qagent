@@ -19,7 +19,7 @@ import {
   SearchOutlined,
 } from "@ant-design/icons";
 import { listFactors, deleteFactor } from "../../api";
-import type { Factor } from "../../api";
+import type { Factor, Market } from "../../api";
 
 const { Text } = Typography;
 
@@ -72,9 +72,9 @@ export default function FactorLibrary({ onViewFactor, refreshKey }: FactorLibrar
     fetchFactors();
   }, [fetchFactors, refreshKey]);
 
-  const handleDelete = async (id: string) => {
+  const handleDelete = async (id: string, market?: string) => {
     try {
-      await deleteFactor(id);
+      await deleteFactor(id, market);
       messageApi.success("因子已删除");
       fetchFactors();
     } catch {
@@ -100,6 +100,13 @@ export default function FactorLibrary({ onViewFactor, refreshKey }: FactorLibrar
           </Text>
         </Tooltip>
       ),
+    },
+    {
+      title: "Market",
+      dataIndex: "market",
+      key: "market",
+      width: 80,
+      render: (m: Market) => <Tag color={m === "CN" ? "red" : "blue"}>{m}</Tag>,
     },
     {
       title: "名称",
@@ -167,7 +174,7 @@ export default function FactorLibrary({ onViewFactor, refreshKey }: FactorLibrar
       render: (_: unknown, record: Factor) => (
         <Space size="small">
           <Button size="small" icon={<EyeOutlined />} onClick={() => onViewFactor(record)} />
-          <Popconfirm title="确定删除此因子?" onConfirm={() => handleDelete(record.id)}>
+          <Popconfirm title="确定删除此因子?" onConfirm={() => handleDelete(record.id, record.market)}>
             <Button size="small" danger icon={<DeleteOutlined />} />
           </Popconfirm>
         </Space>
@@ -232,6 +239,7 @@ export default function FactorLibrary({ onViewFactor, refreshKey }: FactorLibrar
           loading={loading}
           size="small"
           pagination={{ pageSize: 15 }}
+          scroll={{ x: 1000 }}
         />
       </Card>
     </>

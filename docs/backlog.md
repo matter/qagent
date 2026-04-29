@@ -58,29 +58,29 @@
 
 ## Deferred
 
-### [2026-04-30] P3 UI：Ant Design 废弃属性警告
-
-- **状态**：Deferred
-- **来源**：UI 验收
-- **影响范围**：`frontend/src/pages/MarketPage.tsx` 及可能复用旧 AntD 写法的页面
-- **复现入口**：
-  - UI：`http://127.0.0.1:5173/market`
-  - API / MCP：无
-  - 资产 ID：无
-- **当前证据**：
-  - 实际结果：页面可正常渲染，但 Vite console 输出 AntD deprecation warnings。
-  - 日志 / 错误：`[antd: Card] bodyStyle is deprecated. Please use styles.body instead.`；`[antd: Spin] tip is deprecated. Please use description instead.`
-  - 相关指标：不影响 Task 13 build/e2e。
-- **期望行为**：页面不使用 AntD 已废弃 props，dev console 保持低噪音。
-- **验收标准**：
-  - 可量化指标：打开 `/market` 不再出现上述两个 warning。
-  - UI 验收点：行情页加载、图表 loading、卡片样式保持一致。
-  - 命令 / API 复验：`cd frontend && pnpm build`；浏览器打开 `/market`。
-- **修复记录**：
-  - commit：待处理
-  - 验证命令：待处理
-  - 复验结论：计划在 Task 14 页面体验整理时处理。
+暂无。
 
 ## Done
 
-暂无。
+### [2026-04-30] P3 UI：Ant Design 废弃属性警告
+
+- **状态**：Done
+- **来源**：UI 验收
+- **影响范围**：`frontend/src/pages/MarketPage.tsx` 及复用旧 AntD 写法的前端页面/组件
+- **复现入口**：
+  - UI：`http://127.0.0.1:5173/market`、`/data`、`/models`
+  - API / MCP：无
+  - 资产 ID：无
+- **当前证据**：
+  - 实际结果：Task 14 页面可正常渲染，Playwright console 捕获到 `0` 条 Ant Design warning。
+  - 日志 / 错误：已移除 `bodyStyle`、`Spin tip`、`Space direction`、`Modal destroyOnClose`、`Statistic valueStyle`、`Input addonBefore` 废弃用法。
+  - 相关指标：`rg -n "valueStyle|addonBefore|direction=|destroyOnClose|bodyStyle|tip=" frontend/src` 无命中。
+- **期望行为**：页面不使用 AntD 已废弃 props，dev console 保持低噪音。
+- **验收标准**：
+  - 可量化指标：打开 `/market`、切换 CN、进入 `/data` 和 `/models` 不再出现 AntD warning。
+  - UI 验收点：行情页加载、图表 loading、卡片样式、数据概览、模型训练目标选择和模型指标展示保持一致。
+  - 命令 / API 复验：`cd frontend && pnpm build`；Playwright 浏览器 smoke。
+- **修复记录**：
+  - commit：待提交于 Task 14
+  - 验证命令：`cd frontend && pnpm build`；Playwright console capture。
+  - 复验结论：通过，Task 14 提交后闭环。

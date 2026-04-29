@@ -196,7 +196,7 @@ export async function refreshIndexGroups(market?: Market) {
 
 export interface Factor {
   id: string;
-  market: string;
+  market: Market;
   name: string;
   version: number;
   description: string | null;
@@ -216,7 +216,7 @@ export interface FactorTemplate {
 
 export interface LabelDefinition {
   id: string;
-  market: string;
+  market: Market;
   name: string;
   description: string | null;
   target_type: string;
@@ -238,7 +238,7 @@ export interface FactorEvalSummary {
 
 export interface FactorEvalRecord {
   id: string;
-  market: string;
+  market: Market;
   factor_id: string;
   label_id: string;
   universe_group_id: string;
@@ -404,7 +404,7 @@ export async function cancelTask(taskId: string): Promise<{ task_id: string; sta
 
 export interface FeatureSet {
   id: string;
-  market: string;
+  market: Market;
   name: string;
   description: string | null;
   factor_refs: Array<{ factor_id: string; factor_name: string; version: number }>;
@@ -464,7 +464,7 @@ export async function getCorrelationMatrix(
 
 export interface Model {
   id: string;
-  market: string;
+  market: Market;
   name: string;
   feature_set_id: string;
   label_id: string;
@@ -519,7 +519,7 @@ export async function deleteModel(modelId: string, market?: string) {
 
 export interface Strategy {
   id: string;
-  market: string;
+  market: Market;
   name: string;
   version: number;
   description: string | null;
@@ -538,7 +538,7 @@ export interface StrategyTemplate {
 
 export interface BacktestResultSummary {
   id: string;
-  market: string;
+  market: Market;
   strategy_id: string;
   config: Record<string, unknown> | null;
   summary: Record<string, number> | null;
@@ -690,7 +690,7 @@ export interface SignalDetail {
 
 export interface SignalRun {
   id: string;
-  market: string;
+  market: Market;
   strategy_id: string;
   strategy_version: number;
   target_date: string;
@@ -779,7 +779,7 @@ export async function getSystemInfo(): Promise<SystemInfo> {
 
 export interface PaperTradingSession {
   id: string;
-  market: string;
+  market: Market;
   name: string;
   strategy_id: string;
   universe_group_id: string;

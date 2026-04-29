@@ -207,7 +207,7 @@ export default function TaskManagement() {
   return (
     <>
       {contextHolder}
-      <Space direction="vertical" style={{ width: "100%" }} size="middle">
+      <Space orientation="vertical" style={{ width: "100%" }} size="middle">
         {/* Summary */}
         {(runningCount > 0 || queuedCount > 0) && (
           <Card size="small">

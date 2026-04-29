@@ -17,7 +17,7 @@ import {
   getBacktest,
   listStrategies,
 } from "../../api";
-import type { BacktestResultSummary, BacktestResultDetail, Strategy } from "../../api";
+import type { BacktestResultSummary, BacktestResultDetail, Market, Strategy } from "../../api";
 import {
   BacktestSummaryCards,
   NavCurveChart,
@@ -103,7 +103,7 @@ export default function BacktestHistory({ refreshKey, onRestoreConfig }: Backtes
     setDetailLoading(true);
     setDetail(null);
     try {
-      const d = await getBacktest(record.id);
+      const d = await getBacktest(record.id, record.market);
       setDetail(d);
     } catch {
       messageApi.error("加载回测详情失败");
@@ -140,6 +140,7 @@ export default function BacktestHistory({ refreshKey, onRestoreConfig }: Backtes
     const cfg = record.config as Record<string, unknown> | null;
     const params = new URLSearchParams();
     params.set("strategy_id", record.strategy_id);
+    params.set("market", record.market);
     if (cfg?.universe_group_id) params.set("group_id", cfg.universe_group_id as string);
     if (cfg?.initial_capital) params.set("initial_capital", String(cfg.initial_capital));
     if (cfg?.max_positions) params.set("max_positions", String(cfg.max_positions));
@@ -149,6 +150,13 @@ export default function BacktestHistory({ refreshKey, onRestoreConfig }: Backtes
   };
 
   const columns = [
+    {
+      title: "Market",
+      dataIndex: "market",
+      key: "market",
+      width: 80,
+      render: (m: Market) => <Tag color={m === "CN" ? "red" : "blue"}>{m}</Tag>,
+    },
     {
       title: "策略",
       dataIndex: "strategy_name",
@@ -265,6 +273,7 @@ export default function BacktestHistory({ refreshKey, onRestoreConfig }: Backtes
           loading={loading}
           size="small"
           pagination={{ pageSize: 20 }}
+          scroll={{ x: 1000 }}
           onRow={(record) => ({
             onClick: () => handleRowClick(record),
             style: { cursor: "pointer" },
@@ -278,14 +287,14 @@ export default function BacktestHistory({ refreshKey, onRestoreConfig }: Backtes
         onCancel={() => setDetailOpen(false)}
         footer={null}
         width={1000}
-        destroyOnClose
+        destroyOnHidden
       >
         {detailLoading ? (
           <div style={{ textAlign: "center", padding: 48 }}>
             <Text type="secondary">加载中...</Text>
           </div>
         ) : detail ? (
-          <Space direction="vertical" style={{ width: "100%" }} size="middle">
+          <Space orientation="vertical" style={{ width: "100%" }} size="middle">
             {detail.summary && <BacktestSummaryCards summary={detail.summary} />}
             <NavCurveChart navSeries={detail.nav_series} benchmarkNav={detail.benchmark_nav} />
             <DrawdownChart drawdownSeries={detail.drawdown_series} />

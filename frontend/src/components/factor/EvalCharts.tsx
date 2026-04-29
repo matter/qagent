@@ -14,7 +14,7 @@ export function EvalSummaryCards({ summary }: { summary: FactorEvalSummary }) {
             title="IC Mean"
             value={summary.ic_mean}
             precision={4}
-            valueStyle={{ color: summary.ic_mean > 0 ? "#52c41a" : "#ff4d4f", fontSize: 18 }}
+            styles={{ content: { color: summary.ic_mean > 0 ? "#52c41a" : "#ff4d4f", fontSize: 18 } }}
           />
         </Card>
       </Col>
@@ -24,7 +24,7 @@ export function EvalSummaryCards({ summary }: { summary: FactorEvalSummary }) {
             title="IR"
             value={summary.ir}
             precision={3}
-            valueStyle={{ color: summary.ir > 0.5 ? "#52c41a" : summary.ir > 0 ? "#1677ff" : "#ff4d4f", fontSize: 18 }}
+            styles={{ content: { color: summary.ir > 0.5 ? "#52c41a" : summary.ir > 0 ? "#1677ff" : "#ff4d4f", fontSize: 18 } }}
           />
         </Card>
       </Col>
@@ -35,7 +35,7 @@ export function EvalSummaryCards({ summary }: { summary: FactorEvalSummary }) {
             value={summary.ic_win_rate * 100}
             precision={1}
             suffix="%"
-            valueStyle={{ fontSize: 18 }}
+            styles={{ content: { fontSize: 18 } }}
           />
         </Card>
       </Col>
@@ -46,7 +46,7 @@ export function EvalSummaryCards({ summary }: { summary: FactorEvalSummary }) {
             value={summary.coverage * 100}
             precision={1}
             suffix="%"
-            valueStyle={{ fontSize: 18 }}
+            styles={{ content: { fontSize: 18 } }}
           />
         </Card>
       </Col>
@@ -56,7 +56,7 @@ export function EvalSummaryCards({ summary }: { summary: FactorEvalSummary }) {
             title="换手率"
             value={summary.turnover}
             precision={4}
-            valueStyle={{ fontSize: 18 }}
+            styles={{ content: { fontSize: 18 } }}
           />
         </Card>
       </Col>
@@ -67,9 +67,11 @@ export function EvalSummaryCards({ summary }: { summary: FactorEvalSummary }) {
             value={summary.long_short_annual_return * 100}
             precision={2}
             suffix="%"
-            valueStyle={{
-              color: summary.long_short_annual_return > 0 ? "#52c41a" : "#ff4d4f",
-              fontSize: 18,
+            styles={{
+              content: {
+                color: summary.long_short_annual_return > 0 ? "#52c41a" : "#ff4d4f",
+                fontSize: 18,
+              },
             }}
           />
         </Card>

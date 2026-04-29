@@ -13,7 +13,7 @@ import {
 } from "antd";
 import { ReloadOutlined, DeleteOutlined, EyeOutlined, SearchOutlined } from "@ant-design/icons";
 import { listStrategies, deleteStrategy } from "../../api";
-import type { Strategy } from "../../api";
+import type { Market, Strategy } from "../../api";
 
 const { Text } = Typography;
 
@@ -58,9 +58,9 @@ export default function StrategyList({ refreshKey, onViewStrategy }: StrategyLis
     fetchData();
   }, [fetchData, refreshKey]);
 
-  const handleDelete = async (id: string) => {
+  const handleDelete = async (id: string, market?: string) => {
     try {
-      await deleteStrategy(id);
+      await deleteStrategy(id, market);
       messageApi.success("策略已删除");
       fetchData();
     } catch {
@@ -86,6 +86,13 @@ export default function StrategyList({ refreshKey, onViewStrategy }: StrategyLis
           </Text>
         </Tooltip>
       ),
+    },
+    {
+      title: "Market",
+      dataIndex: "market",
+      key: "market",
+      width: 80,
+      render: (m: Market) => <Tag color={m === "CN" ? "red" : "blue"}>{m}</Tag>,
     },
     {
       title: "名称",
@@ -139,7 +146,7 @@ export default function StrategyList({ refreshKey, onViewStrategy }: StrategyLis
           >
             查看
           </Button>
-          <Popconfirm title="确定删除此策略?" onConfirm={() => handleDelete(record.id)}>
+          <Popconfirm title="确定删除此策略?" onConfirm={() => handleDelete(record.id, record.market)}>
             <Button size="small" danger icon={<DeleteOutlined />} />
           </Popconfirm>
         </Space>
@@ -175,6 +182,7 @@ export default function StrategyList({ refreshKey, onViewStrategy }: StrategyLis
           loading={loading}
           size="small"
           pagination={{ pageSize: 15 }}
+          scroll={{ x: 900 }}
         />
       </Card>
     </>

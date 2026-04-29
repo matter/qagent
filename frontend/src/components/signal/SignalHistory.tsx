@@ -23,7 +23,7 @@ import {
   getSignalRun,
   exportSignals,
 } from "../../api";
-import type { SignalRun } from "../../api";
+import type { Market, SignalRun } from "../../api";
 import SignalTable from "./SignalTable";
 
 const { Text } = Typography;
@@ -67,7 +67,7 @@ export default function SignalHistory({ refreshKey, onRestoreConfig }: SignalHis
     setDetailLoading(true);
     setDetailOpen(true);
     try {
-      const detail = await getSignalRun(record.id);
+      const detail = await getSignalRun(record.id, record.market);
       setDetailRun(detail);
     } catch {
       messageApi.error("获取信号详情失败");
@@ -79,7 +79,8 @@ export default function SignalHistory({ refreshKey, onRestoreConfig }: SignalHis
 
   const handleExport = async (runId: string, format: "csv" | "json") => {
     try {
-      await exportSignals(runId, format);
+      const run = runs.find((item) => item.id === runId);
+      await exportSignals(runId, format, run?.market);
       messageApi.success(`导出${format.toUpperCase()}成功`);
     } catch {
       messageApi.error("导出失败");
@@ -98,6 +99,13 @@ export default function SignalHistory({ refreshKey, onRestoreConfig }: SignalHis
   };
 
   const columns: ColumnsType<SignalRun> = [
+    {
+      title: "Market",
+      dataIndex: "market",
+      key: "market",
+      width: 80,
+      render: (m: Market) => <Tag color={m === "CN" ? "red" : "blue"}>{m}</Tag>,
+    },
     {
       title: "策略",
       dataIndex: "strategy_id",
@@ -178,6 +186,7 @@ export default function SignalHistory({ refreshKey, onRestoreConfig }: SignalHis
           loading={loading}
           size="small"
           pagination={{ pageSize: 15, showTotal: (total) => `共 ${total} 条` }}
+          scroll={{ x: 950 }}
           onRow={(record) => ({
             onClick: () => showDetail(record),
             style: { cursor: "pointer" },
@@ -194,15 +203,16 @@ export default function SignalHistory({ refreshKey, onRestoreConfig }: SignalHis
         }}
         footer={null}
         width={900}
-        destroyOnClose
+        destroyOnHidden
       >
         {detailLoading ? (
           <div style={{ textAlign: "center", padding: 48 }}>
             <Text type="secondary">加载中...</Text>
           </div>
         ) : detailRun ? (
-          <Space direction="vertical" style={{ width: "100%" }} size="middle">
+          <Space orientation="vertical" style={{ width: "100%" }} size="middle">
             <Space size="middle">
+              <Tag color={detailRun.market === "CN" ? "red" : "blue"}>{detailRun.market}</Tag>
               <Text strong>结果等级:</Text>
               <Tag color={detailRun.result_level === "formal" ? "green" : "orange"}>
                 {detailRun.result_level === "formal" ? "正式" : "探索性"}
