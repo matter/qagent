@@ -1,9 +1,11 @@
 # Repository Guidelines
 
 ## Product Context
-QAgent is a local-first, single-user low-frequency quantitative research system for US equities. It supports the full research loop: market data management, factor research, feature engineering, model training, strategy backtesting, signal generation, and paper trading. It is a research platform, not a broker integration or high-frequency trading system.
+QAgent is a local-first, single-user low-frequency quantitative research system. The legacy/default scope is US equities, and the V2.0 branch adds explicit `market` isolation for `US` and China A-shares (`CN`). It supports the full research loop: market data management, factor research, feature engineering, model training, strategy backtesting, signal generation, and paper trading. It is a research platform, not a broker integration or high-frequency trading system.
 
 The system is agent-native: humans use the React UI, agents call the REST API or the mounted MCP server, and both paths must share the same backend service layer. Preserve this invariant when adding features.
+
+All V2 market-aware REST and MCP calls must default missing `market` to `US` for backward compatibility. Do not mix assets across markets: groups, factors, labels, feature sets, models, strategies, backtests, signal runs, and paper-trading sessions must resolve dependencies within one market.
 
 ## Project Structure & Module Organization
 `backend/` contains the FastAPI server. Keep route handlers in `backend/api/` thin and move domain logic into `backend/services/`. Reusable protocols and primitives live in `backend/factors/`, `backend/models/`, `backend/strategies/`, and `backend/tasks/`. Data providers live in `backend/providers/`, and shared calendar logic lives in `backend/services/calendar_service.py`.
@@ -74,6 +76,8 @@ For data-sensitive changes, verify against realistic local data when available a
 
 ## Agent Workflow Notes
 Before editing, check `git status --short` and avoid overwriting unrelated user changes. This repository often has runtime data and local experiments in progress.
+
+Use `docs/agent-guide.md` as the operating manual for agent-driven research and development. Record all unresolved problems, requirements, and validation gaps in `docs/backlog.md` using its template; do not leave issue context only in chat history.
 
 When changing behavior that is visible through multiple entry points, update the service layer first and keep REST, MCP, and UI behavior consistent. The MCP server in `backend/mcp_server.py` should call the same service methods as REST routes.
 

@@ -194,3 +194,30 @@ This file records milestone evidence for the V2.0 A-share and ranking upgrade.
     - Temporary CN paper session and strategy were deleted after the check.
   - Old system regression:
     - `uv run python scripts/e2e_demo.py` passed through US factor evaluation, feature set reuse, model training, strategy backtest, and signal generation.
+
+## P6 Agent And Human Workflows
+
+- Task 12 MCP and agent-facing contracts completed:
+  - MCP data, group, factor, label, feature-set, model, strategy, backtest, signal, and paper-trading tools now accept `market`, default missing values to `US`, and use the same service-layer market scope as REST routes.
+  - Long-running MCP tools return `task_id`, `task_type`, `market`, `asset_scope`, and `poll_url` so agents can poll `/api/tasks/{task_id}` without inferring state from logs.
+  - MCP model training exposes `objective_type` and `ranking_config` for `ranking`, `pairwise`, and `listwise` objectives.
+  - Invalid MCP market input is normalized into an actionable `Invalid MCP request` error with allowed values `US, CN`.
+  - Added MCP tools for market-scoped labels, feature sets, strategies, and paper-trading sessions.
+  - Updated `AGENTS.md`, `docs/agent-guide.md`, and `docs/backlog.md` with V2 market-scope rules, ranking/listwise notes, CN examples, and issue-board workflow.
+- Task 12 verification:
+  - `uv run python -m unittest tests.test_mcp_market_contracts` passed: `5` tests.
+  - `uv run python -m py_compile backend/mcp_server.py` passed.
+  - `uv run python -m backend.mcp_server --help` exited `0`.
+  - `uv run python -m unittest discover tests` passed: `76` tests.
+  - `cd frontend && pnpm build` passed. Vite reported the existing large-chunk and dynamic-import warnings.
+  - API smoke with backend on `127.0.0.1:8000`:
+    - `GET /api/health` returned `{"status":"ok"}`.
+    - `GET /api/signals` returned HTTP `200` and US signal rows through the old no-market path.
+    - `GET /api/paper-trading/sessions` returned HTTP `200` and US sessions through the old no-market path.
+  - MCP schema smoke after stopping the backend:
+    - `mcp.list_tools()` returned `24` tools.
+    - Market-scoped MCP tools had no missing `market` input schema fields.
+    - `search_stocks(query="AAPL", limit=1)` returned `market="US"` through the old no-market call shape.
+    - `search_stocks(query="AAPL", market="HK")` raised `Invalid MCP request: market must be one of US, CN...`.
+  - Old system regression:
+    - `uv run python scripts/e2e_demo.py` passed through US factor evaluation, feature set reuse, model training, strategy backtest, and signal generation.
