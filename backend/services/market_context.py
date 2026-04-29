@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
 from backend.config import MarketEntryConfig, Settings, settings
@@ -35,6 +36,32 @@ def normalize_market(value: str | None) -> Market:
     return market  # type: ignore[return-value]
 
 
+def normalize_ticker(ticker: str, market: str | None = None) -> str:
+    """Normalize ticker formatting for storage in one market.
+
+    US symbols are stored uppercase for yfinance compatibility. CN symbols are
+    stored in BaoStock-native lowercase form, for example ``sh.600000``.
+    """
+    resolved = normalize_market(market)
+    value = str(ticker).strip()
+    if resolved == "CN":
+        return value.lower()
+    return value.upper()
+
+
+_CN_TICKER_RE = re.compile(r"^(sh|sz|bj)\.\d{6}$", re.IGNORECASE)
+
+
+def infer_ticker_market(ticker: str) -> Market | None:
+    """Infer a market from ticker syntax when it is unambiguous."""
+    value = str(ticker).strip()
+    if _CN_TICKER_RE.match(value):
+        return "CN"
+    if value and "." not in value and value.replace("-", "").isalnum():
+        return "US"
+    return None
+
+
 def get_market_config(
     market: str | None = None,
     app_settings: Settings | None = None,
@@ -61,4 +88,3 @@ def get_default_benchmark(market: str | None = None, app_settings: Settings | No
 
 def get_default_group(market: str | None = None, app_settings: Settings | None = None) -> str:
     return get_market_config(market, app_settings).default_group
-

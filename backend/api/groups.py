@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from backend.logger import get_logger
@@ -21,7 +21,6 @@ def _get_service() -> GroupService:
     global _service
     if _service is None:
         _service = GroupService()
-        _service.ensure_builtins()
     return _service
 
 
@@ -31,6 +30,7 @@ def _get_service() -> GroupService:
 
 
 class CreateGroupRequest(BaseModel):
+    market: Optional[str] = None
     name: str
     description: Optional[str] = None
     group_type: str = "manual"
@@ -39,6 +39,7 @@ class CreateGroupRequest(BaseModel):
 
 
 class UpdateGroupRequest(BaseModel):
+    market: Optional[str] = None
     name: Optional[str] = None
     description: Optional[str] = None
     tickers: Optional[list[str]] = None
@@ -51,11 +52,11 @@ class UpdateGroupRequest(BaseModel):
 
 
 @router.post("/groups/refresh-indices")
-async def refresh_index_groups() -> list[dict]:
+async def refresh_index_groups(market: Optional[str] = Query(None)) -> list[dict]:
     """Re-fetch S&P 500, NASDAQ 100, and Russell 3000 constituents."""
     svc = _get_service()
     try:
-        return svc.refresh_index_groups()
+        return svc.refresh_index_groups(market=market)
     except Exception as e:
         log.error("api.groups.refresh_indices_error", error=str(e))
         raise HTTPException(status_code=500, detail=f"Failed to refresh index groups: {e}")
@@ -72,24 +73,30 @@ async def create_group(body: CreateGroupRequest) -> dict:
             group_type=body.group_type,
             tickers=body.tickers,
             filter_expr=body.filter_expr,
+            market=body.market,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/groups")
-async def list_groups() -> list[dict]:
+async def list_groups(market: Optional[str] = Query(None)) -> list[dict]:
     """List all stock groups with member counts."""
     svc = _get_service()
-    return svc.list_groups()
+    try:
+        svc.ensure_builtins(market)
+        return svc.list_groups(market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/groups/{group_id}")
-async def get_group(group_id: str) -> dict:
+async def get_group(group_id: str, market: Optional[str] = Query(None)) -> dict:
     """Get group detail including member tickers."""
     svc = _get_service()
     try:
-        return svc.get_group(group_id)
+        svc.ensure_builtins(market)
+        return svc.get_group(group_id, market=market)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -105,27 +112,28 @@ async def update_group(group_id: str, body: UpdateGroupRequest) -> dict:
             description=body.description,
             tickers=body.tickers,
             filter_expr=body.filter_expr,
+            market=body.market,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.delete("/groups/{group_id}")
-async def delete_group(group_id: str) -> dict:
+async def delete_group(group_id: str, market: Optional[str] = Query(None)) -> dict:
     """Delete a stock group."""
     svc = _get_service()
     try:
-        svc.delete_group(group_id)
+        svc.delete_group(group_id, market=market)
         return {"status": "deleted", "id": group_id}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/groups/{group_id}/refresh")
-async def refresh_group(group_id: str) -> dict:
+async def refresh_group(group_id: str, market: Optional[str] = Query(None)) -> dict:
     """Re-evaluate filter expression for a filter group."""
     svc = _get_service()
     try:
-        return svc.refresh_filter(group_id)
+        return svc.refresh_filter(group_id, market=market)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

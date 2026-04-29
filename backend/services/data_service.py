@@ -15,6 +15,7 @@ from backend.logger import get_logger
 from backend.providers.base import DataProvider
 from backend.providers.registry import get_provider
 from backend.services.calendar_service import get_latest_trading_day, get_trading_days, snap_to_trading_day
+from backend.services.market_context import get_default_benchmark, normalize_market, normalize_ticker
 
 log = get_logger(__name__)
 
@@ -22,9 +23,9 @@ _FULL_HISTORY_YEARS = 10
 _PROGRESS_FILE = "update_progress.json"
 
 
-def _get_provider() -> DataProvider:
+def _get_provider(market: str | None = None) -> DataProvider:
     """Instantiate the configured data provider."""
-    return get_provider("US", settings.data.provider)
+    return get_provider(market)
 
 
 class DataService:
@@ -37,33 +38,38 @@ class DataService:
     _LONG_RANGE_BATCH = 50     # > 365 days: small batches, heavy downloads
     _FLUSH_THRESHOLD = 200_000  # flush accumulated rows to DB periodically
 
-    def __init__(self, provider: DataProvider | None = None) -> None:
-        self._provider = provider or _get_provider()
+    def __init__(self, provider: DataProvider | None = None, market: str | None = None) -> None:
+        self._provider = provider
+        self._default_market = normalize_market(market)
         self._progress_path = settings.project_root / "data" / _PROGRESS_FILE
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def update_tickers(self, tickers: list[str]) -> dict:
+    def update_tickers(self, tickers: list[str], market: str | None = None) -> dict:
         """Update market data for a specific list of tickers (incremental).
 
         Groups tickers by date range and uses appropriate batch sizes:
         large batches for recent data, small batches for long history.
         """
+        resolved_market = normalize_market(market or self._default_market)
+        tickers = [normalize_ticker(t, resolved_market) for t in tickers if str(t).strip()]
         if not tickers:
-            return {"total": 0, "success": 0, "failed": 0, "duration_seconds": 0}
+            return {"market": resolved_market, "total": 0, "success": 0, "failed": 0, "duration_seconds": 0}
 
         from datetime import datetime as _dt
         started = _dt.utcnow()
-        end_date = get_latest_trading_day()
+        end_date = get_latest_trading_day(resolved_market)
+        provider = self._provider_for(resolved_market)
 
         # Determine start dates per ticker
-        ticker_starts = self._get_incremental_starts(tickers, end_date)
+        ticker_starts = self._get_incremental_starts(tickers, end_date, market=resolved_market)
         tickers_to_update = [t for t in tickers if t in ticker_starts]
 
         if not tickers_to_update:
             return {
+                "market": resolved_market,
                 "total": len(tickers),
                 "success": len(tickers),
                 "failed": 0,
@@ -80,7 +86,7 @@ class DataService:
         all_frames: list[pd.DataFrame] = []
 
         for batch, batch_start in batches:
-            bars_df = self._provider.get_daily_bars(batch, batch_start, end_date)
+            bars_df = provider.get_daily_bars(batch, batch_start, end_date)
             if bars_df is not None and not bars_df.empty:
                 all_frames.append(bars_df)
                 downloaded = set(bars_df["ticker"].unique())
@@ -93,10 +99,11 @@ class DataService:
 
         if all_frames:
             combined = pd.concat(all_frames, ignore_index=True)
-            self._upsert_daily_bars(combined)
+            self._upsert_daily_bars(combined, market=resolved_market)
 
         duration = (_dt.utcnow() - started).total_seconds()
         return {
+            "market": resolved_market,
             "total": len(tickers),
             "success": success,
             "failed": failed,
@@ -104,7 +111,7 @@ class DataService:
             "failed_tickers_sample": failed_tickers[:20],
         }
 
-    def update_data(self, mode: str = "incremental") -> dict:
+    def update_data(self, mode: str = "incremental", market: str | None = None) -> dict:
         """Main entry point: fetch and store market data.
 
         Args:
@@ -113,24 +120,32 @@ class DataService:
         Returns:
             Summary dict with total, success, failed, duration.
         """
+        resolved_market = normalize_market(market or self._default_market)
+        provider = self._provider_for(resolved_market)
         run_id = uuid.uuid4().hex
         started_at = datetime.utcnow()
         conn = get_connection()
 
         # --- Fast check: if ALL tickers already have the latest bar, skip ---
         if mode == "incremental":
-            latest_completed = get_latest_trading_day()
+            latest_completed = get_latest_trading_day(resolved_market)
+            stock_count = conn.execute(
+                "SELECT COUNT(*) FROM stocks WHERE market = ?",
+                [resolved_market],
+            ).fetchone()[0]
             stale_count = conn.execute(
                 """SELECT COUNT(*) FROM stocks s
                    WHERE NOT EXISTS (
                        SELECT 1 FROM daily_bars b
-                       WHERE b.ticker = s.ticker AND b.date >= ?
-                   )""",
-                [latest_completed],
+                       WHERE b.market = s.market AND b.ticker = s.ticker AND b.date >= ?
+                   )
+                   AND s.market = ?""",
+                [latest_completed, resolved_market],
             ).fetchone()[0]
-            if stale_count == 0:
-                log.info("data.update.already_up_to_date")
+            if stock_count > 0 and stale_count == 0:
+                log.info("data.update.already_up_to_date", market=resolved_market)
                 return {
+                    "market": resolved_market,
                     "run_id": run_id,
                     "mode": mode,
                     "total": 0,
@@ -143,30 +158,36 @@ class DataService:
         # Log the start
         conn.execute(
             """INSERT INTO data_update_log
-               (id, update_type, started_at, status, total_tickers,
+               (id, market, update_type, started_at, status, total_tickers,
                 success_count, fail_count)
-               VALUES (?, ?, ?, 'running', 0, 0, 0)""",
-            [run_id, mode, started_at],
+               VALUES (?, ?, ?, ?, 'running', 0, 0, 0)""",
+            [run_id, resolved_market, mode, started_at],
         )
 
         try:
             # --- Step 1: Update stock list (skip if updated within 24 hours) ---
-            log.info("data.update.stock_list")
-            if mode == "incremental" and self._stock_list_is_fresh(conn):
-                log.info("data.update.stock_list.cached", msg="Stock list updated within 24h, skipping")
-                tickers = [r[0] for r in conn.execute("SELECT ticker FROM stocks").fetchall()]
+            log.info("data.update.stock_list", market=resolved_market)
+            if mode == "incremental" and self._stock_list_is_fresh(conn, resolved_market):
+                log.info("data.update.stock_list.cached", market=resolved_market, msg="Stock list updated within 24h, skipping")
+                tickers = [
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT ticker FROM stocks WHERE market = ?",
+                        [resolved_market],
+                    ).fetchall()
+                ]
             else:
-                stock_df = self._provider.get_stock_list()
-                self._upsert_stocks(stock_df)
-                tickers = stock_df["ticker"].tolist()
+                stock_df = provider.get_stock_list()
+                self._upsert_stocks(stock_df, market=resolved_market)
+                tickers = [normalize_ticker(t, resolved_market) for t in stock_df["ticker"].tolist()]
 
             # --- Step 2: Determine date ranges ---
-            end_date = get_latest_trading_day()
+            end_date = get_latest_trading_day(resolved_market)
             if mode == "full":
                 start_date = date(end_date.year - _FULL_HISTORY_YEARS, 1, 1)
                 ticker_starts = {t: start_date for t in tickers}
             else:
-                ticker_starts = self._get_incremental_starts(tickers, end_date)
+                ticker_starts = self._get_incremental_starts(tickers, end_date, market=resolved_market)
 
             tickers_to_update = [t for t in tickers if t in ticker_starts]
 
@@ -183,6 +204,7 @@ class DataService:
                     [datetime.utcnow(), "Nothing to update", run_id],
                 )
                 return {
+                    "market": resolved_market,
                     "run_id": run_id, "mode": mode,
                     "total": 0, "success": 0, "failed": 0,
                     "duration_seconds": 0.0,
@@ -224,7 +246,7 @@ class DataService:
 
                 # Provider already handles retries + rate limiting
                 try:
-                    bars_df = self._provider.get_daily_bars(batch, batch_start, end_date)
+                    bars_df = provider.get_daily_bars(batch, batch_start, end_date)
                 except Exception as e:
                     log.error("data.update.batch_error", batch=batch_num, error=str(e))
                     fail_count += len(batch)
@@ -247,7 +269,7 @@ class DataService:
                 # Flush accumulated data to DB periodically
                 if pending_rows >= self._FLUSH_THRESHOLD:
                     combined = pd.concat(pending_frames, ignore_index=True)
-                    self._upsert_daily_bars(combined)
+                    self._upsert_daily_bars(combined, market=resolved_market)
                     pending_frames.clear()
                     pending_rows = 0
 
@@ -255,6 +277,7 @@ class DataService:
                 completed_batches.add(batch_num)
                 self._save_progress({
                     "run_id": run_id,
+                    "market": resolved_market,
                     "mode": mode,
                     "completed_batches": list(completed_batches),
                     "success_count": success_count,
@@ -264,15 +287,16 @@ class DataService:
             # Flush remaining
             if pending_frames:
                 combined = pd.concat(pending_frames, ignore_index=True)
-                self._upsert_daily_bars(combined)
+                self._upsert_daily_bars(combined, market=resolved_market)
 
             # --- Step 5: Update index data ---
-            log.info("data.update.index", symbol="SPY")
+            benchmark = get_default_benchmark(resolved_market)
+            log.info("data.update.index", market=resolved_market, symbol=benchmark)
             try:
                 idx_start = date(end_date.year - _FULL_HISTORY_YEARS, 1, 1) if mode == "full" else (end_date - timedelta(days=7))
-                idx_df = self._provider.get_index_data("SPY", idx_start, end_date)
+                idx_df = provider.get_index_data(benchmark, idx_start, end_date)
                 if not idx_df.empty:
-                    self._upsert_index_bars("SPY", idx_df)
+                    self._upsert_index_bars(benchmark, idx_df, market=resolved_market)
             except Exception as e:
                 log.warning("data.update.index_error", error=str(e))
 
@@ -298,6 +322,7 @@ class DataService:
                 self._progress_path.unlink()
 
             summary = {
+                "market": resolved_market,
                 "run_id": run_id,
                 "mode": mode,
                 "total": len(tickers_to_update),
@@ -320,33 +345,43 @@ class DataService:
             log.error("data.update.fatal", error=str(e))
             raise
 
-    def get_data_status(self) -> dict:
+    def get_data_status(self, market: str | None = None) -> dict:
         """Return summary of current data state."""
+        resolved_market = normalize_market(market or self._default_market)
         conn = get_connection()
 
-        stock_count = conn.execute("SELECT COUNT(*) FROM stocks").fetchone()[0]
+        stock_count = conn.execute(
+            "SELECT COUNT(*) FROM stocks WHERE market = ?",
+            [resolved_market],
+        ).fetchone()[0]
 
         bar_stats = conn.execute(
             """SELECT COUNT(DISTINCT ticker), MIN(date), MAX(date), COUNT(*)
-               FROM daily_bars"""
+               FROM daily_bars
+               WHERE market = ?""",
+            [resolved_market],
         ).fetchone()
 
         last_update = conn.execute(
             """SELECT completed_at, status, update_type
                FROM data_update_log
-               ORDER BY started_at DESC LIMIT 1"""
+               WHERE market = ?
+               ORDER BY started_at DESC LIMIT 1""",
+            [resolved_market],
         ).fetchone()
 
         # Count tickers with data gaps (missing recent days)
-        latest_trading = get_latest_trading_day()
+        latest_trading = get_latest_trading_day(resolved_market)
         stale = conn.execute(
             """SELECT COUNT(DISTINCT ticker) FROM daily_bars
+               WHERE market = ?
                GROUP BY ticker
                HAVING MAX(date) < ?""",
-            [latest_trading - timedelta(days=3)],
+            [resolved_market, latest_trading - timedelta(days=3)],
         ).fetchall()
 
         return {
+            "market": resolved_market,
             "stock_count": stock_count,
             "tickers_with_bars": bar_stats[0] if bar_stats[0] else 0,
             "date_range": {
@@ -363,8 +398,9 @@ class DataService:
             },
         }
 
-    def run_quality_check(self) -> dict:
+    def run_quality_check(self, market: str | None = None) -> dict:
         """Check for data quality issues."""
+        resolved_market = normalize_market(market or self._default_market)
         conn = get_connection()
         issues: list[dict] = []
 
@@ -376,10 +412,12 @@ class DataService:
                    SELECT ticker, date, close,
                           LAG(close) OVER (PARTITION BY ticker ORDER BY date) AS prev_close
                    FROM daily_bars
+                   WHERE market = ?
                ) sub
                WHERE prev_close > 0 AND ABS(close - prev_close) / prev_close > 0.5
                ORDER BY date DESC
-               LIMIT 50"""
+               LIMIT 50""",
+            [resolved_market],
         ).fetchall()
         for row in jumps:
             issues.append(
@@ -397,11 +435,12 @@ class DataService:
         zero_vol = conn.execute(
             """SELECT ticker, COUNT(*) AS cnt
                FROM daily_bars
-               WHERE volume = 0
+               WHERE market = ? AND volume = 0
                GROUP BY ticker
                HAVING cnt > 10
                ORDER BY cnt DESC
-               LIMIT 20"""
+               LIMIT 20""",
+            [resolved_market],
         ).fetchall()
         for row in zero_vol:
             issues.append(
@@ -415,10 +454,12 @@ class DataService:
                           LEAD(date) OVER (PARTITION BY ticker ORDER BY date) AS next_date,
                           LEAD(date) OVER (PARTITION BY ticker ORDER BY date) - date AS gap_days
                    FROM daily_bars
+                   WHERE market = ?
                ) sub
                WHERE gap_days > 7
                ORDER BY gap_days DESC
-               LIMIT 20"""
+               LIMIT 20""",
+            [resolved_market],
         ).fetchall()
         for row in gap_check:
             issues.append(
@@ -432,6 +473,7 @@ class DataService:
             )
 
         return {
+            "market": resolved_market,
             "total_issues": len(issues),
             "issues": issues,
         }
@@ -440,58 +482,106 @@ class DataService:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _upsert_stocks(self, df: pd.DataFrame) -> None:
+    def _upsert_stocks(self, df: pd.DataFrame, market: str | None = None) -> None:
         """Insert or update the stocks table."""
+        if df.empty:
+            return
+        data = df.copy()
+        fallback_market = normalize_market(market or self._default_market)
+        if "market" not in data.columns:
+            data["market"] = fallback_market
+        data["market"] = data["market"].map(normalize_market)
+        data["ticker"] = data.apply(lambda row: normalize_ticker(row["ticker"], row["market"]), axis=1)
+        for col, default in {
+            "name": "",
+            "exchange": "",
+            "sector": "",
+            "status": "active",
+        }.items():
+            if col not in data.columns:
+                data[col] = default
+            data[col] = data[col].fillna(default)
+        data["updated_at"] = datetime.utcnow()
+        data = data[["market", "ticker", "name", "exchange", "sector", "status", "updated_at"]]
         conn = get_connection()
-        now = datetime.utcnow()
-        for _, row in df.iterrows():
-            conn.execute(
-                """INSERT OR REPLACE INTO stocks (ticker, name, exchange, sector, status, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                [row["ticker"], row["name"], row["exchange"], row["sector"], row["status"], now],
-            )
-        log.info("data.upsert_stocks", count=len(df))
+        conn.execute("CREATE OR REPLACE TEMP TABLE _tmp_stocks AS SELECT * FROM data")
+        conn.execute(
+            """INSERT OR REPLACE INTO stocks
+               (market, ticker, name, exchange, sector, status, updated_at)
+               SELECT market, ticker, name, exchange, sector, status, updated_at
+               FROM _tmp_stocks"""
+        )
+        conn.execute("DROP TABLE IF EXISTS _tmp_stocks")
+        log.info("data.upsert_stocks", market=fallback_market, count=len(data))
 
-    def _upsert_daily_bars(self, df: pd.DataFrame) -> None:
+    def _upsert_daily_bars(self, df: pd.DataFrame, market: str | None = None) -> None:
         """Bulk insert/replace daily bars."""
+        if df.empty:
+            return
+        data = df.copy()
+        fallback_market = normalize_market(market or self._default_market)
+        if "market" not in data.columns:
+            data["market"] = fallback_market
+        data["market"] = data["market"].map(normalize_market)
+        data["ticker"] = data.apply(lambda row: normalize_ticker(row["ticker"], row["market"]), axis=1)
+        if "adj_factor" not in data.columns:
+            data["adj_factor"] = 1.0
+        data["adj_factor"] = data["adj_factor"].fillna(1.0)
+        data = data[["market", "ticker", "date", "open", "high", "low", "close", "volume", "adj_factor"]]
         conn = get_connection()
         # Register DataFrame and use INSERT OR REPLACE
-        conn.execute("CREATE OR REPLACE TEMP TABLE _tmp_bars AS SELECT * FROM df")
+        conn.execute("CREATE OR REPLACE TEMP TABLE _tmp_bars AS SELECT * FROM data")
         conn.execute(
             """INSERT OR REPLACE INTO daily_bars
-               (ticker, date, open, high, low, close, volume, adj_factor)
-               SELECT ticker, date, open, high, low, close, volume, adj_factor
+               (market, ticker, date, open, high, low, close, volume, adj_factor)
+               SELECT market, ticker, date, open, high, low, close, volume, adj_factor
                FROM _tmp_bars"""
         )
         conn.execute("DROP TABLE IF EXISTS _tmp_bars")
-        log.info("data.upsert_daily_bars", rows=len(df))
+        log.info("data.upsert_daily_bars", market=fallback_market, rows=len(data))
 
-    def _upsert_index_bars(self, symbol: str, df: pd.DataFrame) -> None:
+    def _upsert_index_bars(self, symbol: str, df: pd.DataFrame, market: str | None = None) -> None:
         """Insert/replace index bars."""
+        if df.empty:
+            return
+        fallback_market = normalize_market(market or self._default_market)
+        resolved_symbol = normalize_ticker(symbol, fallback_market)
+        data = df.copy()
+        if "market" not in data.columns:
+            data["market"] = fallback_market
+        data["market"] = data["market"].map(normalize_market)
+        if "symbol" not in data.columns:
+            data["symbol"] = resolved_symbol
+        data["symbol"] = data.apply(lambda row: normalize_ticker(row["symbol"], row["market"]), axis=1)
+        data = data[["market", "symbol", "date", "open", "high", "low", "close", "volume"]]
         conn = get_connection()
-        df_with_sym = df.copy()
-        df_with_sym["symbol"] = symbol
-        conn.execute("CREATE OR REPLACE TEMP TABLE _tmp_idx AS SELECT * FROM df_with_sym")
+        conn.execute("CREATE OR REPLACE TEMP TABLE _tmp_idx AS SELECT * FROM data")
         conn.execute(
             """INSERT OR REPLACE INTO index_bars
-               (symbol, date, open, high, low, close, volume)
-               SELECT symbol, date, open, high, low, close, volume
+               (market, symbol, date, open, high, low, close, volume)
+               SELECT market, symbol, date, open, high, low, close, volume
                FROM _tmp_idx"""
         )
         conn.execute("DROP TABLE IF EXISTS _tmp_idx")
-        log.info("data.upsert_index_bars", symbol=symbol, rows=len(df))
+        log.info("data.upsert_index_bars", market=fallback_market, symbol=resolved_symbol, rows=len(data))
 
     def _get_incremental_starts(
-        self, tickers: list[str], end_date: date
+        self, tickers: list[str], end_date: date, market: str | None = None
     ) -> dict[str, date]:
         """For each ticker, find what date to start fetching from.
 
         Returns only tickers that need updating.
         """
+        resolved_market = normalize_market(market or self._default_market)
+        tickers = [normalize_ticker(t, resolved_market) for t in tickers]
         conn = get_connection()
         # Get max date per ticker
         rows = conn.execute(
-            "SELECT ticker, MAX(date) AS max_date FROM daily_bars GROUP BY ticker"
+            """SELECT ticker, MAX(date) AS max_date
+               FROM daily_bars
+               WHERE market = ?
+               GROUP BY ticker""",
+            [resolved_market],
         ).fetchall()
         max_dates = {row[0]: row[1] for row in rows}
 
@@ -513,10 +603,12 @@ class DataService:
         return result
 
     @staticmethod
-    def _stock_list_is_fresh(conn) -> bool:
+    def _stock_list_is_fresh(conn, market: str | None = None) -> bool:
         """Return True if the stocks table was updated within the last 24 hours."""
+        resolved_market = normalize_market(market)
         row = conn.execute(
-            "SELECT MAX(updated_at) FROM stocks"
+            "SELECT MAX(updated_at) FROM stocks WHERE market = ?",
+            [resolved_market],
         ).fetchone()
         if row and row[0]:
             last_updated = row[0]
@@ -525,6 +617,11 @@ class DataService:
             if (datetime.utcnow() - last_updated) < timedelta(hours=24):
                 return True
         return False
+
+    def _provider_for(self, market: str) -> DataProvider:
+        if self._provider is not None:
+            return self._provider
+        return _get_provider(market)
 
     def _load_progress(self) -> dict | None:
         """Load resume progress from disk."""

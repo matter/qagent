@@ -12,6 +12,7 @@ from backend.db import get_connection
 from backend.logger import get_logger
 from backend.services.data_service import DataService
 from backend.services.group_service import GroupService
+from backend.services.market_context import normalize_market, normalize_ticker
 from backend.tasks.executor import TaskExecutor, get_task_executor
 from backend.tasks.models import TaskSource
 
@@ -51,14 +52,17 @@ def _get_group_service() -> GroupService:
 
 class UpdateRequest(BaseModel):
     mode: str = "incremental"
+    market: Optional[str] = None
 
 
 class UpdateTickersRequest(BaseModel):
     tickers: list[str]
+    market: Optional[str] = None
 
 
 class UpdateGroupRequest(BaseModel):
     group_id: str
+    market: Optional[str] = None
 
 
 # ------------------------------------------------------------------
@@ -67,10 +71,13 @@ class UpdateGroupRequest(BaseModel):
 
 
 @router.get("/data/status")
-async def data_status() -> dict:
+async def data_status(market: Optional[str] = Query(None)) -> dict:
     """Return data status summary."""
     svc = _get_service()
-    return svc.get_data_status()
+    try:
+        return svc.get_data_status(market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/data/update")
@@ -78,6 +85,10 @@ async def trigger_update(body: UpdateRequest) -> dict:
     """Trigger a data update as a background task."""
     if body.mode not in ("incremental", "full"):
         raise HTTPException(status_code=400, detail="mode must be 'incremental' or 'full'")
+    try:
+        market = normalize_market(body.market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     executor = _get_executor()
     svc = _get_service()
@@ -93,13 +104,13 @@ async def trigger_update(body: UpdateRequest) -> dict:
     task_id = executor.submit(
         task_type="data_update",
         fn=svc.update_data,
-        params={"mode": body.mode},
+        params={"mode": body.mode, "market": market},
         timeout=7200,  # 2 hours max
         source=TaskSource.UI,
     )
 
-    log.info("api.data.update_triggered", task_id=task_id, mode=body.mode)
-    return {"task_id": task_id, "status": "queued", "mode": body.mode}
+    log.info("api.data.update_triggered", task_id=task_id, market=market, mode=body.mode)
+    return {"task_id": task_id, "status": "queued", "market": market, "mode": body.mode}
 
 
 @router.post("/data/update/tickers")
@@ -107,6 +118,10 @@ async def update_tickers(body: UpdateTickersRequest) -> dict:
     """Update data for specific tickers as a background task."""
     if not body.tickers:
         raise HTTPException(status_code=400, detail="tickers list is empty")
+    try:
+        market = normalize_market(body.market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     executor = _get_executor()
     svc = _get_service()
@@ -121,13 +136,13 @@ async def update_tickers(body: UpdateTickersRequest) -> dict:
     task_id = executor.submit(
         task_type="data_update",
         fn=svc.update_tickers,
-        params={"tickers": [t.upper() for t in body.tickers]},
+        params={"tickers": [normalize_ticker(t, market) for t in body.tickers], "market": market},
         timeout=600,
         source=TaskSource.UI,
     )
 
-    log.info("api.data.update_tickers", task_id=task_id, count=len(body.tickers))
-    return {"task_id": task_id, "status": "queued", "tickers": len(body.tickers)}
+    log.info("api.data.update_tickers", task_id=task_id, market=market, count=len(body.tickers))
+    return {"task_id": task_id, "status": "queued", "market": market, "tickers": len(body.tickers)}
 
 
 @router.post("/data/update/group")
@@ -135,7 +150,8 @@ async def update_group(body: UpdateGroupRequest) -> dict:
     """Update data for all tickers in a stock group."""
     gsvc = _get_group_service()
     try:
-        tickers = gsvc.get_group_tickers(body.group_id)
+        group = gsvc.get_group(body.group_id, market=body.market)
+        tickers = group["tickers"]
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -155,13 +171,13 @@ async def update_group(body: UpdateGroupRequest) -> dict:
     task_id = executor.submit(
         task_type="data_update",
         fn=svc.update_tickers,
-        params={"tickers": tickers},
+        params={"tickers": tickers, "market": group["market"]},
         timeout=3600,
         source=TaskSource.UI,
     )
 
-    log.info("api.data.update_group", task_id=task_id, group=body.group_id, tickers=len(tickers))
-    return {"task_id": task_id, "status": "queued", "tickers": len(tickers)}
+    log.info("api.data.update_group", task_id=task_id, market=group["market"], group=body.group_id, tickers=len(tickers))
+    return {"task_id": task_id, "status": "queued", "market": group["market"], "tickers": len(tickers)}
 
 
 @router.get("/data/update/progress")
@@ -195,58 +211,88 @@ async def update_progress() -> dict:
 
 
 @router.get("/data/quality")
-async def quality_check() -> dict:
+async def quality_check(market: Optional[str] = Query(None)) -> dict:
     """Run data quality checks and return report."""
     svc = _get_service()
-    return svc.run_quality_check()
+    try:
+        return svc.run_quality_check(market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.delete("/data/bars")
 async def delete_bars_by_date(
     target_date: date = Query(..., alias="date", description="Delete all daily bars for this date"),
+    market: Optional[str] = Query(None),
 ) -> dict:
     """Delete all daily bar records for a specific date."""
+    try:
+        resolved_market = normalize_market(market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     conn = get_connection()
     count_before = conn.execute(
-        "SELECT COUNT(*) FROM daily_bars WHERE date = ?", [target_date]
+        "SELECT COUNT(*) FROM daily_bars WHERE market = ? AND date = ?",
+        [resolved_market, target_date],
     ).fetchone()[0]
     if count_before == 0:
         raise HTTPException(status_code=404, detail=f"No bars found for {target_date}")
-    conn.execute("DELETE FROM daily_bars WHERE date = ?", [target_date])
-    log.info("api.data.bars_deleted", date=str(target_date), count=count_before)
-    return {"date": str(target_date), "deleted_rows": count_before}
+    conn.execute(
+        "DELETE FROM daily_bars WHERE market = ? AND date = ?",
+        [resolved_market, target_date],
+    )
+    log.info("api.data.bars_deleted", market=resolved_market, date=str(target_date), count=count_before)
+    return {"market": resolved_market, "date": str(target_date), "deleted_rows": count_before}
 
 
 @router.get("/stocks/search")
 async def search_stocks(
     q: str = Query(..., min_length=1, description="Search query for ticker or name"),
     limit: int = Query(20, ge=1, le=100),
+    market: Optional[str] = Query(None),
 ) -> list[dict]:
     """Search stocks by ticker or name prefix."""
+    try:
+        resolved_market = normalize_market(market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     conn = get_connection()
-    query_upper = q.upper()
+    query_ticker = normalize_ticker(q, resolved_market)
     query_like = f"%{q}%"
+    ticker_contains = f"%{query_ticker}%"
 
     rows = conn.execute(
-        """SELECT ticker, name, exchange, sector, status
+        """SELECT market, ticker, name, exchange, sector, status
            FROM stocks
-           WHERE ticker LIKE ? OR UPPER(name) LIKE UPPER(?)
+           WHERE market = ?
+             AND (ticker LIKE ? OR ticker LIKE ? OR UPPER(name) LIKE UPPER(?))
            ORDER BY
                CASE WHEN ticker = ? THEN 0
                     WHEN ticker LIKE ? THEN 1
-                    ELSE 2 END,
+                    WHEN ticker LIKE ? THEN 2
+                    ELSE 3 END,
                ticker
            LIMIT ?""",
-        [f"{query_upper}%", query_like, query_upper, f"{query_upper}%", limit],
+        [
+            resolved_market,
+            f"{query_ticker}%",
+            ticker_contains,
+            query_like,
+            query_ticker,
+            f"{query_ticker}%",
+            ticker_contains,
+            limit,
+        ],
     ).fetchall()
 
     return [
         {
-            "ticker": r[0],
-            "name": r[1],
-            "exchange": r[2],
-            "sector": r[3],
-            "status": r[4],
+            "market": r[0],
+            "ticker": r[1],
+            "name": r[2],
+            "exchange": r[3],
+            "sector": r[4],
+            "status": r[5],
         }
         for r in rows
     ]
@@ -257,8 +303,13 @@ async def get_daily_bars(
     ticker: str,
     start: Optional[date] = Query(None),
     end: Optional[date] = Query(None),
+    market: Optional[str] = Query(None),
 ) -> list[dict]:
     """Get daily bars for a specific ticker."""
+    try:
+        resolved_market = normalize_market(market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     conn = get_connection()
 
     if end is None:
@@ -266,12 +317,13 @@ async def get_daily_bars(
     if start is None:
         start = end - timedelta(days=365)
 
+    resolved_ticker = normalize_ticker(ticker, resolved_market)
     rows = conn.execute(
         """SELECT date, open, high, low, close, volume, adj_factor
            FROM daily_bars
-           WHERE ticker = ? AND date BETWEEN ? AND ?
+           WHERE market = ? AND ticker = ? AND date BETWEEN ? AND ?
            ORDER BY date""",
-        [ticker.upper(), start, end],
+        [resolved_market, resolved_ticker, start, end],
     ).fetchall()
 
     if not rows:
@@ -279,6 +331,8 @@ async def get_daily_bars(
 
     return [
         {
+            "market": resolved_market,
+            "ticker": resolved_ticker,
             "date": str(r[0]),
             "open": r[1],
             "high": r[2],

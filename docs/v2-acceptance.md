@@ -48,3 +48,32 @@ This file records milestone evidence for the V2.0 A-share and ranking upgrade.
   - `uv run python scripts/e2e_demo.py` passed through the full US demo flow.
   - `cd frontend && pnpm build` passed.
   - Direct schema check after stopping backend printed `market schema ok`.
+
+## P2 Provider, Calendar, Data, And Groups
+
+- Provider and calendar foundation:
+  - Added provider registry with `US -> yfinance` and `CN -> baostock`.
+  - Added `BaoStockProvider` for A-share stock list, daily bars, and index bars.
+  - Made trading calendar helpers market-aware while preserving old US signatures.
+  - Verification:
+    - `uv run python -m unittest tests.test_provider_contracts tests.test_calendar_contracts` passed.
+    - Real BaoStock smoke for `sh.600000` returned daily bars with `market='CN'`.
+- Data and group market scope:
+  - Data status, updates, ticker search, daily bars, and quality checks accept `market`, defaulting to `US`.
+  - Data upserts now persist `market` for `stocks`, `daily_bars`, and `index_bars`.
+  - Group APIs and service methods accept `market`; group membership rows include market.
+  - Existing US group IDs keep working; added `us_all_market`, `us_sp500`, `us_nasdaq100`, `cn_all_a`, and `cn_hs300`.
+  - Manual group validation rejects unambiguous cross-market tickers, while CN tickers keep BaoStock-native form such as `sh.600000`.
+  - Added regression coverage in `tests/test_data_group_market_scope.py`.
+- CN narrow-path evidence:
+  - `POST /api/data/update/tickers` with `{"market":"CN","tickers":["sh.600000"]}` completed task `8759e76878bb45c3a566c285094cb087` with result `total=1`, `success=1`, `failed=0`.
+  - `GET /api/stocks/sh.600000/daily?market=CN&start=2024-01-02&end=2024-01-03` returned two CN daily bars.
+  - Direct BaoStock benchmark load wrote `7` `index_bars` rows for `market='CN'`, `symbol='sh.000300'`.
+  - `cn_all_a` refresh returned `member_count=1` with `sh.600000`.
+  - `GET /api/stocks/search?q=600000&market=CN&limit=3` returned `sh.600000`.
+- Old system regression after P2:
+  - `GET /api/health` returned `{"status":"ok"}`.
+  - `GET /api/stocks/search?q=AAPL&limit=3` returned US AAPL results through the old no-market path.
+  - `uv run python scripts/e2e_demo.py` passed after CN rows were added.
+  - `uv run python -m unittest discover tests` passed: `41` tests.
+  - `cd frontend && pnpm build` passed. Vite reported the existing large-chunk and dynamic-import warnings.
