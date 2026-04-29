@@ -189,6 +189,26 @@ class PaperTradingService:
             return value
         return date.fromisoformat(str(value))
 
+    @staticmethod
+    def _is_rebalance_signal_day(
+        signal_date: date,
+        execution_date: date,
+        rebalance_freq: str,
+    ) -> bool:
+        """Return whether a signal date should execute on the next trading day."""
+        freq = (rebalance_freq or "daily").lower()
+        if freq == "daily":
+            return True
+        if freq == "weekly":
+            signal_week = signal_date.isocalendar()[:2]
+            execution_week = execution_date.isocalendar()[:2]
+            return signal_week != execution_week
+        if freq == "monthly":
+            signal_month = (signal_date.year, signal_date.month)
+            execution_month = (execution_date.year, execution_date.month)
+            return signal_month != execution_month
+        return True
+
     def _resolve_advance_trading_days(
         self,
         *,
@@ -232,7 +252,7 @@ class PaperTradingService:
 
         Processes each unprocessed trading day sequentially:
           1. Fresh sessions record the first trading day as a no-trade baseline
-          2. Generate signals using data up to T-1 (previous trading day)
+          2. On configured rebalance days, generate signals using data up to T-1
           3. Execute trades at T's open price
           4. Value portfolio at T's close price
           5. Record daily snapshot
@@ -316,6 +336,7 @@ class PaperTradingService:
         rebalance_buffer = config.get("rebalance_buffer", 0.0)
         min_holding_days = config.get("min_holding_days", 0)
         reentry_cooldown_days = config.get("reentry_cooldown_days", 0)
+        rebalance_freq = config.get("rebalance_freq") or config.get("rebalance_frequency", "daily")
 
         # Position sizing (read from strategy definition, aligned with backtest)
         strategy_def = self._strategy_service.get_strategy(session["strategy_id"])
@@ -332,16 +353,21 @@ class PaperTradingService:
         tickers = self._group_service.get_group_tickers(session["universe_group_id"])
 
         record_initial_baseline = session.get("current_date") is None
-        execution_days = trading_days[1:] if record_initial_baseline else trading_days
+        candidate_execution_days = trading_days[1:] if record_initial_baseline else trading_days
+        rebalance_execution_days = [
+            d for d in candidate_execution_days
+            if self._is_rebalance_signal_day(self._prev_trading_day(d), d, rebalance_freq)
+        ]
+        rebalance_execution_day_set = set(rebalance_execution_days)
 
         # Pre-load shared resources once for days that can actually execute.
         # A fresh session's first day is only a baseline snapshot so paper
         # trading matches the backtest engine's T+1 first-trade semantics.
         batch_ctx = None
-        if execution_days:
+        if rebalance_execution_days:
             batch_ctx = self._prepare_signal_context(
                 strategy_id=session["strategy_id"],
-                signal_dates=[self._prev_trading_day(d) for d in execution_days],
+                signal_dates=[self._prev_trading_day(d) for d in rebalance_execution_days],
                 universe_group_id=session["universe_group_id"],
                 tickers=tickers,
             )
@@ -375,6 +401,8 @@ class PaperTradingService:
             range=f"{trading_days[0]}~{trading_days[-1]}",
             execution_constraints=f"buffer={rebalance_buffer}, min_hold={min_holding_days}, cooldown={reentry_cooldown_days}",
             position_sizing=position_sizing,
+            rebalance_freq=rebalance_freq,
+            rebalance_executions=len(rebalance_execution_days),
         )
 
         for idx, trade_date in enumerate(trading_days):
@@ -387,6 +415,18 @@ class PaperTradingService:
                 ))
                 days_processed += 1
                 baseline_days += 1
+                continue
+
+            if trade_date not in rebalance_execution_day_set:
+                for ticker in positions:
+                    ticker_holding_days[ticker] = ticker_holding_days.get(ticker, 0) + 1
+                nav = self._value_portfolio_cached(positions, cash, trade_date, price_cache)
+                daily_snapshots.append((
+                    session_id, trade_date, nav, cash,
+                    json.dumps(positions, default=str),
+                    json.dumps([], default=str),
+                ))
+                days_processed += 1
                 continue
 
             signal_date = self._prev_trading_day(trade_date)
@@ -515,9 +555,12 @@ class PaperTradingService:
             "new_trades": total_new_trades,
             "current_date": str(trading_days[-1]) if trading_days else None,
             "baseline_days": baseline_days,
+            "rebalance_freq": rebalance_freq,
+            "rebalance_executions": len(rebalance_execution_days),
             "execution_rule": (
-                "T+1 open; a fresh session records its first trading day as "
-                "a no-trade baseline and starts executing on the next trading day"
+                f"T+1 open, {rebalance_freq} rebalance; a fresh session records "
+                "its first trading day as a no-trade baseline and starts "
+                "executing on the next eligible trading day"
             ),
         }
         if days_without:
