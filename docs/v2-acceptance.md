@@ -2,6 +2,58 @@
 
 This file records milestone evidence for the V2.0 A-share and ranking upgrade.
 
+## Final Acceptance Summary
+
+- Branch: `V2.0`
+- Current V2 scope: A-share support with BaoStock, explicit `market` isolation, ranking/listwise model objectives, and agent/human market-scope workflows.
+- Backward compatibility rule: old REST/MCP/UI calls without `market` default to `US`.
+- Pairwise scope: V2.0 exposes `pairwise` as a same-day candidate competition objective backed by LightGBM LambdaRank; model metadata records `pairwise_mode="lambdarank"`. This is not a separate pair-sampling learner.
+- Final verification commands:
+  - `uv run python scripts/v2_regression_check.py`
+  - `uv run python scripts/e2e_demo.py`
+  - `uv run python -m unittest discover tests`
+  - `cd frontend && pnpm build`
+  - Playwright browser smoke on `/market`, `/data`, and `/models`
+
+## Final Acceptance Matrix
+
+| Scenario | Status | Evidence |
+|---|---|---|
+| Existing US no-market API compatibility | Accepted | `scripts/v2_regression_check.py` checks `/api/data/status` and `/api/stocks/search?q=AAPL&limit=1` without `market`; both resolve to `US`. |
+| Existing US full research loop | Accepted | `uv run python scripts/e2e_demo.py` passes factor evaluation, feature set reuse, model training, strategy backtest, and signal generation without explicit `market`. |
+| Lossless DB upgrade safety | Accepted | P1 migration added `market='US'`, retained backup path, and validated row counts/null markets/duplicate target keys; Task 15 validates copied DBs through `--migration-copy`. |
+| CN data update and bars | Accepted | BaoStock narrow update for `sh.600000` completed successfully; CN daily bars and `sh.000300` benchmark rows were stored with `market='CN'`. |
+| CN factor evaluation | Accepted | CN factor compute/evaluation reads CN bars/cache only; cache evidence for `factor_values_cache` shows `market='CN'`. |
+| CN feature set isolation | Accepted | CN feature set creation with US factors is rejected; CN factor references create CN feature sets. |
+| CN ranking/listwise model | Accepted | Ranking dataset and LightGBM ranker tests pass; ranking model metadata includes `task="ranking"`, `objective_type`, `ndcg@k`, `rank_ic`, and top-k metrics. |
+| CN backtest safety | Accepted | CN backtests reject US benchmark `SPY`; backtest price/benchmark paths filter by market. |
+| CN signal generation | Accepted | CN signal generation queues and completes with CN strategy/group, persisting `signal_runs` and `signal_details` with `market='CN'`. |
+| CN paper trading | Accepted | CN paper sessions persist `market='CN'`, reject US strategies, and support scoped advancement paths. |
+| Agent workflow parity | Accepted | MCP tools expose `market`, default to `US`, return task polling metadata, and reject invalid markets with actionable errors. |
+| Human UI validation | Accepted | Global market selector persists `US`/`CN`; pages remount on market switch; browser smoke confirms CN data/model pages and ranking metrics with `0` Ant Design warnings. |
+| Refactor safety | Accepted | Provider registry and DuckDB values-table filters pass V2 regression, full unit discovery, and old US e2e. |
+
+## Residual Non-Blocking Items
+
+- Vite still reports the existing dynamic-import and large-chunk warnings during `pnpm build`.
+- Python 3.14 `datetime.utcnow()` deprecation warnings are recorded in `docs/backlog.md` as deferred technical debt.
+- Default `scripts/v2_regression_check.py` skips optional `--migration-copy` and `--cn-provider-smoke` unless those flags are explicitly provided; skipped checks are reported clearly and do not hide required US compatibility failures.
+
+## Final Task 17 Verification
+
+- `uv run python scripts/v2_regression_check.py` passed with `4` passed, `0` failed, `2` skipped.
+- `uv run python scripts/e2e_demo.py` passed through the full old US flow.
+- `uv run python -m unittest discover tests` passed: `84` tests.
+- `cd frontend && pnpm build` passed. Vite still reports the known dynamic-import and large-chunk warnings.
+- `git diff --check` passed.
+- Browser smoke with backend and Vite dev server:
+  - `/market` first requested `/api/stocks/SPY/daily?...market=US`.
+  - Switching to `CN` requested `/api/stocks/sh.600000/daily?...market=CN`.
+  - `/data` requested CN data status and displayed `最近交易日`.
+  - `/models` exposed the `listwise 列表排序` objective and showed `NDCG@5` plus `Rank IC`.
+  - Console capture found `0` Ant Design warnings.
+  - Screenshots saved at `logs/v2-task17-market-cn.png` and `logs/v2-task17-models-cn.png`.
+
 ## P0 Baseline Safety
 
 - Branch: `V2.0`
