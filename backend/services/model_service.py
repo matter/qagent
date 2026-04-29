@@ -23,6 +23,7 @@ from backend.services.feature_service import FeatureService
 from backend.services.group_service import GroupService
 from backend.services.label_service import LabelService
 from backend.services.market_context import normalize_market, normalize_ticker
+from backend.services.ranking_dataset import build_date_groups, compute_ranking_metrics
 
 log = get_logger(__name__)
 
@@ -54,6 +55,7 @@ _MODEL_REGISTRY: dict[str, type] = {
 
 # Label target types that should be treated as classification
 _CLASSIFICATION_TARGETS = {"binary", "top_quantile", "bottom_quantile", "large_move", "excess_binary", "path_quality", "triple_barrier"}
+_RANKING_OBJECTIVES = {"ranking", "pairwise", "listwise"}
 
 # Parameters determined by the system, not user-configurable
 _RESERVED_MODEL_PARAMS = {"task", "objective", "metric", "verbosity", "n_jobs"}
@@ -88,6 +90,8 @@ class ModelService:
         universe_group_id: str | None = None,
         sample_weight_config: dict[str, Any] | None = None,
         market: str | None = None,
+        objective_type: str | None = None,
+        ranking_config: dict[str, Any] | None = None,
     ) -> dict:
         """End-to-end model training pipeline.
 
@@ -114,6 +118,12 @@ class ModelService:
         train_config = train_config or {}
         model_params = model_params or {}
         resolved_market = normalize_market(market)
+        objective = (objective_type or "").strip().lower() or None
+        if objective and objective not in {"regression", "classification", *_RANKING_OBJECTIVES}:
+            raise ValueError(
+                "objective_type must be one of: regression, classification, ranking, pairwise, listwise"
+            )
+        ranking_config = ranking_config or {}
 
         # ---- Strip reserved params that are set by the system ----
         stripped = [k for k in model_params if k in _RESERVED_MODEL_PARAMS]
@@ -210,17 +220,79 @@ class ModelService:
             raise ValueError("Training set is empty after date split")
 
         # ---- 6. Determine task type and fit ----
-        task = "classification" if label_def["target_type"] in _CLASSIFICATION_TARGETS else "regression"
+        if objective in _RANKING_OBJECTIVES:
+            task = "ranking"
+        elif objective in {"regression", "classification"}:
+            task = objective
+        else:
+            task = "classification" if label_def["target_type"] in _CLASSIFICATION_TARGETS else "regression"
+
         model_cls = _MODEL_REGISTRY[model_type]
         model_instance: ModelBase = model_cls(task=task, params=model_params)
 
         fit_kwargs: dict[str, Any] = {}
-        if len(X_valid) > 0:
-            fit_kwargs["eval_set"] = [(X_valid, y_valid)]
+        fit_X_train, fit_y_train = X_train, y_train
+        fit_X_valid, fit_y_valid = X_valid, y_valid
+        fit_X_test, fit_y_test = X_test, y_test
+        metric_y_train = y_train
+        metric_y_valid, metric_y_test = y_valid, y_test
+
+        if task == "ranking":
+            if ranking_config.get("query_group", "date") != "date":
+                raise ValueError("ranking_config.query_group must be 'date' in V2.0")
+            min_group_size = int(ranking_config.get("min_group_size", 5))
+            label_gain = str(ranking_config.get("label_gain", "identity"))
+            train_rank = build_date_groups(
+                X_train,
+                y_train,
+                min_group_size=min_group_size,
+                label_gain=label_gain,
+            )
+            valid_rank = build_date_groups(
+                X_valid,
+                y_valid,
+                min_group_size=min_group_size,
+                label_gain=label_gain,
+            )
+            test_rank = build_date_groups(
+                X_test,
+                y_test,
+                min_group_size=min_group_size,
+                label_gain=label_gain,
+            )
+            if train_rank.X.empty:
+                raise ValueError(
+                    f"Ranking training set is empty after date grouping; "
+                    f"min_group_size={min_group_size}"
+                )
+            fit_X_train, fit_y_train = train_rank.X, train_rank.y
+            fit_X_valid, fit_y_valid = valid_rank.X, valid_rank.y
+            fit_X_test, fit_y_test = test_rank.X, test_rank.y
+            metric_y_train = train_rank.raw_y
+            metric_y_valid, metric_y_test = valid_rank.raw_y, test_rank.raw_y
+            fit_kwargs["group"] = train_rank.group_sizes
+            if not fit_X_valid.empty:
+                fit_kwargs["eval_set"] = [(fit_X_valid, fit_y_valid)]
+                fit_kwargs["eval_group"] = [valid_rank.group_sizes]
+            ranking_summary = {
+                "query_group": "date",
+                "min_group_size": min_group_size,
+                "label_gain": label_gain,
+                "train_groups": len(train_rank.group_sizes),
+                "valid_groups": len(valid_rank.group_sizes),
+                "test_groups": len(test_rank.group_sizes),
+                "dropped_train_groups": train_rank.dropped_groups,
+                "dropped_valid_groups": valid_rank.dropped_groups,
+                "dropped_test_groups": test_rank.dropped_groups,
+            }
+        else:
+            ranking_summary = None
+            if len(X_valid) > 0:
+                fit_kwargs["eval_set"] = [(X_valid, y_valid)]
 
         # ---- 6a. Build sample weights if configured ----
         if sample_weight_config:
-            weights = self._build_sample_weights(X_train, y_train, sample_weight_config, feature_data)
+            weights = self._build_sample_weights(fit_X_train, metric_y_train, sample_weight_config, feature_data)
             if weights is not None:
                 fit_kwargs["sample_weight"] = weights
                 log.info("model.train.sample_weights",
@@ -229,16 +301,33 @@ class ModelService:
                          weight_min=round(float(weights.min()), 4),
                          weight_max=round(float(weights.max()), 4))
 
-        model_instance.fit(X_train, y_train, **fit_kwargs)
+        model_instance.fit(fit_X_train, fit_y_train, **fit_kwargs)
 
         # ---- 7. Predict on valid and test sets ----
-        preds_valid = model_instance.predict(X_valid) if len(X_valid) > 0 else pd.Series(dtype=float)
-        preds_test = model_instance.predict(X_test) if len(X_test) > 0 else pd.Series(dtype=float)
+        preds_valid = model_instance.predict(fit_X_valid) if len(fit_X_valid) > 0 else pd.Series(dtype=float)
+        preds_test = model_instance.predict(fit_X_test) if len(fit_X_test) > 0 else pd.Series(dtype=float)
 
         # ---- 8. Calculate eval metrics ----
-        eval_metrics = self._compute_eval_metrics(
-            task, y_train, y_valid, y_test, preds_valid, preds_test
-        )
+        if task == "ranking":
+            eval_at = ranking_config.get("eval_at", [5, 10, 20])
+            eval_metrics = {
+                "train_samples": len(fit_y_train),
+                "valid_samples": len(fit_y_valid),
+                "test_samples": len(fit_y_test),
+            }
+            valid_metrics = compute_ranking_metrics(metric_y_valid, preds_valid, eval_at=eval_at)
+            test_metrics = compute_ranking_metrics(metric_y_test, preds_test, eval_at=eval_at)
+            eval_metrics.update({f"valid_{k}": v for k, v in valid_metrics.items()})
+            eval_metrics.update({f"test_{k}": v for k, v in test_metrics.items()})
+            if ranking_summary is not None:
+                eval_metrics["ranking_groups"] = ranking_summary
+            eval_metrics["objective_type"] = objective or "ranking"
+            if objective == "pairwise":
+                eval_metrics["pairwise_mode"] = "lambdarank"
+        else:
+            eval_metrics = self._compute_eval_metrics(
+                task, y_train, y_valid, y_test, preds_valid, preds_test
+            )
         eval_metrics["task_type"] = task
 
         # Feature importance
@@ -253,7 +342,7 @@ class ModelService:
         log.info("model.train.metrics", metrics=eval_metrics)
 
         # ---- 9. Validate feature dimensions ----
-        trained_features = list(X.columns)
+        trained_features = list(fit_X_train.columns)
         trained_feature_count = len(trained_features)
 
         # Get expected features from feature set
@@ -287,6 +376,8 @@ class ModelService:
             "name": name,
             "model_type": model_type,
             "task": task,
+            "objective_type": objective or task,
+            "ranking_config": ranking_config if task == "ranking" else None,
             "feature_set_id": feature_set_id,
             "label_id": label_id,
             "model_params": model_instance.get_params(),
@@ -320,9 +411,11 @@ class ModelService:
             "name": name,
             "model_type": model_type,
             "task": task,
-            "train_samples": len(X_train),
-            "valid_samples": len(X_valid),
-            "test_samples": len(X_test),
+            "objective_type": objective or task,
+            "ranking_config": ranking_config if task == "ranking" else None,
+            "train_samples": len(fit_X_train),
+            "valid_samples": len(fit_X_valid),
+            "test_samples": len(fit_X_test),
             "features": trained_feature_count,
             "feature_names": trained_features,
             "eval_metrics": eval_metrics,

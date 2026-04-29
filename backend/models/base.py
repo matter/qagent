@@ -17,6 +17,8 @@ class ModelBase(ABC):
         Args:
             X: Feature matrix (rows = samples, columns = factor names).
             y: Target series aligned with X.
+            **kwargs: Optional estimator-specific fit arguments such as
+                sample weights, validation sets, or ranking query groups.
 
         Returns:
             self, for method chaining.

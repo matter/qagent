@@ -132,5 +132,18 @@ This file records milestone evidence for the V2.0 A-share and ranking upgrade.
   - `GET /api/models/ae5e994c4195?market=US` returned `market="US"`.
   - `uv run python scripts/e2e_demo.py` passed through old US model training, backtest, and signal generation.
   - `cd frontend && pnpm build` passed with the existing Vite warnings.
-- Remaining P4 work:
-  - Add ranking, pairwise, and listwise training objectives.
+- Ranking objectives completed:
+  - Added date-grouped ranking dataset builder in `backend/services/ranking_dataset.py`.
+  - `LightGBMModel(task="ranking")` now uses `LGBMRanker` with query group sizes.
+  - `objective_type="ranking"` and `objective_type="listwise"` use native LambdaRank ranking.
+  - `objective_type="pairwise"` is accepted as a V2.0 user-facing objective and records `pairwise_mode="lambdarank"`.
+  - Ranking metrics include `ndcg@k`, `top_k_mean_label`, `rank_ic_mean`, and `pairwise_accuracy_sampled`.
+  - Prediction output remains per-ticker scores for existing strategy sorting.
+- P4 verification:
+  - `uv run python -m unittest tests.test_ranking_dataset tests.test_model_market_scope` passed: `6` tests.
+  - `uv run python -m unittest discover tests` passed: `59` tests.
+  - `uv run python -m py_compile backend/services/ranking_dataset.py backend/services/model_service.py backend/models/lightgbm_model.py backend/api/models.py` passed.
+  - Real API ranking smoke completed task `aa78ba2d983e4a3e8b4fac6ea4486d8a`.
+  - Ranking smoke model `dfb45466926f` returned `market="US"`, `task="ranking"`, `objective_type="ranking"`, `test_ndcg@5=0.64652`, `test_rank_ic_mean=0.124884`, and `test_pairwise_accuracy_sampled=0.5245`.
+  - `uv run python scripts/e2e_demo.py` passed through old US model training, backtest, and signal generation after ranking support was added.
+  - `cd frontend && pnpm build` passed with the existing Vite warnings.

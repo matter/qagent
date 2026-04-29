@@ -99,12 +99,98 @@ class ModelMarketScopeTests(unittest.TestCase):
                         model_type="lightgbm",
                         train_config={},
                         universe_group_id="cn_all_a",
+                        objective_type="ranking",
+                        ranking_config={"query_group": "date", "min_group_size": 5},
                     )
                 )
             )
 
         self.assertEqual(result["market"], "CN")
         self.assertEqual(executor.params["market"], "CN")
+        self.assertEqual(executor.params["objective_type"], "ranking")
+        self.assertEqual(executor.params["ranking_config"]["min_group_size"], 5)
+
+    def test_pairwise_objective_uses_ranking_groups_and_metadata(self):
+        _FakeModel.last_task = None
+        _FakeModel.last_fit_kwargs = None
+        svc = ModelService()
+        svc._feature_service = _FakeFeatureService()
+        svc._label_service = _FakeLabelService()
+        svc._group_service = _FakeGroupService()
+
+        with (
+            patch("backend.services.model_service.get_connection", return_value=self.conn),
+            patch.dict(model_service_module._MODEL_REGISTRY, {"fake": _FakeModel}),
+            patch.object(model_service_module, "settings", _FakeSettings(self.models_dir)),
+        ):
+            summary = svc.train_model(
+                name="CN pairwise model",
+                feature_set_id="fs_cn",
+                label_id="label_cn",
+                model_type="fake",
+                train_config={
+                    "train_start": "2024-01-02",
+                    "train_end": "2024-01-04",
+                    "valid_start": "2024-01-05",
+                    "valid_end": "2024-01-08",
+                    "test_start": "2024-01-09",
+                    "test_end": "2024-01-10",
+                    "purge_gap": 0,
+                },
+                universe_group_id="cn_all_a",
+                market="CN",
+                objective_type="pairwise",
+                ranking_config={"query_group": "date", "min_group_size": 2, "eval_at": [1]},
+            )
+
+        self.assertEqual(_FakeModel.last_task, "ranking")
+        self.assertEqual(_FakeModel.last_fit_kwargs["group"], [2, 2, 2])
+        self.assertEqual(summary["task"], "ranking")
+        self.assertEqual(summary["objective_type"], "pairwise")
+        self.assertEqual(summary["eval_metrics"]["pairwise_mode"], "lambdarank")
+        self.assertIn("test_ndcg@1", summary["eval_metrics"])
+
+    def test_lightgbm_listwise_training_saves_ranking_task_type(self):
+        svc = ModelService()
+        svc._feature_service = _FakeFeatureService()
+        svc._label_service = _FakeLabelService()
+        svc._group_service = _FakeGroupService()
+
+        with (
+            patch("backend.services.model_service.get_connection", return_value=self.conn),
+            patch.object(model_service_module, "settings", _FakeSettings(self.models_dir)),
+        ):
+            summary = svc.train_model(
+                name="CN listwise model",
+                feature_set_id="fs_cn",
+                label_id="label_cn",
+                model_type="lightgbm",
+                model_params={"n_estimators": 3, "min_child_samples": 1, "num_leaves": 3},
+                train_config={
+                    "train_start": "2024-01-02",
+                    "train_end": "2024-01-04",
+                    "valid_start": "2024-01-05",
+                    "valid_end": "2024-01-08",
+                    "test_start": "2024-01-09",
+                    "test_end": "2024-01-10",
+                    "purge_gap": 0,
+                },
+                universe_group_id="cn_all_a",
+                market="CN",
+                objective_type="listwise",
+                ranking_config={"query_group": "date", "min_group_size": 2, "eval_at": [1]},
+            )
+
+        self.assertEqual(summary["task"], "ranking")
+        self.assertEqual(summary["eval_metrics"]["task_type"], "ranking")
+        self.assertEqual(summary["eval_metrics"]["objective_type"], "listwise")
+        saved_metrics = self.conn.execute(
+            "SELECT eval_metrics FROM models WHERE id = ?",
+            [summary["model_id"]],
+        ).fetchone()[0]
+        if isinstance(saved_metrics, str):
+            saved_metrics = json.loads(saved_metrics)
+        self.assertEqual(saved_metrics["task_type"], "ranking")
 
     def _create_schema(self):
         self.conn.execute(
@@ -207,12 +293,17 @@ class _FakeGroupService:
 
 
 class _FakeModel(ModelBase):
+    last_task = None
+    last_fit_kwargs = None
+
     def __init__(self, task="regression", params=None):
+        _FakeModel.last_task = task
         self.task = task
         self.params = params or {}
         self._feature_names = []
 
     def fit(self, X, y, **kwargs):
+        _FakeModel.last_fit_kwargs = kwargs
         self._feature_names = list(X.columns)
         return self
 

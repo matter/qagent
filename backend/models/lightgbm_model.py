@@ -32,8 +32,8 @@ class LightGBMModel(ModelBase):
     Parameters
     ----------
     task : str
-        ``"regression"`` or ``"classification"``.  Determines which
-        LightGBM estimator is used.
+        ``"regression"``, ``"classification"``, or ``"ranking"``. Determines
+        which LightGBM estimator is used.
     params : dict | None
         Override default hyper-parameters.  Keys that are not supplied
         fall back to ``_DEFAULT_PARAMS``.
@@ -44,8 +44,10 @@ class LightGBMModel(ModelBase):
         task: str = "regression",
         params: dict[str, Any] | None = None,
     ) -> None:
-        if task not in ("regression", "classification"):
-            raise ValueError(f"task must be 'regression' or 'classification', got '{task}'")
+        if task not in ("regression", "classification", "ranking"):
+            raise ValueError(
+                f"task must be 'regression', 'classification', or 'ranking', got '{task}'"
+            )
         self.task = task
 
         # Merge user params on top of defaults
@@ -76,6 +78,10 @@ class LightGBMModel(ModelBase):
         # Pass sample_weight if provided
         if "sample_weight" in kwargs:
             fit_kwargs["sample_weight"] = kwargs["sample_weight"]
+        if "group" in kwargs:
+            fit_kwargs["group"] = kwargs["group"]
+        if "eval_group" in kwargs:
+            fit_kwargs["eval_group"] = kwargs["eval_group"]
 
         self._model.fit(X, y, **fit_kwargs)
         return self
@@ -125,6 +131,10 @@ class LightGBMModel(ModelBase):
         constructor_params = dict(params)
         if self.task == "classification":
             return lgb.LGBMClassifier(**constructor_params)
+        if self.task == "ranking":
+            constructor_params.setdefault("objective", "lambdarank")
+            constructor_params.setdefault("metric", "ndcg")
+            return lgb.LGBMRanker(**constructor_params)
         return lgb.LGBMRegressor(**constructor_params)
 
 

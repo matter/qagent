@@ -46,6 +46,8 @@ class TrainModelRequest(BaseModel):
     train_config: Optional[dict[str, Any]] = None
     universe_group_id: str
     sample_weight_config: Optional[dict[str, Any]] = None
+    objective_type: Optional[str] = None
+    ranking_config: Optional[dict[str, Any]] = None
 
 
 class PredictRequest(BaseModel):
@@ -105,6 +107,8 @@ async def train_model(body: TrainModelRequest) -> dict:
         universe_group_id: str,
         sample_weight_config: dict | None,
         market: str | None,
+        objective_type: str | None,
+        ranking_config: dict | None,
     ) -> dict:
         return svc.train_model(
             name=name,
@@ -116,6 +120,8 @@ async def train_model(body: TrainModelRequest) -> dict:
             universe_group_id=universe_group_id,
             sample_weight_config=sample_weight_config,
             market=market,
+            objective_type=objective_type,
+            ranking_config=ranking_config,
         )
 
     task_id = executor.submit(
@@ -131,6 +137,8 @@ async def train_model(body: TrainModelRequest) -> dict:
             "universe_group_id": body.universe_group_id,
             "sample_weight_config": body.sample_weight_config,
             "market": resolved_market,
+            "objective_type": body.objective_type,
+            "ranking_config": body.ranking_config,
         },
         timeout=7200,  # 2 hours max
         source=TaskSource.UI,

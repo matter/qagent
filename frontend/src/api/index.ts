@@ -445,6 +445,8 @@ export async function trainModel(params: {
   model_params?: Record<string, unknown>;
   train_config?: Record<string, unknown>;
   universe_group_id: string;
+  objective_type?: "regression" | "classification" | "ranking" | "pairwise" | "listwise";
+  ranking_config?: Record<string, unknown>;
 }): Promise<{ task_id: string; market?: string }> {
   const { data } = await client.post<{ task_id: string; market?: string }>("/models/train", params);
   return data;
