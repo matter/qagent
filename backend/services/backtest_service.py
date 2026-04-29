@@ -445,7 +445,7 @@ class BacktestService:
                 "id": r[0],
                 "strategy_id": r[1],
                 "config": _parse_json(r[2]),
-                "summary": _parse_json(r[3]),
+                "summary": self._list_summary(_parse_json(r[3])),
                 "trade_count": r[4],
                 "result_level": r[5],
                 "created_at": str(r[6]) if r[6] else None,
@@ -606,6 +606,31 @@ class BacktestService:
     # ------------------------------------------------------------------
     # Position sizing
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _list_summary(summary: dict) -> dict:
+        """Return a summary safe for list views.
+
+        Full diagnostics can be large and should be fetched via get_backtest().
+        """
+        if not isinstance(summary, dict):
+            return {}
+        heavy_keys = {
+            "rebalance_diagnostics",
+            "leakage_warnings",
+        }
+        lightweight = {
+            key: value
+            for key, value in summary.items()
+            if key not in heavy_keys
+        }
+        lightweight["has_rebalance_diagnostics"] = bool(
+            summary.get("rebalance_diagnostics")
+        )
+        lightweight["has_leakage_warnings"] = bool(
+            summary.get("leakage_warnings")
+        )
+        return lightweight
 
     @staticmethod
     def _round_weight_map(weights: dict[str, float]) -> dict[str, float]:

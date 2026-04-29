@@ -22,6 +22,24 @@ class BacktestDiagnosticsContractTests(unittest.TestCase):
         self.assertAlmostEqual(diag["turnover"], 1.2)
         self.assertEqual(diag["candidate_pool"], ["MSFT", "NVDA"])
 
+    def test_list_summary_strips_heavy_diagnostics(self):
+        summary = {
+            "total_return": 0.12,
+            "sharpe_ratio": 2.3,
+            "rebalance_diagnostics": [{"date": "2026-04-10"}],
+            "leakage_warnings": [{"model_id": "m1"}],
+            "trade_diagnostics": {"by_reason": {}},
+        }
+
+        lightweight = BacktestService._list_summary(summary)
+
+        self.assertEqual(lightweight["total_return"], 0.12)
+        self.assertEqual(lightweight["sharpe_ratio"], 2.3)
+        self.assertNotIn("rebalance_diagnostics", lightweight)
+        self.assertNotIn("leakage_warnings", lightweight)
+        self.assertIn("has_rebalance_diagnostics", lightweight)
+        self.assertTrue(lightweight["has_rebalance_diagnostics"])
+
 
 if __name__ == "__main__":
     unittest.main()
