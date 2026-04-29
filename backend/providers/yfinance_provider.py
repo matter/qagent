@@ -66,10 +66,11 @@ class YFinanceProvider(DataProvider):
             df_nasdaq["exchange"] = "NASDAQ"
             df_nasdaq["sector"] = ""
             df_nasdaq["status"] = "active"
+            df_nasdaq["market"] = "US"
             # Filter out test issues
             if "Test Issue" in df_nasdaq.columns:
                 df_nasdaq = df_nasdaq[df_nasdaq["Test Issue"] == "N"]
-            df_nasdaq = df_nasdaq[["ticker", "name", "exchange", "sector", "status"]]
+            df_nasdaq = df_nasdaq[["market", "ticker", "name", "exchange", "sector", "status"]]
             frames.append(df_nasdaq)
         except Exception as e:
             log.warning("provider.stock_list.nasdaq_failed", error=str(e))
@@ -95,9 +96,10 @@ class YFinanceProvider(DataProvider):
             df_other["exchange"] = df_other["exchange"].map(exchange_map).fillna("OTHER")
             df_other["sector"] = ""
             df_other["status"] = "active"
+            df_other["market"] = "US"
             if "Test Issue" in df_other.columns:
                 df_other = df_other[df_other["Test Issue"] == "N"]
-            df_other = df_other[["ticker", "name", "exchange", "sector", "status"]]
+            df_other = df_other[["market", "ticker", "name", "exchange", "sector", "status"]]
             frames.append(df_other)
         except Exception as e:
             log.warning("provider.stock_list.other_failed", error=str(e))
@@ -153,7 +155,7 @@ class YFinanceProvider(DataProvider):
 
         if not all_frames:
             return pd.DataFrame(
-                columns=["date", "ticker", "open", "high", "low", "close", "volume", "adj_factor"]
+                columns=["market", "date", "ticker", "open", "high", "low", "close", "volume", "adj_factor"]
             )
 
         result = pd.concat(all_frames, ignore_index=True)
@@ -174,7 +176,7 @@ class YFinanceProvider(DataProvider):
                 progress=False,
             )
             if raw.empty:
-                return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+                return pd.DataFrame(columns=["market", "symbol", "date", "open", "high", "low", "close", "volume"])
 
             # Flatten MultiIndex columns if present
             if isinstance(raw.columns, pd.MultiIndex):
@@ -182,6 +184,8 @@ class YFinanceProvider(DataProvider):
 
             df = pd.DataFrame(
                 {
+                    "market": "US",
+                    "symbol": symbol,
                     "date": raw.index.date,
                     "open": raw["Open"].values,
                     "high": raw["High"].values,
@@ -194,7 +198,7 @@ class YFinanceProvider(DataProvider):
 
         except Exception as e:
             log.error("provider.index_data.error", symbol=symbol, error=str(e))
-            return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+            return pd.DataFrame(columns=["market", "symbol", "date", "open", "high", "low", "close", "volume"])
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -309,6 +313,7 @@ class YFinanceProvider(DataProvider):
 
                     df = pd.DataFrame(
                         {
+                            "market": "US",
                             "date": sub.index.date,
                             "ticker": ticker,
                             "open": sub["Open"].values,
@@ -325,7 +330,7 @@ class YFinanceProvider(DataProvider):
 
         if not frames:
             return pd.DataFrame(
-                columns=["date", "ticker", "open", "high", "low", "close", "volume", "adj_factor"]
+                columns=["market", "date", "ticker", "open", "high", "low", "close", "volume", "adj_factor"]
             )
         result = pd.concat(frames, ignore_index=True)
 

@@ -16,7 +16,7 @@ class DataProvider(ABC):
     def get_stock_list(self) -> pd.DataFrame:
         """Return stock universe.
 
-        Expected columns: ticker, name, exchange, sector, status
+        Expected columns: market, ticker, name, exchange, sector, status
         """
 
     @abstractmethod
@@ -25,7 +25,7 @@ class DataProvider(ABC):
     ) -> pd.DataFrame:
         """Return daily OHLCV bars.
 
-        Expected columns: date, ticker, open, high, low, close, volume, adj_factor
+        Expected columns: market, date, ticker, open, high, low, close, volume, adj_factor
         """
 
     @abstractmethod
@@ -34,5 +34,5 @@ class DataProvider(ABC):
     ) -> pd.DataFrame:
         """Return daily bars for an index / ETF.
 
-        Expected columns: date, open, high, low, close, volume
+        Expected columns: market, symbol, date, open, high, low, close, volume
         """

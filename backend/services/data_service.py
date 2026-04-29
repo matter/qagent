@@ -13,7 +13,7 @@ from backend.config import settings
 from backend.db import get_connection
 from backend.logger import get_logger
 from backend.providers.base import DataProvider
-from backend.providers.yfinance_provider import YFinanceProvider
+from backend.providers.registry import get_provider
 from backend.services.calendar_service import get_latest_trading_day, get_trading_days, snap_to_trading_day
 
 log = get_logger(__name__)
@@ -24,10 +24,7 @@ _PROGRESS_FILE = "update_progress.json"
 
 def _get_provider() -> DataProvider:
     """Instantiate the configured data provider."""
-    name = settings.data.provider
-    if name == "yfinance":
-        return YFinanceProvider()
-    raise ValueError(f"Unknown data provider: {name}")
+    return get_provider("US", settings.data.provider)
 
 
 class DataService:
