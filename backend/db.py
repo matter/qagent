@@ -9,6 +9,7 @@ import duckdb
 
 from backend.config import settings
 from backend.logger import get_logger
+from backend.services.schema_migrations import migrate_market_schema
 
 log = get_logger(__name__)
 
@@ -33,17 +34,20 @@ CREATE TABLE IF NOT EXISTS task_runs (
 
 _STOCKS_DDL = """\
 CREATE TABLE IF NOT EXISTS stocks (
-    ticker      VARCHAR PRIMARY KEY,
+    market      VARCHAR NOT NULL DEFAULT 'US',
+    ticker      VARCHAR NOT NULL,
     name        VARCHAR,
     exchange    VARCHAR,
     sector      VARCHAR,
     status      VARCHAR DEFAULT 'active',
-    updated_at  TIMESTAMP
+    updated_at  TIMESTAMP,
+    PRIMARY KEY (market, ticker)
 );
 """
 
 _DAILY_BARS_DDL = """\
 CREATE TABLE IF NOT EXISTS daily_bars (
+    market      VARCHAR NOT NULL DEFAULT 'US',
     ticker      VARCHAR NOT NULL,
     date        DATE NOT NULL,
     open        DOUBLE,
@@ -52,12 +56,13 @@ CREATE TABLE IF NOT EXISTS daily_bars (
     close       DOUBLE,
     volume      BIGINT,
     adj_factor  DOUBLE DEFAULT 1.0,
-    PRIMARY KEY (ticker, date)
+    PRIMARY KEY (market, ticker, date)
 );
 """
 
 _INDEX_BARS_DDL = """\
 CREATE TABLE IF NOT EXISTS index_bars (
+    market  VARCHAR NOT NULL DEFAULT 'US',
     symbol  VARCHAR NOT NULL,
     date    DATE NOT NULL,
     open    DOUBLE,
@@ -65,33 +70,37 @@ CREATE TABLE IF NOT EXISTS index_bars (
     low     DOUBLE,
     close   DOUBLE,
     volume  BIGINT,
-    PRIMARY KEY (symbol, date)
+    PRIMARY KEY (market, symbol, date)
 );
 """
 
 _STOCK_GROUPS_DDL = """\
 CREATE TABLE IF NOT EXISTS stock_groups (
     id              VARCHAR PRIMARY KEY,
-    name            VARCHAR UNIQUE NOT NULL,
+    market          VARCHAR NOT NULL DEFAULT 'US',
+    name            VARCHAR NOT NULL,
     description     TEXT,
     group_type      VARCHAR DEFAULT 'manual',
     filter_expr     TEXT,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(market, name)
 );
 """
 
 _STOCK_GROUP_MEMBERS_DDL = """\
 CREATE TABLE IF NOT EXISTS stock_group_members (
     group_id    VARCHAR NOT NULL,
+    market      VARCHAR NOT NULL DEFAULT 'US',
     ticker      VARCHAR NOT NULL,
-    PRIMARY KEY (group_id, ticker)
+    PRIMARY KEY (group_id, market, ticker)
 );
 """
 
 _DATA_UPDATE_LOG_DDL = """\
 CREATE TABLE IF NOT EXISTS data_update_log (
     id              VARCHAR PRIMARY KEY,
+    market          VARCHAR NOT NULL DEFAULT 'US',
     update_type     VARCHAR,
     started_at      TIMESTAMP,
     completed_at    TIMESTAMP,
@@ -107,7 +116,8 @@ CREATE TABLE IF NOT EXISTS data_update_log (
 _LABEL_DEFINITIONS_DDL = """\
 CREATE TABLE IF NOT EXISTS label_definitions (
     id          VARCHAR PRIMARY KEY,
-    name        VARCHAR UNIQUE NOT NULL,
+    market      VARCHAR NOT NULL DEFAULT 'US',
+    name        VARCHAR NOT NULL,
     description TEXT,
     target_type VARCHAR NOT NULL,
     horizon     INTEGER NOT NULL,
@@ -115,13 +125,15 @@ CREATE TABLE IF NOT EXISTS label_definitions (
     config      TEXT,
     status      VARCHAR DEFAULT 'draft',
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(market, name)
 );
 """
 
 _FACTORS_DDL = """\
 CREATE TABLE IF NOT EXISTS factors (
     id          VARCHAR PRIMARY KEY,
+    market      VARCHAR NOT NULL DEFAULT 'US',
     name        VARCHAR NOT NULL,
     version     INTEGER NOT NULL DEFAULT 1,
     description TEXT,
@@ -131,23 +143,25 @@ CREATE TABLE IF NOT EXISTS factors (
     status      VARCHAR DEFAULT 'draft',
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(name, version)
+    UNIQUE(market, name, version)
 );
 """
 
 _FACTOR_VALUES_CACHE_DDL = """\
 CREATE TABLE IF NOT EXISTS factor_values_cache (
+    market      VARCHAR NOT NULL DEFAULT 'US',
     factor_id   VARCHAR NOT NULL,
     ticker      VARCHAR NOT NULL,
     date        DATE NOT NULL,
     value       DOUBLE,
-    PRIMARY KEY (factor_id, ticker, date)
+    PRIMARY KEY (market, factor_id, ticker, date)
 );
 """
 
 _FACTOR_EVAL_RESULTS_DDL = """\
 CREATE TABLE IF NOT EXISTS factor_eval_results (
     id                  VARCHAR PRIMARY KEY,
+    market              VARCHAR NOT NULL DEFAULT 'US',
     factor_id           VARCHAR NOT NULL,
     label_id            VARCHAR NOT NULL,
     universe_group_id   VARCHAR,
@@ -163,19 +177,22 @@ CREATE TABLE IF NOT EXISTS factor_eval_results (
 _FEATURE_SETS_DDL = """\
 CREATE TABLE IF NOT EXISTS feature_sets (
     id              VARCHAR PRIMARY KEY,
-    name            VARCHAR UNIQUE NOT NULL,
+    market          VARCHAR NOT NULL DEFAULT 'US',
+    name            VARCHAR NOT NULL,
     description     TEXT,
     factor_refs     JSON NOT NULL,
     preprocessing   JSON NOT NULL,
     status          VARCHAR DEFAULT 'draft',
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(market, name)
 );
 """
 
 _MODELS_DDL = """\
 CREATE TABLE IF NOT EXISTS models (
     id              VARCHAR PRIMARY KEY,
+    market          VARCHAR NOT NULL DEFAULT 'US',
     name            VARCHAR NOT NULL,
     feature_set_id  VARCHAR NOT NULL,
     label_id        VARCHAR NOT NULL,
@@ -192,6 +209,7 @@ CREATE TABLE IF NOT EXISTS models (
 _STRATEGIES_DDL = """\
 CREATE TABLE IF NOT EXISTS strategies (
     id              VARCHAR PRIMARY KEY,
+    market          VARCHAR NOT NULL DEFAULT 'US',
     name            VARCHAR NOT NULL,
     version         INTEGER NOT NULL DEFAULT 1,
     description     TEXT,
@@ -202,13 +220,14 @@ CREATE TABLE IF NOT EXISTS strategies (
     status          VARCHAR DEFAULT 'draft',
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(name, version)
+    UNIQUE(market, name, version)
 );
 """
 
 _BACKTEST_RESULTS_DDL = """\
 CREATE TABLE IF NOT EXISTS backtest_results (
     id              VARCHAR PRIMARY KEY,
+    market          VARCHAR NOT NULL DEFAULT 'US',
     strategy_id     VARCHAR NOT NULL,
     config          JSON NOT NULL,
     summary         JSON NOT NULL,
@@ -226,6 +245,7 @@ CREATE TABLE IF NOT EXISTS backtest_results (
 _SIGNAL_RUNS_DDL = """\
 CREATE TABLE IF NOT EXISTS signal_runs (
     id                  VARCHAR PRIMARY KEY,
+    market              VARCHAR NOT NULL DEFAULT 'US',
     strategy_id         VARCHAR NOT NULL,
     strategy_version    INTEGER,
     target_date         DATE NOT NULL,
@@ -240,17 +260,19 @@ CREATE TABLE IF NOT EXISTS signal_runs (
 _SIGNAL_DETAILS_DDL = """\
 CREATE TABLE IF NOT EXISTS signal_details (
     run_id          VARCHAR NOT NULL,
+    market          VARCHAR NOT NULL DEFAULT 'US',
     ticker          VARCHAR NOT NULL,
     signal          INTEGER,
     target_weight   DOUBLE,
     strength        DOUBLE,
-    PRIMARY KEY (run_id, ticker)
+    PRIMARY KEY (run_id, market, ticker)
 );
 """
 
 _PAPER_SESSIONS_DDL = """\
 CREATE TABLE IF NOT EXISTS paper_trading_sessions (
     id              VARCHAR PRIMARY KEY,
+    market          VARCHAR NOT NULL DEFAULT 'US',
     name            VARCHAR NOT NULL,
     strategy_id     VARCHAR NOT NULL,
     universe_group_id VARCHAR NOT NULL,
@@ -269,22 +291,24 @@ CREATE TABLE IF NOT EXISTS paper_trading_sessions (
 _PAPER_DAILY_DDL = """\
 CREATE TABLE IF NOT EXISTS paper_trading_daily (
     session_id      VARCHAR NOT NULL,
+    market          VARCHAR NOT NULL DEFAULT 'US',
     date            DATE NOT NULL,
     nav             DOUBLE NOT NULL,
     cash            DOUBLE NOT NULL,
     positions_json  JSON,
     trades_json     JSON,
-    PRIMARY KEY (session_id, date)
+    PRIMARY KEY (session_id, market, date)
 );
 """
 
 _PAPER_SIGNAL_CACHE_DDL = """
 CREATE TABLE IF NOT EXISTS paper_trading_signal_cache (
     session_id      VARCHAR NOT NULL,
+    market          VARCHAR NOT NULL DEFAULT 'US',
     signal_date     DATE NOT NULL,
     result_json     JSON NOT NULL,
     created_at      TIMESTAMP DEFAULT current_timestamp,
-    PRIMARY KEY (session_id, signal_date)
+    PRIMARY KEY (session_id, market, signal_date)
 );
 """
 
@@ -351,6 +375,13 @@ def _run_migrations(conn) -> None:
             log.info("db.migration", action="added label_definitions.config column")
     except Exception:
         pass  # Table may not exist yet (handled by DDL above)
+
+    try:
+        report = migrate_market_schema(conn)
+        log.info("db.migration.market_schema", status=report["status"])
+    except Exception as exc:
+        log.error("db.migration.market_schema_failed", error=str(exc))
+        raise
 
 
 def close_db() -> None:
