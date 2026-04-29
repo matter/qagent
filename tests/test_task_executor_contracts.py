@@ -55,6 +55,28 @@ class TaskExecutorContractTests(unittest.TestCase):
 
         self.assertEqual(len(executors), 1)
 
+    def test_cancelled_running_task_is_not_overwritten_by_late_completion(self):
+        store = MemoryOnlyStore()
+        executor = TaskExecutor(store=store, max_workers=1)
+        gate = threading.Event()
+
+        task_id = executor.submit(
+            "slow_test",
+            fn=lambda: gate.wait(timeout=1),
+            params={},
+        )
+
+        try:
+            self.assertTrue(executor.cancel(task_id))
+            gate.set()
+            executor.shutdown(wait=True)
+            record = executor.get_task(task_id)
+        finally:
+            gate.set()
+
+        self.assertEqual(record.status.value, "failed")
+        self.assertEqual(record.error_message, "Cancelled by user")
+
 
 if __name__ == "__main__":
     unittest.main()

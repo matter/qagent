@@ -93,7 +93,7 @@ class TaskExecutor:
 
     def cancel(self, task_id: str) -> bool:
         """Cancel a queued or running task. Returns True if cancelled."""
-        record = self._store.get(task_id)
+        record = self.get_task(task_id)
         if record is None:
             return False
         if record.status not in (TaskStatus.QUEUED, TaskStatus.RUNNING):
@@ -165,6 +165,15 @@ class TaskExecutor:
             if error_message is not None:
                 record.error_message = error_message
 
+    def _is_cancelled(self, task_id: str) -> bool:
+        with self._records_lock:
+            record = self._records.get(task_id)
+            return (
+                record is not None
+                and record.status == TaskStatus.FAILED
+                and record.error_message == "Cancelled by user"
+            )
+
     def _run(
         self,
         task_id: str,
@@ -190,6 +199,9 @@ class TaskExecutor:
 
         try:
             result = inner_future.result(timeout=timeout)
+            if self._is_cancelled(task_id):
+                log.info("task.cancelled_late_result_ignored", task_id=task_id)
+                return
             completed = datetime.utcnow()
             summary = result if isinstance(result, dict) else {"result": result}
             self._update_memory_status(
@@ -227,6 +239,9 @@ class TaskExecutor:
             def _watch_completion(fut: Future, tid: str, store: TaskStore) -> None:
                 try:
                     result = fut.result()  # blocks until inner completes
+                    if self._is_cancelled(tid):
+                        log.info("task.cancelled_late_result_ignored", task_id=tid)
+                        return
                     summary = result if isinstance(result, dict) else {"result": result}
                     self._update_memory_status(
                         tid,
@@ -242,6 +257,9 @@ class TaskExecutor:
                     )
                     log.info("task.late_completed", task_id=tid)
                 except Exception:
+                    if self._is_cancelled(tid):
+                        log.info("task.cancelled_late_error_ignored", task_id=tid)
+                        return
                     tb = traceback.format_exc()
                     self._update_memory_status(
                         tid,
