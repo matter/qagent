@@ -45,6 +45,31 @@ class SignalServiceContractTests(unittest.TestCase):
         self.assertEqual(resolved["date_role"], "execution")
         self.assertEqual(resolved["snapshot_timing"], "pre_trade")
 
+    def test_candidate_pool_miss_returns_fixed_membership_fields(self):
+        svc = SignalService.__new__(SignalService)
+
+        detail = svc._analyze_candidate_pool_miss(
+            ticker="OXY",
+            strategy_diagnostics={
+                "host_pool": ["AAPL"],
+                "attack_pool": ["OXY"],
+                "candidate_pool_pre_filter": ["AAPL", "OXY"],
+                "candidate_pool": ["AAPL"],
+            },
+            model_predictions={},
+            agg_scores={"AAPL": 0.7, "OXY": 0.8},
+            candidate_set={"AAPL"},
+        )
+
+        membership = detail["pool_membership"]
+        self.assertFalse(membership["in_host_pool"])
+        self.assertTrue(membership["in_attack_pool"])
+        self.assertFalse(membership["in_launch_pool"])
+        self.assertFalse(membership["in_keep_extra"])
+        self.assertTrue(membership["in_candidate_union_pre_filter"])
+        self.assertFalse(membership["in_candidate_union_post_filter"])
+        self.assertIn("structured_reason", detail)
+
 
 if __name__ == "__main__":
     unittest.main()

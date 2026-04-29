@@ -1674,30 +1674,53 @@ class SignalService:
             "reasons": [],
             "score_analysis": None,
         }
+        membership = result["pool_membership"]
+        pool_aliases = {
+            "host_pool": "in_host_pool",
+            "attack_pool": "in_attack_pool",
+            "launch_pool": "in_launch_pool",
+            "keep_extra": "in_keep_extra",
+            "candidate_pool_pre_filter": "in_candidate_union_pre_filter",
+            "candidate_union_pre_filter": "in_candidate_union_pre_filter",
+            "candidate_pool": "in_candidate_union_post_filter",
+            "candidate_pool_post_filter": "in_candidate_union_post_filter",
+            "candidate_union_post_filter": "in_candidate_union_post_filter",
+        }
+        for field in (
+            "in_host_pool",
+            "in_attack_pool",
+            "in_launch_pool",
+            "in_keep_extra",
+            "in_candidate_union_pre_filter",
+            "in_candidate_union_post_filter",
+        ):
+            membership[field] = False
 
         # -- 1. Extract pool membership from stage_trace if available --
         stage_trace = strategy_diagnostics.get("stage_trace", [])
-        pool_names = (
-            "host_pool", "attack_pool", "launch_pool", "keep_extra",
-            "candidate_pool", "selected_set",
-        )
         for entry in stage_trace:
             if not isinstance(entry, dict):
                 continue
             stage_name = entry.get("stage", "")
-            if stage_name in pool_names:
+            field_name = pool_aliases.get(stage_name)
+            if field_name:
                 data = entry.get("data")
                 if isinstance(data, (list, set)):
-                    result["pool_membership"][stage_name] = ticker in set(data)
+                    membership[field_name] = ticker in set(data)
                 elif isinstance(data, dict):
-                    result["pool_membership"][stage_name] = ticker in data
+                    membership[field_name] = ticker in data
 
         # -- 2. Fallback: check top-level diagnostics keys --
-        for key in ("host_pool", "attack_pool", "launch_pool", "keep_extra"):
-            if key in strategy_diagnostics and key not in result["pool_membership"]:
+        for key, field_name in pool_aliases.items():
+            if key in strategy_diagnostics:
                 pool_data = strategy_diagnostics[key]
                 if isinstance(pool_data, (list, set)):
-                    result["pool_membership"][key] = ticker in set(pool_data)
+                    membership[field_name] = ticker in set(pool_data)
+                elif isinstance(pool_data, dict):
+                    membership[field_name] = ticker in pool_data
+
+        if ticker in candidate_set:
+            membership["in_candidate_union_post_filter"] = True
 
         # -- 3. Per-model score analysis for this ticker --
         ticker_model_scores: dict[str, dict] = {}
@@ -1754,6 +1777,17 @@ class SignalService:
                 result["reasons"].append(
                     f"in pools: [{', '.join(hit)}] but missed: [{', '.join(missed)}]"
                 )
+            if (
+                pm["in_candidate_union_pre_filter"]
+                and not pm["in_candidate_union_post_filter"]
+            ):
+                result["structured_reason"] = "filtered_after_candidate_union"
+            elif not any(pm.values()):
+                result["structured_reason"] = "not_in_any_candidate_layer"
+            elif not pm["in_candidate_union_pre_filter"]:
+                result["structured_reason"] = "not_in_candidate_union_pre_filter"
+            elif pm["in_candidate_union_post_filter"]:
+                result["structured_reason"] = "in_candidate_union_post_filter"
 
         if result.get("score_analysis"):
             sa = result["score_analysis"]
