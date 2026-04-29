@@ -147,3 +147,27 @@ This file records milestone evidence for the V2.0 A-share and ranking upgrade.
   - Ranking smoke model `dfb45466926f` returned `market="US"`, `task="ranking"`, `objective_type="ranking"`, `test_ndcg@5=0.64652`, `test_rank_ic_mean=0.124884`, and `test_pairwise_accuracy_sampled=0.5245`.
   - `uv run python scripts/e2e_demo.py` passed through old US model training, backtest, and signal generation after ranking support was added.
   - `cd frontend && pnpm build` passed with the existing Vite warnings.
+
+## P5 Full Research Loop Safety
+
+- Task 10 strategy and backtest scope completed:
+  - Strategy records now carry `market`; old strategy CRUD calls default to `US`.
+  - Strategy versioning is scoped by `(market, name)`.
+  - Strategy dependency validation rejects concrete model IDs from another market and rejects factor names that only exist in another market.
+  - Backtest config, persisted result rows, list/detail responses, and result summaries now include `market`.
+  - Backtest price, benchmark, factor-cache, factor-compute, model-prediction, and leakage-check paths now pass the same market through the shared service layer.
+  - Backtest engine price and benchmark queries filter by `market` and use parameterized ticker lists.
+  - CN backtests with US-style benchmarks such as `SPY` are rejected before a background task is queued.
+  - Frontend strategy/backtest API types accept optional `market` while preserving current US defaults.
+- Task 10 verification:
+  - `uv run python -m unittest tests.test_strategy_backtest_market_scope` passed: `7` tests.
+  - `uv run python -m unittest discover tests` passed: `66` tests.
+  - `uv run python -m py_compile backend/services/strategy_service.py backend/services/backtest_service.py backend/services/backtest_engine.py backend/api/strategies.py` passed.
+  - API smoke with backend on `127.0.0.1:8000`:
+    - `GET /api/strategies` returned HTTP `200` through the old no-market US path.
+    - Temporary CN strategy and CN group creation returned `market="CN"`.
+    - `POST /api/strategies/{cn_strategy_id}/backtest` with `market="CN"` and `benchmark="SPY"` returned HTTP `400` with a benchmark-market validation message.
+    - Temporary CN smoke assets were deleted after the check.
+  - Old system regression:
+    - `uv run python scripts/e2e_demo.py` passed through US factor evaluation, feature set reuse, model training, strategy backtest, and signal generation.
+    - `cd frontend && pnpm build` passed. Vite reported the existing large-chunk and dynamic-import warnings.

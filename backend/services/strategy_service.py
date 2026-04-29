@@ -10,6 +10,7 @@ from datetime import datetime
 
 from backend.db import get_connection
 from backend.logger import get_logger
+from backend.services.market_context import normalize_market
 from backend.strategies.loader import load_strategy_from_code
 
 log = get_logger(__name__)
@@ -28,12 +29,15 @@ class StrategyService:
         source_code: str,
         description: str | None = None,
         position_sizing: str = "equal_weight",
+        market: str | None = None,
     ) -> dict:
         """Create a new strategy (auto-versioned).
 
         If a strategy with the same *name* already exists the version is
         incremented automatically.
         """
+        resolved_market = normalize_market(market)
+
         # Validate source code is loadable
         try:
             instance = load_strategy_from_code(source_code)
@@ -42,9 +46,10 @@ class StrategyService:
 
         conn = get_connection()
 
-        # Auto-version: find max version for this name
+        # Auto-version: find max version for this market/name pair
         row = conn.execute(
-            "SELECT MAX(version) FROM strategies WHERE name = ?", [name]
+            "SELECT MAX(version) FROM strategies WHERE market = ? AND name = ?",
+            [resolved_market, name],
         ).fetchone()
         version = 1
         if row and row[0] is not None:
@@ -59,6 +64,7 @@ class StrategyService:
             instance.required_models(),
             self._extract_model_references(source_code),
         )
+        self._validate_dependencies(required_factors, required_models, resolved_market)
 
         # Static validation: check source code model references vs declaration
         model_warnings = self._validate_model_references(source_code, required_models)
@@ -72,12 +78,13 @@ class StrategyService:
 
         conn.execute(
             """INSERT INTO strategies
-               (id, name, version, description, source_code,
+               (id, market, name, version, description, source_code,
                 required_factors, required_models, position_sizing,
                 status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)""",
             [
                 strategy_id,
+                resolved_market,
                 name,
                 version,
                 description or getattr(instance, "description", ""),
@@ -92,10 +99,11 @@ class StrategyService:
         log.info(
             "strategy.created",
             id=strategy_id,
+            market=resolved_market,
             name=name,
             version=version,
         )
-        result = self.get_strategy(strategy_id)
+        result = self.get_strategy(strategy_id, market=resolved_market)
         if model_warnings:
             result["model_ref_warnings"] = model_warnings
         if weight_warnings:
@@ -109,10 +117,12 @@ class StrategyService:
         description: str | None = None,
         position_sizing: str | None = None,
         status: str | None = None,
+        market: str | None = None,
     ) -> dict:
         """Update a strategy -- if source_code changes, create a new version."""
         conn = get_connection()
-        existing = self._fetch_row(strategy_id)
+        resolved_market = normalize_market(market)
+        existing = self._fetch_row(strategy_id, market=resolved_market)
         if existing is None:
             raise ValueError(f"Strategy {strategy_id} not found")
 
@@ -125,8 +135,8 @@ class StrategyService:
 
             # Create a new version
             max_ver = conn.execute(
-                "SELECT MAX(version) FROM strategies WHERE name = ?",
-                [existing["name"]],
+                "SELECT MAX(version) FROM strategies WHERE market = ? AND name = ?",
+                [existing["market"], existing["name"]],
             ).fetchone()
             new_version = (max_ver[0] or 0) + 1
             new_id = uuid.uuid4().hex[:12]
@@ -137,6 +147,7 @@ class StrategyService:
                 instance.required_models(),
                 self._extract_model_references(source_code),
             )
+            self._validate_dependencies(required_factors, required_models, existing["market"])
 
             # Static validation: check source code model references vs declaration
             model_warnings = self._validate_model_references(source_code, required_models)
@@ -151,12 +162,13 @@ class StrategyService:
 
             conn.execute(
                 """INSERT INTO strategies
-                   (id, name, version, description, source_code,
+                   (id, market, name, version, description, source_code,
                     required_factors, required_models, position_sizing,
                     status, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     new_id,
+                    existing["market"],
                     existing["name"],
                     new_version,
                     description or existing["description"],
@@ -172,10 +184,11 @@ class StrategyService:
             log.info(
                 "strategy.new_version",
                 id=new_id,
+                market=existing["market"],
                 name=existing["name"],
                 version=new_version,
             )
-            result = self.get_strategy(new_id)
+            result = self.get_strategy(new_id, market=existing["market"])
             if model_warnings:
                 result["model_ref_warnings"] = model_warnings
             if weight_warnings:
@@ -197,38 +210,47 @@ class StrategyService:
                 vals.append(val)
 
         vals.append(strategy_id)
+        vals.append(existing["market"])
         conn.execute(
-            f"UPDATE strategies SET {', '.join(sets)} WHERE id = ?", vals
+            f"UPDATE strategies SET {', '.join(sets)} WHERE id = ? AND market = ?",
+            vals,
         )
-        log.info("strategy.updated", id=strategy_id)
-        return self.get_strategy(strategy_id)
+        log.info("strategy.updated", id=strategy_id, market=existing["market"])
+        return self.get_strategy(strategy_id, market=existing["market"])
 
-    def delete_strategy(self, strategy_id: str) -> None:
+    def delete_strategy(self, strategy_id: str, market: str | None = None) -> None:
         """Delete a strategy definition."""
         conn = get_connection()
-        existing = self._fetch_row(strategy_id)
+        resolved_market = normalize_market(market)
+        existing = self._fetch_row(strategy_id, market=resolved_market)
         if existing is None:
             raise ValueError(f"Strategy {strategy_id} not found")
 
-        conn.execute("DELETE FROM strategies WHERE id = ?", [strategy_id])
-        log.info("strategy.deleted", id=strategy_id)
+        conn.execute(
+            "DELETE FROM strategies WHERE id = ? AND market = ?",
+            [strategy_id, existing["market"]],
+        )
+        log.info("strategy.deleted", id=strategy_id, market=existing["market"])
 
-    def get_strategy(self, strategy_id: str) -> dict:
+    def get_strategy(self, strategy_id: str, market: str | None = None) -> dict:
         """Return a single strategy definition."""
-        row = self._fetch_row(strategy_id)
+        row = self._fetch_row(strategy_id, market=market)
         if row is None:
             raise ValueError(f"Strategy {strategy_id} not found")
         return row
 
-    def list_strategies(self) -> list[dict]:
+    def list_strategies(self, market: str | None = None) -> list[dict]:
         """List all strategies."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         rows = conn.execute(
-            """SELECT id, name, version, description, source_code,
+            """SELECT id, market, name, version, description, source_code,
                       required_factors, required_models, position_sizing,
                       status, created_at, updated_at
                FROM strategies
-               ORDER BY name, version DESC"""
+               WHERE market = ?
+               ORDER BY name, version DESC""",
+            [resolved_market],
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
@@ -253,6 +275,51 @@ class StrategyService:
             strategy_def.get("required_models", []),
             StrategyService._extract_model_references(strategy_def.get("source_code", "")),
         )
+
+    @staticmethod
+    def _validate_dependencies(
+        required_factors: list[str] | None,
+        required_models: list[str] | None,
+        market: str,
+    ) -> None:
+        """Reject dependencies that clearly belong to another market.
+
+        Factor dependencies are declared by name.  Missing names are allowed so
+        users can register a strategy before creating every factor, but an
+        existing same-name factor in another market without a matching market
+        factor is rejected.  Model dependencies are concrete IDs and must exist
+        in the strategy market.
+        """
+        conn = get_connection()
+        resolved_market = normalize_market(market)
+
+        for factor_name in required_factors or []:
+            rows = conn.execute(
+                "SELECT DISTINCT market FROM factors WHERE name = ?",
+                [factor_name],
+            ).fetchall()
+            markets = sorted(str(r[0]) for r in rows if r[0])
+            if markets and resolved_market not in markets:
+                raise ValueError(
+                    f"Strategy factor dependency '{factor_name}' is not available "
+                    f"in market {resolved_market}; found markets={markets}"
+                )
+
+        for model_id in required_models or []:
+            rows = conn.execute(
+                "SELECT market FROM models WHERE id = ?",
+                [model_id],
+            ).fetchall()
+            markets = sorted(str(r[0]) for r in rows if r[0])
+            if not markets:
+                raise ValueError(
+                    f"Strategy model dependency '{model_id}' not found in market {resolved_market}"
+                )
+            if resolved_market not in markets:
+                raise ValueError(
+                    f"Strategy model dependency '{model_id}' belongs to market "
+                    f"{markets[0]}, not market {resolved_market}"
+                )
 
     @staticmethod
     def _extract_model_references(source_code: str) -> set[str]:
@@ -432,14 +499,15 @@ class StrategyService:
             f"如需权重生效，请将 position_sizing 改为 'signal_weight' 或 'max_position'。"
         ]
 
-    def _fetch_row(self, strategy_id: str) -> dict | None:
+    def _fetch_row(self, strategy_id: str, market: str | None = None) -> dict | None:
+        resolved_market = normalize_market(market)
         conn = get_connection()
         row = conn.execute(
-            """SELECT id, name, version, description, source_code,
+            """SELECT id, market, name, version, description, source_code,
                       required_factors, required_models, position_sizing,
                       status, created_at, updated_at
-               FROM strategies WHERE id = ?""",
-            [strategy_id],
+               FROM strategies WHERE id = ? AND market = ?""",
+            [strategy_id, resolved_market],
         ).fetchone()
         if row is None:
             return None
@@ -457,14 +525,15 @@ class StrategyService:
 
         return {
             "id": row[0],
-            "name": row[1],
-            "version": row[2],
-            "description": row[3],
-            "source_code": row[4],
-            "required_factors": _parse_json(row[5]),
-            "required_models": _parse_json(row[6]),
-            "position_sizing": row[7],
-            "status": row[8],
-            "created_at": str(row[9]) if row[9] else None,
-            "updated_at": str(row[10]) if row[10] else None,
+            "market": row[1],
+            "name": row[2],
+            "version": row[3],
+            "description": row[4],
+            "source_code": row[5],
+            "required_factors": _parse_json(row[6]),
+            "required_models": _parse_json(row[7]),
+            "position_sizing": row[8],
+            "status": row[9],
+            "created_at": str(row[10]) if row[10] else None,
+            "updated_at": str(row[11]) if row[11] else None,
         }

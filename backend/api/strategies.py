@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from backend.logger import get_logger
 from backend.services.backtest_service import BacktestService
+from backend.services.market_context import get_default_benchmark, normalize_market
 from backend.services.strategy_service import StrategyService
 from backend.strategies.builtins import get_template_names, get_template_source
 from backend.tasks.executor import TaskExecutor, get_task_executor
@@ -46,6 +47,7 @@ def _get_executor() -> TaskExecutor:
 
 
 class CreateStrategyRequest(BaseModel):
+    market: Optional[str] = None
     name: str
     source_code: str
     description: Optional[str] = None
@@ -53,6 +55,7 @@ class CreateStrategyRequest(BaseModel):
 
 
 class UpdateStrategyRequest(BaseModel):
+    market: Optional[str] = None
     source_code: Optional[str] = None
     description: Optional[str] = None
     position_sizing: Optional[str] = None
@@ -60,11 +63,13 @@ class UpdateStrategyRequest(BaseModel):
 
 
 class RunBacktestRequest(BaseModel):
+    market: Optional[str] = None
     config: dict = {}
     universe_group_id: str
 
 
 class CompareBacktestsRequest(BaseModel):
+    market: Optional[str] = None
     backtest_ids: list[str]
 
 
@@ -83,16 +88,20 @@ async def create_strategy(body: CreateStrategyRequest) -> dict:
             source_code=body.source_code,
             description=body.description,
             position_sizing=body.position_sizing,
+            market=body.market,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/strategies")
-async def list_strategies() -> list[dict]:
+async def list_strategies(market: Optional[str] = Query(None)) -> list[dict]:
     """List all strategies."""
     svc = _get_strategy_service()
-    return svc.list_strategies()
+    try:
+        return svc.list_strategies(market=market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/strategies/templates")
@@ -116,39 +125,56 @@ async def get_template(template_name: str) -> dict:
 
 
 @router.get("/strategies/backtests")
-async def list_all_backtests(strategy_id: Optional[str] = None) -> list[dict]:
+async def list_all_backtests(
+    strategy_id: Optional[str] = None,
+    market: Optional[str] = Query(None),
+) -> list[dict]:
     """List all backtest results, optionally filtered by strategy_id."""
     svc = _get_backtest_service()
-    return svc.list_backtests(strategy_id=strategy_id)
+    try:
+        return svc.list_backtests(strategy_id=strategy_id, market=market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/strategies/backtests/{backtest_id}")
-async def get_backtest(backtest_id: str) -> dict:
+async def get_backtest(
+    backtest_id: str,
+    market: Optional[str] = Query(None),
+) -> dict:
     """Get full backtest result."""
     svc = _get_backtest_service()
     try:
-        return svc.get_backtest(backtest_id)
+        return svc.get_backtest(backtest_id, market=market)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.delete("/strategies/backtests/{backtest_id}")
-async def delete_backtest(backtest_id: str) -> dict:
+async def delete_backtest(
+    backtest_id: str,
+    market: Optional[str] = Query(None),
+) -> dict:
     """Delete a backtest result."""
     svc = _get_backtest_service()
     try:
-        svc.delete_backtest(backtest_id)
-        return {"status": "deleted", "id": backtest_id}
+        resolved_market = normalize_market(market)
+        svc.delete_backtest(backtest_id, market=resolved_market)
+        return {"status": "deleted", "id": backtest_id, "market": resolved_market}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/strategies/backtests/{backtest_id}/stock/{ticker}")
-async def get_backtest_stock_chart(backtest_id: str, ticker: str) -> dict:
+async def get_backtest_stock_chart(
+    backtest_id: str,
+    ticker: str,
+    market: Optional[str] = Query(None),
+) -> dict:
     """Get daily bars and trade markers for a single stock within a backtest."""
     svc = _get_backtest_service()
     try:
-        return svc.get_stock_chart_data(backtest_id, ticker)
+        return svc.get_stock_chart_data(backtest_id, ticker, market=market)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -158,17 +184,20 @@ async def compare_backtests(body: CompareBacktestsRequest) -> dict:
     """Compare multiple backtest results."""
     svc = _get_backtest_service()
     try:
-        return svc.compare_strategies(body.backtest_ids)
+        return svc.compare_strategies(body.backtest_ids, market=body.market)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/strategies/{strategy_id}")
-async def get_strategy(strategy_id: str) -> dict:
+async def get_strategy(
+    strategy_id: str,
+    market: Optional[str] = Query(None),
+) -> dict:
     """Get strategy definition detail including source code."""
     svc = _get_strategy_service()
     try:
-        return svc.get_strategy(strategy_id)
+        return svc.get_strategy(strategy_id, market=market)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -184,18 +213,23 @@ async def update_strategy(strategy_id: str, body: UpdateStrategyRequest) -> dict
             description=body.description,
             position_sizing=body.position_sizing,
             status=body.status,
+            market=body.market,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.delete("/strategies/{strategy_id}")
-async def delete_strategy(strategy_id: str) -> dict:
+async def delete_strategy(
+    strategy_id: str,
+    market: Optional[str] = Query(None),
+) -> dict:
     """Delete a strategy definition."""
     svc = _get_strategy_service()
     try:
-        svc.delete_strategy(strategy_id)
-        return {"status": "deleted", "id": strategy_id}
+        resolved_market = normalize_market(market)
+        svc.delete_strategy(strategy_id, market=resolved_market)
+        return {"status": "deleted", "id": strategy_id, "market": resolved_market}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -211,30 +245,45 @@ async def run_backtest(strategy_id: str, body: RunBacktestRequest) -> dict:
 
     Returns a task_id to poll for progress.
     """
+    try:
+        resolved_market = normalize_market(body.market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     # Validate strategy exists
     svc = _get_strategy_service()
     try:
-        svc.get_strategy(strategy_id)
+        svc.get_strategy(strategy_id, market=resolved_market)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
     bt_svc = _get_backtest_service()
+    try:
+        benchmark = body.config.get("benchmark") or get_default_benchmark(resolved_market)
+        BacktestService._validate_benchmark_market(benchmark, resolved_market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     executor = _get_executor()
 
     def _do_backtest(
         strategy_id: str,
         config: dict,
         universe_group_id: str,
+        market: str,
     ) -> dict:
         full = bt_svc.run_backtest(
             strategy_id=strategy_id,
             config_dict=config,
             universe_group_id=universe_group_id,
+            market=market,
         )
         # Return compact summary for task store; full result is persisted in
         # backtest_results table and retrievable via GET /backtests/{id}.
         summary = {
             "backtest_id": full.get("backtest_id"),
+            "id": full.get("backtest_id"),
+            "market": full.get("market"),
             "strategy_id": full.get("strategy_id"),
             "strategy_name": full.get("strategy_name"),
             "result_level": full.get("result_level"),
@@ -254,6 +303,7 @@ async def run_backtest(strategy_id: str, body: RunBacktestRequest) -> dict:
         fn=_do_backtest,
         params={
             "strategy_id": strategy_id,
+            "market": resolved_market,
             "config": body.config,
             "universe_group_id": body.universe_group_id,
         },
@@ -265,5 +315,11 @@ async def run_backtest(strategy_id: str, body: RunBacktestRequest) -> dict:
         "api.strategy.backtest_triggered",
         task_id=task_id,
         strategy_id=strategy_id,
+        market=resolved_market,
     )
-    return {"task_id": task_id, "status": "queued", "strategy_id": strategy_id}
+    return {
+        "task_id": task_id,
+        "status": "queued",
+        "strategy_id": strategy_id,
+        "market": resolved_market,
+    }

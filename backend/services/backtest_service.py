@@ -18,6 +18,12 @@ from backend.logger import get_logger
 from backend.services.backtest_engine import BacktestConfig, BacktestEngine, BacktestResult
 from backend.services.factor_engine import FactorEngine
 from backend.services.group_service import GroupService
+from backend.services.market_context import (
+    get_default_benchmark,
+    infer_ticker_market,
+    normalize_market,
+    normalize_ticker,
+)
 from backend.services.model_service import ModelService
 from backend.services.strategy_service import StrategyService
 from backend.strategies.base import StrategyContext
@@ -45,6 +51,7 @@ class BacktestService:
         strategy_id: str,
         config_dict: dict,
         universe_group_id: str,
+        market: str | None = None,
     ) -> dict:
         """Full backtest pipeline orchestrator.
 
@@ -62,27 +69,42 @@ class BacktestService:
         9.  Save to backtest_results table.
         10. Return result dict.
         """
+        resolved_market = normalize_market(market)
+
         # ---- 1. Load strategy ----
-        strategy_def = self._strategy_service.get_strategy(strategy_id)
+        strategy_def = self._strategy_service.get_strategy(strategy_id, market=resolved_market)
         strategy_instance = load_strategy_from_code(strategy_def["source_code"])
+        required_models = StrategyService.resolve_required_models(strategy_def)
+        StrategyService._validate_dependencies(
+            strategy_def.get("required_factors", []),
+            required_models,
+            resolved_market,
+        )
 
         log.info(
             "backtest_service.start",
+            market=resolved_market,
             strategy=strategy_def["name"],
             version=strategy_def["version"],
         )
 
         # ---- 2. Resolve universe tickers ----
-        tickers = self._group_service.get_group_tickers(universe_group_id)
+        tickers = self._group_service.get_group_tickers(
+            universe_group_id, market=resolved_market
+        )
         if not tickers:
             raise ValueError(f"Universe group '{universe_group_id}' has no members")
+        tickers = [normalize_ticker(t, resolved_market) for t in tickers]
 
         # ---- 3. Build config ----
+        benchmark = config_dict.get("benchmark") or get_default_benchmark(resolved_market)
+        self._validate_benchmark_market(benchmark, resolved_market)
         bt_config = BacktestConfig(
             initial_capital=config_dict.get("initial_capital", 1_000_000),
             start_date=config_dict.get("start_date", "2020-01-01"),
             end_date=config_dict.get("end_date", "2024-12-31"),
-            benchmark=config_dict.get("benchmark", "SPY"),
+            market=resolved_market,
+            benchmark=benchmark,
             commission_rate=config_dict.get("commission_rate", 0.001),
             slippage_rate=config_dict.get("slippage_rate", 0.001),
             max_positions=config_dict.get("max_positions", 50),
@@ -107,7 +129,9 @@ class BacktestService:
 
         # ---- 4. Load OHLCV price data ----
         prices_close, prices_open, prices_high, prices_low, prices_volume = (
-            self._backtest_engine._load_prices(tickers, start_str, end_str)
+            self._backtest_engine._load_prices(
+                tickers, start_str, end_str, market=resolved_market
+            )
         )
         if prices_close.empty:
             raise ValueError("No price data available for the given tickers and date range")
@@ -117,10 +141,12 @@ class BacktestService:
         factor_data: dict[str, pd.DataFrame] = {}
 
         if required_factors:
-            factor_id_map = self._resolve_factor_ids(required_factors)
+            factor_id_map = self._resolve_factor_ids(
+                required_factors, market=resolved_market
+            )
             all_factor_ids = list(factor_id_map.values())
             cached_by_id = self._factor_engine.load_cached_factors_bulk(
-                all_factor_ids, tickers, start_str, end_str
+                all_factor_ids, tickers, start_str, end_str, market=resolved_market
             )
             for factor_name, factor_id in factor_id_map.items():
                 if factor_id in cached_by_id and not cached_by_id[factor_id].empty:
@@ -128,7 +154,7 @@ class BacktestService:
                 else:
                     try:
                         df = self._factor_engine.compute_factor(
-                            factor_id, tickers, start_str, end_str
+                            factor_id, tickers, start_str, end_str, market=resolved_market
                         )
                         if not df.empty:
                             factor_data[factor_name] = df
@@ -140,7 +166,6 @@ class BacktestService:
                         )
 
         # ---- 6. Build signals for each trading day ----
-        required_models = StrategyService.resolve_required_models(strategy_def)
         all_trading_days = sorted(prices_close.index)
         rebalance_dates = self._backtest_engine._get_rebalance_dates(
             all_trading_days, bt_config.rebalance_freq
@@ -163,6 +188,7 @@ class BacktestService:
             model_preds_by_date = self._batch_predict_all_dates(
                 required_models, tickers, start_str, end_str,
                 [d for d in all_trading_days if d in rebalance_dates_set],
+                market=resolved_market,
             )
 
         # -- Runtime check: warn if required models produced no predictions --
@@ -350,10 +376,13 @@ class BacktestService:
 
         # ---- 9. Save to backtest_results table ----
         bt_id = uuid.uuid4().hex[:12]
+        config_to_save = bt_config.to_dict()
+        config_to_save["universe_group_id"] = universe_group_id
         self._save_result(
             bt_id=bt_id,
+            market=resolved_market,
             strategy_id=strategy_id,
-            config=bt_config.to_dict(),
+            config=config_to_save,
             result=result,
             result_level=result_level,
         )
@@ -361,6 +390,7 @@ class BacktestService:
         # ---- 10. Return result ----
         result_dict = result.to_dict()
         result_dict["backtest_id"] = bt_id
+        result_dict["market"] = resolved_market
         result_dict["strategy_id"] = strategy_id
         result_dict["strategy_name"] = strategy_def["name"]
         result_dict["result_level"] = result_level
@@ -373,33 +403,35 @@ class BacktestService:
             # Persist diagnostics into stored summary
             conn = get_connection()
             row = conn.execute(
-                "SELECT summary FROM backtest_results WHERE id = ?", [bt_id]
+                "SELECT summary FROM backtest_results WHERE id = ? AND market = ?",
+                [bt_id, resolved_market],
             ).fetchone()
             if row:
                 summary_data = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
                 summary_data["rebalance_diagnostics"] = rebalance_diagnostics
                 conn.execute(
-                    "UPDATE backtest_results SET summary = ? WHERE id = ?",
-                    [json.dumps(summary_data, default=str), bt_id],
+                    "UPDATE backtest_results SET summary = ? WHERE id = ? AND market = ?",
+                    [json.dumps(summary_data, default=str), bt_id, resolved_market],
                 )
 
         # ---- 11. Check for data leakage ----
         leakage_warnings = self._check_data_leakage(
-            required_models, bt_config, tickers, universe_group_id,
+            required_models, bt_config, tickers, universe_group_id, market=resolved_market,
         )
         if leakage_warnings:
             result_dict["leakage_warnings"] = leakage_warnings
             # Persist warnings into the stored summary
             conn = get_connection()
             row = conn.execute(
-                "SELECT summary FROM backtest_results WHERE id = ?", [bt_id]
+                "SELECT summary FROM backtest_results WHERE id = ? AND market = ?",
+                [bt_id, resolved_market],
             ).fetchone()
             if row:
                 summary_data = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
                 summary_data["leakage_warnings"] = leakage_warnings
                 conn.execute(
-                    "UPDATE backtest_results SET summary = ? WHERE id = ?",
-                    [json.dumps(summary_data, default=str), bt_id],
+                    "UPDATE backtest_results SET summary = ? WHERE id = ? AND market = ?",
+                    [json.dumps(summary_data, default=str), bt_id, resolved_market],
                 )
             log.warning(
                 "backtest_service.leakage_detected",
@@ -419,94 +451,115 @@ class BacktestService:
     # CRUD for backtest results
     # ------------------------------------------------------------------
 
-    def list_backtests(self, strategy_id: str | None = None) -> list[dict]:
+    def list_backtests(
+        self,
+        strategy_id: str | None = None,
+        market: str | None = None,
+    ) -> list[dict]:
         """List backtest results (summary only, no heavy series)."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         if strategy_id:
             rows = conn.execute(
-                """SELECT id, strategy_id, config, summary, trade_count,
+                """SELECT id, market, strategy_id, config, summary, trade_count,
                           result_level, created_at
                    FROM backtest_results
-                   WHERE strategy_id = ?
+                   WHERE market = ? AND strategy_id = ?
                    ORDER BY created_at DESC""",
-                [strategy_id],
+                [resolved_market, strategy_id],
             ).fetchall()
         else:
             rows = conn.execute(
-                """SELECT id, strategy_id, config, summary, trade_count,
+                """SELECT id, market, strategy_id, config, summary, trade_count,
                           result_level, created_at
                    FROM backtest_results
-                   ORDER BY created_at DESC"""
+                   WHERE market = ?
+                   ORDER BY created_at DESC""",
+                [resolved_market],
             ).fetchall()
 
         results = []
         for r in rows:
             results.append({
                 "id": r[0],
-                "strategy_id": r[1],
-                "config": _parse_json(r[2]),
-                "summary": self._list_summary(_parse_json(r[3])),
-                "trade_count": r[4],
-                "result_level": r[5],
-                "created_at": str(r[6]) if r[6] else None,
+                "market": r[1],
+                "strategy_id": r[2],
+                "config": _parse_json(r[3]),
+                "summary": self._list_summary(_parse_json(r[4])),
+                "trade_count": r[5],
+                "result_level": r[6],
+                "created_at": str(r[7]) if r[7] else None,
             })
         return results
 
-    def get_backtest(self, backtest_id: str) -> dict:
+    def get_backtest(self, backtest_id: str, market: str | None = None) -> dict:
         """Return full backtest result including all series data."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         row = conn.execute(
-            """SELECT id, strategy_id, config, summary,
+            """SELECT id, market, strategy_id, config, summary,
                       nav_series, benchmark_nav, drawdown_series,
                       monthly_returns, trade_count, result_level, created_at,
                       trades
                FROM backtest_results
-               WHERE id = ?""",
-            [backtest_id],
+               WHERE id = ? AND market = ?""",
+            [backtest_id, resolved_market],
         ).fetchone()
 
         if row is None:
             raise ValueError(f"Backtest {backtest_id} not found")
 
-        trades = _parse_json(row[11]) if row[11] else []
+        trades = _parse_json(row[12]) if row[12] else []
 
         return {
             "id": row[0],
-            "strategy_id": row[1],
-            "config": _parse_json(row[2]),
-            "summary": _parse_json(row[3]),
-            "nav_series": _parse_json(row[4]),
-            "benchmark_nav": _parse_json(row[5]),
-            "drawdown_series": _parse_json(row[6]),
-            "monthly_returns": _parse_json(row[7]),
-            "trade_count": row[8],
-            "result_level": row[9],
-            "created_at": str(row[10]) if row[10] else None,
+            "market": row[1],
+            "strategy_id": row[2],
+            "config": _parse_json(row[3]),
+            "summary": _parse_json(row[4]),
+            "nav_series": _parse_json(row[5]),
+            "benchmark_nav": _parse_json(row[6]),
+            "drawdown_series": _parse_json(row[7]),
+            "monthly_returns": _parse_json(row[8]),
+            "trade_count": row[9],
+            "result_level": row[10],
+            "created_at": str(row[11]) if row[11] else None,
             "trades": trades,
             "stock_pnl": _compute_stock_pnl(trades if isinstance(trades, list) else []),
         }
 
-    def delete_backtest(self, backtest_id: str) -> None:
+    def delete_backtest(self, backtest_id: str, market: str | None = None) -> None:
         """Delete a backtest result."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         row = conn.execute(
-            "SELECT id FROM backtest_results WHERE id = ?", [backtest_id]
+            "SELECT id FROM backtest_results WHERE id = ? AND market = ?",
+            [backtest_id, resolved_market],
         ).fetchone()
         if row is None:
             raise ValueError(f"Backtest {backtest_id} not found")
 
-        conn.execute("DELETE FROM backtest_results WHERE id = ?", [backtest_id])
-        log.info("backtest_service.deleted", backtest_id=backtest_id)
+        conn.execute(
+            "DELETE FROM backtest_results WHERE id = ? AND market = ?",
+            [backtest_id, resolved_market],
+        )
+        log.info("backtest_service.deleted", backtest_id=backtest_id, market=resolved_market)
 
-    def get_stock_chart_data(self, backtest_id: str, ticker: str) -> dict:
+    def get_stock_chart_data(
+        self,
+        backtest_id: str,
+        ticker: str,
+        market: str | None = None,
+    ) -> dict:
         """Return daily bars and trade markers for a single stock within a backtest.
 
         Used to render a K-line chart with buy/sell markers.
         """
         conn = get_connection()
+        resolved_market = normalize_market(market)
         row = conn.execute(
-            "SELECT config, trades FROM backtest_results WHERE id = ?",
-            [backtest_id],
+            "SELECT config, trades, market FROM backtest_results WHERE id = ? AND market = ?",
+            [backtest_id, resolved_market],
         ).fetchone()
 
         if row is None:
@@ -514,6 +567,8 @@ class BacktestService:
 
         config = _parse_json(row[0])
         all_trades = _parse_json(row[1]) if row[1] else []
+        resolved_market = row[2]
+        normalized_ticker = normalize_ticker(ticker, resolved_market)
 
         start_date = config.get("start_date", "2020-01-01")
         end_date = config.get("end_date", "2024-12-31")
@@ -522,9 +577,11 @@ class BacktestService:
         bars = conn.execute(
             """SELECT date, open, high, low, close, volume
                FROM daily_bars
-               WHERE ticker = ? AND date >= ? AND date <= ?
+               WHERE market = ?
+                 AND ticker = ?
+                 AND date >= ? AND date <= ?
                ORDER BY date""",
-            [ticker, start_date, end_date],
+            [resolved_market, normalized_ticker, start_date, end_date],
         ).fetchall()
 
         daily_bars = [
@@ -549,16 +606,21 @@ class BacktestService:
                 "cost": t.get("cost", 0),
             }
             for t in all_trades
-            if isinstance(t, dict) and t.get("ticker") == ticker
+            if isinstance(t, dict) and t.get("ticker") == normalized_ticker
         ]
 
         return {
-            "ticker": ticker,
+            "market": resolved_market,
+            "ticker": normalized_ticker,
             "daily_bars": daily_bars,
             "trades": ticker_trades,
         }
 
-    def compare_strategies(self, backtest_ids: list[str]) -> dict:
+    def compare_strategies(
+        self,
+        backtest_ids: list[str],
+        market: str | None = None,
+    ) -> dict:
         """Compare multiple backtest results.
 
         Returns aligned NAV curves and a metric comparison table.
@@ -568,7 +630,7 @@ class BacktestService:
 
         results = []
         for bt_id in backtest_ids:
-            results.append(self.get_backtest(bt_id))
+            results.append(self.get_backtest(bt_id, market=market))
 
         # Build comparison metrics
         metrics_table = []
@@ -769,6 +831,7 @@ class BacktestService:
         start_date: str,
         end_date: str,
         rebalance_days: list,
+        market: str | None = None,
     ) -> dict[str, dict[str, pd.Series]]:
         """Pre-compute model predictions for ALL rebalance dates at once.
 
@@ -785,18 +848,21 @@ class BacktestService:
         """
         from backend.services.model_service import ModelService
 
+        resolved_market = normalize_market(market)
         result: dict[str, dict[str, pd.Series]] = {}
         failed_models: list[tuple[str, str]] = []
 
         for model_id in model_ids:
             try:
-                record = self._model_service.get_model(model_id)
-                model_instance = self._model_service.load_model(model_id)
+                record = self._model_service.get_model(model_id, market=resolved_market)
+                model_instance = self._model_service.load_model(
+                    model_id, market=resolved_market
+                )
                 fs_id = record["feature_set_id"]
 
                 # Compute features for full date range (use bulk cache path)
                 feature_data = self._model_service._feature_service.compute_features_from_cache(
-                    fs_id, tickers, start_date, end_date
+                    fs_id, tickers, start_date, end_date, market=resolved_market
                 )
 
                 # Build full X matrix: (date, ticker) x factors
@@ -889,17 +955,23 @@ class BacktestService:
         X = X.dropna()
         return X
 
-    def _resolve_factor_ids(self, factor_names: list[str]) -> dict[str, str]:
+    def _resolve_factor_ids(
+        self,
+        factor_names: list[str],
+        market: str | None = None,
+    ) -> dict[str, str]:
         """Resolve factor names to factor IDs (latest version) in a single query."""
         if not factor_names:
             return {}
+        resolved_market = normalize_market(market)
         conn = get_connection()
         placeholders = ",".join("?" for _ in factor_names)
         rows = conn.execute(
             f"""SELECT name, id, version FROM factors
-                WHERE name IN ({placeholders})
+                WHERE market = ?
+                  AND name IN ({placeholders})
                 ORDER BY version DESC""",
-            factor_names,
+            [resolved_market, *factor_names],
         ).fetchall()
         result: dict[str, str] = {}
         for name, fid, _version in rows:
@@ -907,8 +979,28 @@ class BacktestService:
                 result[name] = fid
         for name in factor_names:
             if name not in result:
-                log.warning("backtest_service.factor_not_found", name=name)
+                log.warning(
+                    "backtest_service.factor_not_found",
+                    name=name,
+                    market=resolved_market,
+                )
         return result
+
+    @staticmethod
+    def _validate_benchmark_market(symbol: str, market: str) -> None:
+        """Reject unambiguous benchmark/market mismatches."""
+        resolved_market = normalize_market(market)
+        inferred = infer_ticker_market(symbol)
+        if resolved_market == "CN" and inferred != "CN":
+            raise ValueError(
+                f"benchmark '{symbol}' is not a CN benchmark. "
+                "Use a BaoStock-style symbol such as sh.000300 for market CN."
+            )
+        if inferred is not None and inferred != resolved_market:
+            raise ValueError(
+                f"benchmark '{symbol}' belongs to market {inferred}, "
+                f"not market {resolved_market}"
+            )
 
     @staticmethod
     def _build_prices_multi(
@@ -949,6 +1041,7 @@ class BacktestService:
         bt_config: BacktestConfig,
         backtest_tickers: list[str],
         backtest_group_id: str,
+        market: str | None = None,
     ) -> list[dict]:
         """Detect overlap between model training data and backtest window.
 
@@ -964,13 +1057,14 @@ class BacktestService:
             return []
 
         warnings: list[dict] = []
+        resolved_market = normalize_market(market)
         bt_start = bt_config.start_date
         bt_end = bt_config.end_date
         backtest_ticker_set = set(backtest_tickers)
 
         for model_id in model_ids:
             try:
-                record = self._model_service.get_model(model_id)
+                record = self._model_service.get_model(model_id, market=resolved_market)
             except Exception:
                 continue
 
@@ -1024,7 +1118,9 @@ class BacktestService:
                 else:
                     try:
                         model_tickers = set(
-                            self._group_service.get_group_tickers(model_group_id)
+                            self._group_service.get_group_tickers(
+                                model_group_id, market=resolved_market
+                            )
                         )
                         if backtest_ticker_set & model_tickers:
                             ticker_overlap = True
@@ -1070,6 +1166,7 @@ class BacktestService:
     def _save_result(
         self,
         bt_id: str,
+        market: str,
         strategy_id: str,
         config: dict,
         result: BacktestResult,
@@ -1079,7 +1176,9 @@ class BacktestService:
         conn = get_connection()
         now = datetime.utcnow()
 
+        resolved_market = normalize_market(market)
         summary = {
+            "market": resolved_market,
             "total_return": result.total_return,
             "annual_return": result.annual_return,
             "annual_volatility": result.annual_volatility,
@@ -1114,12 +1213,13 @@ class BacktestService:
 
         conn.execute(
             """INSERT INTO backtest_results
-               (id, strategy_id, config, summary,
+               (id, market, strategy_id, config, summary,
                 nav_series, benchmark_nav, drawdown_series,
                 monthly_returns, trade_count, trades, result_level, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 bt_id,
+                resolved_market,
                 strategy_id,
                 json.dumps(config, default=str),
                 json.dumps(summary, default=str),
@@ -1133,7 +1233,7 @@ class BacktestService:
                 now,
             ],
         )
-        log.info("backtest_service.saved", backtest_id=bt_id)
+        log.info("backtest_service.saved", backtest_id=bt_id, market=resolved_market)
 
 
 # ------------------------------------------------------------------

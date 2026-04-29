@@ -19,6 +19,7 @@ import pandas as pd
 from backend.db import get_connection
 from backend.logger import get_logger
 from backend.services.calendar_service import snap_to_trading_day
+from backend.services.market_context import normalize_market, normalize_ticker
 
 log = get_logger(__name__)
 
@@ -33,6 +34,7 @@ class BacktestConfig:
     initial_capital: float = 1_000_000.0
     start_date: date | str = "2020-01-01"
     end_date: date | str = "2024-12-31"
+    market: str = "US"
     benchmark: str = "SPY"
     commission_rate: float = 0.001   # 0.1% per trade
     slippage_rate: float = 0.001     # 0.1% slippage
@@ -45,19 +47,25 @@ class BacktestConfig:
     reentry_cooldown_days: int = 0      # after selling, wait N days before re-buying
 
     def __post_init__(self) -> None:
+        self.market = normalize_market(self.market)
         if isinstance(self.start_date, str):
             self.start_date = date.fromisoformat(self.start_date)
         if isinstance(self.end_date, str):
             self.end_date = date.fromisoformat(self.end_date)
         # Snap to valid trading days so weekends/holidays don't cause empty ranges
-        self.start_date = snap_to_trading_day(self.start_date, direction="forward")
-        self.end_date = snap_to_trading_day(self.end_date, direction="backward")
+        self.start_date = snap_to_trading_day(
+            self.start_date, direction="forward", market=self.market
+        )
+        self.end_date = snap_to_trading_day(
+            self.end_date, direction="backward", market=self.market
+        )
 
     def to_dict(self) -> dict:
         return {
             "initial_capital": self.initial_capital,
             "start_date": str(self.start_date),
             "end_date": str(self.end_date),
+            "market": self.market,
             "benchmark": self.benchmark,
             "commission_rate": self.commission_rate,
             "slippage_rate": self.slippage_rate,
@@ -156,6 +164,7 @@ class BacktestEngine:
         """
         log.info(
             "backtest.start",
+            market=config.market,
             start=str(config.start_date),
             end=str(config.end_date),
             tickers=len(signals.columns),
@@ -164,10 +173,10 @@ class BacktestEngine:
         # 1. Load price data
         tickers = list(signals.columns)
         prices_close, prices_open, _high, _low, _vol = self._load_prices(
-            tickers, str(config.start_date), str(config.end_date)
+            tickers, str(config.start_date), str(config.end_date), market=config.market
         )
         benchmark_close = self._load_benchmark(
-            config.benchmark, str(config.start_date), str(config.end_date)
+            config.benchmark, str(config.start_date), str(config.end_date), market=config.market
         )
 
         if prices_close.empty:
@@ -473,6 +482,7 @@ class BacktestEngine:
         tickers: list[str],
         start_date: str,
         end_date: str,
+        market: str | None = None,
     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """Load OHLCV prices from daily_bars.
 
@@ -480,17 +490,31 @@ class BacktestEngine:
             (close_df, open_df, high_df, low_df, volume_df) each with
             DatetimeIndex and ticker columns.
         """
+        resolved_market = normalize_market(market)
+        normalized_tickers = [
+            normalize_ticker(t, resolved_market)
+            for t in tickers
+            if str(t).strip()
+        ]
+        if not normalized_tickers:
+            empty = pd.DataFrame()
+            return empty, empty, empty, empty, empty
+
         conn = get_connection()
-        placeholders = ",".join(f"'{t}'" for t in tickers)
+        placeholders = ",".join("?" for _ in normalized_tickers)
         query = f"""
             SELECT ticker, date, open, high, low, close, volume
             FROM daily_bars
-            WHERE ticker IN ({placeholders})
+            WHERE market = ?
+              AND ticker IN ({placeholders})
               AND date >= ?
               AND date <= ?
             ORDER BY date, ticker
         """
-        rows = conn.execute(query, [start_date, end_date]).fetchdf()
+        rows = conn.execute(
+            query,
+            [resolved_market, *normalized_tickers, start_date, end_date],
+        ).fetchdf()
 
         if rows.empty:
             empty = pd.DataFrame()
@@ -507,18 +531,20 @@ class BacktestEngine:
         return close_df, open_df, high_df, low_df, volume_df
 
     def _load_benchmark(
-        self, symbol: str, start_date: str, end_date: str
+        self, symbol: str, start_date: str, end_date: str, market: str | None = None
     ) -> pd.Series:
         """Load benchmark close prices from index_bars."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         rows = conn.execute(
             """SELECT date, close
                FROM index_bars
-               WHERE symbol = ?
+               WHERE market = ?
+                 AND symbol = ?
                  AND date >= ?
                  AND date <= ?
                ORDER BY date""",
-            [symbol, start_date, end_date],
+            [resolved_market, normalize_ticker(symbol, resolved_market), start_date, end_date],
         ).fetchdf()
 
         if rows.empty:

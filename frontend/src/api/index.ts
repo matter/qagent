@@ -477,6 +477,7 @@ export async function deleteModel(modelId: string, market?: string) {
 
 export interface Strategy {
   id: string;
+  market: string;
   name: string;
   version: number;
   description: string | null;
@@ -495,6 +496,7 @@ export interface StrategyTemplate {
 
 export interface BacktestResultSummary {
   id: string;
+  market: string;
   strategy_id: string;
   config: Record<string, unknown> | null;
   summary: Record<string, number> | null;
@@ -534,6 +536,7 @@ export interface StockPnL {
 }
 
 export interface StockChartData {
+  market?: string;
   ticker: string;
   daily_bars: Array<{ date: string; open: number; high: number; low: number; close: number; volume: number }>;
   trades: Array<{ date: string; action: string; shares: number; price: number; cost: number }>;
@@ -542,6 +545,7 @@ export interface StockChartData {
 // ---- Strategy API ----
 
 export async function createStrategy(params: {
+  market?: string;
   name: string;
   source_code: string;
   description?: string;
@@ -551,19 +555,24 @@ export async function createStrategy(params: {
   return data;
 }
 
-export async function listStrategies(): Promise<Strategy[]> {
-  const { data } = await client.get<Strategy[]>("/strategies");
+export async function listStrategies(market?: string): Promise<Strategy[]> {
+  const { data } = await client.get<Strategy[]>("/strategies", {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
-export async function getStrategy(strategyId: string): Promise<Strategy> {
-  const { data } = await client.get<Strategy>(`/strategies/${strategyId}`);
+export async function getStrategy(strategyId: string, market?: string): Promise<Strategy> {
+  const { data } = await client.get<Strategy>(`/strategies/${strategyId}`, {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
 export async function updateStrategy(
   strategyId: string,
   params: {
+    market?: string;
     source_code?: string;
     description?: string;
     position_sizing?: string;
@@ -574,8 +583,10 @@ export async function updateStrategy(
   return data;
 }
 
-export async function deleteStrategy(strategyId: string) {
-  const { data } = await client.delete(`/strategies/${strategyId}`);
+export async function deleteStrategy(strategyId: string, market?: string) {
+  const { data } = await client.delete(`/strategies/${strategyId}`, {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
@@ -591,31 +602,37 @@ export async function getStrategyTemplate(name: string): Promise<StrategyTemplat
 
 export async function runBacktest(
   strategyId: string,
-  body: { config: Record<string, unknown>; universe_group_id: string },
-): Promise<{ task_id: string }> {
-  const { data } = await client.post<{ task_id: string }>(`/strategies/${strategyId}/backtest`, body);
+  body: { market?: string; config: Record<string, unknown>; universe_group_id: string },
+): Promise<{ task_id: string; market?: string }> {
+  const { data } = await client.post<{ task_id: string; market?: string }>(`/strategies/${strategyId}/backtest`, body);
   return data;
 }
 
-export async function listBacktests(strategyId?: string): Promise<BacktestResultSummary[]> {
+export async function listBacktests(strategyId?: string, market?: string): Promise<BacktestResultSummary[]> {
   const { data } = await client.get<BacktestResultSummary[]>("/strategies/backtests", {
-    params: { strategy_id: strategyId || undefined },
+    params: { strategy_id: strategyId || undefined, market: market || undefined },
   });
   return data;
 }
 
-export async function getBacktest(backtestId: string): Promise<BacktestResultDetail> {
-  const { data } = await client.get<BacktestResultDetail>(`/strategies/backtests/${backtestId}`);
+export async function getBacktest(backtestId: string, market?: string): Promise<BacktestResultDetail> {
+  const { data } = await client.get<BacktestResultDetail>(`/strategies/backtests/${backtestId}`, {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
-export async function deleteBacktest(backtestId: string) {
-  const { data } = await client.delete(`/strategies/backtests/${backtestId}`);
+export async function deleteBacktest(backtestId: string, market?: string) {
+  const { data } = await client.delete(`/strategies/backtests/${backtestId}`, {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
-export async function getBacktestStockChart(backtestId: string, ticker: string): Promise<StockChartData> {
-  const { data } = await client.get<StockChartData>(`/strategies/backtests/${backtestId}/stock/${ticker}`);
+export async function getBacktestStockChart(backtestId: string, ticker: string, market?: string): Promise<StockChartData> {
+  const { data } = await client.get<StockChartData>(`/strategies/backtests/${backtestId}/stock/${ticker}`, {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
