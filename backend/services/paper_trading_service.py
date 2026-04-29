@@ -231,10 +231,11 @@ class PaperTradingService:
                    0 means advance to target_date or latest trading day.
 
         Processes each unprocessed trading day sequentially:
-          1. Generate signals using data up to T-1 (previous trading day)
-          2. Execute trades at T's open price
-          3. Value portfolio at T's close price
-          4. Record daily snapshot
+          1. Fresh sessions record the first trading day as a no-trade baseline
+          2. Generate signals using data up to T-1 (previous trading day)
+          3. Execute trades at T's open price
+          4. Value portfolio at T's close price
+          5. Record daily snapshot
 
         Returns summary of the advancement.
         """
@@ -330,15 +331,20 @@ class PaperTradingService:
 
         tickers = self._group_service.get_group_tickers(session["universe_group_id"])
 
-        # Pre-load shared resources once: strategy instance, factors, models, prices
-        # (same as _generate_signals_batch but we generate signals day-by-day
-        # so stateful strategies see correct portfolio state at each step)
-        batch_ctx = self._prepare_signal_context(
-            strategy_id=session["strategy_id"],
-            signal_dates=[self._prev_trading_day(d) for d in trading_days],
-            universe_group_id=session["universe_group_id"],
-            tickers=tickers,
-        )
+        record_initial_baseline = session.get("current_date") is None
+        execution_days = trading_days[1:] if record_initial_baseline else trading_days
+
+        # Pre-load shared resources once for days that can actually execute.
+        # A fresh session's first day is only a baseline snapshot so paper
+        # trading matches the backtest engine's T+1 first-trade semantics.
+        batch_ctx = None
+        if execution_days:
+            batch_ctx = self._prepare_signal_context(
+                strategy_id=session["strategy_id"],
+                signal_dates=[self._prev_trading_day(d) for d in execution_days],
+                universe_group_id=session["universe_group_id"],
+                tickers=tickers,
+            )
 
         # Load price cache for trade execution (separate from signal generation)
         price_cache = self._preload_prices(tickers, trading_days[0], trading_days[-1], conn)
@@ -346,6 +352,7 @@ class PaperTradingService:
         positions, cash = self._load_latest_state(session_id, capital)
         days_processed = 0
         total_new_trades = 0
+        baseline_days = 0
         signal_errors = 0
         daily_snapshots: list[tuple] = []
 
@@ -371,6 +378,17 @@ class PaperTradingService:
         )
 
         for idx, trade_date in enumerate(trading_days):
+            if record_initial_baseline and idx == 0:
+                nav = self._value_portfolio_cached(positions, cash, trade_date, price_cache)
+                daily_snapshots.append((
+                    session_id, trade_date, nav, cash,
+                    json.dumps(positions, default=str),
+                    json.dumps([], default=str),
+                ))
+                days_processed += 1
+                baseline_days += 1
+                continue
+
             signal_date = self._prev_trading_day(trade_date)
 
             # --- Day-by-day signal generation with real-time portfolio state ---
@@ -496,6 +514,11 @@ class PaperTradingService:
             "days_processed": days_processed,
             "new_trades": total_new_trades,
             "current_date": str(trading_days[-1]) if trading_days else None,
+            "baseline_days": baseline_days,
+            "execution_rule": (
+                "T+1 open; a fresh session records its first trading day as "
+                "a no-trade baseline and starts executing on the next trading day"
+            ),
         }
         if days_without:
             result["message"] = (
