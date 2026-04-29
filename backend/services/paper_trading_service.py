@@ -23,6 +23,7 @@ from backend.services.strategy_service import StrategyService
 from backend.services.factor_engine import FactorEngine
 from backend.services.feature_service import FeatureService
 from backend.services.model_service import ModelService
+from backend.services.sql_filters import registered_values_table
 from backend.strategies.base import StrategyContext
 
 log = get_logger(__name__)
@@ -2133,19 +2134,19 @@ class PaperTradingService:
             empty = pd.DataFrame()
             return empty, empty, empty, empty, empty
         conn = get_connection()
-        placeholders = ",".join("?" for _ in normalized_tickers)
-        query = f"""
-            SELECT ticker, date, open, high, low, close, volume
-            FROM daily_bars
-            WHERE market = ?
-              AND ticker IN ({placeholders})
-              AND date >= ? AND date <= ?
-            ORDER BY date
-        """
-        df = conn.execute(
-            query,
-            [resolved_market, *normalized_tickers, start_date, end_date],
-        ).fetchdf()
+        with registered_values_table(conn, "ticker", normalized_tickers, table_prefix="_qagent_tickers") as ticker_table:
+            query = f"""
+                SELECT b.ticker, b.date, b.open, b.high, b.low, b.close, b.volume
+                FROM daily_bars b
+                JOIN {ticker_table} t ON b.ticker = t.ticker
+                WHERE b.market = ?
+                  AND b.date >= ? AND b.date <= ?
+                ORDER BY b.date
+            """
+            df = conn.execute(
+                query,
+                [resolved_market, start_date, end_date],
+            ).fetchdf()
         if df.empty:
             empty = pd.DataFrame()
             return empty, empty, empty, empty, empty
@@ -2210,13 +2211,14 @@ class PaperTradingService:
         ]
         if not normalized_tickers:
             return {}
-        placeholders = ",".join("?" for _ in normalized_tickers)
-        rows = conn.execute(
-            f"""SELECT date, ticker, open, close FROM daily_bars
-                WHERE market = ?
-                  AND date >= ? AND date <= ? AND ticker IN ({placeholders})""",
-            [resolved_market, start, end, *normalized_tickers],
-        ).fetchall()
+        with registered_values_table(conn, "ticker", normalized_tickers, table_prefix="_qagent_tickers") as ticker_table:
+            rows = conn.execute(
+                f"""SELECT b.date, b.ticker, b.open, b.close FROM daily_bars b
+                    JOIN {ticker_table} t ON b.ticker = t.ticker
+                    WHERE b.market = ?
+                      AND b.date >= ? AND b.date <= ?""",
+                [resolved_market, start, end],
+            ).fetchall()
 
         cache: dict[date, dict[str, tuple[float, float]]] = {}
         for r in rows:

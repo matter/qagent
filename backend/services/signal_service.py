@@ -23,6 +23,7 @@ from backend.services.group_service import GroupService
 from backend.services.calendar_service import offset_trading_days
 from backend.services.market_context import normalize_market, normalize_ticker
 from backend.services.model_service import ModelService
+from backend.services.sql_filters import registered_values_table
 from backend.services.strategy_service import StrategyService
 from backend.strategies.base import StrategyContext
 from backend.strategies.loader import load_strategy_from_code
@@ -2193,19 +2194,19 @@ class SignalService:
             empty = pd.DataFrame()
             return empty, empty, empty, empty, empty
         conn = get_connection()
-        placeholders = ",".join("?" for _ in normalized_tickers)
-        query = f"""
-            SELECT ticker, date, open, high, low, close, volume
-            FROM daily_bars
-            WHERE market = ?
-              AND ticker IN ({placeholders})
-              AND date >= ? AND date <= ?
-            ORDER BY date
-        """
-        df = conn.execute(
-            query,
-            [resolved_market, *normalized_tickers, start_date, end_date],
-        ).fetchdf()
+        with registered_values_table(conn, "ticker", normalized_tickers, table_prefix="_qagent_tickers") as ticker_table:
+            query = f"""
+                SELECT b.ticker, b.date, b.open, b.high, b.low, b.close, b.volume
+                FROM daily_bars b
+                JOIN {ticker_table} t ON b.ticker = t.ticker
+                WHERE b.market = ?
+                  AND b.date >= ? AND b.date <= ?
+                ORDER BY b.date
+            """
+            df = conn.execute(
+                query,
+                [resolved_market, start_date, end_date],
+            ).fetchdf()
         if df.empty:
             empty = pd.DataFrame()
             return empty, empty, empty, empty, empty

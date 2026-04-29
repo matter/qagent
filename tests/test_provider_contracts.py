@@ -1,7 +1,8 @@
 import unittest
 from datetime import date
 
-from backend.providers.registry import get_provider
+from backend.providers.base import DataProvider
+from backend.providers.registry import available_providers, get_provider, register_provider
 from backend.providers.baostock_provider import BaoStockProvider
 from backend.providers.yfinance_provider import YFinanceProvider
 
@@ -79,6 +80,14 @@ class ProviderContractTests(unittest.TestCase):
         self.assertIsInstance(get_provider("US"), YFinanceProvider)
         self.assertIsInstance(get_provider("CN"), BaoStockProvider)
 
+    def test_registry_supports_provider_registration_without_branching(self):
+        register_provider("US", "fake_provider", _FakeProvider)
+
+        provider = get_provider("US", "fake_provider")
+
+        self.assertIsInstance(provider, _FakeProvider)
+        self.assertIn("fake_provider", available_providers("US"))
+
     def test_baostock_stock_list_is_market_scoped_and_filters_indices(self):
         provider = BaoStockProvider(client=_FakeBaoClient())
 
@@ -103,6 +112,16 @@ class ProviderContractTests(unittest.TestCase):
         self.assertEqual(float(df.loc[0, "adj_factor"]), 1.0)
 
 
+class _FakeProvider(DataProvider):
+    def get_stock_list(self):
+        raise NotImplementedError
+
+    def get_daily_bars(self, tickers, start, end):
+        raise NotImplementedError
+
+    def get_index_data(self, symbol, start, end):
+        raise NotImplementedError
+
+
 if __name__ == "__main__":
     unittest.main()
-

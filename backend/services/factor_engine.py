@@ -14,6 +14,7 @@ from backend.logger import get_logger
 from backend.services.calendar_service import snap_to_trading_day
 from backend.services.factor_service import FactorService
 from backend.services.market_context import normalize_market, normalize_ticker
+from backend.services.sql_filters import registered_values_table
 
 log = get_logger(__name__)
 
@@ -164,22 +165,20 @@ class FactorEngine:
         tickers = [normalize_ticker(t, resolved_market) for t in tickers]
 
         conn = get_connection()
-        fid_placeholders = ",".join("?" for _ in factor_ids)
-        tk_placeholders = ",".join("?" for _ in tickers)
-
-        query = f"""
-            SELECT factor_id, ticker, date, value
-            FROM factor_values_cache
-            WHERE market = ?
-              AND factor_id IN ({fid_placeholders})
-              AND ticker IN ({tk_placeholders})
-              AND date >= ? AND date <= ?
-            ORDER BY factor_id, date, ticker
-        """
-        df = conn.execute(
-            query,
-            [resolved_market, *factor_ids, *tickers, start_date, end_date],
-        ).fetchdf()
+        with (
+            registered_values_table(conn, "factor_id", factor_ids, table_prefix="_qagent_factor_ids") as factor_table,
+            registered_values_table(conn, "ticker", tickers, table_prefix="_qagent_tickers") as ticker_table,
+        ):
+            query = f"""
+                SELECT c.factor_id, c.ticker, c.date, c.value
+                FROM factor_values_cache c
+                JOIN {factor_table} f ON c.factor_id = f.factor_id
+                JOIN {ticker_table} t ON c.ticker = t.ticker
+                WHERE c.market = ?
+                  AND c.date >= ? AND c.date <= ?
+                ORDER BY c.factor_id, c.date, c.ticker
+            """
+            df = conn.execute(query, [resolved_market, start_date, end_date]).fetchdf()
         if df.empty:
             return {}
 
@@ -219,18 +218,21 @@ class FactorEngine:
         resolved_market = normalize_market(market)
         conn = get_connection()
 
-        # Single aggregate query — DuckDB handles the GROUP BY efficiently
-        # even with the PRIMARY KEY (factor_id, ticker, date).
-        meta_rows = conn.execute(
-            """SELECT ticker, MIN(date) AS min_d, MAX(date) AS max_d,
-                      COUNT(*) AS cnt
-               FROM factor_values_cache
-               WHERE market = ?
-                 AND factor_id = ?
-                 AND date >= ? AND date <= ?
-               GROUP BY ticker""",
-            [resolved_market, factor_id, start_date, end_date],
-        ).fetchall()
+        # Single aggregate query scoped to requested tickers via a registered
+        # values table, avoiding a huge dynamic IN list for large universes.
+        normalized_tickers = [normalize_ticker(t, resolved_market) for t in tickers]
+        with registered_values_table(conn, "ticker", normalized_tickers, table_prefix="_qagent_tickers") as ticker_table:
+            meta_rows = conn.execute(
+                f"""SELECT c.ticker, MIN(c.date) AS min_d, MAX(c.date) AS max_d,
+                          COUNT(*) AS cnt
+                   FROM factor_values_cache c
+                   JOIN {ticker_table} t ON c.ticker = t.ticker
+                   WHERE c.market = ?
+                     AND c.factor_id = ?
+                     AND c.date >= ? AND c.date <= ?
+                   GROUP BY c.ticker""",
+                [resolved_market, factor_id, start_date, end_date],
+            ).fetchall()
 
         # Build lookup: ticker -> (min_date, max_date, count)
         coverage: dict[str, tuple] = {}
@@ -278,22 +280,18 @@ class FactorEngine:
         tickers = [normalize_ticker(t, resolved_market) for t in tickers]
         conn = get_connection()
 
-        # Build IN clause for tickers
-        placeholders = ",".join("?" for _ in tickers)
-        query = f"""
-            SELECT ticker, date, value
-            FROM factor_values_cache
-            WHERE market = ?
-              AND factor_id = ?
-              AND ticker IN ({placeholders})
-              AND date >= ?
-              AND date <= ?
-            ORDER BY date, ticker
-        """
-        rows = conn.execute(
-            query,
-            [resolved_market, factor_id, *tickers, start_date, end_date],
-        ).fetchdf()
+        with registered_values_table(conn, "ticker", tickers, table_prefix="_qagent_tickers") as ticker_table:
+            query = f"""
+                SELECT c.ticker, c.date, c.value
+                FROM factor_values_cache c
+                JOIN {ticker_table} t ON c.ticker = t.ticker
+                WHERE c.market = ?
+                  AND c.factor_id = ?
+                  AND c.date >= ?
+                  AND c.date <= ?
+                ORDER BY c.date, c.ticker
+            """
+            rows = conn.execute(query, [resolved_market, factor_id, start_date, end_date]).fetchdf()
 
         if rows.empty:
             return pd.DataFrame()
@@ -370,21 +368,21 @@ class FactorEngine:
         sd = date_type.fromisoformat(str(start_date))
         ed = date_type.fromisoformat(str(end_date))
         warm_start = sd - timedelta(days=400)
-        placeholders = ",".join("?" for _ in tickers)
-        warm_up_query = f"""
-            SELECT ticker, date, open, high, low, close, volume
-            FROM daily_bars
-            WHERE market = ?
-              AND ticker IN ({placeholders})
-              AND date >= ?
-              AND date <= ?
-            ORDER BY ticker, date
-        """
         try:
-            all_bars = conn.execute(
-                warm_up_query,
-                [resolved_market, *tickers, warm_start, ed],
-            ).fetchdf()
+            with registered_values_table(conn, "ticker", tickers, table_prefix="_qagent_tickers") as ticker_table:
+                warm_up_query = f"""
+                    SELECT b.ticker, b.date, b.open, b.high, b.low, b.close, b.volume
+                    FROM daily_bars b
+                    JOIN {ticker_table} t ON b.ticker = t.ticker
+                    WHERE b.market = ?
+                      AND b.date >= ?
+                      AND b.date <= ?
+                    ORDER BY b.ticker, b.date
+                """
+                all_bars = conn.execute(
+                    warm_up_query,
+                    [resolved_market, warm_start, ed],
+                ).fetchdf()
         except Exception as exc:
             log.error("factor_engine.compute.query_failed", error=str(exc))
             return pd.DataFrame()

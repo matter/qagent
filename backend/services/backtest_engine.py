@@ -20,6 +20,7 @@ from backend.db import get_connection
 from backend.logger import get_logger
 from backend.services.calendar_service import snap_to_trading_day
 from backend.services.market_context import normalize_market, normalize_ticker
+from backend.services.sql_filters import registered_values_table
 
 log = get_logger(__name__)
 
@@ -501,20 +502,20 @@ class BacktestEngine:
             return empty, empty, empty, empty, empty
 
         conn = get_connection()
-        placeholders = ",".join("?" for _ in normalized_tickers)
-        query = f"""
-            SELECT ticker, date, open, high, low, close, volume
-            FROM daily_bars
-            WHERE market = ?
-              AND ticker IN ({placeholders})
-              AND date >= ?
-              AND date <= ?
-            ORDER BY date, ticker
-        """
-        rows = conn.execute(
-            query,
-            [resolved_market, *normalized_tickers, start_date, end_date],
-        ).fetchdf()
+        with registered_values_table(conn, "ticker", normalized_tickers, table_prefix="_qagent_tickers") as ticker_table:
+            query = f"""
+                SELECT b.ticker, b.date, b.open, b.high, b.low, b.close, b.volume
+                FROM daily_bars b
+                JOIN {ticker_table} t ON b.ticker = t.ticker
+                WHERE b.market = ?
+                  AND b.date >= ?
+                  AND b.date <= ?
+                ORDER BY b.date, b.ticker
+            """
+            rows = conn.execute(
+                query,
+                [resolved_market, start_date, end_date],
+            ).fetchdf()
 
         if rows.empty:
             empty = pd.DataFrame()

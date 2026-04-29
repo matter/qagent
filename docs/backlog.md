@@ -58,7 +58,28 @@
 
 ## Deferred
 
-暂无。
+### [2026-04-30] P3 技术债：Python 3.14 `datetime.utcnow()` 废弃警告
+
+- **状态**：Deferred
+- **来源**：agent 发现
+- **影响范围**：backend services、tasks、部分测试 fixture
+- **复现入口**：
+  - UI：无
+  - API / MCP：无直接入口
+  - 资产 ID：无
+- **当前证据**：
+  - 实际结果：`uv run python -m unittest discover tests` 通过，但输出多处 `DeprecationWarning: datetime.datetime.utcnow() is deprecated`。
+  - 日志 / 错误：涉及 `backend/services/data_service.py`、`factor_service.py`、`model_service.py`、`paper_trading_service.py`、`signal_service.py`、`strategy_service.py`、`backend/tasks/executor.py` 和相关测试。
+  - 相关指标：`rg -n "datetime\\.utcnow|utcnow\\(" backend tests` 当前约 `48` 处。
+- **期望行为**：时间戳写入保持兼容，同时测试输出不再被 Python 3.14 deprecation warnings 污染。
+- **验收标准**：
+  - 可量化指标：全量测试不再出现 `datetime.utcnow()` deprecation warning。
+  - UI 验收点：无。
+  - 命令 / API 复验：`uv run python -m unittest discover tests`。
+- **修复记录**：
+  - commit：待处理
+  - 验证命令：待处理
+  - 复验结论：当前不阻断 V2.0 功能里程碑，建议作为独立技术债处理。
 
 ## Done
 

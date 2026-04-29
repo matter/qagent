@@ -227,6 +227,34 @@ This file records milestone evidence for the V2.0 A-share and ranking upgrade.
     - `cd frontend && pnpm build` passed. Vite still reports the existing dynamic-import and large-chunk warnings.
     - `git diff --check` passed.
 
+- Task 16 bounded refactoring/performance pass completed:
+  - Provider resolution now uses a registry factory map with `register_provider()` and `available_providers()`, so adding future data providers does not require branching inside `get_provider()`.
+  - Added `backend/services/sql_filters.py` with `registered_values_table()` for large DuckDB value filters.
+  - Replaced large dynamic ticker/factor `IN (...)` filters with registered values-table joins in:
+    - Factor cache bulk loads.
+    - Factor cache coverage checks.
+    - Factor cached-value loads.
+    - Factor compute warm-up price loads.
+    - Backtest engine price loads.
+    - Signal service price loads.
+    - Paper-trading batch price loads and preload price cache.
+  - Left small current-position lookup paths on parameterized `IN` because tests use a lightweight fake connection and those lists are bounded by current positions rather than full universes.
+- Task 16 verification:
+  - Red/green contract checks:
+    - `uv run python -m unittest tests.test_sql_filters tests.test_provider_contracts` failed before `registered_values_table()`, `register_provider()`, and `available_providers()` existed.
+    - The same command passed after implementation.
+  - Focused regression:
+    - `uv run python -m unittest tests.test_signal_paper_market_scope tests.test_paper_trading_contracts tests.test_signal_contracts tests.test_backtest_engine_contracts tests.test_strategy_backtest_market_scope tests.test_factor_feature_market_scope` passed: `36` tests.
+    - `uv run python -m py_compile backend/services/signal_service.py backend/services/paper_trading_service.py backend/services/factor_engine.py backend/services/backtest_engine.py backend/services/sql_filters.py` passed.
+  - V2 regression:
+    - `uv run python scripts/v2_regression_check.py` passed with `4` passed, `0` failed, `2` skipped.
+  - Submission gate:
+    - `uv run python -m unittest discover tests` passed: `84` tests.
+    - `cd frontend && pnpm build` passed. Vite still reports the existing dynamic-import and large-chunk warnings.
+    - `git diff --check` passed.
+  - Follow-up recorded:
+    - Python 3.14 `datetime.utcnow()` deprecation warnings are logged in `docs/backlog.md` as deferred technical debt.
+
 - Task 13 frontend API market scope and global selector completed:
   - Added shared frontend `Market = "US" | "CN"` type and market helper exports.
   - Added API client market state with `qagent.market` localStorage persistence, first-load default `US`, and request interceptor injection for market-scoped REST paths.
