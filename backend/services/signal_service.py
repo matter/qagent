@@ -20,6 +20,7 @@ from backend.logger import get_logger
 from backend.services.factor_engine import FactorEngine
 from backend.services.feature_service import FeatureService
 from backend.services.group_service import GroupService
+from backend.services.calendar_service import offset_trading_days
 from backend.services.model_service import ModelService
 from backend.services.strategy_service import StrategyService
 from backend.strategies.base import StrategyContext
@@ -213,6 +214,13 @@ class SignalService:
                 )
 
         # ---- 7. Build StrategyContext ----
+        # -- Runtime check: warn if required models produced no predictions --
+        self._raise_if_missing_model_predictions(
+            required_models=required_models,
+            model_predictions=model_predictions,
+            context="signal_generate",
+        )
+
         prices_multi = self._build_prices_multi(
             prices_close, prices_open, prices_high, prices_low, prices_volume, tickers,
         )
@@ -286,6 +294,7 @@ class SignalService:
         strategy_id: str,
         target_date: str,
         universe_group_id: str,
+        date_role: str = "decision",
         max_tickers: int = 0,
         focus_tickers: list[str] | None = None,
         current_weights: dict[str, float] | None = None,
@@ -306,6 +315,8 @@ class SignalService:
             focus_tickers: If provided, always include these tickers in the
                 universe (even when sampling) and append a per-ticker
                 diagnostic snapshot to the result.
+            date_role: Whether target_date is the strategy decision date
+                ("decision") or the backtest execution date ("execution").
             current_weights: Explicit portfolio weights (方案 A).
             holding_days: Explicit holding days per ticker.
             avg_entry_price: Explicit average entry price per ticker.
@@ -316,6 +327,10 @@ class SignalService:
         """
         t0 = time.time()
         timings: dict[str, float] = {}
+        date_info = self._resolve_diagnose_dates(target_date, date_role)
+        decision_date = date_info["decision_date"]
+        execution_date = date_info["execution_date"]
+        analysis_date = decision_date
 
         # ---- 1. Load strategy ----
         strategy_def = self._strategy_service.get_strategy(strategy_id)
@@ -358,17 +373,17 @@ class SignalService:
                 LIMIT 250
             )
         """
-        row = conn.execute(lookback_query, [target_date]).fetchone()
-        start_date = str(row[0]) if row and row[0] else target_date
+        row = conn.execute(lookback_query, [analysis_date]).fetchone()
+        start_date = str(row[0]) if row and row[0] else analysis_date
 
         prices_close, prices_open, prices_high, prices_low, prices_volume = (
-            self._load_prices(tickers, start_date, target_date)
+            self._load_prices(tickers, start_date, analysis_date)
         )
         if prices_close.empty:
             raise ValueError("No price data available for the given tickers and date range")
 
-        # Track tickers with price data on target_date
-        trade_ts = pd.Timestamp(target_date)
+        # Track tickers with price data on the strategy decision date
+        trade_ts = pd.Timestamp(analysis_date)
         has_price = set()
         if trade_ts in prices_close.index:
             row_data = prices_close.loc[trade_ts]
@@ -388,8 +403,8 @@ class SignalService:
                 LIMIT 10
             )
         """
-        frow = conn.execute(factor_lookback_query, [target_date]).fetchone()
-        factor_start_date = str(frow[0]) if frow and frow[0] else target_date
+        frow = conn.execute(factor_lookback_query, [analysis_date]).fetchone()
+        factor_start_date = str(frow[0]) if frow and frow[0] else analysis_date
 
         required_factors = strategy_def.get("required_factors", [])
         required_models = strategy_def.get("required_models", [])
@@ -430,10 +445,10 @@ class SignalService:
         cached_by_id: dict[str, pd.DataFrame] = {}
         if cache_key in self._factor_bulk_cache:
             c_start, c_end, c_data = self._factor_bulk_cache[cache_key]
-            if c_start <= factor_start_date and c_end >= target_date:
+            if c_start <= factor_start_date and c_end >= analysis_date:
                 # Slice from memory – no DB query needed
                 cached_by_id = {
-                    fid: df.loc[factor_start_date:target_date]
+                    fid: df.loc[factor_start_date:analysis_date]
                     for fid, df in c_data.items()
                 }
             else:
@@ -449,15 +464,15 @@ class SignalService:
                     LIMIT 30
                 )
             """
-            wrow = conn.execute(wide_lookback_query, [target_date]).fetchone()
+            wrow = conn.execute(wide_lookback_query, [analysis_date]).fetchone()
             wide_start = str(wrow[0]) if wrow and wrow[0] else factor_start_date
 
             full_data = self._factor_engine.load_cached_factors_bulk(
-                list(all_factor_ids), tickers, wide_start, target_date
+                list(all_factor_ids), tickers, wide_start, analysis_date
             )
-            self._factor_bulk_cache[cache_key] = (wide_start, target_date, full_data)
+            self._factor_bulk_cache[cache_key] = (wide_start, analysis_date, full_data)
             cached_by_id = {
-                fid: df.loc[factor_start_date:target_date]
+                fid: df.loc[factor_start_date:analysis_date]
                 for fid, df in full_data.items()
             }
 
@@ -504,7 +519,7 @@ class SignalService:
             if model_id not in model_fs_map:
                 return None
             fs_id, fs_id_to_name, preprocessing = model_fs_map[model_id]
-            pp_key = (fs_id, target_date)
+            pp_key = (fs_id, analysis_date)
             if pp_key in self._preprocessed_cache:
                 return self._preprocessed_cache[pp_key]
             feature_data_local: dict[str, pd.DataFrame] = {}
@@ -528,7 +543,7 @@ class SignalService:
                     model_id=model_id,
                     feature_data=processed,
                     tickers=tickers,
-                    date=target_date,
+                    date=analysis_date,
                 )
                 if not preds.empty:
                     snap = {
@@ -543,28 +558,16 @@ class SignalService:
             except Exception as exc:
                 return model_id, None, {"error": str(exc)}
 
-        # Pre-compute all feature preprocessing (sequential, shares cache)
-        for model_id in required_models:
-            _prepare_features(model_id)
-        timings["5a_preprocess"] = time.time() - t4
-
-        # Run predictions in parallel across models
-        t4b = time.time()
-        with ThreadPoolExecutor(max_workers=min(len(required_models), 4)) as pool:
-            futures = {pool.submit(_predict_one, mid): mid for mid in required_models}
-            for fut in futures:
-                try:
-                    mid, preds, snap = fut.result(timeout=per_model_timeout)
-                    model_snapshot[mid] = snap
-                    if preds is not None:
-                        model_predictions[mid] = preds
-                except FuturesTimeoutError:
-                    mid = futures[fut]
-                    model_snapshot[mid] = {"error": f"predict timed out ({per_model_timeout}s)"}
-                    log.warning("diagnose.model_timeout", model_id=mid, timeout=per_model_timeout)
-
-        timings["5b_predict_parallel"] = time.time() - t4b
-
+        model_predictions, model_snapshot = self._predict_diagnose_models(
+            required_models=required_models,
+            prepare_features=_prepare_features,
+            predict_one=_predict_one,
+            per_model_timeout=per_model_timeout,
+        )
+        missing_model_predictions = [
+            model_id for model_id in required_models
+            if model_id not in model_predictions
+        ]
         timings["5_model_predict"] = time.time() - t4
 
         # ---- 6. Build StrategyContext & generate signals ----
@@ -577,8 +580,9 @@ class SignalService:
         portfolio_state: dict = {}
         replay_source: str | None = None
         if backtest_id:
+            replay_date = execution_date if date_role == "execution" else decision_date
             portfolio_state = self._reconstruct_portfolio_state(
-                backtest_id, target_date, prices_close,
+                backtest_id, replay_date, prices_close,
             )
             replay_source = f"backtest:{backtest_id}"
         else:
@@ -611,6 +615,18 @@ class SignalService:
         # ---- 7. Build diagnostic output ----
         # Extract strategy-populated diagnostics (candidate_pool, gates, etc.)
         strategy_diagnostics = dict(context.diagnostics) if context.diagnostics else {}
+
+        # ---- 7a. Auto stage-trace (framework-level) ----
+        # Build coarse-grained decision chain automatically so that even
+        # strategies that don't use StageTracer still get a useful trace.
+        auto_trace = self._build_auto_stage_trace(
+            universe_tickers=tickers,
+            has_price=has_price,
+            model_predictions=model_predictions,
+            strategy_diagnostics=strategy_diagnostics,
+            raw_signals=raw_signals,
+            portfolio_state=portfolio_state,
+        )
 
         # Handle both dict and DataFrame signal formats
         signal_tickers: set[str] = set()
@@ -703,11 +719,41 @@ class SignalService:
             pool_rank_map: dict[str, int] = {t: i + 1 for i, (t, _) in enumerate(pool_scores_sorted)}
             pool_size = len(pool_scores_sorted)
 
+            # Pre-compute portfolio delta for current-holding analysis
+            cw = portfolio_state.get("current_weights", {})
+            hd = portfolio_state.get("holding_days", {})
+            aep = portfolio_state.get("avg_entry_price", {})
+            upnl = portfolio_state.get("unrealized_pnl", {})
+            existing_holdings = set(cw.keys()) if cw else set()
+
+            # Compute kept / entered / exited for drop analysis
+            kept_holdings = signal_tickers & existing_holdings
+            exited_holdings = existing_holdings - signal_tickers
+            entered_holdings = signal_tickers - existing_holdings
+
             for ft in focus_tickers:
                 snap: dict = {"ticker": ft}
 
                 # Price availability
                 snap["has_price"] = ft in has_price
+
+                # Current-holding awareness
+                is_current_holding = ft in existing_holdings
+                snap["was_current_holding"] = is_current_holding
+                if is_current_holding:
+                    snap["holding_state"] = {
+                        "weight": round(float(cw.get(ft, 0)), 6),
+                        "holding_days": hd.get(ft),
+                        "avg_entry_price": round(float(aep[ft]), 4) if ft in aep else None,
+                        "unrealized_pnl": round(float(upnl[ft]), 6) if ft in upnl else None,
+                    }
+                    if ft in signal_tickers:
+                        snap["kept_or_dropped"] = "kept"
+                    else:
+                        snap["kept_or_dropped"] = "dropped"
+                else:
+                    snap["holding_state"] = None
+                    snap["kept_or_dropped"] = None
 
                 # Elimination reason
                 if ft in signal_tickers:
@@ -797,8 +843,91 @@ class SignalService:
                     if not reasons:
                         reasons.append("filtered by strategy selection logic")
                 elif snap["status"] == "strategy_filtered":
-                    reasons.append("not in candidate pool (pre-filter or score threshold)")
+                    # Enhanced candidate pool miss analysis
+                    pool_miss_detail = self._analyze_candidate_pool_miss(
+                        ticker=ft,
+                        strategy_diagnostics=strategy_diagnostics,
+                        model_predictions=model_predictions,
+                        agg_scores=agg_scores,
+                        candidate_set=candidate_set,
+                    )
+                    if pool_miss_detail.get("reasons"):
+                        reasons.extend(pool_miss_detail["reasons"])
+                    else:
+                        reasons.append("not in candidate pool (pre-filter or score threshold)")
+                    snap["pool_miss_detail"] = pool_miss_detail
                 snap["reasons"] = reasons if reasons else None
+
+                # Enhanced drop analysis for current holdings
+                if is_current_holding and snap.get("kept_or_dropped") == "dropped":
+                    drop_detail: dict = {"was_current_holding": True}
+
+                    # Classify the drop reason more precisely
+                    if snap["status"] == "no_price_data":
+                        drop_detail["drop_reason"] = "no_price_data"
+                        drop_detail["detail"] = "holding lost price data on target date"
+                    elif snap["status"] == "no_model_coverage":
+                        drop_detail["drop_reason"] = "no_model_coverage"
+                        drop_detail["detail"] = "holding lost model coverage"
+                    elif snap["status"] == "strategy_filtered":
+                        # Was a holding but didn't even make candidate pool
+                        drop_detail["drop_reason"] = "not_in_candidate_pool"
+                        drop_detail["detail"] = (
+                            "current holding was not included in candidate pool; "
+                            "strategy's keep/support logic may have excluded it "
+                            "or it failed pre-filter criteria"
+                        )
+                    elif snap["status"] == "in_candidate_but_filtered":
+                        # Was in candidate pool but didn't survive selection
+                        drop_detail["drop_reason"] = "candidate_but_not_selected"
+                        # Check gates
+                        if ft in per_ticker_gates:
+                            gate_info = per_ticker_gates[ft]
+                            if isinstance(gate_info, dict):
+                                failed = [k for k, v in gate_info.items()
+                                          if v is False or v == "failed"]
+                                passed = [k for k, v in gate_info.items()
+                                          if v is True or v == "passed"]
+                                drop_detail["failed_gates"] = failed
+                                drop_detail["passed_gates"] = passed
+                                if failed:
+                                    drop_detail["detail"] = (
+                                        f"current holding failed gates: {', '.join(failed)}"
+                                    )
+                                else:
+                                    drop_detail["detail"] = (
+                                        "current holding passed all gates but lost "
+                                        "portfolio selection competition"
+                                    )
+                            elif isinstance(gate_info, list):
+                                drop_detail["gate_info"] = gate_info[:10]
+                                drop_detail["detail"] = "current holding filtered by strategy gates"
+                        else:
+                            drop_detail["detail"] = (
+                                "current holding was in candidate pool but not selected; "
+                                "likely lost portfolio competition to higher-ranked entries"
+                            )
+
+                    # Identify replacements: new entries that took this holding's slot
+                    if entered_holdings:
+                        # Find entrants with higher scores
+                        ft_score = agg_scores.get(ft)
+                        replacements = []
+                        for entrant in sorted(entered_holdings):
+                            ent_score = agg_scores.get(entrant)
+                            if ent_score is not None:
+                                replacements.append({
+                                    "ticker": entrant,
+                                    "agg_score": round(ent_score, 6),
+                                })
+                        if replacements:
+                            # Sort by score descending
+                            replacements.sort(key=lambda x: -x["agg_score"])
+                            drop_detail["replaced_by"] = replacements[:5]
+                            if ft_score is not None:
+                                drop_detail["incumbent_score"] = round(ft_score, 6)
+
+                    snap["drop_detail"] = drop_detail
 
                 focus_snapshot.append(snap)
 
@@ -806,6 +935,10 @@ class SignalService:
             "strategy_id": strategy_id,
             "strategy_name": strategy_def["name"],
             "target_date": target_date,
+            "decision_date": decision_date,
+            "execution_date": execution_date,
+            "date_role": date_info["date_role"],
+            "snapshot_timing": date_info["snapshot_timing"],
             "universe_group_id": universe_group_id,
             "universe_size": full_universe_size,
             "sampled": sampled,
@@ -819,11 +952,16 @@ class SignalService:
             "eliminated_tickers": eliminated[:50],
             "gates": gates,
             "model_diagnostics": model_snapshot,
+            "declared_models": required_models,
+            "injected_models": sorted(model_predictions.keys()),
+            "missing_model_predictions": missing_model_predictions,
             "factor_diagnostics": factor_snapshot,
             "strategy_diagnostics": {
                 k: v for k, v in strategy_diagnostics.items()
-                if k not in ("candidate_pool", "gates")
+                if k not in ("candidate_pool", "gates", "stage_trace")
             },
+            "stage_trace": strategy_diagnostics.get("stage_trace") or None,
+            "auto_stage_trace": auto_trace,
             "focus_ticker_snapshots": focus_snapshot if focus_snapshot else None,
             "portfolio_state": {
                 "source": replay_source,
@@ -1008,6 +1146,20 @@ class SignalService:
                     warnings.append(
                         f"Model '{model_id}' is in draft status"
                     )
+                elif row[1] != "trained":
+                    warnings.append(
+                        f"Model '{model_id}' status is '{row[1]}' (not trained), "
+                        f"predictions may be unavailable"
+                    )
+
+        # -- Source code vs required_models cross-check --
+        source_code = strategy_def.get("source_code", "")
+        if source_code:
+            from backend.services.strategy_service import StrategyService
+            model_ref_warnings = StrategyService._validate_model_references(
+                source_code, required_models
+            )
+            warnings.extend(model_ref_warnings)
 
         # -- Data freshness check --
         data_fresh = True
@@ -1249,6 +1401,381 @@ class SignalService:
     # ------------------------------------------------------------------
     # Internal helpers (reused from BacktestService pattern)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_diagnose_dates(target_date: str, date_role: str = "decision") -> dict:
+        """Resolve diagnose date semantics.
+
+        ``decision`` preserves the original API behavior: target_date is the
+        date passed into StrategyContext. ``execution`` lets callers pass a
+        backtest trade date and inspect the pre-trade decision snapshot that
+        produced that execution.
+        """
+        if date_role not in ("decision", "execution"):
+            raise ValueError("date_role must be 'decision' or 'execution'")
+
+        if date_role == "execution":
+            execution_date = target_date
+            decision_date = str(offset_trading_days(datetime.fromisoformat(target_date).date(), -1))
+            snapshot_timing = "pre_trade"
+        else:
+            decision_date = target_date
+            execution_date = str(offset_trading_days(datetime.fromisoformat(target_date).date(), 1))
+            snapshot_timing = "pre_decision"
+
+        return {
+            "target_date": target_date,
+            "date_role": date_role,
+            "decision_date": decision_date,
+            "execution_date": execution_date,
+            "snapshot_timing": snapshot_timing,
+        }
+
+    @staticmethod
+    def _raise_if_missing_model_predictions(
+        *,
+        required_models: list[str],
+        model_predictions: dict,
+        context: str,
+    ) -> None:
+        """Fail fast when a declared required model was not injected."""
+        if not required_models:
+            return
+
+        missing_models = [
+            model_id for model_id in required_models
+            if model_id not in model_predictions
+        ]
+        if not missing_models:
+            return
+
+        detail = (
+            f"{context}: missing_model_predictions={missing_models}; "
+            f"declared_models={required_models}; "
+            f"injected_models={sorted(model_predictions.keys())}. "
+            "A strategy that references a missing model would silently run as "
+            "a no-op or fallback path, so this run is blocked."
+        )
+        log.error("signal_service.missing_model_predictions", detail=detail)
+        raise ValueError(detail)
+
+    def _predict_diagnose_models(
+        self,
+        *,
+        required_models: list[str],
+        prepare_features,
+        predict_one,
+        per_model_timeout: int,
+    ) -> tuple[dict[str, pd.Series], dict[str, dict]]:
+        """Prepare features and predict diagnose models without zero-worker pools."""
+        if not required_models:
+            return {}, {}
+
+        for model_id in required_models:
+            prepare_features(model_id)
+
+        model_predictions: dict[str, pd.Series] = {}
+        model_snapshot: dict[str, dict] = {}
+        with ThreadPoolExecutor(max_workers=min(len(required_models), 4)) as pool:
+            futures = {pool.submit(predict_one, mid): mid for mid in required_models}
+            for fut in futures:
+                try:
+                    mid, preds, snap = fut.result(timeout=per_model_timeout)
+                    model_snapshot[mid] = snap
+                    if preds is not None:
+                        model_predictions[mid] = preds
+                except FuturesTimeoutError:
+                    mid = futures[fut]
+                    model_snapshot[mid] = {
+                        "error": f"predict timed out ({per_model_timeout}s)"
+                    }
+                    log.warning(
+                        "diagnose.model_timeout",
+                        model_id=mid,
+                        timeout=per_model_timeout,
+                    )
+
+        return model_predictions, model_snapshot
+
+    def _build_auto_stage_trace(
+        self,
+        *,
+        universe_tickers: list[str],
+        has_price: set[str],
+        model_predictions: dict[str, pd.Series],
+        strategy_diagnostics: dict,
+        raw_signals: pd.DataFrame | dict,
+        portfolio_state: dict,
+    ) -> list[dict]:
+        """Build a coarse-grained decision chain automatically.
+
+        This runs at the framework level so even strategies that don't
+        use :class:`StageTracer` get a useful trace.  The trace covers:
+
+        1. **universe** – full ticker list before any filtering
+        2. **has_price** – tickers with valid price data
+        3. **model_coverage** – tickers covered by all required models
+        4. **candidate_pool** – strategy-reported candidate pool (or inferred)
+        5. **portfolio_state** – existing holdings injected into context
+        6. **selected** – tickers that made it into final signals
+        7. **kept / entered / exited** – delta vs existing holdings (if stateful)
+        """
+        trace: list[dict] = []
+
+        # 1. Universe
+        universe_set = set(universe_tickers)
+        trace.append({
+            "stage": "universe",
+            "count": len(universe_set),
+            "tickers": sorted(universe_set)[:50],
+            "truncated": len(universe_set) > 50,
+        })
+
+        # 2. Has price
+        trace.append({
+            "stage": "has_price",
+            "count": len(has_price),
+            "dropped": sorted(universe_set - has_price)[:30],
+        })
+
+        # 3. Model coverage
+        if model_predictions:
+            all_model_tickers: set[str] = set()
+            per_model: dict[str, int] = {}
+            for mid, preds in model_predictions.items():
+                tset = set(preds.index)
+                all_model_tickers.update(tset)
+                per_model[mid] = len(tset)
+            covered = has_price & all_model_tickers
+            trace.append({
+                "stage": "model_coverage",
+                "count": len(covered),
+                "per_model_count": per_model,
+                "dropped": sorted(has_price - covered)[:30],
+            })
+        else:
+            covered = has_price
+            trace.append({
+                "stage": "model_coverage",
+                "count": len(covered),
+                "note": "no models required",
+            })
+
+        # 4. Candidate pool (from strategy diagnostics or inferred)
+        raw_pool = strategy_diagnostics.get("candidate_pool")
+        if raw_pool:
+            pool_set = set(raw_pool) if isinstance(raw_pool, (list, set)) else set()
+            trace.append({
+                "stage": "candidate_pool",
+                "source": "strategy",
+                "count": len(pool_set),
+                "tickers": sorted(pool_set)[:50],
+                "truncated": len(pool_set) > 50,
+            })
+        else:
+            trace.append({
+                "stage": "candidate_pool",
+                "source": "inferred (=model_coverage)",
+                "count": len(covered),
+            })
+
+        # 5. Portfolio state (holdings going into this evaluation)
+        cw = portfolio_state.get("current_weights", {})
+        hd_map = portfolio_state.get("holding_days", {})
+        if cw:
+            trace.append({
+                "stage": "portfolio_state",
+                "holding_count": len(cw),
+                "tickers": sorted(cw.keys()),
+                "weights": {t: round(float(w), 6) for t, w in sorted(cw.items())},
+                "holding_days": {t: hd_map.get(t) for t in sorted(cw.keys())} if hd_map else None,
+            })
+
+        # 6. Selected (final signals)
+        if isinstance(raw_signals, dict):
+            selected = set(raw_signals.keys())
+        elif isinstance(raw_signals, pd.DataFrame) and not raw_signals.empty:
+            selected = set(raw_signals.index)
+        else:
+            selected = set()
+
+        trace.append({
+            "stage": "selected",
+            "count": len(selected),
+            "tickers": sorted(selected)[:50],
+            "truncated": len(selected) > 50,
+        })
+
+        # 7. Delta vs existing holdings (kept / entered / exited)
+        if cw:
+            existing = set(cw.keys())
+            kept = selected & existing
+            entered = selected - existing
+            exited = existing - selected
+
+            # Build per-exited-ticker detail for drop analysis
+            exited_detail: list[dict] = []
+            for ticker in sorted(exited):
+                detail: dict = {
+                    "ticker": ticker,
+                    "prior_weight": round(float(cw.get(ticker, 0)), 6),
+                }
+                if ticker in hd_map:
+                    detail["holding_days"] = hd_map[ticker]
+                exited_detail.append(detail)
+
+            trace.append({
+                "stage": "portfolio_delta",
+                "kept": sorted(kept),
+                "entered": sorted(entered),
+                "exited": sorted(exited),
+                "exited_detail": exited_detail if exited_detail else None,
+            })
+
+        # 8. Gates summary (from strategy diagnostics)
+        gates = strategy_diagnostics.get("gates", {})
+        if gates:
+            per_ticker_gates = gates.get("per_ticker", {}) if isinstance(gates, dict) else {}
+            if per_ticker_gates:
+                failed_tickers = [
+                    t for t, g in per_ticker_gates.items()
+                    if isinstance(g, dict) and any(v is False or v == "failed" for v in g.values())
+                ]
+                if failed_tickers:
+                    trace.append({
+                        "stage": "gate_filtered",
+                        "count": len(failed_tickers),
+                        "tickers": sorted(failed_tickers)[:30],
+                    })
+
+        return trace
+
+    def _analyze_candidate_pool_miss(
+        self,
+        *,
+        ticker: str,
+        strategy_diagnostics: dict,
+        model_predictions: dict[str, pd.Series],
+        agg_scores: dict[str, float],
+        candidate_set: set[str],
+    ) -> dict:
+        """Analyze why a ticker missed the candidate pool.
+
+        Extracts per-pool membership from ``strategy_diagnostics.stage_trace``
+        (if the strategy used :class:`StageTracer`) or from known diagnostics
+        keys (``host_pool``, ``attack_pool``, ``launch_pool``, ``keep_extra``).
+        Also computes the ticker's score rank relative to pool cutoffs.
+
+        Returns a dict with ``pool_membership``, ``reasons``, and optional
+        ``score_analysis`` fields.
+        """
+        result: dict = {
+            "pool_membership": {},
+            "reasons": [],
+            "score_analysis": None,
+        }
+
+        # -- 1. Extract pool membership from stage_trace if available --
+        stage_trace = strategy_diagnostics.get("stage_trace", [])
+        pool_names = (
+            "host_pool", "attack_pool", "launch_pool", "keep_extra",
+            "candidate_pool", "selected_set",
+        )
+        for entry in stage_trace:
+            if not isinstance(entry, dict):
+                continue
+            stage_name = entry.get("stage", "")
+            if stage_name in pool_names:
+                data = entry.get("data")
+                if isinstance(data, (list, set)):
+                    result["pool_membership"][stage_name] = ticker in set(data)
+                elif isinstance(data, dict):
+                    result["pool_membership"][stage_name] = ticker in data
+
+        # -- 2. Fallback: check top-level diagnostics keys --
+        for key in ("host_pool", "attack_pool", "launch_pool", "keep_extra"):
+            if key in strategy_diagnostics and key not in result["pool_membership"]:
+                pool_data = strategy_diagnostics[key]
+                if isinstance(pool_data, (list, set)):
+                    result["pool_membership"][key] = ticker in set(pool_data)
+
+        # -- 3. Per-model score analysis for this ticker --
+        ticker_model_scores: dict[str, dict] = {}
+        for mid, preds in model_predictions.items():
+            if ticker in preds.index:
+                score = float(preds[ticker])
+                rank = int((preds > score).sum()) + 1
+                total = len(preds)
+                ticker_model_scores[mid] = {
+                    "score": round(score, 6),
+                    "rank": rank,
+                    "total": total,
+                    "percentile": round(1.0 - (rank - 1) / max(total - 1, 1), 4),
+                }
+            else:
+                ticker_model_scores[mid] = {"error": "no_coverage"}
+
+        # Aggregate score + rank within full universe (not just candidate pool)
+        ticker_agg = agg_scores.get(ticker)
+        if ticker_agg is not None:
+            # Rank this ticker among all tickers with agg scores
+            better_count = sum(1 for s in agg_scores.values() if s > ticker_agg)
+            score_analysis = {
+                "agg_score": round(ticker_agg, 6),
+                "universe_rank": better_count + 1,
+                "universe_total": len(agg_scores),
+            }
+
+            # If candidate pool is available, find cutoff
+            if candidate_set:
+                pool_scores = sorted(
+                    [agg_scores[t] for t in candidate_set if t in agg_scores],
+                    reverse=True,
+                )
+                if pool_scores:
+                    min_pool_score = pool_scores[-1]
+                    score_analysis["pool_cutoff_score"] = round(min_pool_score, 6)
+                    score_analysis["pool_size"] = len(pool_scores)
+                    score_analysis["above_cutoff"] = ticker_agg >= min_pool_score
+
+            score_analysis["per_model"] = ticker_model_scores
+            result["score_analysis"] = score_analysis
+
+        # -- 4. Build human-readable reasons --
+        pm = result["pool_membership"]
+        if pm:
+            missed = [k for k, v in pm.items() if v is False]
+            hit = [k for k, v in pm.items() if v is True]
+            if missed and not hit:
+                result["reasons"].append(
+                    f"not in any pool: {', '.join(missed)}"
+                )
+            elif missed:
+                result["reasons"].append(
+                    f"in pools: [{', '.join(hit)}] but missed: [{', '.join(missed)}]"
+                )
+
+        if result.get("score_analysis"):
+            sa = result["score_analysis"]
+            if sa.get("above_cutoff") is False:
+                result["reasons"].append(
+                    f"agg_score={sa['agg_score']:.4f} below pool cutoff "
+                    f"{sa['pool_cutoff_score']:.4f} "
+                    f"(universe rank {sa['universe_rank']}/{sa['universe_total']})"
+                )
+            elif not pm:
+                result["reasons"].append(
+                    f"universe rank {sa['universe_rank']}/{sa['universe_total']} "
+                    f"(agg_score={sa['agg_score']:.4f})"
+                )
+
+        # If no model coverage at all, that's the reason
+        if ticker_model_scores and all(
+            "error" in v for v in ticker_model_scores.values()
+        ):
+            result["reasons"] = ["no model coverage for any required model"]
+
+        return result
 
     def _reconstruct_portfolio_state(
         self,

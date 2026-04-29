@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from backend.logger import get_logger
 from backend.services.model_service import ModelService
-from backend.tasks.executor import TaskExecutor
+from backend.tasks.executor import TaskExecutor, get_task_executor
 from backend.tasks.models import TaskSource
 
 log = get_logger(__name__)
@@ -17,7 +17,6 @@ log = get_logger(__name__)
 router = APIRouter(prefix="/api", tags=["models"])
 
 _service: ModelService | None = None
-_executor: TaskExecutor | None = None
 
 
 def _get_service() -> ModelService:
@@ -28,10 +27,7 @@ def _get_service() -> ModelService:
 
 
 def _get_executor() -> TaskExecutor:
-    global _executor
-    if _executor is None:
-        _executor = TaskExecutor()
-    return _executor
+    return get_task_executor()
 
 
 # ------------------------------------------------------------------

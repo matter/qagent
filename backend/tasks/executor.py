@@ -31,6 +31,8 @@ class TaskExecutor:
         self._store = store or TaskStore()
         self._pool = ThreadPoolExecutor(max_workers=max_workers)
         self._futures: dict[str, Future] = {}
+        self._records: dict[str, TaskRecord] = {}
+        self._records_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public API
@@ -62,6 +64,7 @@ class TaskExecutor:
             source=source,
         )
         self._store.insert(record)
+        self._remember(record)
 
         future = self._pool.submit(self._run, tid, fn, params or {}, timeout)
         self._futures[tid] = future
@@ -82,6 +85,10 @@ class TaskExecutor:
         )
 
     def get_task(self, task_id: str) -> TaskRecord | None:
+        with self._records_lock:
+            record = self._records.get(task_id)
+            if record is not None:
+                return record
         return self._store.get(task_id)
 
     def cancel(self, task_id: str) -> bool:
@@ -96,6 +103,12 @@ class TaskExecutor:
         if future is not None:
             future.cancel()
 
+        self._update_memory_status(
+            task_id,
+            TaskStatus.FAILED,
+            completed_at=datetime.utcnow(),
+            error_message="Cancelled by user",
+        )
         self._store.update_status(
             task_id,
             TaskStatus.FAILED,
@@ -124,6 +137,34 @@ class TaskExecutor:
     # Internal
     # ------------------------------------------------------------------
 
+    def _remember(self, record: TaskRecord) -> None:
+        with self._records_lock:
+            self._records[record.id] = record
+
+    def _update_memory_status(
+        self,
+        task_id: str,
+        status: TaskStatus,
+        *,
+        started_at: datetime | None = None,
+        completed_at: datetime | None = None,
+        result_summary: dict[str, Any] | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        with self._records_lock:
+            record = self._records.get(task_id)
+            if record is None:
+                return
+            record.status = status
+            if started_at is not None:
+                record.started_at = started_at
+            if completed_at is not None:
+                record.completed_at = completed_at
+            if result_summary is not None:
+                record.result_summary = result_summary
+            if error_message is not None:
+                record.error_message = error_message
+
     def _run(
         self,
         task_id: str,
@@ -133,6 +174,9 @@ class TaskExecutor:
     ) -> None:
         """Wrapper executed inside the thread pool."""
         started = datetime.utcnow()
+        self._update_memory_status(
+            task_id, TaskStatus.RUNNING, started_at=started
+        )
         self._store.update_status(
             task_id, TaskStatus.RUNNING, started_at=started
         )
@@ -148,6 +192,12 @@ class TaskExecutor:
             result = inner_future.result(timeout=timeout)
             completed = datetime.utcnow()
             summary = result if isinstance(result, dict) else {"result": result}
+            self._update_memory_status(
+                task_id,
+                TaskStatus.COMPLETED,
+                completed_at=completed,
+                result_summary=summary,
+            )
             self._store.update_status(
                 task_id,
                 TaskStatus.COMPLETED,
@@ -158,6 +208,12 @@ class TaskExecutor:
 
         except TimeoutError:
             completed = datetime.utcnow()
+            self._update_memory_status(
+                task_id,
+                TaskStatus.TIMEOUT,
+                completed_at=completed,
+                error_message=f"Task timed out after {timeout}s (still running in background)",
+            )
             self._store.update_status(
                 task_id,
                 TaskStatus.TIMEOUT,
@@ -172,6 +228,12 @@ class TaskExecutor:
                 try:
                     result = fut.result()  # blocks until inner completes
                     summary = result if isinstance(result, dict) else {"result": result}
+                    self._update_memory_status(
+                        tid,
+                        TaskStatus.COMPLETED,
+                        completed_at=datetime.utcnow(),
+                        result_summary=summary,
+                    )
                     store.update_status(
                         tid,
                         TaskStatus.COMPLETED,
@@ -181,6 +243,12 @@ class TaskExecutor:
                     log.info("task.late_completed", task_id=tid)
                 except Exception:
                     tb = traceback.format_exc()
+                    self._update_memory_status(
+                        tid,
+                        TaskStatus.FAILED,
+                        completed_at=datetime.utcnow(),
+                        error_message=tb,
+                    )
                     store.update_status(
                         tid,
                         TaskStatus.FAILED,
@@ -199,6 +267,12 @@ class TaskExecutor:
         except Exception:
             completed = datetime.utcnow()
             tb = traceback.format_exc()
+            self._update_memory_status(
+                task_id,
+                TaskStatus.FAILED,
+                completed_at=completed,
+                error_message=tb,
+            )
             self._store.update_status(
                 task_id,
                 TaskStatus.FAILED,
@@ -209,3 +283,17 @@ class TaskExecutor:
 
         finally:
             inner_pool.shutdown(wait=False)
+
+
+_shared_executor: TaskExecutor | None = None
+_shared_executor_lock = threading.Lock()
+
+
+def get_task_executor() -> TaskExecutor:
+    """Return the process-wide task executor used by API and MCP entry points."""
+    global _shared_executor
+    if _shared_executor is None:
+        with _shared_executor_lock:
+            if _shared_executor is None:
+                _shared_executor = TaskExecutor()
+    return _shared_executor

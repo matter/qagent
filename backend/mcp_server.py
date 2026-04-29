@@ -55,8 +55,8 @@ def _group_service():
 
 
 def _task_executor():
-    from backend.tasks.executor import TaskExecutor
-    return TaskExecutor()
+    from backend.tasks.executor import get_task_executor
+    return get_task_executor()
 
 
 # ======================================================================

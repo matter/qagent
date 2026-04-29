@@ -125,7 +125,7 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
           slippage_rate: slippage,
           max_positions: maxPositions,
           benchmark,
-          rebalance_frequency: rebalanceFreq,
+          rebalance_freq: rebalanceFreq,
           rebalance_buffer: rebalanceBuffer,
           min_holding_days: minHoldingDays,
           reentry_cooldown_days: reentryCooldownDays,

@@ -86,7 +86,7 @@ class BacktestService:
             commission_rate=config_dict.get("commission_rate", 0.001),
             slippage_rate=config_dict.get("slippage_rate", 0.001),
             max_positions=config_dict.get("max_positions", 50),
-            rebalance_freq=config_dict.get("rebalance_freq", "monthly"),
+            rebalance_freq=config_dict.get("rebalance_freq") or config_dict.get("rebalance_frequency", "monthly"),
             rebalance_buffer=config_dict.get("rebalance_buffer", 0.0),
             min_holding_days=config_dict.get("min_holding_days", 0),
             reentry_cooldown_days=config_dict.get("reentry_cooldown_days", 0),
@@ -94,6 +94,13 @@ class BacktestService:
 
         position_sizing = strategy_def.get("position_sizing", "equal_weight")
         max_position_pct = config_dict.get("max_position_pct", 0.10)
+
+        # Warn if strategy has custom weight logic under equal_weight sizing
+        weight_warnings = StrategyService._validate_weight_effectiveness(
+            strategy_def.get("source_code", ""), position_sizing
+        )
+        for w in weight_warnings:
+            log.warning("backtest_service.weight_ineffective", detail=w)
 
         start_str = str(bt_config.start_date)
         end_str = str(bt_config.end_date)
@@ -157,6 +164,31 @@ class BacktestService:
                 required_models, tickers, start_str, end_str,
                 [d for d in all_trading_days if d in rebalance_dates_set],
             )
+
+        # -- Runtime check: warn if required models produced no predictions --
+        if required_models and not model_preds_by_date:
+            missing_all_msg = (
+                f"策略声明了 required_models={required_models} 但回测区间内没有任何模型产出预测。"
+                f"这通常意味着模型未训练、特征集不兼容、或预测加载失败。"
+                f"回测可能退化为 0 trades。"
+            )
+            log.error("backtest_service.no_model_predictions", detail=missing_all_msg)
+            raise ValueError(missing_all_msg)
+        elif required_models:
+            # Check if any model has zero predictions across all dates
+            all_model_ids_in_preds = set()
+            for date_preds in model_preds_by_date.values():
+                all_model_ids_in_preds.update(date_preds.keys())
+            missing_models = [m for m in required_models if m not in all_model_ids_in_preds]
+            if missing_models:
+                missing_msg = (
+                    f"missing_model_predictions={missing_models}; "
+                    f"declared_models={required_models}; "
+                    f"injected_models={sorted(all_model_ids_in_preds)}. "
+                    "回测已阻断，避免策略静默退化为 no-op。"
+                )
+                log.error("backtest_service.partial_model_predictions", detail=missing_msg)
+                raise ValueError(missing_msg)
 
         log.info(
             "backtest_service.signals",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from datetime import datetime
 
@@ -55,6 +56,16 @@ class StrategyService:
         required_factors = instance.required_factors()
         required_models = instance.required_models()
 
+        # Static validation: check source code model references vs declaration
+        model_warnings = self._validate_model_references(source_code, required_models)
+        for w in model_warnings:
+            log.warning("strategy.model_ref_mismatch", name=name, detail=w)
+
+        # Static validation: check if custom weights are effective under position_sizing
+        weight_warnings = self._validate_weight_effectiveness(source_code, position_sizing)
+        for w in weight_warnings:
+            log.warning("strategy.weight_ineffective", name=name, detail=w)
+
         conn.execute(
             """INSERT INTO strategies
                (id, name, version, description, source_code,
@@ -80,7 +91,12 @@ class StrategyService:
             name=name,
             version=version,
         )
-        return self.get_strategy(strategy_id)
+        result = self.get_strategy(strategy_id)
+        if model_warnings:
+            result["model_ref_warnings"] = model_warnings
+        if weight_warnings:
+            result["weight_warnings"] = weight_warnings
+        return result
 
     def update_strategy(
         self,
@@ -115,6 +131,17 @@ class StrategyService:
             required_factors = instance.required_factors()
             required_models = instance.required_models()
 
+            # Static validation: check source code model references vs declaration
+            model_warnings = self._validate_model_references(source_code, required_models)
+            for w in model_warnings:
+                log.warning("strategy.model_ref_mismatch", name=existing["name"], detail=w)
+
+            # Static validation: check if custom weights are effective under position_sizing
+            effective_sizing = position_sizing or existing["position_sizing"]
+            weight_warnings = self._validate_weight_effectiveness(source_code, effective_sizing)
+            for w in weight_warnings:
+                log.warning("strategy.weight_ineffective", name=existing["name"], detail=w)
+
             conn.execute(
                 """INSERT INTO strategies
                    (id, name, version, description, source_code,
@@ -141,7 +168,12 @@ class StrategyService:
                 name=existing["name"],
                 version=new_version,
             )
-            return self.get_strategy(new_id)
+            result = self.get_strategy(new_id)
+            if model_warnings:
+                result["model_ref_warnings"] = model_warnings
+            if weight_warnings:
+                result["weight_warnings"] = weight_warnings
+            return result
 
         # Simple metadata update (no version bump)
         now = datetime.utcnow()
@@ -196,6 +228,113 @@ class StrategyService:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_model_references(source_code: str, declared_models: list[str]) -> list[str]:
+        """Scan strategy source code for model_predictions references and warn on mismatch.
+
+        Returns a list of warning strings.  This is intentionally best-effort:
+        dynamic patterns like ``list(context.model_predictions.keys())[0]``
+        won't be caught, which is fine -- the goal is to catch the most common
+        mistake: hard-coded model IDs that aren't declared in required_models().
+        """
+        warnings: list[str] = []
+
+        # Patterns that extract a string literal used as a model ID key:
+        #   context.model_predictions["abc123"]
+        #   context.model_predictions['abc123']
+        #   context.model_predictions.get("abc123" ...)
+        #   model_predictions["abc123"]
+        #   model_predictions.get("abc123" ...)
+        pattern = re.compile(
+            r"""model_predictions\s*(?:\[|\.get\s*\()\s*['"]([a-zA-Z0-9_]+)['"]""",
+        )
+        referenced_ids = set(pattern.findall(source_code))
+
+        declared_set = set(declared_models)
+
+        # IDs referenced in code but missing from required_models()
+        undeclared = referenced_ids - declared_set
+        if undeclared:
+            warnings.append(
+                f"策略源码中引用了模型 {sorted(undeclared)} 但未在 required_models() 中声明。"
+                f"这些模型的预测不会被加载，可能导致策略静默退化为 0 trades。"
+                f"请在策略类的 required_models() 方法中添加这些模型 ID。"
+            )
+
+        # Check for generic model_predictions access without any declared models
+        if not declared_models:
+            # Look for any model_predictions usage (including dynamic patterns)
+            has_model_access = bool(re.search(
+                r"""model_predictions\s*[\[.]""", source_code
+            ))
+            if has_model_access:
+                warnings.append(
+                    f"策略源码中访问了 model_predictions 但 required_models() 返回空列表。"
+                    f"运行时将不会加载任何模型预测数据。"
+                )
+
+        return warnings
+
+    @staticmethod
+    def _validate_weight_effectiveness(
+        source_code: str, position_sizing: str
+    ) -> list[str]:
+        """Check if strategy source code customises signal weights under a sizing
+        mode that would ignore them.
+
+        Under ``equal_weight`` position sizing, the backtest engine overwrites
+        every ticker's weight with ``1/n``, so custom weight logic in the
+        strategy is effectively dead code.  This check looks for non-trivial
+        weight manipulation patterns in source and warns when the sizing mode
+        will discard those values.
+
+        Returns a list of warning strings (empty if everything is fine).
+        """
+        if position_sizing != "equal_weight":
+            return []
+
+        # Patterns indicating non-trivial weight manipulation:
+        #   out["weight"] = ...  (not 1/n or 1.0/n)
+        #   weight_map[...] = ...
+        #   row["weight"] = ...
+        #   .loc[..., "weight"] = ...
+        #   signals["weight"] = some_variable  (not 1/n)
+        weight_assignment = re.compile(
+            r"""(?:"""
+            r"""\["weight"\]\s*="""  # dict/DataFrame assignment
+            r"""|\.weight\s*="""     # attr assignment
+            r"""|weight_map"""       # weight_map variable usage
+            r""")""",
+            re.VERBOSE,
+        )
+        matches = weight_assignment.findall(source_code)
+        if not matches:
+            return []
+
+        # Heuristic: check if any weight assignment looks non-uniform
+        # Simple 1/n patterns: = 1.0 / len(...), = 1 / n, = equal_w
+        uniform_pattern = re.compile(
+            r"""["']weight["']\]\s*=\s*(?:1(?:\.0)?\s*/\s*(?:len|n\b|num|count)|equal)""",
+        )
+        non_uniform_assignments = []
+        for line in source_code.splitlines():
+            if weight_assignment.search(line):
+                if not uniform_pattern.search(line):
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith("#"):
+                        non_uniform_assignments.append(stripped)
+
+        if not non_uniform_assignments:
+            return []
+
+        sample = non_uniform_assignments[0][:120]
+        return [
+            f"策略使用 position_sizing='equal_weight'，但源码中包含自定义 weight 赋值逻辑"
+            f"（如 `{sample}`）。在 equal_weight 模式下，执行层会将所有持仓权重覆盖为 1/n，"
+            f"策略输出的自定义权重不会生效。"
+            f"如需权重生效，请将 position_sizing 改为 'signal_weight' 或 'max_position'。"
+        ]
 
     def _fetch_row(self, strategy_id: str) -> dict | None:
         conn = get_connection()

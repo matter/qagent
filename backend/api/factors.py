@@ -13,7 +13,7 @@ from backend.services.factor_service import FactorService
 from backend.services.factor_engine import FactorEngine
 from backend.services.factor_eval_service import FactorEvalService
 from backend.services.group_service import GroupService
-from backend.tasks.executor import TaskExecutor
+from backend.tasks.executor import TaskExecutor, get_task_executor
 from backend.tasks.models import TaskSource
 
 log = get_logger(__name__)
@@ -23,7 +23,6 @@ router = APIRouter(prefix="/api", tags=["factors"])
 _service: FactorService | None = None
 _engine: FactorEngine | None = None
 _eval_service: FactorEvalService | None = None
-_executor: TaskExecutor | None = None
 _group_service: GroupService | None = None
 
 
@@ -49,10 +48,7 @@ def _get_eval_service() -> FactorEvalService:
 
 
 def _get_executor() -> TaskExecutor:
-    global _executor
-    if _executor is None:
-        _executor = TaskExecutor()
-    return _executor
+    return get_task_executor()
 
 
 def _get_group_service() -> GroupService:

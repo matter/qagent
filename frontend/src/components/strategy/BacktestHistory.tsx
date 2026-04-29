@@ -127,7 +127,7 @@ export default function BacktestHistory({ refreshKey, onRestoreConfig }: Backtes
       slippage: (cfg?.slippage_rate as number) ?? 0.001,
       maxPositions: (cfg?.max_positions as number) ?? 50,
       benchmark: (cfg?.benchmark as string) ?? "SPY",
-      rebalanceFreq: (cfg?.rebalance_frequency as string) ?? "daily",
+      rebalanceFreq: (cfg?.rebalance_freq as string) ?? (cfg?.rebalance_frequency as string) ?? "daily",
       rebalanceBuffer: (cfg?.rebalance_buffer as number) ?? 0,
       minHoldingDays: (cfg?.min_holding_days as number) ?? 0,
       reentryCooldownDays: (cfg?.reentry_cooldown_days as number) ?? 0,

@@ -7,14 +7,13 @@ from pydantic import BaseModel
 
 from backend.logger import get_logger
 from backend.services.paper_trading_service import PaperTradingService
-from backend.tasks.executor import TaskExecutor
+from backend.tasks.executor import TaskExecutor, get_task_executor
 
 log = get_logger(__name__)
 
 router = APIRouter(prefix="/api", tags=["paper-trading"])
 
 _svc: PaperTradingService | None = None
-_executor: TaskExecutor | None = None
 
 
 def _get_svc() -> PaperTradingService:
@@ -25,10 +24,7 @@ def _get_svc() -> PaperTradingService:
 
 
 def _get_executor() -> TaskExecutor:
-    global _executor
-    if _executor is None:
-        _executor = TaskExecutor()
-    return _executor
+    return get_task_executor()
 
 
 # ---- Request models ----
@@ -115,7 +111,13 @@ async def advance_session(session_id: str, body: AdvanceRequest | None = None) -
             params={"session_id": session_id, "target_date": target, "steps": steps},
             timeout=1800,  # 30 minutes for multi-day advance
         )
-        return {"task_id": task_id, "status": "running"}
+        return {
+            "task_id": task_id,
+            "status": "queued",
+            "task_type": "paper_trading_advance",
+            "async": True,
+            "poll_url": f"/api/tasks/{task_id}",
+        }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

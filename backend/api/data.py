@@ -12,7 +12,7 @@ from backend.db import get_connection
 from backend.logger import get_logger
 from backend.services.data_service import DataService
 from backend.services.group_service import GroupService
-from backend.tasks.executor import TaskExecutor
+from backend.tasks.executor import TaskExecutor, get_task_executor
 from backend.tasks.models import TaskSource
 
 log = get_logger(__name__)
@@ -20,15 +20,11 @@ log = get_logger(__name__)
 router = APIRouter(prefix="/api", tags=["data"])
 
 # Shared instances (initialised lazily).
-_executor: TaskExecutor | None = None
 _service: DataService | None = None
 
 
 def _get_executor() -> TaskExecutor:
-    global _executor
-    if _executor is None:
-        _executor = TaskExecutor()
-    return _executor
+    return get_task_executor()
 
 
 def _get_service() -> DataService:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 import io
 import json
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 from backend.logger import get_logger
 from backend.services.signal_service import SignalService
-from backend.tasks.executor import TaskExecutor
+from backend.tasks.executor import TaskExecutor, get_task_executor
 from backend.tasks.models import TaskSource
 
 log = get_logger(__name__)
@@ -21,7 +21,6 @@ log = get_logger(__name__)
 router = APIRouter(prefix="/api/signals", tags=["signals"])
 
 _service: SignalService | None = None
-_executor: TaskExecutor | None = None
 
 
 def _get_service() -> SignalService:
@@ -32,10 +31,7 @@ def _get_service() -> SignalService:
 
 
 def _get_executor() -> TaskExecutor:
-    global _executor
-    if _executor is None:
-        _executor = TaskExecutor()
-    return _executor
+    return get_task_executor()
 
 
 # ------------------------------------------------------------------
@@ -53,6 +49,7 @@ class DiagnoseSignalsRequest(BaseModel):
     strategy_id: str
     target_date: str
     universe_group_id: str
+    date_role: Literal["decision", "execution"] = "decision"
     max_tickers: int = 0
     focus_tickers: list[str] | None = None
     timeout: int = 600
@@ -134,11 +131,13 @@ async def diagnose_signals(body: DiagnoseSignalsRequest) -> dict:
         avg_entry_price: dict[str, float] | None,
         unrealized_pnl: dict[str, float] | None,
         backtest_id: str | None,
+        date_role: str,
     ) -> dict:
         return svc.diagnose_signals(
             strategy_id=strategy_id,
             target_date=target_date,
             universe_group_id=universe_group_id,
+            date_role=date_role,
             max_tickers=max_tickers,
             focus_tickers=focus_tickers,
             current_weights=current_weights,
@@ -162,6 +161,7 @@ async def diagnose_signals(body: DiagnoseSignalsRequest) -> dict:
             "avg_entry_price": body.avg_entry_price,
             "unrealized_pnl": body.unrealized_pnl,
             "backtest_id": body.backtest_id,
+            "date_role": body.date_role,
         },
         timeout=body.timeout,
         source=TaskSource.UI,

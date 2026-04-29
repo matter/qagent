@@ -181,6 +181,44 @@ class PaperTradingService:
     # Day-by-day advancement
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _coerce_date(value) -> date | None:
+        if value is None:
+            return None
+        if isinstance(value, date):
+            return value
+        return date.fromisoformat(str(value))
+
+    def _resolve_advance_trading_days(
+        self,
+        *,
+        session: dict,
+        target_date: str | None,
+        steps: int,
+    ) -> list[date]:
+        """Resolve the unfiltered trading-day window for session advancement."""
+        session_start = self._coerce_date(session.get("start_date"))
+        if session_start is None:
+            raise ValueError("Session is missing start_date")
+
+        current = self._coerce_date(session.get("current_date"))
+        start_from = current + timedelta(days=1) if current else session_start
+
+        if steps > 0:
+            generous_end = start_from + timedelta(days=steps * 3 + 30)
+            all_days = get_trading_days(start_from, generous_end)
+            return all_days[:steps] if all_days else []
+
+        end = date.fromisoformat(target_date) if target_date else get_latest_trading_day()
+        if start_from > end:
+            if current is None:
+                raise ValueError(
+                    f"target_date {end} is before session start_date {session_start}"
+                )
+            return []
+
+        return get_trading_days(start_from, end)
+
     def advance(
         self, session_id: str, target_date: str | None = None, steps: int = 0
     ) -> dict:
@@ -206,30 +244,11 @@ class PaperTradingService:
             raise ValueError(f"Session is {session['status']}, not active")
 
         # Determine which days to process
-        current = session["current_date"]
-        if current:
-            if isinstance(current, str):
-                current = date.fromisoformat(current)
-            start_from = current + timedelta(days=1)
-        else:
-            start_from = date.fromisoformat(session["start_date"])
-
-        if steps > 0:
-            generous_end = start_from + timedelta(days=steps * 3 + 30)
-            all_days = get_trading_days(start_from, generous_end)
-            trading_days = all_days[:steps] if all_days else []
-        else:
-            if target_date:
-                end = date.fromisoformat(target_date)
-            else:
-                end = get_latest_trading_day()
-            if start_from > end:
-                return {
-                    "session_id": session_id,
-                    "days_processed": 0,
-                    "message": "Already up to date",
-                }
-            trading_days = get_trading_days(start_from, end)
+        trading_days = self._resolve_advance_trading_days(
+            session=session,
+            target_date=target_date,
+            steps=steps,
+        )
 
         if not trading_days:
             return {
@@ -271,9 +290,17 @@ class PaperTradingService:
         trading_days = [d for d in trading_days if d not in processed]
 
         if not trading_days:
+            if not session.get("current_date"):
+                return {
+                    "session_id": session_id,
+                    "days_processed": 0,
+                    "current_date": None,
+                    "message": "No unprocessed trading days",
+                }
             return {
                 "session_id": session_id,
                 "days_processed": 0,
+                "current_date": session.get("current_date"),
                 "message": "Already up to date",
             }
 
@@ -284,36 +311,34 @@ class PaperTradingService:
         max_positions = config.get("max_positions", 50)
         cost_rate = commission_rate + slippage_rate
 
+        # Execution constraints (aligned with backtest engine)
+        rebalance_buffer = config.get("rebalance_buffer", 0.0)
+        min_holding_days = config.get("min_holding_days", 0)
+        reentry_cooldown_days = config.get("reentry_cooldown_days", 0)
+
+        # Position sizing (read from strategy definition, aligned with backtest)
+        strategy_def = self._strategy_service.get_strategy(session["strategy_id"])
+        position_sizing = strategy_def.get("position_sizing", "equal_weight")
+        max_position_pct = config.get("max_position_pct", 0.10)
+
+        # Warn if strategy has custom weight logic under equal_weight sizing
+        weight_warnings = StrategyService._validate_weight_effectiveness(
+            strategy_def.get("source_code", ""), position_sizing
+        )
+        for w in weight_warnings:
+            log.warning("paper_trading.weight_ineffective", detail=w)
+
         tickers = self._group_service.get_group_tickers(session["universe_group_id"])
 
-        # Batch load signals for all trading days at once
-        signal_dates = [self._prev_trading_day(d) for d in trading_days]
-        try:
-            batch_signals = self._generate_signals_batch(
-                strategy_id=session["strategy_id"],
-                signal_dates=signal_dates,
-                universe_group_id=session["universe_group_id"],
-                tickers=tickers,
-                session_id=session_id,
-            )
-        except Exception as exc:
-            log.warning(
-                "paper_trading.batch_signal_fallback",
-                error=str(exc),
-                msg="Falling back to SignalService per-day generation",
-            )
-            # Fallback: generate signals one day at a time via SignalService
-            batch_signals = {}
-            for idx, sig_date in enumerate(signal_dates):
-                try:
-                    result = self._signal_service.generate_signals(
-                        strategy_id=session["strategy_id"],
-                        target_date=str(sig_date),
-                        universe_group_id=session["universe_group_id"],
-                    )
-                    batch_signals[idx] = result.get("signals", [])
-                except Exception:
-                    batch_signals[idx] = []
+        # Pre-load shared resources once: strategy instance, factors, models, prices
+        # (same as _generate_signals_batch but we generate signals day-by-day
+        # so stateful strategies see correct portfolio state at each step)
+        batch_ctx = self._prepare_signal_context(
+            strategy_id=session["strategy_id"],
+            signal_dates=[self._prev_trading_day(d) for d in trading_days],
+            universe_group_id=session["universe_group_id"],
+            tickers=tickers,
+        )
 
         # Load price cache for trade execution (separate from signal generation)
         price_cache = self._preload_prices(tickers, trading_days[0], trading_days[-1], conn)
@@ -324,67 +349,112 @@ class PaperTradingService:
         signal_errors = 0
         daily_snapshots: list[tuple] = []
 
+        # Track holding days and exit dates for execution constraints
+        ticker_holding_days: dict[str, int] = {}
+        ticker_exit_day: dict[str, int] = {}  # ticker -> day_idx when last sold
+
+        # Initialize holding_days from existing positions
+        if positions:
+            existing_holding = self._calculate_holding_days(
+                session_id, list(positions.keys()),
+                trading_days[0] if trading_days else date.today(), conn,
+            )
+            ticker_holding_days.update(existing_holding)
+
         log.info(
             "paper_trading.advance_start",
             session_id=session_id,
             days_to_process=len(trading_days),
             range=f"{trading_days[0]}~{trading_days[-1]}",
+            execution_constraints=f"buffer={rebalance_buffer}, min_hold={min_holding_days}, cooldown={reentry_cooldown_days}",
+            position_sizing=position_sizing,
         )
 
         for idx, trade_date in enumerate(trading_days):
-            # Build portfolio state for this day (before trading)
-            portfolio_state = self._build_portfolio_state(
-                session_id, positions, cash,
-                self._prev_trading_day(trade_date) if idx > 0 else trading_days[0]
+            signal_date = self._prev_trading_day(trade_date)
+
+            # --- Day-by-day signal generation with real-time portfolio state ---
+            # Build portfolio state from current (evolving) positions
+            portfolio_state = self._build_portfolio_state_from_memory(
+                positions, cash, trade_date, price_cache,
+                ticker_holding_days,
             )
 
-            signals = batch_signals.get(idx, [])
+            # Generate signals for this single day using pre-loaded context
+            signals = self._generate_signal_single_day(
+                batch_ctx, signal_date, portfolio_state,
+            )
+
             if not signals:
                 signal_errors += 1
 
-            target_weights: dict[str, float] = {}
-            for sig in signals:
-                ticker = sig.get("ticker", "")
-                weight = sig.get("target_weight", 0.0)
-                if weight and weight > 0:
-                    target_weights[ticker] = float(weight)
+            # Apply position sizing (aligned with backtest_service._apply_position_sizing)
+            target_weights = self._apply_position_sizing_from_signals(
+                signals, position_sizing, max_positions, max_position_pct,
+            )
 
-            if len(target_weights) > max_positions:
-                sorted_tw = sorted(
-                    target_weights.items(), key=lambda x: x[1], reverse=True
-                )
-                target_weights = dict(sorted_tw[:max_positions])
+            # Apply execution constraints (aligned with backtest_engine)
+            if rebalance_buffer > 0 or min_holding_days > 0 or reentry_cooldown_days > 0:
+                # Calculate current weights from positions
+                current_weights = portfolio_state.get("current_weights", {})
+                effective_targets = dict(target_weights)
 
-            # Optional: normalize weights to 100% (default behavior for backward compatibility)
-            normalize_weights = config.get("normalize_weights", True)
-            if normalize_weights:
-                w_sum = sum(target_weights.values())
-                if w_sum > 0:
-                    target_weights = {t: w / w_sum for t, w in target_weights.items()}
-            else:
-                # Absolute weight mode: respect strategy's target weights
-                # Apply cash_reserve and max_position_pct constraints if configured
-                cash_reserve_pct = config.get("cash_reserve_pct", 0.0)
-                max_position_pct = config.get("max_position_pct", 1.0)
+                all_involved = set(current_weights.keys()) | set(target_weights.keys())
+                for ticker in all_involved:
+                    old_w = current_weights.get(ticker, 0.0)
+                    new_w = target_weights.get(ticker, 0.0)
 
-                # Cap individual positions
-                for ticker in target_weights:
-                    if target_weights[ticker] > max_position_pct:
-                        target_weights[ticker] = max_position_pct
+                    # Buffer: skip trade if weight change is below threshold
+                    if rebalance_buffer > 0 and abs(new_w - old_w) < rebalance_buffer:
+                        effective_targets[ticker] = old_w
+                        continue
 
-                # Scale down if total exceeds (1 - cash_reserve)
-                max_total = 1.0 - cash_reserve_pct
-                w_sum = sum(target_weights.values())
-                if w_sum > max_total:
-                    scale = max_total / w_sum
-                    target_weights = {t: w * scale for t, w in target_weights.items()}
+                    # Min holding days: prevent selling before N days
+                    if min_holding_days > 0 and old_w > 0 and new_w < old_w:
+                        days_held = ticker_holding_days.get(ticker, 0)
+                        if days_held < min_holding_days:
+                            effective_targets[ticker] = old_w
+                            continue
+
+                    # Re-entry cooldown: prevent buying back after recent sell
+                    if reentry_cooldown_days > 0 and old_w == 0 and new_w > 0:
+                        exit_idx = ticker_exit_day.get(ticker)
+                        if exit_idx is not None and (idx - exit_idx) < reentry_cooldown_days:
+                            effective_targets.pop(ticker, None)
+                            continue
+
+                # Re-normalize if constraints altered the weights
+                eff_sum = sum(w for w in effective_targets.values() if w > 0)
+                if eff_sum > 0:
+                    target_weights = {
+                        t: w / eff_sum for t, w in effective_targets.items() if w > 0
+                    }
+                else:
+                    target_weights = {}
 
             day_trades = self._execute_trades_cached(
                 positions, cash, target_weights,
                 trade_date, cost_rate, price_cache,
             )
+
+            # Track exits and holding days for execution constraints
+            old_positions = set(positions.keys())
             cash = day_trades["cash_after"]
             positions = day_trades["positions_after"]
+            new_positions = set(positions.keys())
+
+            # Update holding days: increment for held, reset for new entries
+            for ticker in new_positions:
+                if ticker in old_positions:
+                    ticker_holding_days[ticker] = ticker_holding_days.get(ticker, 0) + 1
+                else:
+                    ticker_holding_days[ticker] = 1
+
+            # Track exits for cooldown
+            for ticker in old_positions - new_positions:
+                ticker_exit_day[ticker] = idx
+                ticker_holding_days.pop(ticker, None)
+
             total_new_trades += len(day_trades["trades"])
             nav = self._value_portfolio_cached(positions, cash, trade_date, price_cache)
 
@@ -949,6 +1019,352 @@ class PaperTradingService:
     def _prev_trading_day(d: date) -> date:
         """Return the trading day immediately before *d*."""
         return offset_trading_days(d, -1)
+
+    def _prepare_signal_context(
+        self,
+        strategy_id: str,
+        signal_dates: list[date],
+        universe_group_id: str,
+        tickers: list[str],
+    ) -> dict:
+        """Pre-load strategy, factors, models, and prices for signal generation.
+
+        Loads everything once so that day-by-day signal generation only needs
+        to build the StrategyContext per day without re-loading from DB.
+
+        Returns a dict with all pre-loaded resources.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        strategy_def = self._strategy_service.get_strategy(strategy_id)
+        strategy_instance = self._load_strategy_instance(strategy_def)
+
+        required_factors = strategy_def.get("required_factors", [])
+        required_models = strategy_def.get("required_models", [])
+
+        start_lookback = min(signal_dates) - timedelta(days=250)
+        end_date = max(signal_dates)
+        start_str = str(start_lookback)
+        end_str = str(end_date)
+
+        # Bulk load ALL factor data (strategy + model features)
+        strategy_factor_map = self._resolve_factor_ids(required_factors) if required_factors else {}
+        all_factor_ids = set(strategy_factor_map.values())
+
+        model_fs_map: dict[str, tuple[str, dict[str, str]]] = {}
+        for model_id in required_models:
+            try:
+                model_record = self._model_service.get_model(model_id)
+                fs_id = model_record["feature_set_id"]
+                fs = self._feature_service.get_feature_set(fs_id)
+                fs_id_to_name: dict[str, str] = {}
+                for ref in fs["factor_refs"]:
+                    fid = ref["factor_id"]
+                    fname = ref.get("factor_name", fid)
+                    fs_id_to_name[fid] = fname
+                    all_factor_ids.add(fid)
+                model_fs_map[model_id] = (fs_id, fs_id_to_name)
+            except Exception as exc:
+                log.warning("paper_trading.prepare_model_fs_failed", model_id=model_id, error=str(exc))
+
+        cached_by_id = self._factor_engine.load_cached_factors_bulk(
+            list(all_factor_ids), tickers, start_str, end_str
+        )
+
+        # Build strategy factor_data
+        factor_data: dict[str, pd.DataFrame] = {}
+        for factor_name, factor_id in strategy_factor_map.items():
+            if factor_id in cached_by_id and not cached_by_id[factor_id].empty:
+                factor_data[factor_name] = cached_by_id[factor_id]
+            else:
+                try:
+                    df = self._factor_engine.compute_factor(factor_id, tickers, start_str, end_str)
+                    if not df.empty:
+                        factor_data[factor_name] = df
+                except Exception as exc:
+                    log.warning("paper_trading.prepare_factor_failed", factor_name=factor_name, error=str(exc))
+
+        # Build model predictions for all dates
+        model_predictions: dict[str, dict[date, pd.Series]] = {}
+
+        def _predict_model_batch(model_id: str) -> tuple[str, dict[date, pd.Series]]:
+            result_preds: dict[date, pd.Series] = {}
+            if model_id not in model_fs_map:
+                return (model_id, result_preds)
+
+            fs_id, fs_id_to_name = model_fs_map[model_id]
+            fs = self._feature_service.get_feature_set(fs_id)
+            preprocessing = fs["preprocessing"]
+
+            feature_data_local: dict[str, pd.DataFrame] = {}
+            for fid, fname in fs_id_to_name.items():
+                if fid in cached_by_id and not cached_by_id[fid].empty:
+                    feature_data_local[fname] = cached_by_id[fid]
+                else:
+                    try:
+                        df = self._factor_engine.compute_factor(fid, tickers, start_str, end_str)
+                        if not df.empty:
+                            feature_data_local[fname] = df
+                    except Exception as exc:
+                        log.warning("paper_trading.prepare_model_factor_failed", factor=fname, error=str(exc))
+
+            processed_features: dict[str, pd.DataFrame] = {}
+            for fname, df in feature_data_local.items():
+                processed_features[fname] = self._feature_service._apply_preprocessing(df, preprocessing)
+
+            for d in signal_dates:
+                try:
+                    preds = self._model_service.predict_with_features(
+                        model_id=model_id,
+                        feature_data=processed_features,
+                        tickers=tickers,
+                        date=str(d),
+                    )
+                    if not preds.empty:
+                        result_preds[d] = preds
+                except Exception as exc:
+                    log.warning("paper_trading.prepare_model_failed", model_id=model_id, date=str(d), error=str(exc))
+
+            return (model_id, result_preds)
+
+        if required_models:
+            with ThreadPoolExecutor(max_workers=min(4, max(1, len(required_models)))) as executor:
+                futures = {executor.submit(_predict_model_batch, mid): mid for mid in required_models}
+                for future in as_completed(futures):
+                    model_id, preds_by_date = future.result()
+                    model_predictions[model_id] = preds_by_date
+
+        # -- Runtime check: warn if required models produced no predictions --
+        if required_models and not model_predictions:
+            log.error(
+                "paper_trading.no_model_predictions",
+                detail=(
+                    f"策略声明了 required_models={required_models} "
+                    f"但没有任何模型产出预测。策略可能退化为 0 trades。"
+                ),
+            )
+        elif required_models:
+            empty_models = [m for m, preds in model_predictions.items() if not preds]
+            if empty_models:
+                log.warning(
+                    "paper_trading.partial_model_predictions",
+                    empty_models=empty_models,
+                    signal_dates=[str(d) for d in signal_dates],
+                )
+
+        # Pre-load OHLCV data
+        prices_close, prices_open, prices_high, prices_low, prices_volume = self._load_prices(
+            tickers, start_str, end_str
+        )
+        prices_multi = self._build_prices_multi(
+            prices_close, prices_open, prices_high, prices_low, prices_volume, tickers
+        )
+
+        return {
+            "strategy_instance": strategy_instance,
+            "factor_data": factor_data,
+            "model_predictions": model_predictions,
+            "prices_multi": prices_multi,
+            "tickers": tickers,
+        }
+
+    def _generate_signal_single_day(
+        self,
+        batch_ctx: dict,
+        signal_date: date,
+        portfolio_state: dict | None = None,
+    ) -> list[dict]:
+        """Generate signals for a single day using pre-loaded context.
+
+        Unlike _generate_signals_batch which pre-generates all days,
+        this generates one day at a time so stateful strategies see
+        the correct evolving portfolio state.
+        """
+        strategy_instance = batch_ctx["strategy_instance"]
+        factor_data = batch_ctx["factor_data"]
+        model_predictions = batch_ctx["model_predictions"]
+        prices_multi = batch_ctx["prices_multi"]
+
+        trade_ts = pd.Timestamp(signal_date)
+
+        # Filter factor data up to this date
+        date_factor_data = {}
+        for name, df in factor_data.items():
+            if not df.empty:
+                date_factor_data[name] = df[df.index <= trade_ts]
+
+        # Filter model predictions for this date
+        date_model_preds = {}
+        for model_id, preds_by_date in model_predictions.items():
+            if signal_date in preds_by_date:
+                date_model_preds[model_id] = preds_by_date[signal_date]
+
+        # Build context with portfolio state
+        context_kwargs = {
+            "prices": prices_multi.loc[:trade_ts],
+            "factor_values": date_factor_data,
+            "model_predictions": date_model_preds,
+            "current_date": trade_ts,
+        }
+
+        if portfolio_state:
+            context_kwargs.update(portfolio_state)
+
+        context = StrategyContext(**context_kwargs)
+
+        try:
+            raw_signals = strategy_instance.generate_signals(context)
+            if raw_signals.empty:
+                return []
+
+            signal_list = []
+            for ticker in raw_signals.index:
+                row = raw_signals.loc[ticker]
+                signal_list.append({
+                    "ticker": str(ticker),
+                    "signal": int(row.get("signal", 0)),
+                    "target_weight": float(row.get("weight", 0.0)),
+                    "strength": float(row.get("strength", 0.0)),
+                })
+            return signal_list
+        except Exception as exc:
+            log.warning("paper_trading.signal_single_day_failed", date=str(signal_date), error=str(exc))
+            return []
+
+    def _build_portfolio_state_from_memory(
+        self,
+        positions: dict[str, dict],
+        cash: float,
+        trade_date: date,
+        price_cache: dict[date, dict[str, tuple[float, float]]],
+        ticker_holding_days: dict[str, int],
+    ) -> dict:
+        """Build portfolio state from in-memory positions (no DB query).
+
+        Unlike _build_portfolio_state which queries paper_trading_daily,
+        this builds state from the evolving in-memory positions dict,
+        ensuring stateful strategies see correct day-by-day state.
+        """
+        if not positions:
+            return {
+                "current_weights": {},
+                "holding_days": {},
+                "avg_entry_price": {},
+                "unrealized_pnl": {},
+            }
+
+        # Use price_cache for current prices
+        day_prices = price_cache.get(trade_date, {})
+        prev_day = self._prev_trading_day(trade_date)
+        prev_prices = price_cache.get(prev_day, {})
+        # Prefer previous day close (most recent settlement), fall back to trade_date
+        best_prices = prev_prices if prev_prices else day_prices
+
+        portfolio_value = cash
+        current_prices: dict[str, float] = {}
+        for ticker, pos in positions.items():
+            prices = best_prices.get(ticker)
+            if prices:
+                current_prices[ticker] = prices[1]  # close price
+            else:
+                current_prices[ticker] = pos.get("avg_price", 0)
+            portfolio_value += pos["shares"] * current_prices[ticker]
+
+        current_weights = {}
+        avg_entry_price = {}
+        unrealized_pnl = {}
+
+        for ticker, pos in positions.items():
+            shares = pos["shares"]
+            entry_price = pos.get("avg_price", 0)
+            cur_price = current_prices.get(ticker, entry_price)
+
+            position_value = shares * cur_price
+            current_weights[ticker] = position_value / portfolio_value if portfolio_value > 0 else 0
+            avg_entry_price[ticker] = entry_price
+            unrealized_pnl[ticker] = (cur_price / entry_price - 1) if entry_price > 0 else 0
+
+        return {
+            "current_weights": current_weights,
+            "holding_days": dict(ticker_holding_days),
+            "avg_entry_price": avg_entry_price,
+            "unrealized_pnl": unrealized_pnl,
+        }
+
+    @staticmethod
+    def _apply_position_sizing_from_signals(
+        signals: list[dict],
+        method: str,
+        max_positions: int,
+        max_position_pct: float = 0.10,
+    ) -> dict[str, float]:
+        """Apply position sizing to signal list, aligned with backtest_service._apply_position_sizing.
+
+        Args:
+            signals: List of signal dicts with ticker, signal, target_weight, strength.
+            method: One of 'equal_weight', 'signal_weight', 'max_position'.
+            max_positions: Maximum number of positions.
+            max_position_pct: Maximum weight per position.
+
+        Returns:
+            Dict mapping ticker -> target weight (summing to ~1.0).
+        """
+        # Filter to buy signals only
+        buys = [s for s in signals if s.get("signal") == 1 and s.get("target_weight", 0) > 0]
+        if not buys:
+            return {}
+
+        # Sort by strength descending, take top N
+        buys.sort(key=lambda x: x.get("strength", 0), reverse=True)
+        if len(buys) > max_positions:
+            buys = buys[:max_positions]
+
+        if method == "equal_weight":
+            n = len(buys)
+            return {s["ticker"]: 1.0 / n for s in buys}
+
+        elif method == "signal_weight":
+            total_strength = sum(s.get("strength", 0) for s in buys)
+            if total_strength > 0:
+                return {s["ticker"]: s.get("strength", 0) / total_strength for s in buys}
+            else:
+                n = len(buys)
+                return {s["ticker"]: 1.0 / n for s in buys}
+
+        elif method == "max_position":
+            total_strength = sum(s.get("strength", 0) for s in buys)
+            if total_strength > 0:
+                raw_weights = {s["ticker"]: s.get("strength", 0) / total_strength for s in buys}
+            else:
+                n = len(buys)
+                raw_weights = {s["ticker"]: 1.0 / n for s in buys}
+
+            # Iterative capping
+            capped = {}
+            uncapped = dict(raw_weights)
+            for _ in range(10):  # max iterations
+                excess = 0.0
+                newly_capped = {}
+                for t, w in list(uncapped.items()):
+                    if w > max_position_pct:
+                        excess += w - max_position_pct
+                        newly_capped[t] = max_position_pct
+                        del uncapped[t]
+                if not newly_capped:
+                    break
+                capped.update(newly_capped)
+                if uncapped and excess > 0:
+                    uncapped_sum = sum(uncapped.values())
+                    if uncapped_sum > 0:
+                        for t in uncapped:
+                            uncapped[t] += excess * (uncapped[t] / uncapped_sum)
+            capped.update(uncapped)
+            return capped
+
+        else:
+            # Default to equal weight
+            n = len(buys)
+            return {s["ticker"]: 1.0 / n for s in buys}
 
     def _generate_signals_batch(
         self,

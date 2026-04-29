@@ -2,10 +2,63 @@
 
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import Any
 
 import pandas as pd
+
+
+class StageTracer:
+    """Lightweight helper that strategies can use to log decision-chain stages.
+
+    Usage inside a strategy::
+
+        def generate_signals(self, context: StrategyContext) -> pd.DataFrame:
+            tracer = StageTracer(context)
+            candidates = self._build_candidate_pool(context)
+            tracer.log("candidate_pool", sorted(candidates))
+
+            scores = self._score(context, candidates)
+            tracer.log("score_map", scores)
+
+            selected = self._select(scores)
+            tracer.log("selected_set", sorted(selected))
+
+            kept, replaced, exited = self._portfolio_action(context, selected)
+            tracer.log("keep", sorted(kept))
+            tracer.log("replace", sorted(replaced))
+            tracer.log("exit", sorted(exited))
+            ...
+
+    The tracer writes into ``context.diagnostics["stage_trace"]`` which the
+    diagnose endpoint already captures and returns.
+    """
+
+    def __init__(self, context: StrategyContext) -> None:
+        self._context = context
+        self._stages: list[dict[str, Any]] = []
+        self._t0 = time.monotonic()
+        context.diagnostics.setdefault("stage_trace", self._stages)
+
+    def log(self, stage: str, data: Any, *, meta: dict | None = None) -> None:
+        """Record one decision stage.
+
+        Args:
+            stage: Stage name, e.g. ``"candidate_pool"``, ``"score_map"``.
+            data: Payload — list of tickers, dict of scores, etc.
+                  Must be JSON-serialisable (or will be repr'd).
+            meta: Optional extra metadata dict.
+        """
+        entry: dict[str, Any] = {
+            "stage": stage,
+            "elapsed_ms": round((time.monotonic() - self._t0) * 1000, 1),
+            "data": data,
+        }
+        if meta:
+            entry["meta"] = meta
+        self._stages.append(entry)
 
 
 @dataclass

@@ -11,7 +11,7 @@ from backend.logger import get_logger
 from backend.services.backtest_service import BacktestService
 from backend.services.strategy_service import StrategyService
 from backend.strategies.builtins import get_template_names, get_template_source
-from backend.tasks.executor import TaskExecutor
+from backend.tasks.executor import TaskExecutor, get_task_executor
 from backend.tasks.models import TaskSource
 
 log = get_logger(__name__)
@@ -20,7 +20,6 @@ router = APIRouter(prefix="/api", tags=["strategies"])
 
 _strategy_service: StrategyService | None = None
 _backtest_service: BacktestService | None = None
-_executor: TaskExecutor | None = None
 
 
 def _get_strategy_service() -> StrategyService:
@@ -38,10 +37,7 @@ def _get_backtest_service() -> BacktestService:
 
 
 def _get_executor() -> TaskExecutor:
-    global _executor
-    if _executor is None:
-        _executor = TaskExecutor()
-    return _executor
+    return get_task_executor()
 
 
 # ------------------------------------------------------------------

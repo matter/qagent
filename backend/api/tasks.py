@@ -7,7 +7,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 
 from backend.logger import get_logger
-from backend.tasks.executor import TaskExecutor
+from backend.tasks.executor import TaskExecutor, get_task_executor
 from backend.tasks.models import TaskStatus
 from backend.tasks.store import TaskStore
 
@@ -15,15 +15,11 @@ log = get_logger(__name__)
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
-_executor: TaskExecutor | None = None
 _store: TaskStore | None = None
 
 
 def _get_executor() -> TaskExecutor:
-    global _executor
-    if _executor is None:
-        _executor = TaskExecutor()
-    return _executor
+    return get_task_executor()
 
 
 def _get_store() -> TaskStore:
