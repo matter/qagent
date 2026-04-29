@@ -63,7 +63,7 @@ class PaperTradingServiceContractTests(unittest.TestCase):
             rows = svc.get_daily_series("session-1")
 
         self.assertIn("FROM paper_trading_daily", fake_conn.query)
-        self.assertEqual(fake_conn.params, ["session-1"])
+        self.assertEqual(fake_conn.params, ["session-1", "US"])
         self.assertEqual(rows[0]["position_count"], 1)
         self.assertEqual(rows[0]["trade_count"], 1)
 
@@ -96,10 +96,13 @@ class PaperTradingServiceContractTests(unittest.TestCase):
         svc = PaperTradingService.__new__(PaperTradingService)
         fake_conn = FakeConnection()
 
-        with patch("backend.services.paper_trading_service.get_connection", return_value=fake_conn):
+        with (
+            patch("backend.services.paper_trading_service.get_connection", return_value=fake_conn),
+            patch.object(svc, "get_session", return_value={"market": "US"}),
+        ):
             positions = svc.get_positions("session-1", as_of_date="2026-04-10")
 
-        self.assertEqual(fake_conn.snapshot_params, ["session-1", "2026-04-10"])
+        self.assertEqual(fake_conn.snapshot_params, ["session-1", "US", "2026-04-10"])
         self.assertEqual(positions[0]["ticker"], "AAA")
         self.assertEqual(positions[0]["date"], "2026-04-10")
         self.assertEqual(positions[0]["latest_price"], 11.0)
@@ -258,7 +261,7 @@ class PaperTradingServiceContractTests(unittest.TestCase):
             patch.object(
                 svc,
                 "_prev_trading_day",
-                side_effect=lambda d: d - timedelta(days=1),
+                side_effect=lambda d, market=None: d - timedelta(days=1),
             ),
             patch.object(svc, "_prepare_signal_context", return_value={"ctx": True}) as prepare_ctx,
             patch.object(
@@ -299,8 +302,9 @@ class PaperTradingServiceContractTests(unittest.TestCase):
         generate_signal.assert_called_once()
         execute.assert_called_once()
         self.assertEqual(execute.call_args.args[3], second_day)
-        self.assertEqual(fake_conn.snapshots[0][1], first_day)
-        self.assertEqual(json.loads(fake_conn.snapshots[0][5]), [])
+        self.assertEqual(fake_conn.snapshots[0][1], "US")
+        self.assertEqual(fake_conn.snapshots[0][2], first_day)
+        self.assertEqual(json.loads(fake_conn.snapshots[0][6]), [])
 
     def test_paper_advance_respects_weekly_rebalance_frequency(self):
         class FakeResult:
@@ -375,7 +379,7 @@ class PaperTradingServiceContractTests(unittest.TestCase):
             patch.object(
                 svc,
                 "_prev_trading_day",
-                side_effect=lambda d: trading_days[trading_days.index(d) - 1],
+                side_effect=lambda d, market=None: trading_days[trading_days.index(d) - 1],
             ),
             patch.object(svc, "_prepare_signal_context", return_value={"ctx": True}) as prepare_ctx,
             patch.object(
@@ -495,7 +499,7 @@ class PaperTradingServiceContractTests(unittest.TestCase):
             patch.object(
                 svc,
                 "_prev_trading_day",
-                side_effect=lambda d: trading_days[trading_days.index(d) - 1],
+                side_effect=lambda d, market=None: trading_days[trading_days.index(d) - 1],
             ),
             patch.object(svc, "_prepare_signal_context", return_value={"ctx": True}),
             patch.object(
@@ -596,7 +600,7 @@ class PaperTradingServiceContractTests(unittest.TestCase):
             patch.object(
                 svc,
                 "_prev_trading_day",
-                side_effect=lambda d: trading_days[trading_days.index(d) - 1],
+                side_effect=lambda d, market=None: trading_days[trading_days.index(d) - 1],
             ),
             patch.object(svc, "_prepare_signal_context", return_value={"ctx": True}),
             patch.object(

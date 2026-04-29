@@ -21,6 +21,7 @@ from backend.services.factor_engine import FactorEngine
 from backend.services.feature_service import FeatureService
 from backend.services.group_service import GroupService
 from backend.services.calendar_service import offset_trading_days
+from backend.services.market_context import normalize_market, normalize_ticker
 from backend.services.model_service import ModelService
 from backend.services.strategy_service import StrategyService
 from backend.strategies.base import StrategyContext
@@ -40,15 +41,15 @@ class SignalService:
         self._group_service = GroupService()
 
         # Instance-level caches for cross-call reuse
-        self._factor_id_cache: dict[tuple[str, ...], dict[str, str]] = {}
-        self._model_fs_cache: dict[str, tuple[str, dict[str, str], dict]] = {}
+        self._factor_id_cache: dict[tuple[str, tuple[str, ...]], dict[str, str]] = {}
+        self._model_fs_cache: dict[tuple[str, str], tuple[str, dict[str, str], dict]] = {}
         # Factors: (frozenset(factor_ids), frozenset(tickers)) -> (start, end, data)
         self._factor_bulk_cache: dict[
-            tuple[frozenset[str], frozenset[str]],
+            tuple[str, frozenset[str], frozenset[str]],
             tuple[str, str, dict[str, pd.DataFrame]],
         ] = {}
         # Preprocessed features: (fs_id, target_date) -> dict[fname -> DataFrame]
-        self._preprocessed_cache: dict[tuple[str, str], dict[str, pd.DataFrame]] = {}
+        self._preprocessed_cache: dict[tuple[str, str, str], dict[str, pd.DataFrame]] = {}
 
     # ------------------------------------------------------------------
     # Signal generation
@@ -59,6 +60,7 @@ class SignalService:
         strategy_id: str,
         target_date: str,
         universe_group_id: str,
+        market: str | None = None,
     ) -> dict:
         """Full signal generation pipeline.
 
@@ -77,19 +79,29 @@ class SignalService:
         11. Save to signal_runs + signal_details tables.
         12. Return signal list with metadata.
         """
+        resolved_market = normalize_market(market)
+
         # ---- 1. Load strategy ----
-        strategy_def = self._strategy_service.get_strategy(strategy_id)
+        strategy_def = self._strategy_service.get_strategy(strategy_id, market=resolved_market)
         strategy_instance = load_strategy_from_code(strategy_def["source_code"])
+        StrategyService._validate_dependencies(
+            strategy_def.get("required_factors", []),
+            StrategyService.resolve_required_models(strategy_def),
+            resolved_market,
+        )
 
         log.info(
             "signal_service.start",
+            market=resolved_market,
             strategy=strategy_def["name"],
             version=strategy_def["version"],
             target_date=target_date,
         )
 
         # ---- 2. Validate dependency chain ----
-        validation = self._validate_dependency_chain(strategy_def, target_date, universe_group_id)
+        validation = self._validate_dependency_chain(
+            strategy_def, target_date, universe_group_id, market=resolved_market
+        )
 
         # If pipeline is blocked (a critical step cannot proceed), raise
         if validation["blocked"]:
@@ -98,26 +110,31 @@ class SignalService:
             )
 
         # ---- 3. Resolve universe tickers ----
-        tickers = self._group_service.get_group_tickers(universe_group_id)
+        tickers = self._group_service.get_group_tickers(
+            universe_group_id, market=resolved_market
+        )
         if not tickers:
             raise ValueError(f"Universe group '{universe_group_id}' has no members")
+        tickers = [normalize_ticker(t, resolved_market) for t in tickers]
 
         # ---- 4. Load OHLCV data up to target_date ----
         # Use a lookback window for factor warm-up (120 trading days ~ 6 months)
         conn = get_connection()
         lookback_query = """
-            SELECT MIN(date) FROM (
-                SELECT DISTINCT date FROM daily_bars
-                WHERE date <= ?
-                ORDER BY date DESC
-                LIMIT 250
-            )
+                SELECT MIN(date) FROM (
+                    SELECT DISTINCT date FROM daily_bars
+                    WHERE market = ? AND date <= ?
+                    ORDER BY date DESC
+                    LIMIT 250
+                )
         """
-        row = conn.execute(lookback_query, [target_date]).fetchone()
+        row = conn.execute(lookback_query, [resolved_market, target_date]).fetchone()
         start_date = str(row[0]) if row and row[0] else target_date
 
         prices_close, prices_open, prices_high, prices_low, prices_volume = (
-            self._load_prices(tickers, start_date, target_date)
+            self._load_prices(
+                tickers, start_date, target_date, market=resolved_market
+            )
         )
         if prices_close.empty:
             raise ValueError("No price data available for the given tickers and date range")
@@ -127,16 +144,20 @@ class SignalService:
         required_models = StrategyService.resolve_required_models(strategy_def)
 
         # Resolve strategy factor IDs
-        strategy_factor_map = self._resolve_factor_ids(required_factors) if required_factors else {}
+        strategy_factor_map = (
+            self._resolve_factor_ids(required_factors, market=resolved_market)
+            if required_factors
+            else {}
+        )
         all_factor_ids = set(strategy_factor_map.values())
 
         # Resolve model feature sets and collect all factor IDs
         model_fs_map: dict[str, tuple[str, dict[str, str], dict]] = {}
         for model_id in required_models:
             try:
-                model_record = self._model_service.get_model(model_id)
+                model_record = self._model_service.get_model(model_id, market=resolved_market)
                 fs_id = model_record["feature_set_id"]
-                fs = self._feature_service.get_feature_set(fs_id)
+                fs = self._feature_service.get_feature_set(fs_id, market=resolved_market)
                 fs_id_to_name: dict[str, str] = {}
                 for ref in fs["factor_refs"]:
                     fid = ref["factor_id"]
@@ -149,7 +170,7 @@ class SignalService:
 
         # Bulk load all cached factor values in ONE query
         cached_by_id = self._factor_engine.load_cached_factors_bulk(
-            list(all_factor_ids), tickers, start_date, target_date
+            list(all_factor_ids), tickers, start_date, target_date, market=resolved_market
         )
 
         # Build strategy factor_data from cache, fallback to compute
@@ -160,7 +181,7 @@ class SignalService:
             else:
                 try:
                     df = self._factor_engine.compute_factor(
-                        factor_id, tickers, start_date, target_date
+                        factor_id, tickers, start_date, target_date, market=resolved_market
                     )
                     if not df.empty:
                         factor_data[factor_name] = df
@@ -187,7 +208,9 @@ class SignalService:
                         feature_data_local[fname] = cached_by_id[fid]
                     else:
                         try:
-                            df = self._factor_engine.compute_factor(fid, tickers, start_date, target_date)
+                            df = self._factor_engine.compute_factor(
+                                fid, tickers, start_date, target_date, market=resolved_market
+                            )
                             if not df.empty:
                                 feature_data_local[fname] = df
                         except Exception:
@@ -203,6 +226,7 @@ class SignalService:
                     feature_data=processed,
                     tickers=tickers,
                     date=target_date,
+                    market=resolved_market,
                 )
                 if not preds.empty:
                     model_predictions[model_id] = preds
@@ -246,13 +270,15 @@ class SignalService:
 
         # ---- 10. Build dependency_snapshot ----
         dependency_snapshot = self._build_dependency_snapshot(
-            strategy_def, required_factors, required_models, target_date, validation
+            strategy_def, required_factors, required_models, target_date, validation,
+            market=resolved_market,
         )
 
         # ---- 11. Save to DB ----
         run_id = uuid.uuid4().hex[:12]
         signal_records = self._save_signal_run(
             run_id=run_id,
+            market=resolved_market,
             strategy_id=strategy_id,
             strategy_version=strategy_def.get("version", 1),
             target_date=target_date,
@@ -265,6 +291,7 @@ class SignalService:
         # ---- 12. Return results ----
         result = {
             "run_id": run_id,
+            "market": resolved_market,
             "strategy_id": strategy_id,
             "strategy_name": strategy_def["name"],
             "strategy_version": strategy_def.get("version", 1),
@@ -280,6 +307,7 @@ class SignalService:
         log.info(
             "signal_service.done",
             run_id=run_id,
+            market=resolved_market,
             signal_count=len(signal_records),
             result_level=result_level,
         )
@@ -294,6 +322,7 @@ class SignalService:
         strategy_id: str,
         target_date: str,
         universe_group_id: str,
+        market: str | None = None,
         date_role: str = "decision",
         max_tickers: int = 0,
         focus_tickers: list[str] | None = None,
@@ -326,22 +355,33 @@ class SignalService:
                 any explicit state fields above.
         """
         t0 = time.time()
+        resolved_market = normalize_market(market)
         timings: dict[str, float] = {}
-        date_info = self._resolve_diagnose_dates(target_date, date_role)
+        date_info = self._resolve_diagnose_dates(
+            target_date, date_role, market=resolved_market
+        )
         decision_date = date_info["decision_date"]
         execution_date = date_info["execution_date"]
         analysis_date = decision_date
 
         # ---- 1. Load strategy ----
-        strategy_def = self._strategy_service.get_strategy(strategy_id)
+        strategy_def = self._strategy_service.get_strategy(strategy_id, market=resolved_market)
         strategy_instance = load_strategy_from_code(strategy_def["source_code"])
+        StrategyService._validate_dependencies(
+            strategy_def.get("required_factors", []),
+            StrategyService.resolve_required_models(strategy_def),
+            resolved_market,
+        )
         timings["1_load_strategy"] = time.time() - t0
 
         # ---- 2. Resolve universe tickers ----
         t1 = time.time()
-        tickers = self._group_service.get_group_tickers(universe_group_id)
+        tickers = self._group_service.get_group_tickers(
+            universe_group_id, market=resolved_market
+        )
         if not tickers:
             raise ValueError(f"Universe group '{universe_group_id}' has no members")
+        tickers = [normalize_ticker(t, resolved_market) for t in tickers]
 
         full_universe_size = len(tickers)
         sampled = False
@@ -366,18 +406,18 @@ class SignalService:
         t2 = time.time()
         conn = get_connection()
         lookback_query = """
-            SELECT MIN(date) FROM (
-                SELECT DISTINCT date FROM daily_bars
-                WHERE date <= ?
-                ORDER BY date DESC
-                LIMIT 250
-            )
+                SELECT MIN(date) FROM (
+                    SELECT DISTINCT date FROM daily_bars
+                    WHERE market = ? AND date <= ?
+                    ORDER BY date DESC
+                    LIMIT 250
+                )
         """
-        row = conn.execute(lookback_query, [analysis_date]).fetchone()
+        row = conn.execute(lookback_query, [resolved_market, analysis_date]).fetchone()
         start_date = str(row[0]) if row and row[0] else analysis_date
 
         prices_close, prices_open, prices_high, prices_low, prices_volume = (
-            self._load_prices(tickers, start_date, analysis_date)
+            self._load_prices(tickers, start_date, analysis_date, market=resolved_market)
         )
         if prices_close.empty:
             raise ValueError("No price data available for the given tickers and date range")
@@ -396,35 +436,42 @@ class SignalService:
         # buffer for forward-fill), not the full 250-day price lookback.
         t3 = time.time()
         factor_lookback_query = """
-            SELECT MIN(date) FROM (
-                SELECT DISTINCT date FROM daily_bars
-                WHERE date <= ?
-                ORDER BY date DESC
-                LIMIT 10
-            )
+                SELECT MIN(date) FROM (
+                    SELECT DISTINCT date FROM daily_bars
+                    WHERE market = ? AND date <= ?
+                    ORDER BY date DESC
+                    LIMIT 10
+                )
         """
-        frow = conn.execute(factor_lookback_query, [analysis_date]).fetchone()
+        frow = conn.execute(
+            factor_lookback_query, [resolved_market, analysis_date]
+        ).fetchone()
         factor_start_date = str(frow[0]) if frow and frow[0] else analysis_date
 
         required_factors = strategy_def.get("required_factors", [])
         required_models = StrategyService.resolve_required_models(strategy_def)
 
-        strategy_factor_map = self._resolve_factor_ids(required_factors) if required_factors else {}
+        strategy_factor_map = (
+            self._resolve_factor_ids(required_factors, market=resolved_market)
+            if required_factors
+            else {}
+        )
         all_factor_ids = set(strategy_factor_map.values())
 
         # Resolve model -> feature_set mapping (cached at instance level)
         model_fs_map: dict[str, tuple[str, dict[str, str], dict]] = {}
         for model_id in required_models:
-            if model_id in self._model_fs_cache:
-                fs_id, fs_id_to_name, preprocessing = self._model_fs_cache[model_id]
+            model_cache_key = (resolved_market, model_id)
+            if model_cache_key in self._model_fs_cache:
+                fs_id, fs_id_to_name, preprocessing = self._model_fs_cache[model_cache_key]
                 for fid in fs_id_to_name:
                     all_factor_ids.add(fid)
-                model_fs_map[model_id] = self._model_fs_cache[model_id]
+                model_fs_map[model_id] = self._model_fs_cache[model_cache_key]
                 continue
             try:
-                model_record = self._model_service.get_model(model_id)
+                model_record = self._model_service.get_model(model_id, market=resolved_market)
                 fs_id = model_record["feature_set_id"]
-                fs = self._feature_service.get_feature_set(fs_id)
+                fs = self._feature_service.get_feature_set(fs_id, market=resolved_market)
                 fs_id_to_name: dict[str, str] = {}
                 for ref in fs["factor_refs"]:
                     fid = ref["factor_id"]
@@ -433,14 +480,14 @@ class SignalService:
                     all_factor_ids.add(fid)
                 entry = (fs_id, fs_id_to_name, fs["preprocessing"])
                 model_fs_map[model_id] = entry
-                self._model_fs_cache[model_id] = entry
+                self._model_fs_cache[model_cache_key] = entry
             except Exception as exc:
                 log.warning("signal_service.diagnose_model_fs_failed", model_id=model_id, error=str(exc))
 
         # Load factor data with wide-window instance cache
         tickers_fs = frozenset(tickers)
         factor_ids_fs = frozenset(all_factor_ids)
-        cache_key = (factor_ids_fs, tickers_fs)
+        cache_key = (resolved_market, factor_ids_fs, tickers_fs)
 
         cached_by_id: dict[str, pd.DataFrame] = {}
         if cache_key in self._factor_bulk_cache:
@@ -457,18 +504,21 @@ class SignalService:
         if not cached_by_id:
             # Load a wider 30-day window to cover future calls with nearby dates
             wide_lookback_query = """
-                SELECT MIN(date) FROM (
-                    SELECT DISTINCT date FROM daily_bars
-                    WHERE date <= ?
-                    ORDER BY date DESC
-                    LIMIT 30
-                )
+                    SELECT MIN(date) FROM (
+                        SELECT DISTINCT date FROM daily_bars
+                        WHERE market = ? AND date <= ?
+                        ORDER BY date DESC
+                        LIMIT 30
+                    )
             """
-            wrow = conn.execute(wide_lookback_query, [analysis_date]).fetchone()
+            wrow = conn.execute(
+                wide_lookback_query, [resolved_market, analysis_date]
+            ).fetchone()
             wide_start = str(wrow[0]) if wrow and wrow[0] else factor_start_date
 
             full_data = self._factor_engine.load_cached_factors_bulk(
-                list(all_factor_ids), tickers, wide_start, analysis_date
+                list(all_factor_ids), tickers, wide_start, analysis_date,
+                market=resolved_market,
             )
             self._factor_bulk_cache[cache_key] = (wide_start, analysis_date, full_data)
             cached_by_id = {
@@ -519,7 +569,7 @@ class SignalService:
             if model_id not in model_fs_map:
                 return None
             fs_id, fs_id_to_name, preprocessing = model_fs_map[model_id]
-            pp_key = (fs_id, analysis_date)
+            pp_key = (resolved_market, fs_id, analysis_date)
             if pp_key in self._preprocessed_cache:
                 return self._preprocessed_cache[pp_key]
             feature_data_local: dict[str, pd.DataFrame] = {}
@@ -544,6 +594,7 @@ class SignalService:
                     feature_data=processed,
                     tickers=tickers,
                     date=analysis_date,
+                    market=resolved_market,
                 )
                 if not preds.empty:
                     snap = {
@@ -582,7 +633,7 @@ class SignalService:
         if backtest_id:
             replay_date = execution_date if date_role == "execution" else decision_date
             portfolio_state = self._reconstruct_portfolio_state(
-                backtest_id, replay_date, prices_close,
+                backtest_id, replay_date, prices_close, market=resolved_market,
             )
             replay_source = f"backtest:{backtest_id}"
         else:
@@ -940,6 +991,7 @@ class SignalService:
 
         return {
             "strategy_id": strategy_id,
+            "market": resolved_market,
             "strategy_name": strategy_def["name"],
             "target_date": target_date,
             "decision_date": decision_date,
@@ -983,91 +1035,105 @@ class SignalService:
 
 
     def list_signal_runs(
-        self, strategy_id: str | None = None, limit: int = 50
+        self,
+        strategy_id: str | None = None,
+        limit: int = 50,
+        market: str | None = None,
     ) -> list[dict]:
         """List signal runs, optionally filtered by strategy_id."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         if strategy_id:
             rows = conn.execute(
-                """SELECT id, strategy_id, strategy_version, target_date,
+                """SELECT id, market, strategy_id, strategy_version, target_date,
                           universe_group_id, result_level, signal_count, created_at
                    FROM signal_runs
-                   WHERE strategy_id = ?
+                   WHERE market = ? AND strategy_id = ?
                    ORDER BY created_at DESC
                    LIMIT ?""",
-                [strategy_id, limit],
+                [resolved_market, strategy_id, limit],
             ).fetchall()
         else:
             rows = conn.execute(
-                """SELECT id, strategy_id, strategy_version, target_date,
+                """SELECT id, market, strategy_id, strategy_version, target_date,
                           universe_group_id, result_level, signal_count, created_at
                    FROM signal_runs
+                   WHERE market = ?
                    ORDER BY created_at DESC
                    LIMIT ?""",
-                [limit],
+                [resolved_market, limit],
             ).fetchall()
 
         return [
             {
                 "id": r[0],
-                "strategy_id": r[1],
-                "strategy_version": r[2],
-                "target_date": str(r[3]) if r[3] else None,
-                "universe_group_id": r[4],
-                "result_level": r[5],
-                "signal_count": r[6],
-                "created_at": str(r[7]) if r[7] else None,
+                "market": r[1],
+                "strategy_id": r[2],
+                "strategy_version": r[3],
+                "target_date": str(r[4]) if r[4] else None,
+                "universe_group_id": r[5],
+                "result_level": r[6],
+                "signal_count": r[7],
+                "created_at": str(r[8]) if r[8] else None,
             }
             for r in rows
         ]
 
-    def get_signal_run(self, run_id: str) -> dict:
+    def get_signal_run(self, run_id: str, market: str | None = None) -> dict:
         """Return a signal run with its detail entries."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         row = conn.execute(
-            """SELECT id, strategy_id, strategy_version, target_date,
+            """SELECT id, market, strategy_id, strategy_version, target_date,
                       universe_group_id, result_level, dependency_snapshot,
                       signal_count, created_at
                FROM signal_runs
-               WHERE id = ?""",
-            [run_id],
+               WHERE id = ? AND market = ?""",
+            [run_id, resolved_market],
         ).fetchone()
 
         if row is None:
             raise ValueError(f"Signal run {run_id} not found")
 
-        details = self.get_signal_details(run_id)
+        details = self.get_signal_details(run_id, market=resolved_market)
 
         return {
             "id": row[0],
-            "strategy_id": row[1],
-            "strategy_version": row[2],
-            "target_date": str(row[3]) if row[3] else None,
-            "universe_group_id": row[4],
-            "result_level": row[5],
-            "dependency_snapshot": _parse_json(row[6]),
-            "signal_count": row[7],
-            "created_at": str(row[8]) if row[8] else None,
+            "market": row[1],
+            "strategy_id": row[2],
+            "strategy_version": row[3],
+            "target_date": str(row[4]) if row[4] else None,
+            "universe_group_id": row[5],
+            "result_level": row[6],
+            "dependency_snapshot": _parse_json(row[7]),
+            "signal_count": row[8],
+            "created_at": str(row[9]) if row[9] else None,
             "signals": details,
         }
 
-    def get_signal_details(self, run_id: str) -> list[dict]:
+    def get_signal_details(
+        self,
+        run_id: str,
+        market: str | None = None,
+    ) -> list[dict]:
         """Return signal detail entries for a run."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         rows = conn.execute(
-            """SELECT run_id, ticker, signal, target_weight, strength
+            """SELECT run_id, market, ticker, signal, target_weight, strength
                FROM signal_details
-               WHERE run_id = ?
+               WHERE run_id = ? AND market = ?
                ORDER BY strength DESC""",
-            [run_id],
+            [run_id, resolved_market],
         ).fetchall()
 
         return [
             {
-                "ticker": r[1],
-                "signal": r[2],
-                "target_weight": r[3],
-                "strength": r[4],
+                "market": r[1],
+                "ticker": r[2],
+                "signal": r[3],
+                "target_weight": r[4],
+                "strength": r[5],
             }
             for r in rows
         ]
@@ -1077,7 +1143,11 @@ class SignalService:
     # ------------------------------------------------------------------
 
     def _validate_dependency_chain(
-        self, strategy_def: dict, target_date: str, universe_group_id: str | None = None
+        self,
+        strategy_def: dict,
+        target_date: str,
+        universe_group_id: str | None = None,
+        market: str | None = None,
     ) -> dict:
         """Validate the full dependency chain before signal generation.
 
@@ -1093,6 +1163,7 @@ class SignalService:
         errors: list[str] = []
         warnings: list[str] = []
         blocked = False
+        resolved_market = normalize_market(market)
 
         # -- Strategy status check --
         strategy_status = strategy_def.get("status", "draft")
@@ -1116,10 +1187,10 @@ class SignalService:
         for factor_name in required_factors:
             row = conn.execute(
                 """SELECT id, status FROM factors
-                   WHERE name = ?
+                   WHERE market = ? AND name = ?
                    ORDER BY version DESC
                    LIMIT 1""",
-                [factor_name],
+                [resolved_market, factor_name],
             ).fetchone()
             if row is None:
                 errors.append(f"Required factor '{factor_name}' not found")
@@ -1141,8 +1212,8 @@ class SignalService:
 
         for model_id in required_models:
             row = conn.execute(
-                "SELECT id, status FROM models WHERE id = ?",
-                [model_id],
+                "SELECT id, status FROM models WHERE id = ? AND market = ?",
+                [model_id, resolved_market],
             ).fetchone()
             if row is None:
                 errors.append(f"Required model '{model_id}' not found")
@@ -1170,7 +1241,8 @@ class SignalService:
         # -- Data freshness check --
         data_fresh = True
         latest_bar = conn.execute(
-            "SELECT MAX(date) FROM daily_bars"
+            "SELECT MAX(date) FROM daily_bars WHERE market = ?",
+            [resolved_market],
         ).fetchone()
         if latest_bar and latest_bar[0]:
             latest_date = str(latest_bar[0])
@@ -1191,13 +1263,19 @@ class SignalService:
             from backend.services.group_service import GroupService
             group_svc = GroupService()
             try:
-                universe_tickers = group_svc.get_group_tickers(universe_group_id)
+                universe_tickers = group_svc.get_group_tickers(
+                    universe_group_id, market=resolved_market
+                )
                 if universe_tickers:
-                    placeholders = ",".join(f"'{t}'" for t in universe_tickers)
+                    normalized_tickers = [
+                        normalize_ticker(t, resolved_market)
+                        for t in universe_tickers
+                    ]
+                    placeholders = ",".join("?" for _ in normalized_tickers)
                     covered = conn.execute(
                         f"SELECT COUNT(DISTINCT ticker) FROM daily_bars "
-                        f"WHERE ticker IN ({placeholders}) AND date = ?",
-                        [target_date],
+                        f"WHERE market = ? AND ticker IN ({placeholders}) AND date = ?",
+                        [resolved_market, *normalized_tickers, target_date],
                     ).fetchone()[0]
                     universe_coverage = covered / len(universe_tickers)
                     if universe_coverage < 0.95:
@@ -1267,8 +1345,10 @@ class SignalService:
         required_models: list[str],
         target_date: str,
         validation: dict,
+        market: str | None = None,
     ) -> dict:
         """Build a snapshot of all dependencies used for this signal run."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
 
         # Factor versions
@@ -1276,10 +1356,10 @@ class SignalService:
         for factor_name in required_factors:
             row = conn.execute(
                 """SELECT id, version, status FROM factors
-                   WHERE name = ?
+                   WHERE market = ? AND name = ?
                    ORDER BY version DESC
                    LIMIT 1""",
-                [factor_name],
+                [resolved_market, factor_name],
             ).fetchone()
             if row:
                 factor_snapshots.append({
@@ -1293,8 +1373,8 @@ class SignalService:
         model_snapshots = []
         for model_id in required_models:
             row = conn.execute(
-                "SELECT id, name, status FROM models WHERE id = ?",
-                [model_id],
+                "SELECT id, name, status FROM models WHERE id = ? AND market = ?",
+                [model_id, resolved_market],
             ).fetchone()
             if row:
                 model_snapshots.append({
@@ -1304,7 +1384,10 @@ class SignalService:
                 })
 
         # Data status
-        latest_bar = conn.execute("SELECT MAX(date) FROM daily_bars").fetchone()
+        latest_bar = conn.execute(
+            "SELECT MAX(date) FROM daily_bars WHERE market = ?",
+            [resolved_market],
+        ).fetchone()
         data_status = {
             "latest_bar_date": str(latest_bar[0]) if latest_bar and latest_bar[0] else None,
             "target_date": target_date,
@@ -1314,6 +1397,7 @@ class SignalService:
         return {
             "strategy": {
                 "id": strategy_def["id"],
+                "market": resolved_market,
                 "name": strategy_def["name"],
                 "version": strategy_def.get("version", 1),
                 "status": strategy_def.get("status", "draft"),
@@ -1331,6 +1415,7 @@ class SignalService:
     def _save_signal_run(
         self,
         run_id: str,
+        market: str,
         strategy_id: str,
         strategy_version: int,
         target_date: str,
@@ -1340,6 +1425,7 @@ class SignalService:
         raw_signals: pd.DataFrame,
     ) -> list[dict]:
         """Persist signal run and detail records. Returns list of signal dicts."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         now = datetime.utcnow()
 
@@ -1354,7 +1440,8 @@ class SignalService:
                 weight = float(row.get("weight", 0.0))
                 strength = float(row.get("strength", 0.0))
                 signal_records.append({
-                    "ticker": str(ticker),
+                    "market": resolved_market,
+                    "ticker": normalize_ticker(str(ticker), resolved_market),
                     "signal": sig,
                     "target_weight": weight,
                     "strength": strength,
@@ -1365,12 +1452,13 @@ class SignalService:
         # Insert signal_runs
         conn.execute(
             """INSERT INTO signal_runs
-               (id, strategy_id, strategy_version, target_date,
+               (id, market, strategy_id, strategy_version, target_date,
                 universe_group_id, result_level, dependency_snapshot,
                 signal_count, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 run_id,
+                resolved_market,
                 strategy_id,
                 strategy_version,
                 target_date,
@@ -1386,10 +1474,11 @@ class SignalService:
         for rec in signal_records:
             conn.execute(
                 """INSERT INTO signal_details
-                   (run_id, ticker, signal, target_weight, strength)
-                   VALUES (?, ?, ?, ?, ?)""",
+                   (run_id, market, ticker, signal, target_weight, strength)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
                 [
                     run_id,
+                    resolved_market,
                     rec["ticker"],
                     rec["signal"],
                     rec["target_weight"],
@@ -1400,6 +1489,7 @@ class SignalService:
         log.info(
             "signal_service.saved",
             run_id=run_id,
+            market=resolved_market,
             signal_count=signal_count,
         )
         return signal_records
@@ -1409,7 +1499,11 @@ class SignalService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _resolve_diagnose_dates(target_date: str, date_role: str = "decision") -> dict:
+    def _resolve_diagnose_dates(
+        target_date: str,
+        date_role: str = "decision",
+        market: str | None = None,
+    ) -> dict:
         """Resolve diagnose date semantics.
 
         ``decision`` preserves the original API behavior: target_date is the
@@ -1422,11 +1516,23 @@ class SignalService:
 
         if date_role == "execution":
             execution_date = target_date
-            decision_date = str(offset_trading_days(datetime.fromisoformat(target_date).date(), -1))
+            decision_date = str(
+                offset_trading_days(
+                    datetime.fromisoformat(target_date).date(),
+                    -1,
+                    market=market,
+                )
+            )
             snapshot_timing = "pre_trade"
         else:
             decision_date = target_date
-            execution_date = str(offset_trading_days(datetime.fromisoformat(target_date).date(), 1))
+            execution_date = str(
+                offset_trading_days(
+                    datetime.fromisoformat(target_date).date(),
+                    1,
+                    market=market,
+                )
+            )
             snapshot_timing = "pre_decision"
 
         return {
@@ -1914,6 +2020,7 @@ class SignalService:
         backtest_id: str,
         target_date: str,
         prices_close: pd.DataFrame,
+        market: str | None = None,
     ) -> dict:
         """Reconstruct portfolio state as of *target_date* from a saved backtest.
 
@@ -1923,10 +2030,11 @@ class SignalService:
 
         Returns a dict suitable for ``**kwargs`` into :class:`StrategyContext`.
         """
+        resolved_market = normalize_market(market)
         conn = get_connection()
         row = conn.execute(
-            "SELECT trades, config FROM backtest_results WHERE id = ?",
-            [backtest_id],
+            "SELECT trades, config FROM backtest_results WHERE id = ? AND market = ?",
+            [backtest_id, resolved_market],
         ).fetchone()
         if row is None:
             raise ValueError(f"Backtest {backtest_id} not found")
@@ -2025,6 +2133,7 @@ class SignalService:
         log.info(
             "signal_service.replay_state",
             backtest_id=backtest_id,
+            market=resolved_market,
             target_date=target_date,
             held_count=len(held),
         )
@@ -2036,20 +2145,25 @@ class SignalService:
             "unrealized_pnl": unrealized_out,
         }
 
-    def _resolve_factor_ids(self, factor_names: list[str]) -> dict[str, str]:
+    def _resolve_factor_ids(
+        self,
+        factor_names: list[str],
+        market: str | None = None,
+    ) -> dict[str, str]:
         """Resolve factor names to factor IDs (latest version) in a single query."""
         if not factor_names:
             return {}
-        cache_key = tuple(sorted(factor_names))
+        resolved_market = normalize_market(market)
+        cache_key = (resolved_market, tuple(sorted(factor_names)))
         if cache_key in self._factor_id_cache:
             return self._factor_id_cache[cache_key]
         conn = get_connection()
         placeholders = ",".join("?" for _ in factor_names)
         rows = conn.execute(
             f"""SELECT name, id, version FROM factors
-                WHERE name IN ({placeholders})
+                WHERE market = ? AND name IN ({placeholders})
                 ORDER BY version DESC""",
-            factor_names,
+            [resolved_market, *factor_names],
         ).fetchall()
         result: dict[str, str] = {}
         for name, fid, _version in rows:
@@ -2057,7 +2171,7 @@ class SignalService:
                 result[name] = fid
         for name in factor_names:
             if name not in result:
-                log.warning("signal_service.factor_not_found", name=name)
+                log.warning("signal_service.factor_not_found", name=name, market=resolved_market)
         self._factor_id_cache[cache_key] = result
         return result
 
@@ -2066,18 +2180,32 @@ class SignalService:
         tickers: list[str],
         start_date: str,
         end_date: str,
+        market: str | None = None,
     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """Load OHLCV price DataFrames from daily_bars."""
+        resolved_market = normalize_market(market)
+        normalized_tickers = [
+            normalize_ticker(t, resolved_market)
+            for t in tickers
+            if str(t).strip()
+        ]
+        if not normalized_tickers:
+            empty = pd.DataFrame()
+            return empty, empty, empty, empty, empty
         conn = get_connection()
-        placeholders = ",".join(f"'{t}'" for t in tickers)
+        placeholders = ",".join("?" for _ in normalized_tickers)
         query = f"""
             SELECT ticker, date, open, high, low, close, volume
             FROM daily_bars
-            WHERE ticker IN ({placeholders})
+            WHERE market = ?
+              AND ticker IN ({placeholders})
               AND date >= ? AND date <= ?
             ORDER BY date
         """
-        df = conn.execute(query, [start_date, end_date]).fetchdf()
+        df = conn.execute(
+            query,
+            [resolved_market, *normalized_tickers, start_date, end_date],
+        ).fetchdf()
         if df.empty:
             empty = pd.DataFrame()
             return empty, empty, empty, empty, empty

@@ -639,6 +639,7 @@ export async function getBacktestStockChart(backtestId: string, ticker: string, 
 // ---- Signal Types ----
 
 export interface SignalDetail {
+  market?: string;
   ticker: string;
   signal: number;  // 1=buy, -1=sell, 0=hold
   target_weight: number;
@@ -647,6 +648,7 @@ export interface SignalDetail {
 
 export interface SignalRun {
   id: string;
+  market: string;
   strategy_id: string;
   strategy_version: number;
   target_date: string;
@@ -662,29 +664,32 @@ export interface SignalRun {
 // ---- Signal API ----
 
 export async function generateSignals(body: {
+  market?: string;
   strategy_id: string;
   target_date: string;
   universe_group_id: string;
-}): Promise<{ task_id: string }> {
-  const { data } = await client.post<{ task_id: string }>("/signals/generate", body);
+}): Promise<{ task_id: string; market?: string }> {
+  const { data } = await client.post<{ task_id: string; market?: string }>("/signals/generate", body);
   return data;
 }
 
-export async function listSignalRuns(strategyId?: string): Promise<SignalRun[]> {
+export async function listSignalRuns(strategyId?: string, market?: string): Promise<SignalRun[]> {
   const { data } = await client.get<SignalRun[]>("/signals", {
-    params: { strategy_id: strategyId || undefined },
+    params: { strategy_id: strategyId || undefined, market: market || undefined },
   });
   return data;
 }
 
-export async function getSignalRun(runId: string): Promise<SignalRun> {
-  const { data } = await client.get<SignalRun>(`/signals/${runId}`);
+export async function getSignalRun(runId: string, market?: string): Promise<SignalRun> {
+  const { data } = await client.get<SignalRun>(`/signals/${runId}`, {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
-export async function exportSignals(runId: string, format: "csv" | "json"): Promise<void> {
+export async function exportSignals(runId: string, format: "csv" | "json", market?: string): Promise<void> {
   const response = await client.get(`/signals/${runId}/export`, {
-    params: { format },
+    params: { format, market: market || undefined },
     responseType: "blob",
   });
   const blob = new Blob([response.data as BlobPart]);
@@ -732,6 +737,7 @@ export async function getSystemInfo(): Promise<SystemInfo> {
 
 export interface PaperTradingSession {
   id: string;
+  market: string;
   name: string;
   strategy_id: string;
   universe_group_id: string;
@@ -781,6 +787,7 @@ export interface PaperTrade {
 export interface PaperAdvanceResult {
   task_id: string;
   status: string;
+  market?: string;
 }
 
 export interface PaperBacktestComparisonDay {
@@ -803,6 +810,7 @@ export interface PaperBacktestComparisonDay {
 
 export interface PaperBacktestComparison {
   session_id: string;
+  market?: string;
   backtest_id: string;
   summary: {
     paper_total_trades: number;
@@ -819,12 +827,15 @@ export interface PaperBacktestComparison {
 
 // ---- Paper Trading API ----
 
-export async function listPaperSessions(): Promise<PaperTradingSession[]> {
-  const { data } = await client.get<PaperTradingSession[]>("/paper-trading/sessions");
+export async function listPaperSessions(market?: string): Promise<PaperTradingSession[]> {
+  const { data } = await client.get<PaperTradingSession[]>("/paper-trading/sessions", {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
 export async function createPaperSession(body: {
+  market?: string;
   strategy_id: string;
   universe_group_id: string;
   start_date: string;
@@ -835,18 +846,28 @@ export async function createPaperSession(body: {
   return data;
 }
 
-export async function deletePaperSession(sessionId: string) {
-  const { data } = await client.delete(`/paper-trading/sessions/${sessionId}`);
+export async function deletePaperSession(sessionId: string, market?: string) {
+  const { data } = await client.delete(`/paper-trading/sessions/${sessionId}`, {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
-export async function pausePaperSession(sessionId: string): Promise<PaperTradingSession> {
-  const { data } = await client.post<PaperTradingSession>(`/paper-trading/sessions/${sessionId}/pause`);
+export async function pausePaperSession(sessionId: string, market?: string): Promise<PaperTradingSession> {
+  const { data } = await client.post<PaperTradingSession>(
+    `/paper-trading/sessions/${sessionId}/pause`,
+    undefined,
+    { params: { market: market || undefined } },
+  );
   return data;
 }
 
-export async function resumePaperSession(sessionId: string): Promise<PaperTradingSession> {
-  const { data } = await client.post<PaperTradingSession>(`/paper-trading/sessions/${sessionId}/resume`);
+export async function resumePaperSession(sessionId: string, market?: string): Promise<PaperTradingSession> {
+  const { data } = await client.post<PaperTradingSession>(
+    `/paper-trading/sessions/${sessionId}/resume`,
+    undefined,
+    { params: { market: market || undefined } },
+  );
   return data;
 }
 
@@ -854,10 +875,12 @@ export async function advancePaperSession(
   sessionId: string,
   targetDate?: string,
   steps?: number,
-): Promise<{ task_id: string; status: string }> {
+  market?: string,
+): Promise<PaperAdvanceResult> {
   const body: Record<string, unknown> = {};
   if (targetDate) body.target_date = targetDate;
   if (steps && steps > 0) body.steps = steps;
+  if (market) body.market = market;
   const { data } = await client.post(
     `/paper-trading/sessions/${sessionId}/advance`,
     body,
@@ -865,14 +888,16 @@ export async function advancePaperSession(
   return data;
 }
 
-export async function getPaperDailySeries(sessionId: string): Promise<PaperDailyRecord[]> {
-  const { data } = await client.get<PaperDailyRecord[]>(`/paper-trading/sessions/${sessionId}/daily`);
+export async function getPaperDailySeries(sessionId: string, market?: string): Promise<PaperDailyRecord[]> {
+  const { data } = await client.get<PaperDailyRecord[]>(`/paper-trading/sessions/${sessionId}/daily`, {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
-export async function getPaperPositions(sessionId: string, date?: string): Promise<PaperPosition[]> {
+export async function getPaperPositions(sessionId: string, date?: string, market?: string): Promise<PaperPosition[]> {
   const { data } = await client.get<PaperPosition[]>(`/paper-trading/sessions/${sessionId}/positions`, {
-    params: { date },
+    params: { date, market: market || undefined },
   });
   return data;
 }
@@ -880,27 +905,31 @@ export async function getPaperPositions(sessionId: string, date?: string): Promi
 export async function comparePaperWithBacktest(
   sessionId: string,
   backtestId: string,
+  market?: string,
 ): Promise<PaperBacktestComparison> {
   const { data } = await client.get<PaperBacktestComparison>(
     `/paper-trading/sessions/${sessionId}/compare-backtest/${backtestId}`,
+    { params: { market: market || undefined } },
   );
   return data;
 }
 
-export async function getPaperTrades(sessionId: string, limit = 200): Promise<PaperTrade[]> {
+export async function getPaperTrades(sessionId: string, limit = 200, market?: string): Promise<PaperTrade[]> {
   const { data } = await client.get<PaperTrade[]>(`/paper-trading/sessions/${sessionId}/trades`, {
-    params: { limit },
+    params: { limit, market: market || undefined },
   });
   return data;
 }
 
-export async function getPaperSummary(sessionId: string): Promise<PaperTradingSession & {
+export async function getPaperSummary(sessionId: string, market?: string): Promise<PaperTradingSession & {
   total_return: number;
   max_drawdown: number;
   trading_days: number;
   latest_nav?: number;
 }> {
-  const { data } = await client.get(`/paper-trading/sessions/${sessionId}/summary`);
+  const { data } = await client.get(`/paper-trading/sessions/${sessionId}/summary`, {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
@@ -912,18 +941,23 @@ export interface PaperActionPlan {
 }
 
 export interface PaperSignalsResult {
+  market?: string;
   signals: Array<{ ticker: string; signal: number; target_weight: number; strength: number }>;
   action_plan: PaperActionPlan[];
   target_date: string | null;
   error?: string;
 }
 
-export async function getPaperLatestSignals(sessionId: string): Promise<PaperSignalsResult | { task_id: string; status: string }> {
-  const { data } = await client.get(`/paper-trading/sessions/${sessionId}/signals`);
+export async function getPaperLatestSignals(sessionId: string, market?: string): Promise<PaperSignalsResult | { task_id: string; status: string; market?: string }> {
+  const { data } = await client.get(`/paper-trading/sessions/${sessionId}/signals`, {
+    params: { market: market || undefined },
+  });
   return data;
 }
 
-export async function getPaperStockChart(sessionId: string, ticker: string): Promise<StockChartData> {
-  const { data } = await client.get<StockChartData>(`/paper-trading/sessions/${sessionId}/stock/${ticker}`);
+export async function getPaperStockChart(sessionId: string, ticker: string, market?: string): Promise<StockChartData> {
+  const { data } = await client.get<StockChartData>(`/paper-trading/sessions/${sessionId}/stock/${ticker}`, {
+    params: { market: market || undefined },
+  });
   return data;
 }

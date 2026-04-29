@@ -12,6 +12,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 from backend.logger import get_logger
+from backend.services.market_context import normalize_market
 from backend.services.signal_service import SignalService
 from backend.tasks.executor import TaskExecutor, get_task_executor
 from backend.tasks.models import TaskSource
@@ -40,12 +41,14 @@ def _get_executor() -> TaskExecutor:
 
 
 class GenerateSignalsRequest(BaseModel):
+    market: Optional[str] = None
     strategy_id: str
     target_date: str
     universe_group_id: str
 
 
 class DiagnoseSignalsRequest(BaseModel):
+    market: Optional[str] = None
     strategy_id: str
     target_date: str
     universe_group_id: str
@@ -75,16 +78,22 @@ async def generate_signals(body: GenerateSignalsRequest) -> dict:
     """
     svc = _get_service()
     executor = _get_executor()
+    try:
+        resolved_market = normalize_market(body.market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     def _do_generate(
         strategy_id: str,
         target_date: str,
         universe_group_id: str,
+        market: str,
     ) -> dict:
         return svc.generate_signals(
             strategy_id=strategy_id,
             target_date=target_date,
             universe_group_id=universe_group_id,
+            market=market,
         )
 
     task_id = executor.submit(
@@ -92,6 +101,7 @@ async def generate_signals(body: GenerateSignalsRequest) -> dict:
         fn=_do_generate,
         params={
             "strategy_id": body.strategy_id,
+            "market": resolved_market,
             "target_date": body.target_date,
             "universe_group_id": body.universe_group_id,
         },
@@ -103,12 +113,14 @@ async def generate_signals(body: GenerateSignalsRequest) -> dict:
         "api.signals.generate_triggered",
         task_id=task_id,
         strategy_id=body.strategy_id,
+        market=resolved_market,
         target_date=body.target_date,
     )
     return {
         "task_id": task_id,
         "status": "queued",
         "strategy_id": body.strategy_id,
+        "market": resolved_market,
         "target_date": body.target_date,
     }
 
@@ -119,6 +131,10 @@ async def diagnose_signals(body: DiagnoseSignalsRequest) -> dict:
     candidate pool, final signals, and eliminated tickers without DB persistence."""
     svc = _get_service()
     executor = _get_executor()
+    try:
+        resolved_market = normalize_market(body.market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     def _do_diagnose(
         strategy_id: str,
@@ -132,11 +148,13 @@ async def diagnose_signals(body: DiagnoseSignalsRequest) -> dict:
         unrealized_pnl: dict[str, float] | None,
         backtest_id: str | None,
         date_role: str,
+        market: str,
     ) -> dict:
         return svc.diagnose_signals(
             strategy_id=strategy_id,
             target_date=target_date,
             universe_group_id=universe_group_id,
+            market=market,
             date_role=date_role,
             max_tickers=max_tickers,
             focus_tickers=focus_tickers,
@@ -162,6 +180,7 @@ async def diagnose_signals(body: DiagnoseSignalsRequest) -> dict:
             "unrealized_pnl": body.unrealized_pnl,
             "backtest_id": body.backtest_id,
             "date_role": body.date_role,
+            "market": resolved_market,
         },
         timeout=body.timeout,
         source=TaskSource.UI,
@@ -172,11 +191,13 @@ async def diagnose_signals(body: DiagnoseSignalsRequest) -> dict:
         task_id=task_id,
         strategy_id=body.strategy_id,
         target_date=body.target_date,
+        market=resolved_market,
     )
     return {
         "task_id": task_id,
         "status": "queued",
         "strategy_id": body.strategy_id,
+        "market": resolved_market,
         "target_date": body.target_date,
     }
 
@@ -184,19 +205,23 @@ async def diagnose_signals(body: DiagnoseSignalsRequest) -> dict:
 @router.get("")
 async def list_signal_runs(
     strategy_id: Optional[str] = Query(None),
+    market: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=500),
 ) -> list[dict]:
     """List signal runs, optionally filtered by strategy_id."""
     svc = _get_service()
-    return svc.list_signal_runs(strategy_id=strategy_id, limit=limit)
+    return svc.list_signal_runs(strategy_id=strategy_id, limit=limit, market=market)
 
 
 @router.get("/{run_id}")
-async def get_signal_run(run_id: str) -> dict:
+async def get_signal_run(
+    run_id: str,
+    market: Optional[str] = Query(None),
+) -> dict:
     """Get signal run detail with all signal entries."""
     svc = _get_service()
     try:
-        return svc.get_signal_run(run_id)
+        return svc.get_signal_run(run_id, market=market)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -204,12 +229,13 @@ async def get_signal_run(run_id: str) -> dict:
 @router.get("/{run_id}/export")
 async def export_signals(
     run_id: str,
+    market: Optional[str] = Query(None),
     format: str = Query("csv", description="Export format: csv or json"),
 ) -> Response:
     """Export signal details as CSV or JSON file."""
     svc = _get_service()
     try:
-        run = svc.get_signal_run(run_id)
+        run = svc.get_signal_run(run_id, market=market)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -244,6 +270,7 @@ async def export_signals(
     elif format == "json":
         export_data = {
             "run_id": run_id,
+            "market": run.get("market"),
             "strategy_id": strategy_id,
             "target_date": target_date,
             "result_level": run.get("result_level"),

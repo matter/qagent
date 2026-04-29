@@ -171,3 +171,26 @@ This file records milestone evidence for the V2.0 A-share and ranking upgrade.
   - Old system regression:
     - `uv run python scripts/e2e_demo.py` passed through US factor evaluation, feature set reuse, model training, strategy backtest, and signal generation.
     - `cd frontend && pnpm build` passed. Vite reported the existing large-chunk and dynamic-import warnings.
+
+- Task 11 signal and paper-trading scope completed:
+  - Signal generation and diagnosis now accept `market`, default to `US`, and resolve strategies, groups, factors, feature sets, models, price data, backtest replay state, signal runs, and signal details within one market.
+  - Signal run/detail persistence stores `market`, and list/detail/export queries are market-scoped.
+  - Paper trading sessions, daily snapshots, signal cache, price preload, latest-signal preview, stock chart, positions, trades, summary, and backtest comparison paths are market-scoped.
+  - Paper session creation rejects strategies/groups from another market through the shared service layer.
+  - Paper-trading API request/response contracts and frontend API client types expose optional `market` while preserving old no-market `US` defaults.
+  - Existing paper-trading contract tests were updated to assert the new `US` default market scope.
+- Task 11 verification:
+  - `uv run python -m unittest tests.test_signal_paper_market_scope` passed: `5` tests.
+  - `uv run python -m unittest tests.test_paper_trading_contracts tests.test_signal_paper_market_scope` passed: `15` tests.
+  - `uv run python -m unittest discover tests` passed: `71` tests.
+  - `uv run python -m py_compile backend/services/paper_trading_service.py backend/api/paper_trading.py backend/services/signal_service.py backend/api/signals.py` passed.
+  - `cd frontend && pnpm build` passed. Vite reported the existing large-chunk and dynamic-import warnings.
+  - API smoke with backend on `127.0.0.1:8000`:
+    - `GET /api/signals` returned HTTP `200` through the old no-market US path.
+    - `GET /api/paper-trading/sessions` returned HTTP `200` through the old no-market US path.
+    - Temporary CN strategy creation returned `market="CN"`.
+    - `POST /api/signals/generate` with `market="CN"`, `strategy_id=<cn_strategy>`, and `universe_group_id="cn_all_a"` queued task `f7eae9b2837f47c5a6e5cca03389c053`; task completed successfully.
+    - Temporary CN paper session creation returned `market="CN"`.
+    - Temporary CN paper session and strategy were deleted after the check.
+  - Old system regression:
+    - `uv run python scripts/e2e_demo.py` passed through US factor evaluation, feature set reuse, model training, strategy backtest, and signal generation.

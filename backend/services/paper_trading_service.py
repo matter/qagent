@@ -17,6 +17,7 @@ from backend.db import get_connection
 from backend.logger import get_logger
 from backend.services.calendar_service import get_latest_trading_day, get_trading_days, offset_trading_days
 from backend.services.group_service import GroupService
+from backend.services.market_context import normalize_market, normalize_ticker
 from backend.services.signal_service import SignalService
 from backend.services.strategy_service import StrategyService
 from backend.services.factor_engine import FactorEngine
@@ -49,10 +50,19 @@ class PaperTradingService:
         start_date: str,
         name: str | None = None,
         config: dict | None = None,
+        market: str | None = None,
     ) -> dict:
         """Create a new paper trading session."""
-        strategy = self._strategy_service.get_strategy(strategy_id)
-        tickers = self._group_service.get_group_tickers(universe_group_id)
+        resolved_market = normalize_market(market)
+        strategy = self._strategy_service.get_strategy(strategy_id, market=resolved_market)
+        StrategyService._validate_dependencies(
+            strategy.get("required_factors", []),
+            StrategyService.resolve_required_models(strategy),
+            resolved_market,
+        )
+        tickers = self._group_service.get_group_tickers(
+            universe_group_id, market=resolved_market
+        )
         if not tickers:
             raise ValueError(f"Universe group '{universe_group_id}' has no members")
 
@@ -67,12 +77,12 @@ class PaperTradingService:
         now = datetime.utcnow()
         conn.execute(
             """INSERT INTO paper_trading_sessions
-               (id, name, strategy_id, universe_group_id, config,
+               (id, market, name, strategy_id, universe_group_id, config,
                 status, start_date, current_date, initial_capital,
                 current_nav, total_trades, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, 'active', ?, NULL, ?, ?, 0, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, 'active', ?, NULL, ?, ?, 0, ?, ?)""",
             [
-                session_id, name, strategy_id, universe_group_id,
+                session_id, resolved_market, name, strategy_id, universe_group_id,
                 json.dumps(config, default=str),
                 start_date, initial_capital, initial_capital, now, now,
             ],
@@ -81,80 +91,98 @@ class PaperTradingService:
         log.info(
             "paper_trading.created",
             session_id=session_id,
+            market=resolved_market,
             strategy=strategy["name"],
             start_date=start_date,
         )
-        return self.get_session(session_id)
+        return self.get_session(session_id, market=resolved_market)
 
-    def list_sessions(self) -> list[dict]:
+    def list_sessions(self, market: str | None = None) -> list[dict]:
         """List all paper trading sessions."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         rows = conn.execute(
-            """SELECT s.id, s.name, s.strategy_id, s.universe_group_id,
+            """SELECT s.id, s.market, s.name, s.strategy_id, s.universe_group_id,
                       s.config, s.status, s.start_date, s.current_date,
                       s.initial_capital, s.current_nav, s.total_trades,
                       s.created_at, s.updated_at,
                       st.name AS strategy_name
                FROM paper_trading_sessions s
-               LEFT JOIN strategies st ON s.strategy_id = st.id
-               ORDER BY s.created_at DESC"""
+               LEFT JOIN strategies st ON s.strategy_id = st.id AND s.market = st.market
+               WHERE s.market = ?
+               ORDER BY s.created_at DESC""",
+            [resolved_market],
         ).fetchall()
         return [self._session_row_to_dict(r) for r in rows]
 
-    def get_session(self, session_id: str) -> dict:
+    def get_session(self, session_id: str, market: str | None = None) -> dict:
         """Get a single session with full detail."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         row = conn.execute(
-            """SELECT s.id, s.name, s.strategy_id, s.universe_group_id,
+            """SELECT s.id, s.market, s.name, s.strategy_id, s.universe_group_id,
                       s.config, s.status, s.start_date, s.current_date,
                       s.initial_capital, s.current_nav, s.total_trades,
                       s.created_at, s.updated_at,
                       st.name AS strategy_name
                FROM paper_trading_sessions s
-               LEFT JOIN strategies st ON s.strategy_id = st.id
-               WHERE s.id = ?""",
-            [session_id],
+               LEFT JOIN strategies st ON s.strategy_id = st.id AND s.market = st.market
+               WHERE s.id = ? AND s.market = ?""",
+            [session_id, resolved_market],
         ).fetchone()
         if not row:
             raise ValueError(f"Session {session_id} not found")
         return self._session_row_to_dict(row)
 
-    def delete_session(self, session_id: str) -> None:
+    def delete_session(self, session_id: str, market: str | None = None) -> None:
         """Delete a session and all its daily records."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
-        conn.execute("DELETE FROM paper_trading_daily WHERE session_id = ?", [session_id])
-        conn.execute("DELETE FROM paper_trading_sessions WHERE id = ?", [session_id])
-        log.info("paper_trading.deleted", session_id=session_id)
+        conn.execute(
+            "DELETE FROM paper_trading_daily WHERE session_id = ? AND market = ?",
+            [session_id, resolved_market],
+        )
+        conn.execute(
+            "DELETE FROM paper_trading_signal_cache WHERE session_id = ? AND market = ?",
+            [session_id, resolved_market],
+        )
+        conn.execute(
+            "DELETE FROM paper_trading_sessions WHERE id = ? AND market = ?",
+            [session_id, resolved_market],
+        )
+        log.info("paper_trading.deleted", session_id=session_id, market=resolved_market)
 
-    def pause_session(self, session_id: str) -> dict:
+    def pause_session(self, session_id: str, market: str | None = None) -> dict:
         """Pause an active session."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         conn.execute(
-            "UPDATE paper_trading_sessions SET status = 'paused', updated_at = ? WHERE id = ?",
-            [datetime.utcnow(), session_id],
+            "UPDATE paper_trading_sessions SET status = 'paused', updated_at = ? WHERE id = ? AND market = ?",
+            [datetime.utcnow(), session_id, resolved_market],
         )
-        return self.get_session(session_id)
+        return self.get_session(session_id, market=resolved_market)
 
-    def resume_session(self, session_id: str) -> dict:
+    def resume_session(self, session_id: str, market: str | None = None) -> dict:
         """Resume a paused session."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         conn.execute(
-            "UPDATE paper_trading_sessions SET status = 'active', updated_at = ? WHERE id = ?",
-            [datetime.utcnow(), session_id],
+            "UPDATE paper_trading_sessions SET status = 'active', updated_at = ? WHERE id = ? AND market = ?",
+            [datetime.utcnow(), session_id, resolved_market],
         )
-        return self.get_session(session_id)
+        return self.get_session(session_id, market=resolved_market)
 
     @staticmethod
     def _session_row_to_dict(row) -> dict:
         """Convert a DuckDB row from the paper_trading_sessions query to a dict.
 
         Expected column order (matching list_sessions / get_session SQL):
-          0: id, 1: name, 2: strategy_id, 3: universe_group_id,
-          4: config, 5: status, 6: start_date, 7: current_date,
-          8: initial_capital, 9: current_nav, 10: total_trades,
-          11: created_at, 12: updated_at, 13: strategy_name
+          0: id, 1: market, 2: name, 3: strategy_id, 4: universe_group_id,
+          5: config, 6: status, 7: start_date, 8: current_date,
+          9: initial_capital, 10: current_nav, 11: total_trades,
+          12: created_at, 13: updated_at, 14: strategy_name
         """
-        config_raw = row[4]
+        config_raw = row[5]
         if isinstance(config_raw, str):
             try:
                 config_raw = json.loads(config_raw)
@@ -162,19 +190,20 @@ class PaperTradingService:
                 config_raw = {}
         return {
             "id": row[0],
-            "name": row[1],
-            "strategy_id": row[2],
-            "universe_group_id": row[3],
+            "market": row[1],
+            "name": row[2],
+            "strategy_id": row[3],
+            "universe_group_id": row[4],
             "config": config_raw or {},
-            "status": row[5],
-            "start_date": str(row[6]) if row[6] else None,
-            "current_date": str(row[7]) if row[7] else None,
-            "initial_capital": float(row[8]) if row[8] is not None else 1_000_000.0,
-            "current_nav": float(row[9]) if row[9] is not None else None,
-            "total_trades": int(row[10]) if row[10] is not None else 0,
-            "created_at": str(row[11]) if row[11] else None,
-            "updated_at": str(row[12]) if row[12] else None,
-            "strategy_name": row[13] if len(row) > 13 else None,
+            "status": row[6],
+            "start_date": str(row[7]) if row[7] else None,
+            "current_date": str(row[8]) if row[8] else None,
+            "initial_capital": float(row[9]) if row[9] is not None else 1_000_000.0,
+            "current_nav": float(row[10]) if row[10] is not None else None,
+            "total_trades": int(row[11]) if row[11] is not None else 0,
+            "created_at": str(row[12]) if row[12] else None,
+            "updated_at": str(row[13]) if row[13] else None,
+            "strategy_name": row[14] if len(row) > 14 else None,
         }
 
     # ------------------------------------------------------------------
@@ -226,10 +255,14 @@ class PaperTradingService:
 
         if steps > 0:
             generous_end = start_from + timedelta(days=steps * 3 + 30)
-            all_days = get_trading_days(start_from, generous_end)
+            all_days = get_trading_days(start_from, generous_end, market=session["market"])
             return all_days[:steps] if all_days else []
 
-        end = date.fromisoformat(target_date) if target_date else get_latest_trading_day()
+        end = (
+            date.fromisoformat(target_date)
+            if target_date
+            else get_latest_trading_day(market=session["market"])
+        )
         if start_from > end:
             if current is None:
                 raise ValueError(
@@ -237,10 +270,14 @@ class PaperTradingService:
                 )
             return []
 
-        return get_trading_days(start_from, end)
+        return get_trading_days(start_from, end, market=session["market"])
 
     def advance(
-        self, session_id: str, target_date: str | None = None, steps: int = 0
+        self,
+        session_id: str,
+        target_date: str | None = None,
+        steps: int = 0,
+        market: str | None = None,
     ) -> dict:
         """Advance a session forward.
 
@@ -260,7 +297,9 @@ class PaperTradingService:
         Returns summary of the advancement.
         """
         # Use batch-optimized version for multiple days
-        session = self.get_session(session_id)
+        resolved_market = normalize_market(market)
+        session = self.get_session(session_id, market=resolved_market)
+        session.setdefault("market", resolved_market)
         if session["status"] != "active":
             raise ValueError(f"Session is {session['status']}, not active")
 
@@ -279,7 +318,10 @@ class PaperTradingService:
             }
 
         conn = get_connection()
-        latest_bar_row = conn.execute("SELECT MAX(date) FROM daily_bars").fetchone()
+        latest_bar_row = conn.execute(
+            "SELECT MAX(date) FROM daily_bars WHERE market = ?",
+            [resolved_market],
+        ).fetchone()
         if not latest_bar_row or not latest_bar_row[0]:
             raise ValueError("本地无行情数据，请先更新数据")
         latest_bar_date = (
@@ -303,8 +345,8 @@ class PaperTradingService:
 
         processed = set()
         rows = conn.execute(
-            "SELECT date FROM paper_trading_daily WHERE session_id = ?",
-            [session_id],
+            "SELECT date FROM paper_trading_daily WHERE session_id = ? AND market = ?",
+            [session_id, resolved_market],
         ).fetchall()
         for r in rows:
             processed.add(r[0] if isinstance(r[0], date) else date.fromisoformat(str(r[0])))
@@ -339,7 +381,9 @@ class PaperTradingService:
         rebalance_freq = config.get("rebalance_freq") or config.get("rebalance_frequency", "daily")
 
         # Position sizing (read from strategy definition, aligned with backtest)
-        strategy_def = self._strategy_service.get_strategy(session["strategy_id"])
+        strategy_def = self._strategy_service.get_strategy(
+            session["strategy_id"], market=resolved_market
+        )
         position_sizing = strategy_def.get("position_sizing", "equal_weight")
         max_position_pct = config.get("max_position_pct", 0.10)
 
@@ -350,13 +394,18 @@ class PaperTradingService:
         for w in weight_warnings:
             log.warning("paper_trading.weight_ineffective", detail=w)
 
-        tickers = self._group_service.get_group_tickers(session["universe_group_id"])
+        tickers = self._group_service.get_group_tickers(
+            session["universe_group_id"], market=resolved_market
+        )
+        tickers = [normalize_ticker(t, resolved_market) for t in tickers]
 
         record_initial_baseline = session.get("current_date") is None
         candidate_execution_days = trading_days[1:] if record_initial_baseline else trading_days
         rebalance_execution_days = [
             d for d in candidate_execution_days
-            if self._is_rebalance_signal_day(self._prev_trading_day(d), d, rebalance_freq)
+            if self._is_rebalance_signal_day(
+                self._prev_trading_day(d, market=resolved_market), d, rebalance_freq
+            )
         ]
         rebalance_execution_day_set = set(rebalance_execution_days)
 
@@ -367,15 +416,23 @@ class PaperTradingService:
         if rebalance_execution_days:
             batch_ctx = self._prepare_signal_context(
                 strategy_id=session["strategy_id"],
-                signal_dates=[self._prev_trading_day(d) for d in rebalance_execution_days],
+                signal_dates=[
+                    self._prev_trading_day(d, market=resolved_market)
+                    for d in rebalance_execution_days
+                ],
                 universe_group_id=session["universe_group_id"],
                 tickers=tickers,
+                market=resolved_market,
             )
 
         # Load price cache for trade execution (separate from signal generation)
-        price_cache = self._preload_prices(tickers, trading_days[0], trading_days[-1], conn)
+        price_cache = self._preload_prices(
+            tickers, trading_days[0], trading_days[-1], conn, market=resolved_market
+        )
 
-        positions, cash = self._load_latest_state(session_id, capital)
+        positions, cash = self._load_latest_state(
+            session_id, capital, market=resolved_market
+        )
         days_processed = 0
         total_new_trades = 0
         baseline_days = 0
@@ -391,6 +448,7 @@ class PaperTradingService:
             existing_holding = self._calculate_holding_days(
                 session_id, list(positions.keys()),
                 trading_days[0] if trading_days else date.today(), conn,
+                market=resolved_market,
             )
             ticker_holding_days.update(existing_holding)
         execution_weights: dict[str, float] = {}
@@ -399,7 +457,8 @@ class PaperTradingService:
         strategy_entry_price: dict[str, float] = {}
         if positions and trading_days:
             initial_portfolio_state = self._build_portfolio_state_from_memory(
-                positions, cash, trading_days[0], price_cache, ticker_holding_days
+                positions, cash, trading_days[0], price_cache, ticker_holding_days,
+                market=resolved_market,
             )
             execution_weights = dict(initial_portfolio_state.get("current_weights", {}))
             strategy_weights = dict(execution_weights)
@@ -423,7 +482,7 @@ class PaperTradingService:
             if record_initial_baseline and idx == 0:
                 nav = self._value_portfolio_cached(positions, cash, trade_date, price_cache)
                 daily_snapshots.append((
-                    session_id, trade_date, nav, cash,
+                    session_id, resolved_market, trade_date, nav, cash,
                     json.dumps(positions, default=str),
                     json.dumps([], default=str),
                 ))
@@ -439,20 +498,21 @@ class PaperTradingService:
                     ticker_holding_days[ticker] = ticker_holding_days.get(ticker, 0) + 1
                 nav = self._value_portfolio_cached(positions, cash, trade_date, price_cache)
                 daily_snapshots.append((
-                    session_id, trade_date, nav, cash,
+                    session_id, resolved_market, trade_date, nav, cash,
                     json.dumps(positions, default=str),
                     json.dumps([], default=str),
                 ))
                 days_processed += 1
                 continue
 
-            signal_date = self._prev_trading_day(trade_date)
+            signal_date = self._prev_trading_day(trade_date, market=resolved_market)
 
             # --- Day-by-day signal generation with real-time portfolio state ---
             # Build portfolio state from current (evolving) positions
             portfolio_state = self._build_portfolio_state_from_memory(
                 positions, cash, trade_date, price_cache,
                 ticker_holding_days,
+                market=resolved_market,
             )
             strategy_portfolio_state = self._build_strategy_portfolio_state(
                 strategy_weights,
@@ -558,7 +618,7 @@ class PaperTradingService:
             nav = self._value_portfolio_cached(positions, cash, trade_date, price_cache)
 
             daily_snapshots.append((
-                session_id, trade_date, nav, cash,
+                session_id, resolved_market, trade_date, nav, cash,
                 json.dumps(positions, default=str),
                 json.dumps(day_trades["trades"], default=str),
             ))
@@ -567,31 +627,33 @@ class PaperTradingService:
         if daily_snapshots:
             conn.executemany(
                 """INSERT OR REPLACE INTO paper_trading_daily
-                   (session_id, date, nav, cash, positions_json, trades_json)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                   (session_id, market, date, nav, cash, positions_json, trades_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 daily_snapshots,
             )
             last_date = trading_days[-1] if trading_days else None
-            last_nav = daily_snapshots[-1][2] if daily_snapshots else None
+            last_nav = daily_snapshots[-1][3] if daily_snapshots else None
             conn.execute(
                 """UPDATE paper_trading_sessions
                    SET current_date = ?, current_nav = ?,
                        total_trades = total_trades + ?,
                        updated_at = ?
-                   WHERE id = ?""",
+                   WHERE id = ? AND market = ?""",
                 [last_date, last_nav, total_new_trades,
-                 datetime.utcnow(), session_id],
+                 datetime.utcnow(), session_id, resolved_market],
             )
 
         log.info(
             "paper_trading.advance_done",
             session_id=session_id,
+            market=resolved_market,
             days=days_processed,
             trades=total_new_trades,
             signal_errors=signal_errors,
         )
         result = {
             "session_id": session_id,
+            "market": resolved_market,
             "days_processed": days_processed,
             "new_trades": total_new_trades,
             "current_date": str(trading_days[-1]) if trading_days else None,
@@ -616,9 +678,10 @@ class PaperTradingService:
     # Latest signals / T+1 action plan
     # ------------------------------------------------------------------
 
-    def get_cached_signals(self, session_id: str) -> dict | None:
+    def get_cached_signals(self, session_id: str, market: str | None = None) -> dict | None:
         """Return cached signal result for current T+1 date, or None."""
-        session = self.get_session(session_id)
+        resolved_market = normalize_market(market)
+        session = self.get_session(session_id, market=resolved_market)
         current = session.get("current_date")
         if not current:
             return None
@@ -626,36 +689,48 @@ class PaperTradingService:
             current_d = date.fromisoformat(current)
         else:
             current_d = current
-        next_days = get_trading_days(current_d + timedelta(days=1), current_d + timedelta(days=10))
+        next_days = get_trading_days(
+            current_d + timedelta(days=1),
+            current_d + timedelta(days=10),
+            market=resolved_market,
+        )
         if not next_days:
             return None
         signal_date = next_days[0]
         conn = get_connection()
         row = conn.execute(
             "SELECT result_json FROM paper_trading_signal_cache "
-            "WHERE session_id = ? AND signal_date = ?",
-            [session_id, str(signal_date)],
+            "WHERE session_id = ? AND market = ? AND signal_date = ?",
+            [session_id, resolved_market, str(signal_date)],
         ).fetchone()
         if row:
             return json.loads(row[0])
         return None
 
-    def _save_signal_cache(self, session_id: str, signal_date: date, result: dict) -> None:
+    def _save_signal_cache(
+        self,
+        session_id: str,
+        signal_date: date,
+        result: dict,
+        market: str | None = None,
+    ) -> None:
         """Persist signal result to cache."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         conn.execute(
             "INSERT OR REPLACE INTO paper_trading_signal_cache "
-            "(session_id, signal_date, result_json) VALUES (?, ?, ?)",
-            [session_id, str(signal_date), json.dumps(result, default=str)],
+            "(session_id, market, signal_date, result_json) VALUES (?, ?, ?, ?)",
+            [session_id, resolved_market, str(signal_date), json.dumps(result, default=str)],
         )
 
-    def get_latest_signals(self, session_id: str) -> dict:
+    def get_latest_signals(self, session_id: str, market: str | None = None) -> dict:
         """Generate signals for the next trading day (T+1 action plan).
 
         Uses data up to session's current_date (T) to generate signals
         for T+1.  This mirrors what advance() would do on the next step.
         """
-        session = self.get_session(session_id)
+        resolved_market = normalize_market(market)
+        session = self.get_session(session_id, market=resolved_market)
         current = session.get("current_date")
         if not current:
             return {"signals": [], "action_plan": [], "target_date": None}
@@ -665,20 +740,28 @@ class PaperTradingService:
             current_d = date.fromisoformat(current)
         else:
             current_d = current
-        next_days = get_trading_days(current_d + timedelta(days=1), current_d + timedelta(days=10))
+        next_days = get_trading_days(
+            current_d + timedelta(days=1),
+            current_d + timedelta(days=10),
+            market=resolved_market,
+        )
         if not next_days:
             return {"signals": [], "action_plan": [], "target_date": None}
         target_date = next_days[0]
 
         # Check signal cache first
-        cached = self.get_cached_signals(session_id)
+        cached = self.get_cached_signals(session_id, market=resolved_market)
         if cached:
             log.info("paper_trading.signals_cache_hit", session_id=session_id, target_date=str(target_date))
             return cached
 
         # Load current portfolio state for stateful strategies
-        positions, cash = self._load_latest_state(session_id, session["initial_capital"])
-        portfolio_state = self._build_portfolio_state(session_id, positions, cash, current_d)
+        positions, cash = self._load_latest_state(
+            session_id, session["initial_capital"], market=resolved_market
+        )
+        portfolio_state = self._build_portfolio_state(
+            session_id, positions, cash, current_d, market=resolved_market
+        )
 
         # Lightweight signal generation: no validation, no persistence, just signals
         try:
@@ -688,6 +771,7 @@ class PaperTradingService:
                 universe_group_id=session["universe_group_id"],
                 tickers_override=None,
                 portfolio_state=portfolio_state,
+                market=resolved_market,
             )
         except Exception as exc:
             log.warning("paper_trading.lightweight_signal_fallback", error=str(exc))
@@ -697,6 +781,7 @@ class PaperTradingService:
                     strategy_id=session["strategy_id"],
                     target_date=str(current_d),
                     universe_group_id=session["universe_group_id"],
+                    market=resolved_market,
                 )
                 signals = signal_result.get("signals", [])
             except Exception as exc2:
@@ -704,7 +789,9 @@ class PaperTradingService:
                 return {"signals": [], "action_plan": [], "target_date": str(target_date), "error": str(exc2)}
 
         # Load current positions
-        positions, cash = self._load_latest_state(session_id, session["initial_capital"])
+        positions, cash = self._load_latest_state(
+            session_id, session["initial_capital"], market=resolved_market
+        )
         config = session.get("config") or {}
         max_positions = config.get("max_positions", 50)
 
@@ -762,6 +849,7 @@ class PaperTradingService:
             })
 
         result = {
+            "market": resolved_market,
             "signals": signals,
             "action_plan": action_plan,
             "target_date": str(target_date),
@@ -769,7 +857,7 @@ class PaperTradingService:
 
         # Cache for future requests
         try:
-            self._save_signal_cache(session_id, target_date, result)
+            self._save_signal_cache(session_id, target_date, result, market=resolved_market)
             log.info("paper_trading.signals_cached", session_id=session_id, target_date=str(target_date))
         except Exception as exc:
             log.warning("paper_trading.signal_cache_save_error", error=str(exc))
@@ -783,6 +871,7 @@ class PaperTradingService:
         universe_group_id: str,
         tickers_override: list[str] | None = None,
         portfolio_state: dict | None = None,
+        market: str | None = None,
     ) -> list[dict]:
         """Generate signals for a single date without validation or persistence.
 
@@ -795,12 +884,18 @@ class PaperTradingService:
 
         Returns list of signal dicts with ticker, signal, target_weight, strength.
         """
-        strategy_def = self._strategy_service.get_strategy(strategy_id)
+        resolved_market = normalize_market(market)
+        strategy_def = self._strategy_service.get_strategy(strategy_id, market=resolved_market)
         strategy_instance = self._load_strategy_instance(strategy_def)
 
-        tickers = tickers_override if tickers_override else self._group_service.get_group_tickers(universe_group_id)
+        tickers = (
+            tickers_override
+            if tickers_override
+            else self._group_service.get_group_tickers(universe_group_id, market=resolved_market)
+        )
         if not tickers:
             return []
+        tickers = [normalize_ticker(t, resolved_market) for t in tickers]
 
         start_lookback = signal_date - timedelta(days=250)
         start_str = str(start_lookback)
@@ -808,7 +903,7 @@ class PaperTradingService:
 
         # Load OHLCV data with lookback
         prices_close, prices_open, prices_high, prices_low, prices_volume = self._load_prices(
-            tickers, start_str, end_str
+            tickers, start_str, end_str, market=resolved_market
         )
         if prices_close.empty:
             return []
@@ -817,16 +912,20 @@ class PaperTradingService:
         required_factors = strategy_def.get("required_factors", [])
         required_models = StrategyService.resolve_required_models(strategy_def)
 
-        strategy_factor_map = self._resolve_factor_ids(required_factors) if required_factors else {}
+        strategy_factor_map = (
+            self._resolve_factor_ids(required_factors, market=resolved_market)
+            if required_factors
+            else {}
+        )
         all_factor_ids = set(strategy_factor_map.values())
 
         # Resolve model feature sets
         model_fs_map: dict[str, tuple[str, dict[str, str]]] = {}
         for model_id in required_models:
             try:
-                model_record = self._model_service.get_model(model_id)
+                model_record = self._model_service.get_model(model_id, market=resolved_market)
                 fs_id = model_record["feature_set_id"]
-                fs = self._feature_service.get_feature_set(fs_id)
+                fs = self._feature_service.get_feature_set(fs_id, market=resolved_market)
                 fs_id_to_name: dict[str, str] = {}
                 for ref in fs["factor_refs"]:
                     fid = ref["factor_id"]
@@ -839,7 +938,7 @@ class PaperTradingService:
 
         # Bulk load all cached factor values in ONE query
         cached_by_id = self._factor_engine.load_cached_factors_bulk(
-            list(all_factor_ids), tickers, start_str, end_str
+            list(all_factor_ids), tickers, start_str, end_str, market=resolved_market
         )
 
         # Build strategy factor_data
@@ -849,7 +948,9 @@ class PaperTradingService:
                 factor_data[factor_name] = cached_by_id[factor_id]
             else:
                 try:
-                    df = self._factor_engine.compute_factor(factor_id, tickers, start_str, end_str)
+                    df = self._factor_engine.compute_factor(
+                        factor_id, tickers, start_str, end_str, market=resolved_market
+                    )
                     if not df.empty:
                         factor_data[factor_name] = df
                 except Exception as exc:
@@ -867,7 +968,7 @@ class PaperTradingService:
                 return (model_id, None)
 
             fs_id, fs_id_to_name = model_fs_map[model_id]
-            fs = self._feature_service.get_feature_set(fs_id)
+            fs = self._feature_service.get_feature_set(fs_id, market=resolved_market)
             preprocessing = fs["preprocessing"]
 
             feature_data_local: dict[str, pd.DataFrame] = {}
@@ -876,7 +977,9 @@ class PaperTradingService:
                     feature_data_local[fname] = cached_by_id[fid]
                 else:
                     try:
-                        df = self._factor_engine.compute_factor(fid, tickers, start_str, end_str)
+                        df = self._factor_engine.compute_factor(
+                            fid, tickers, start_str, end_str, market=resolved_market
+                        )
                         if not df.empty:
                             feature_data_local[fname] = df
                     except Exception as exc:
@@ -893,6 +996,7 @@ class PaperTradingService:
                     feature_data=processed,
                     tickers=tickers,
                     date=end_str,
+                    market=resolved_market,
                 )
                 return (model_id, preds if not preds.empty else None)
             except Exception as exc:
@@ -945,21 +1049,29 @@ class PaperTradingService:
     # Stock trade chart data
     # ------------------------------------------------------------------
 
-    def get_stock_chart(self, session_id: str, ticker: str) -> dict:
+    def get_stock_chart(
+        self,
+        session_id: str,
+        ticker: str,
+        market: str | None = None,
+    ) -> dict:
         """Return daily bars and trade markers for a stock within a paper session."""
-        session = self.get_session(session_id)
+        resolved_market = normalize_market(market)
+        session = self.get_session(session_id, market=resolved_market)
         conn = get_connection()
 
         start = session["start_date"]
         end = session.get("current_date") or start
 
+        normalized_ticker = normalize_ticker(ticker, resolved_market)
+
         # Fetch daily bars
         bars = conn.execute(
             """SELECT date, open, high, low, close, volume
                FROM daily_bars
-               WHERE ticker = ? AND date >= ? AND date <= ?
+               WHERE market = ? AND ticker = ? AND date >= ? AND date <= ?
                ORDER BY date""",
-            [ticker, start, end],
+            [resolved_market, normalized_ticker, start, end],
         ).fetchall()
 
         daily_bars = [
@@ -977,15 +1089,15 @@ class PaperTradingService:
         # Collect trades for this ticker from daily snapshots
         trade_rows = conn.execute(
             """SELECT date, trades_json FROM paper_trading_daily
-               WHERE session_id = ? ORDER BY date""",
-            [session_id],
+               WHERE session_id = ? AND market = ? ORDER BY date""",
+            [session_id, resolved_market],
         ).fetchall()
 
         ticker_trades = []
         for row in trade_rows:
             trades = json.loads(row[1]) if isinstance(row[1], str) else (row[1] or [])
             for t in trades:
-                if t.get("ticker") == ticker:
+                if t.get("ticker") == normalized_ticker:
                     ticker_trades.append({
                         "date": str(row[0]),
                         "action": t["action"],
@@ -995,7 +1107,8 @@ class PaperTradingService:
                     })
 
         return {
-            "ticker": ticker,
+            "market": resolved_market,
+            "ticker": normalized_ticker,
             "daily_bars": daily_bars,
             "trades": ticker_trades,
         }
@@ -1004,14 +1117,15 @@ class PaperTradingService:
     # Query daily data
     # ------------------------------------------------------------------
 
-    def get_daily_series(self, session_id: str) -> list[dict]:
+    def get_daily_series(self, session_id: str, market: str | None = None) -> list[dict]:
         """Return daily NAV series for charting."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         rows = conn.execute(
             """SELECT date, nav, cash, positions_json, trades_json
                FROM paper_trading_daily
-               WHERE session_id = ? ORDER BY date""",
-            [session_id],
+               WHERE session_id = ? AND market = ? ORDER BY date""",
+            [session_id, resolved_market],
         ).fetchall()
         result = []
         for r in rows:
@@ -1026,21 +1140,28 @@ class PaperTradingService:
             })
         return result
 
-    def get_positions(self, session_id: str, as_of_date: str | None = None) -> list[dict]:
+    def get_positions(
+        self,
+        session_id: str,
+        as_of_date: str | None = None,
+        market: str | None = None,
+    ) -> list[dict]:
         """Return positions for the latest or requested historical snapshot."""
+        session = self.get_session(session_id, market=market)
+        resolved_market = session["market"]
         conn = get_connection()
         if as_of_date:
             row = conn.execute(
                 """SELECT positions_json, date, nav FROM paper_trading_daily
-                   WHERE session_id = ? AND date <= ?
+                   WHERE session_id = ? AND market = ? AND date <= ?
                    ORDER BY date DESC LIMIT 1""",
-                [session_id, as_of_date],
+                [session_id, resolved_market, as_of_date],
             ).fetchone()
         else:
             row = conn.execute(
                 """SELECT positions_json, date, nav FROM paper_trading_daily
-                   WHERE session_id = ? ORDER BY date DESC LIMIT 1""",
-                [session_id],
+                   WHERE session_id = ? AND market = ? ORDER BY date DESC LIMIT 1""",
+                [session_id, resolved_market],
             ).fetchone()
         if not row or not row[0]:
             return []
@@ -1055,9 +1176,9 @@ class PaperTradingService:
             placeholders = ",".join("?" for _ in pos_tickers)
             price_rows = conn.execute(
                 f"""SELECT ticker, close FROM daily_bars
-                    WHERE ticker IN ({placeholders}) AND date <= ?
+                    WHERE market = ? AND ticker IN ({placeholders}) AND date <= ?
                     QUALIFY ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC) = 1""",
-                [*pos_tickers, pos_date],
+                [resolved_market, *pos_tickers, pos_date],
             ).fetchall()
             for t, c in price_rows:
                 latest_prices[t] = float(c)
@@ -1082,20 +1203,26 @@ class PaperTradingService:
             })
         return result
 
-    def compare_with_backtest(self, session_id: str, backtest_id: str) -> dict:
+    def compare_with_backtest(
+        self,
+        session_id: str,
+        backtest_id: str,
+        market: str | None = None,
+    ) -> dict:
         """Return a minimal daily trade/position reconciliation against a backtest."""
         from backend.services.backtest_service import BacktestService
 
+        resolved_market = normalize_market(market)
         conn = get_connection()
         rows = conn.execute(
             """SELECT date, nav, cash, positions_json, trades_json
                FROM paper_trading_daily
-               WHERE session_id = ? ORDER BY date""",
-            [session_id],
+               WHERE session_id = ? AND market = ? ORDER BY date""",
+            [session_id, resolved_market],
         ).fetchall()
 
         backtest_service = getattr(self, "_backtest_service", None) or BacktestService()
-        backtest = backtest_service.get_backtest(backtest_id)
+        backtest = backtest_service.get_backtest(backtest_id, market=resolved_market)
         backtest_trades = [
             t for t in backtest.get("trades", [])
             if isinstance(t, dict) and t.get("date")
@@ -1196,6 +1323,7 @@ class PaperTradingService:
         backtest_final_nav = bt_nav_by_date.get(final_date) if final_date else None
         return {
             "session_id": session_id,
+            "market": resolved_market,
             "backtest_id": backtest_id,
             "summary": {
                 "paper_total_trades": paper_total_trades,
@@ -1219,13 +1347,19 @@ class PaperTradingService:
             "daily": daily,
         }
 
-    def get_trades(self, session_id: str, limit: int = 200) -> list[dict]:
+    def get_trades(
+        self,
+        session_id: str,
+        limit: int = 200,
+        market: str | None = None,
+    ) -> list[dict]:
         """Return recent trades across all days."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         rows = conn.execute(
             """SELECT date, trades_json FROM paper_trading_daily
-               WHERE session_id = ? ORDER BY date DESC""",
-            [session_id],
+               WHERE session_id = ? AND market = ? ORDER BY date DESC""",
+            [session_id, resolved_market],
         ).fetchall()
         all_trades: list[dict] = []
         for row in rows:
@@ -1237,10 +1371,11 @@ class PaperTradingService:
                 break
         return all_trades[:limit]
 
-    def get_summary(self, session_id: str) -> dict:
+    def get_summary(self, session_id: str, market: str | None = None) -> dict:
         """Compute summary metrics for a session."""
-        session = self.get_session(session_id)
-        series = self.get_daily_series(session_id)
+        resolved_market = normalize_market(market)
+        session = self.get_session(session_id, market=resolved_market)
+        series = self.get_daily_series(session_id, market=resolved_market)
 
         if len(series) < 2:
             return {
@@ -1277,9 +1412,9 @@ class PaperTradingService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _prev_trading_day(d: date) -> date:
+    def _prev_trading_day(d: date, market: str | None = None) -> date:
         """Return the trading day immediately before *d*."""
-        return offset_trading_days(d, -1)
+        return offset_trading_days(d, -1, market=market)
 
     def _prepare_signal_context(
         self,
@@ -1287,6 +1422,7 @@ class PaperTradingService:
         signal_dates: list[date],
         universe_group_id: str,
         tickers: list[str],
+        market: str | None = None,
     ) -> dict:
         """Pre-load strategy, factors, models, and prices for signal generation.
 
@@ -1297,7 +1433,8 @@ class PaperTradingService:
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        strategy_def = self._strategy_service.get_strategy(strategy_id)
+        resolved_market = normalize_market(market)
+        strategy_def = self._strategy_service.get_strategy(strategy_id, market=resolved_market)
         strategy_instance = self._load_strategy_instance(strategy_def)
 
         required_factors = strategy_def.get("required_factors", [])
@@ -1309,15 +1446,19 @@ class PaperTradingService:
         end_str = str(end_date)
 
         # Bulk load ALL factor data (strategy + model features)
-        strategy_factor_map = self._resolve_factor_ids(required_factors) if required_factors else {}
+        strategy_factor_map = (
+            self._resolve_factor_ids(required_factors, market=resolved_market)
+            if required_factors
+            else {}
+        )
         all_factor_ids = set(strategy_factor_map.values())
 
         model_fs_map: dict[str, tuple[str, dict[str, str]]] = {}
         for model_id in required_models:
             try:
-                model_record = self._model_service.get_model(model_id)
+                model_record = self._model_service.get_model(model_id, market=resolved_market)
                 fs_id = model_record["feature_set_id"]
-                fs = self._feature_service.get_feature_set(fs_id)
+                fs = self._feature_service.get_feature_set(fs_id, market=resolved_market)
                 fs_id_to_name: dict[str, str] = {}
                 for ref in fs["factor_refs"]:
                     fid = ref["factor_id"]
@@ -1329,7 +1470,7 @@ class PaperTradingService:
                 log.warning("paper_trading.prepare_model_fs_failed", model_id=model_id, error=str(exc))
 
         cached_by_id = self._factor_engine.load_cached_factors_bulk(
-            list(all_factor_ids), tickers, start_str, end_str
+            list(all_factor_ids), tickers, start_str, end_str, market=resolved_market
         )
 
         # Build strategy factor_data
@@ -1339,7 +1480,9 @@ class PaperTradingService:
                 factor_data[factor_name] = cached_by_id[factor_id]
             else:
                 try:
-                    df = self._factor_engine.compute_factor(factor_id, tickers, start_str, end_str)
+                    df = self._factor_engine.compute_factor(
+                        factor_id, tickers, start_str, end_str, market=resolved_market
+                    )
                     if not df.empty:
                         factor_data[factor_name] = df
                 except Exception as exc:
@@ -1354,7 +1497,7 @@ class PaperTradingService:
                 return (model_id, result_preds)
 
             fs_id, fs_id_to_name = model_fs_map[model_id]
-            fs = self._feature_service.get_feature_set(fs_id)
+            fs = self._feature_service.get_feature_set(fs_id, market=resolved_market)
             preprocessing = fs["preprocessing"]
 
             feature_data_local: dict[str, pd.DataFrame] = {}
@@ -1363,7 +1506,9 @@ class PaperTradingService:
                     feature_data_local[fname] = cached_by_id[fid]
                 else:
                     try:
-                        df = self._factor_engine.compute_factor(fid, tickers, start_str, end_str)
+                        df = self._factor_engine.compute_factor(
+                            fid, tickers, start_str, end_str, market=resolved_market
+                        )
                         if not df.empty:
                             feature_data_local[fname] = df
                     except Exception as exc:
@@ -1380,6 +1525,7 @@ class PaperTradingService:
                         feature_data=processed_features,
                         tickers=tickers,
                         date=str(d),
+                        market=resolved_market,
                     )
                     if not preds.empty:
                         result_preds[d] = preds
@@ -1415,7 +1561,7 @@ class PaperTradingService:
 
         # Pre-load OHLCV data
         prices_close, prices_open, prices_high, prices_low, prices_volume = self._load_prices(
-            tickers, start_str, end_str
+            tickers, start_str, end_str, market=resolved_market
         )
         prices_multi = self._build_prices_multi(
             prices_close, prices_open, prices_high, prices_low, prices_volume, tickers
@@ -1499,6 +1645,7 @@ class PaperTradingService:
         trade_date: date,
         price_cache: dict[date, dict[str, tuple[float, float]]],
         ticker_holding_days: dict[str, int],
+        market: str | None = None,
     ) -> dict:
         """Build portfolio state from in-memory positions (no DB query).
 
@@ -1516,7 +1663,7 @@ class PaperTradingService:
 
         # Use price_cache for current prices
         day_prices = price_cache.get(trade_date, {})
-        prev_day = self._prev_trading_day(trade_date)
+        prev_day = self._prev_trading_day(trade_date, market=market)
         prev_prices = price_cache.get(prev_day, {})
         # Prefer previous day close (most recent settlement), fall back to trade_date
         best_prices = prev_prices if prev_prices else day_prices
@@ -1700,6 +1847,7 @@ class PaperTradingService:
         universe_group_id: str,
         tickers: list[str],
         session_id: str | None = None,
+        market: str | None = None,
     ) -> dict[int, list[dict]]:
         """Generate signals for multiple dates in one batch.
 
@@ -1719,7 +1867,10 @@ class PaperTradingService:
             return {}
 
         # Load strategy definition and instantiate once
-        strategy_def = self._strategy_service.get_strategy(strategy_id)
+        resolved_market = normalize_market(market)
+        tickers = [normalize_ticker(t, resolved_market) for t in tickers]
+
+        strategy_def = self._strategy_service.get_strategy(strategy_id, market=resolved_market)
         strategy_instance = self._load_strategy_instance(strategy_def)
 
         required_factors = strategy_def.get("required_factors", [])
@@ -1732,16 +1883,20 @@ class PaperTradingService:
 
         # --- Bulk load ALL factor data (strategy + model features) ---
         # 1. Collect all factor IDs we need
-        strategy_factor_map = self._resolve_factor_ids(required_factors) if required_factors else {}
+        strategy_factor_map = (
+            self._resolve_factor_ids(required_factors, market=resolved_market)
+            if required_factors
+            else {}
+        )
         all_factor_ids = set(strategy_factor_map.values())
 
         # Resolve model feature sets and collect their factor IDs
         model_fs_map: dict[str, tuple[str, dict[str, str]]] = {}  # model_id -> (fs_id, {factor_name: factor_id})
         for model_id in required_models:
             try:
-                model_record = self._model_service.get_model(model_id)
+                model_record = self._model_service.get_model(model_id, market=resolved_market)
                 fs_id = model_record["feature_set_id"]
-                fs = self._feature_service.get_feature_set(fs_id)
+                fs = self._feature_service.get_feature_set(fs_id, market=resolved_market)
                 fs_id_to_name: dict[str, str] = {}
                 for ref in fs["factor_refs"]:
                     fid = ref["factor_id"]
@@ -1755,7 +1910,7 @@ class PaperTradingService:
         # 2. Bulk load all cached factor values in ONE query
         all_factor_ids_list = list(all_factor_ids)
         cached_by_id = self._factor_engine.load_cached_factors_bulk(
-            all_factor_ids_list, tickers, start_str, end_str
+            all_factor_ids_list, tickers, start_str, end_str, market=resolved_market
         )
 
         # 3. Build strategy factor_data (name -> DataFrame)
@@ -1770,7 +1925,9 @@ class PaperTradingService:
         # Fallback: compute any uncached strategy factors individually
         for factor_name, factor_id in missing_strategy_factors:
             try:
-                df = self._factor_engine.compute_factor(factor_id, tickers, start_str, end_str)
+                df = self._factor_engine.compute_factor(
+                    factor_id, tickers, start_str, end_str, market=resolved_market
+                )
                 if not df.empty:
                     factor_data[factor_name] = df
             except Exception as exc:
@@ -1789,7 +1946,7 @@ class PaperTradingService:
                 return (model_id, result)
 
             fs_id, fs_id_to_name = model_fs_map[model_id]
-            fs = self._feature_service.get_feature_set(fs_id)
+            fs = self._feature_service.get_feature_set(fs_id, market=resolved_market)
             preprocessing = fs["preprocessing"]
 
             # Build feature_data from bulk cache (factor_name -> DataFrame)
@@ -1804,7 +1961,9 @@ class PaperTradingService:
             # Fallback for uncached model factors
             for fname, fid in missing_model_factors:
                 try:
-                    df = self._factor_engine.compute_factor(fid, tickers, start_str, end_str)
+                    df = self._factor_engine.compute_factor(
+                        fid, tickers, start_str, end_str, market=resolved_market
+                    )
                     if not df.empty:
                         feature_data_local[fname] = df
                 except Exception as exc:
@@ -1823,6 +1982,7 @@ class PaperTradingService:
                         feature_data=processed_features,
                         tickers=tickers,
                         date=str(d),
+                        market=resolved_market,
                     )
                     if not preds.empty:
                         result[d] = preds
@@ -1841,7 +2001,7 @@ class PaperTradingService:
 
         # Pre-load OHLCV data for the entire range
         prices_close, prices_open, prices_high, prices_low, prices_volume = self._load_prices(
-            tickers, start_str, end_str
+            tickers, start_str, end_str, market=resolved_market
         )
 
         # Generate signals per date
@@ -1861,9 +2021,9 @@ class PaperTradingService:
                 # Get positions as of the day before signal generation
                 row = conn.execute(
                     """SELECT positions_json, cash FROM paper_trading_daily
-                       WHERE session_id = ? AND date <= ?
+                       WHERE session_id = ? AND market = ? AND date <= ?
                        ORDER BY date DESC LIMIT 1""",
-                    [session_id, target_date],
+                    [session_id, resolved_market, target_date],
                 ).fetchone()
                 if row:
                     positions_by_date[target_date] = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
@@ -1899,6 +2059,7 @@ class PaperTradingService:
                     positions_by_date[target_date],
                     cash_by_date[target_date],
                     target_date,
+                    market=resolved_market,
                 )
                 context_kwargs.update(portfolio_state)
 
@@ -1931,17 +2092,22 @@ class PaperTradingService:
         from backend.strategies.loader import load_strategy_from_code
         return load_strategy_from_code(strategy_def["source_code"])
 
-    def _resolve_factor_ids(self, factor_names: list[str]) -> dict[str, str]:
+    def _resolve_factor_ids(
+        self,
+        factor_names: list[str],
+        market: str | None = None,
+    ) -> dict[str, str]:
         """Resolve factor names to factor IDs (latest version) in a single query."""
         if not factor_names:
             return {}
+        resolved_market = normalize_market(market)
         conn = get_connection()
         placeholders = ",".join("?" for _ in factor_names)
         rows = conn.execute(
             f"""SELECT name, id, version FROM factors
-                WHERE name IN ({placeholders})
+                WHERE market = ? AND name IN ({placeholders})
                 ORDER BY version DESC""",
-            factor_names,
+            [resolved_market, *factor_names],
         ).fetchall()
         result: dict[str, str] = {}
         for name, fid, _version in rows:
@@ -1954,18 +2120,32 @@ class PaperTradingService:
         tickers: list[str],
         start_date: str,
         end_date: str,
+        market: str | None = None,
     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """Load OHLCV price DataFrames from daily_bars."""
+        resolved_market = normalize_market(market)
+        normalized_tickers = [
+            normalize_ticker(t, resolved_market)
+            for t in tickers
+            if str(t).strip()
+        ]
+        if not normalized_tickers:
+            empty = pd.DataFrame()
+            return empty, empty, empty, empty, empty
         conn = get_connection()
-        placeholders = ",".join(f"'{t}'" for t in tickers)
+        placeholders = ",".join("?" for _ in normalized_tickers)
         query = f"""
             SELECT ticker, date, open, high, low, close, volume
             FROM daily_bars
-            WHERE ticker IN ({placeholders})
+            WHERE market = ?
+              AND ticker IN ({placeholders})
               AND date >= ? AND date <= ?
             ORDER BY date
         """
-        df = conn.execute(query, [start_date, end_date]).fetchdf()
+        df = conn.execute(
+            query,
+            [resolved_market, *normalized_tickers, start_date, end_date],
+        ).fetchdf()
         if df.empty:
             empty = pd.DataFrame()
             return empty, empty, empty, empty, empty
@@ -2016,18 +2196,26 @@ class PaperTradingService:
         start: date,
         end: date,
         conn,
+        market: str | None = None,
     ) -> dict[date, dict[str, tuple[float, float]]]:
         """Pre-load open and close prices for all tickers in a date range.
 
         Returns: {date: {ticker: (open, close)}}
         """
-        if not tickers:
+        resolved_market = normalize_market(market)
+        normalized_tickers = [
+            normalize_ticker(t, resolved_market)
+            for t in tickers
+            if str(t).strip()
+        ]
+        if not normalized_tickers:
             return {}
-        placeholders = ",".join(f"'{t}'" for t in tickers)
+        placeholders = ",".join("?" for _ in normalized_tickers)
         rows = conn.execute(
             f"""SELECT date, ticker, open, close FROM daily_bars
-                WHERE date >= ? AND date <= ? AND ticker IN ({placeholders})""",
-            [start, end],
+                WHERE market = ?
+                  AND date >= ? AND date <= ? AND ticker IN ({placeholders})""",
+            [resolved_market, start, end, *normalized_tickers],
         ).fetchall()
 
         cache: dict[date, dict[str, tuple[float, float]]] = {}
@@ -2040,14 +2228,18 @@ class PaperTradingService:
         return cache
 
     def _load_latest_state(
-        self, session_id: str, initial_capital: float
+        self,
+        session_id: str,
+        initial_capital: float,
+        market: str | None = None,
     ) -> tuple[dict[str, dict], float]:
         """Load positions and cash from the last recorded day."""
+        resolved_market = normalize_market(market)
         conn = get_connection()
         row = conn.execute(
             """SELECT positions_json, cash FROM paper_trading_daily
-               WHERE session_id = ? ORDER BY date DESC LIMIT 1""",
-            [session_id],
+               WHERE session_id = ? AND market = ? ORDER BY date DESC LIMIT 1""",
+            [session_id, resolved_market],
         ).fetchone()
         if row:
             positions = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
@@ -2174,6 +2366,7 @@ class PaperTradingService:
         positions: dict[str, dict],
         cash: float,
         current_date: date,
+        market: str | None = None,
     ) -> dict:
         """Build portfolio state dict for StrategyContext.
 
@@ -2192,13 +2385,15 @@ class PaperTradingService:
 
         conn = get_connection()
 
+        resolved_market = normalize_market(market)
+
         # Get latest close prices for current_date
-        tickers = list(positions.keys())
-        placeholders = ",".join(f"'{t}'" for t in tickers)
+        tickers = [normalize_ticker(t, resolved_market) for t in positions.keys()]
+        placeholders = ",".join("?" for _ in tickers)
         price_rows = conn.execute(
             f"""SELECT ticker, close FROM daily_bars
-                WHERE date = ? AND ticker IN ({placeholders})""",
-            [current_date],
+                WHERE market = ? AND date = ? AND ticker IN ({placeholders})""",
+            [resolved_market, current_date, *tickers],
         ).fetchall()
         current_prices = {r[0]: float(r[1]) for r in price_rows if r[1]}
 
@@ -2224,7 +2419,9 @@ class PaperTradingService:
             unrealized_pnl[ticker] = (current_price / entry_price - 1) if entry_price > 0 else 0
 
         # Calculate holding_days from trade history
-        holding_days = self._calculate_holding_days(session_id, tickers, current_date, conn)
+        holding_days = self._calculate_holding_days(
+            session_id, tickers, current_date, conn, market=resolved_market
+        )
 
         return {
             "current_weights": current_weights,
@@ -2239,17 +2436,21 @@ class PaperTradingService:
         tickers: list[str],
         current_date: date,
         conn,
+        market: str | None = None,
     ) -> dict[str, int]:
         """Calculate holding days for each ticker from trade history.
 
         Returns dict[ticker -> days_held]
         """
+        resolved_market = normalize_market(market)
+        tickers = [normalize_ticker(t, resolved_market) for t in tickers]
+
         # Get all daily snapshots up to current_date
         rows = conn.execute(
             """SELECT date, trades_json FROM paper_trading_daily
-               WHERE session_id = ? AND date <= ?
+               WHERE session_id = ? AND market = ? AND date <= ?
                ORDER BY date""",
-            [session_id, current_date],
+            [session_id, resolved_market, current_date],
         ).fetchall()
 
         # Track first buy date for each ticker
@@ -2278,7 +2479,8 @@ class PaperTradingService:
         holding_days = {}
         trading_days_list = get_trading_days(
             min(first_buy.values()) if first_buy else current_date,
-            current_date
+            current_date,
+            market=resolved_market,
         )
 
         for ticker in tickers:
@@ -2289,26 +2491,3 @@ class PaperTradingService:
                 holding_days[ticker] = max(1, days_held)
 
         return holding_days
-        config_raw = row[4]
-        if isinstance(config_raw, str):
-            try:
-                config_raw = json.loads(config_raw)
-            except (json.JSONDecodeError, TypeError):
-                config_raw = {}
-
-        return {
-            "id": row[0],
-            "name": row[1],
-            "strategy_id": row[2],
-            "universe_group_id": row[3],
-            "config": config_raw,
-            "status": row[5],
-            "start_date": str(row[6]) if row[6] else None,
-            "current_date": str(row[7]) if row[7] else None,
-            "initial_capital": row[8],
-            "current_nav": row[9],
-            "total_trades": row[10],
-            "created_at": str(row[11]) if row[11] else None,
-            "updated_at": str(row[12]) if row[12] else None,
-            "strategy_name": row[13] if len(row) > 13 else None,
-        }
