@@ -17,3 +17,15 @@ backtest:
 
 market:
   calendar: NYSE
+
+markets:
+  US:
+    provider: yfinance
+    calendar: NYSE
+    benchmark: SPY
+    default_group: us_all_market
+  CN:
+    provider: baostock
+    calendar: XSHG
+    benchmark: sh.000300
+    default_group: cn_all_a

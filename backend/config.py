@@ -42,11 +42,20 @@ class MarketConfig:
 
 
 @dataclass
+class MarketEntryConfig:
+    provider: str
+    calendar: str
+    benchmark: str
+    default_group: str
+
+
+@dataclass
 class Settings:
     data: DataConfig = field(default_factory=DataConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
     market: MarketConfig = field(default_factory=MarketConfig)
+    markets: dict[str, MarketEntryConfig] = field(default_factory=dict)
 
     # Resolved absolute paths (set after loading)
     project_root: Path = field(default=_PROJECT_ROOT)
@@ -73,12 +82,59 @@ class Settings:
 
 
 def _build_settings(raw: dict[str, Any]) -> Settings:
+    data = DataConfig(**raw.get("data", {}))
+    server = ServerConfig(**raw.get("server", {}))
+    backtest = BacktestConfig(**raw.get("backtest", {}))
+    market = MarketConfig(**raw.get("market", {}))
+    markets = _build_market_configs(raw.get("markets", {}), data, backtest, market)
+
     return Settings(
-        data=DataConfig(**raw.get("data", {})),
-        server=ServerConfig(**raw.get("server", {})),
-        backtest=BacktestConfig(**raw.get("backtest", {})),
-        market=MarketConfig(**raw.get("market", {})),
+        data=data,
+        server=server,
+        backtest=backtest,
+        market=market,
+        markets=markets,
     )
+
+
+def _build_market_configs(
+    raw_markets: dict[str, Any],
+    data: DataConfig,
+    backtest: BacktestConfig,
+    market: MarketConfig,
+) -> dict[str, MarketEntryConfig]:
+    markets = {
+        "US": MarketEntryConfig(
+            provider=data.provider,
+            calendar=market.calendar,
+            benchmark=backtest.default_benchmark,
+            default_group="us_all_market",
+        ),
+        "CN": MarketEntryConfig(
+            provider="baostock",
+            calendar="XSHG",
+            benchmark="sh.000300",
+            default_group="cn_all_a",
+        ),
+    }
+
+    for key, value in (raw_markets or {}).items():
+        if not isinstance(value, dict):
+            continue
+        normalized = str(key).upper()
+        base = markets.get(normalized)
+        if base is None:
+            continue
+        merged = {
+            "provider": base.provider,
+            "calendar": base.calendar,
+            "benchmark": base.benchmark,
+            "default_group": base.default_group,
+            **value,
+        }
+        markets[normalized] = MarketEntryConfig(**merged)
+
+    return markets
 
 
 def load_settings(config_path: Path | None = None) -> Settings:
