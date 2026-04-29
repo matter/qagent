@@ -195,6 +195,38 @@ This file records milestone evidence for the V2.0 A-share and ranking upgrade.
     - `GET /api/health` remained available through the old server path.
     - `uv run python scripts/e2e_demo.py` passed with no explicit `market` arguments, confirming `US` default compatibility.
 
+## P7 Regression, Refactor, And Final Acceptance
+
+- Task 15 V2 regression check script completed:
+  - Added `scripts/v2_regression_check.py` as the repeatable phase gate for V2.0.
+  - The script reports `passed`, `failed`, and `skipped` checks with a non-zero exit code only when required checks fail.
+  - Default checks cover:
+    - Market context defaults and aliases, including missing market -> `US`.
+    - Old REST API calls without `market`: `/api/data/status` and `/api/stocks/search?q=AAPL&limit=1`.
+    - Simulated BaoStock/CN provider failure isolation followed by a live US API status check.
+    - Old US e2e flow through `scripts/e2e_demo.py`.
+  - Optional checks cover:
+    - `--migration-copy PATH` validation on a copied DuckDB file.
+    - `--cn-provider-smoke` BaoStock network smoke for `sh.600000`.
+  - CN optional checks report `skipped` with a clear reason when not requested or unavailable.
+- Task 15 verification:
+  - Red/green contract check:
+    - `uv run python -m unittest tests.test_v2_regression_check` failed before the script existed.
+    - The same command passed after implementation: `4` tests.
+  - `uv run python -m py_compile scripts/v2_regression_check.py` passed.
+  - Lightweight script smoke:
+    - `uv run python scripts/v2_regression_check.py --skip-us-e2e --json` passed with `3` passed, `0` failed, `3` skipped.
+  - Migration-copy branch smoke on a synthetic DuckDB file:
+    - `uv run python scripts/v2_regression_check.py --source-db logs/v2-task15-migration-source.duckdb --migration-copy logs/v2-task15-migration-copy.duckdb --skip-us-e2e --json` passed.
+    - Migration status was `applied`; `2` tables were checked.
+  - Default regression command:
+    - `uv run python scripts/v2_regression_check.py` passed with `4` passed, `0` failed, `2` skipped.
+    - The skipped checks were the optional migration-copy and BaoStock network checks.
+  - Submission gate:
+    - `uv run python -m unittest discover tests` passed: `82` tests.
+    - `cd frontend && pnpm build` passed. Vite still reports the existing dynamic-import and large-chunk warnings.
+    - `git diff --check` passed.
+
 - Task 13 frontend API market scope and global selector completed:
   - Added shared frontend `Market = "US" | "CN"` type and market helper exports.
   - Added API client market state with `qagent.market` localStorage persistence, first-load default `US`, and request interceptor injection for market-scoped REST paths.
