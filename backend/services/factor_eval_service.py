@@ -17,6 +17,7 @@ from backend.services.factor_service import FactorService
 from backend.services.group_service import GroupService
 from backend.services.label_service import LabelService
 from backend.services.market_context import normalize_market
+from backend.time_utils import utc_now_naive
 
 log = get_logger(__name__)
 
@@ -550,7 +551,7 @@ class FactorEvalService:
                 json.dumps(summary),
                 json.dumps(ic_series),
                 json.dumps(group_returns),
-                datetime.utcnow(),
+                utc_now_naive(),
             ],
         )
         log.info("factor_eval.saved", eval_id=eval_id)

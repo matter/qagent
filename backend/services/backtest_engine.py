@@ -44,6 +44,10 @@ class BacktestConfig:
 
     # Low-turnover controls
     rebalance_buffer: float = 0.0       # ignore weight change below this threshold
+    rebalance_buffer_add: float | None = None
+    rebalance_buffer_reduce: float | None = None
+    rebalance_buffer_mode: str = "all"  # all / hold_overlap_only
+    rebalance_buffer_reference: str = "target"  # target / actual_open
     min_holding_days: int = 0           # don't sell a position before N trading days
     reentry_cooldown_days: int = 0      # after selling, wait N days before re-buying
 
@@ -73,6 +77,10 @@ class BacktestConfig:
             "max_positions": self.max_positions,
             "rebalance_freq": self.rebalance_freq,
             "rebalance_buffer": self.rebalance_buffer,
+            "rebalance_buffer_add": self.rebalance_buffer_add,
+            "rebalance_buffer_reduce": self.rebalance_buffer_reduce,
+            "rebalance_buffer_mode": self.rebalance_buffer_mode,
+            "rebalance_buffer_reference": self.rebalance_buffer_reference,
             "min_holding_days": self.min_holding_days,
             "reentry_cooldown_days": self.reentry_cooldown_days,
         }
@@ -253,6 +261,18 @@ class BacktestEngine:
                     )
                     if portfolio_value <= 0:
                         portfolio_value = cash
+                    actual_open_weights: dict[str, float] = {}
+                    if portfolio_value > 0:
+                        for ticker, shares in holdings.items():
+                            if (
+                                trade_date_ts in prices_open.index
+                                and ticker in prices_open.columns
+                            ):
+                                open_price = prices_open.loc[trade_date_ts, ticker]
+                                if pd.notna(open_price) and open_price > 0:
+                                    actual_open_weights[ticker] = (
+                                        shares * float(open_price) / portfolio_value
+                                    )
 
                     # Compute trades: current weights vs target weights
                     # Apply low-turnover constraints before executing trades
@@ -264,30 +284,48 @@ class BacktestEngine:
                         )
                         for ticker in all_involved_tickers:
                             old_w = current_weights.get(ticker, 0.0)
+                            reference_w = old_w
+                            if config.rebalance_buffer_reference == "actual_open":
+                                reference_w = actual_open_weights.get(ticker, 0.0)
                             new_w = target_weights.get(ticker, 0.0)
 
-                            # Buffer: skip trade if weight change is below threshold
-                            if config.rebalance_buffer > 0 and abs(new_w - old_w) < config.rebalance_buffer:
-                                effective_targets[ticker] = old_w
+                            # Buffer: skip small weight-only add/reduce trades.
+                            buffer_applies = True
+                            if config.rebalance_buffer_mode == "hold_overlap_only":
+                                buffer_applies = reference_w > 0 and new_w > 0
+                            direction_buffer = config.rebalance_buffer
+                            if new_w > reference_w and config.rebalance_buffer_add is not None:
+                                direction_buffer = config.rebalance_buffer_add
+                            elif new_w < reference_w and config.rebalance_buffer_reduce is not None:
+                                direction_buffer = config.rebalance_buffer_reduce
+                            if (
+                                direction_buffer > 0
+                                and buffer_applies
+                                and abs(new_w - reference_w) < direction_buffer
+                            ):
+                                effective_targets[ticker] = reference_w
                                 continue
 
                             # Min holding days: prevent selling before N days
-                            if config.min_holding_days > 0 and old_w > 0 and new_w < old_w:
+                            if config.min_holding_days > 0 and reference_w > 0 and new_w < reference_w:
                                 days_held = ticker_holding_days.get(ticker, 0)
                                 if days_held < config.min_holding_days:
-                                    effective_targets[ticker] = old_w
+                                    effective_targets[ticker] = reference_w
                                     continue
 
                             # Re-entry cooldown: prevent buying back after recent sell
-                            if config.reentry_cooldown_days > 0 and old_w == 0 and new_w > 0:
+                            if config.reentry_cooldown_days > 0 and reference_w == 0 and new_w > 0:
                                 exit_idx = ticker_exit_day.get(ticker)
                                 if exit_idx is not None and (day_idx - exit_idx) < config.reentry_cooldown_days:
                                     effective_targets.pop(ticker, None)
                                     continue
 
-                        # Re-normalize if constraints altered the weights
+                        # Re-normalize if constraints altered the weights. In
+                        # hold-overlap mode the buffer is specifically meant to
+                        # preserve existing position sizes, so normalizing would
+                        # reintroduce the same add/reduce trades it just blocked.
                         eff_sum = sum(w for w in effective_targets.values() if w > 0)
-                        if eff_sum > 0:
+                        if eff_sum > 0 and config.rebalance_buffer_mode != "hold_overlap_only":
                             effective_targets = {
                                 t: w / eff_sum for t, w in effective_targets.items() if w > 0
                             }
@@ -301,7 +339,6 @@ class BacktestEngine:
                         old_w = current_weights.get(ticker, 0.0)
                         new_w = effective_targets.get(ticker, 0.0)
                         weight_change = abs(new_w - old_w)
-                        day_turnover += weight_change
 
                         if weight_change < 1e-8:
                             continue
@@ -322,9 +359,12 @@ class BacktestEngine:
 
                         old_shares = holdings.get(ticker, 0.0)
                         share_change = target_shares - old_shares
+                        if abs(share_change) < 1e-8:
+                            continue
 
                         # Cost on the traded dollar amount
                         trade_value = abs(share_change * exec_price)
+                        day_turnover += trade_value / portfolio_value if portfolio_value > 0 else weight_change
                         trade_cost = trade_value * cost_rate
                         total_cost += trade_cost
                         if share_change > 0:

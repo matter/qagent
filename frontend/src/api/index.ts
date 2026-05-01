@@ -99,8 +99,19 @@ export async function getDataStatus(market?: Market): Promise<DataStatus> {
   return data;
 }
 
-export async function triggerUpdate(mode: "incremental" | "full", market?: Market) {
-  const { data } = await client.post("/data/update", { mode, market: market || undefined });
+export async function triggerUpdate(mode: "incremental" | "full", market?: Market, historyYears?: number) {
+  const { data } = await client.post("/data/update", {
+    mode,
+    market: market || undefined,
+    history_years: historyYears,
+  });
+  return data;
+}
+
+export async function refreshStockList(
+  market?: Market,
+): Promise<{ task_id: string; status: string; market?: Market }> {
+  const { data } = await client.post("/data/refresh-stock-list", { market: market || undefined });
   return data;
 }
 
@@ -183,7 +194,7 @@ export async function refreshGroup(groupId: string, market?: Market): Promise<St
   return data;
 }
 
-export async function refreshIndexGroups(market?: Market) {
+export async function refreshIndexGroups(market?: Market): Promise<StockGroup[]> {
   const { data } = await client.post(
     "/groups/refresh-indices",
     undefined,

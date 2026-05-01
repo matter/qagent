@@ -24,7 +24,7 @@ def build_date_groups(
     y: pd.Series,
     *,
     min_group_size: int = 5,
-    label_gain: str = "identity",
+    label_gain: str = "ordinal",
 ) -> RankingDataset:
     """Build LightGBM ranking groups from a MultiIndex(date, ticker) dataset.
 
@@ -178,7 +178,7 @@ def compute_ranking_metrics(
 
 
 def _to_gain_labels(raw: pd.Series, *, label_gain: str) -> pd.Series:
-    if label_gain == "identity" and _is_non_negative_integer_like(raw):
+    if label_gain == "identity" and _is_dense_non_negative_integer_like(raw):
         gain = raw.astype(int)
     else:
         gain = raw.rank(method="first", ascending=True).astype(int) - 1
@@ -204,6 +204,15 @@ def _normalize_date_index(obj):
 def _is_non_negative_integer_like(values: pd.Series) -> bool:
     arr = values.to_numpy(dtype=float)
     return bool(np.all(arr >= 0) and np.all(np.isclose(arr, np.round(arr))))
+
+
+def _is_dense_non_negative_integer_like(values: pd.Series) -> bool:
+    if not _is_non_negative_integer_like(values):
+        return False
+    labels = sorted({int(v) for v in values})
+    if not labels:
+        return False
+    return labels == list(range(max(labels) + 1))
 
 
 def _ndcg_at_k(y_true: np.ndarray, y_score: np.ndarray, k: int) -> float:

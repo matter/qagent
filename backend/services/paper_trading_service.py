@@ -24,6 +24,7 @@ from backend.services.factor_engine import FactorEngine
 from backend.services.feature_service import FeatureService
 from backend.services.model_service import ModelService
 from backend.services.sql_filters import registered_values_table
+from backend.time_utils import utc_now_naive
 from backend.strategies.base import StrategyContext
 
 log = get_logger(__name__)
@@ -75,7 +76,7 @@ class PaperTradingService:
             name = f"{strategy['name']} 模拟 {start_date}"
 
         conn = get_connection()
-        now = datetime.utcnow()
+        now = utc_now_naive()
         conn.execute(
             """INSERT INTO paper_trading_sessions
                (id, market, name, strategy_id, universe_group_id, config,
@@ -159,7 +160,7 @@ class PaperTradingService:
         conn = get_connection()
         conn.execute(
             "UPDATE paper_trading_sessions SET status = 'paused', updated_at = ? WHERE id = ? AND market = ?",
-            [datetime.utcnow(), session_id, resolved_market],
+            [utc_now_naive(), session_id, resolved_market],
         )
         return self.get_session(session_id, market=resolved_market)
 
@@ -169,7 +170,7 @@ class PaperTradingService:
         conn = get_connection()
         conn.execute(
             "UPDATE paper_trading_sessions SET status = 'active', updated_at = ? WHERE id = ? AND market = ?",
-            [datetime.utcnow(), session_id, resolved_market],
+            [utc_now_naive(), session_id, resolved_market],
         )
         return self.get_session(session_id, market=resolved_market)
 
@@ -641,7 +642,7 @@ class PaperTradingService:
                        updated_at = ?
                    WHERE id = ? AND market = ?""",
                 [last_date, last_nav, total_new_trades,
-                 datetime.utcnow(), session_id, resolved_market],
+                 utc_now_naive(), session_id, resolved_market],
             )
 
         log.info(

@@ -1,9 +1,12 @@
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 import duckdb
+import pandas as pd
 
 from backend.api import factors as factor_api
 from backend.api import features as feature_api
@@ -79,6 +82,33 @@ class FactorFeatureMarketScopeTests(unittest.TestCase):
             ).fetchall(),
             [("CN",)],
         )
+
+    def test_factor_cache_writes_are_serialized_per_market_factor(self):
+        fake_conn = _ContendedCacheConnection()
+        frame = pd.DataFrame(
+            {"sh.600000": [1.0, 2.0]},
+            index=pd.to_datetime(["2024-01-02", "2024-01-03"]),
+        )
+        barrier = threading.Barrier(2)
+        errors: list[str] = []
+
+        def write_cache() -> None:
+            barrier.wait()
+            try:
+                FactorEngine()._write_cache("factor_cn", frame, market="CN")
+            except Exception as exc:
+                errors.append(str(exc))
+
+        with patch("backend.services.factor_engine.get_connection", return_value=fake_conn):
+            threads = [threading.Thread(target=write_cache) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(fake_conn.insert_count, 2)
+        self.assertEqual(fake_conn.max_active_inserts, 1)
 
     def test_factor_list_defaults_to_us_and_filters_explicit_market(self):
         with self._patch_connections():
@@ -337,6 +367,40 @@ class _MultiPatch:
     def __exit__(self, exc_type, exc, tb):
         for item in reversed(self._patches):
             item.__exit__(exc_type, exc, tb)
+
+
+class _ContendedCacheConnection:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active_inserts = 0
+        self.max_active_inserts = 0
+        self.insert_count = 0
+
+    def register(self, table_name, frame):
+        return None
+
+    def unregister(self, table_name):
+        return None
+
+    def execute(self, sql, params=None):
+        normalized = " ".join(str(sql).split()).upper()
+        if normalized.startswith("INSERT OR REPLACE INTO FACTOR_VALUES_CACHE"):
+            with self._lock:
+                self._active_inserts += 1
+                self.max_active_inserts = max(
+                    self.max_active_inserts,
+                    self._active_inserts,
+                )
+                if self._active_inserts > 1:
+                    self._active_inserts -= 1
+                    raise RuntimeError("simulated concurrent factor cache constraint failure")
+            try:
+                time.sleep(0.05)
+                self.insert_count += 1
+            finally:
+                with self._lock:
+                    self._active_inserts -= 1
+        return self
 
 
 def _run_async(coro):

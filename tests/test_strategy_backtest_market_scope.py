@@ -223,6 +223,32 @@ class StrategyBacktestMarketScopeTests(unittest.TestCase):
         self.assertIn("benchmark", str(ctx.exception.detail))
         self.assertIsNone(executor.params)
 
+    def test_create_strategy_api_logs_unexpected_failures_with_readable_detail(self):
+        strategy_service = _FailingCreateStrategyService()
+
+        with (
+            patch.object(strategy_api, "_get_strategy_service", return_value=strategy_service),
+            patch.object(strategy_api.log, "error") as log_error,
+        ):
+            with self.assertRaises(strategy_api.HTTPException) as ctx:
+                asyncio.run(
+                    strategy_api.create_strategy(
+                        strategy_api.CreateStrategyRequest(
+                            market="CN",
+                            name="CN broken strategy",
+                            source_code=_BASIC_STRATEGY_SOURCE,
+                        )
+                    )
+                )
+
+        self.assertEqual(ctx.exception.status_code, 500)
+        self.assertIn("Failed to create strategy", str(ctx.exception.detail))
+        self.assertIn("duckdb internal failure", str(ctx.exception.detail))
+        log_error.assert_called_once()
+        self.assertEqual(log_error.call_args.args[0], "api.strategy.create_failed")
+        self.assertEqual(log_error.call_args.kwargs["market"], "CN")
+        self.assertEqual(log_error.call_args.kwargs["name"], "CN broken strategy")
+
     def _patch_connections(self):
         return _MultiPatch(
             patch("backend.services.strategy_service.get_connection", return_value=self.conn),
@@ -387,6 +413,11 @@ class _FakeExecutor:
 class _FakeStrategyService:
     def get_strategy(self, strategy_id, market=None):
         return {"id": strategy_id, "market": market}
+
+
+class _FailingCreateStrategyService:
+    def create_strategy(self, **kwargs):
+        raise RuntimeError("duckdb internal failure")
 
 
 class _FakeBacktestService:

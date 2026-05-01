@@ -36,7 +36,7 @@ This file records milestone evidence for the V2.0 A-share and ranking upgrade.
 ## Residual Non-Blocking Items
 
 - Vite still reports the existing dynamic-import and large-chunk warnings during `pnpm build`.
-- Python 3.14 `datetime.utcnow()` deprecation warnings are recorded in `docs/backlog.md` as deferred technical debt.
+- Python 3.14 UTC timestamp cleanup is accepted: backend code uses `backend.time_utils` instead of deprecated `datetime.utcnow()` calls, with a regression test preventing reintroduction.
 - Default `scripts/v2_regression_check.py` skips optional `--migration-copy` and `--cn-provider-smoke` unless those flags are explicitly provided; skipped checks are reported clearly and do not hide required US compatibility failures.
 
 ## Final Task 17 Verification
@@ -114,7 +114,9 @@ This file records milestone evidence for the V2.0 A-share and ranking upgrade.
   - Data status, updates, ticker search, daily bars, and quality checks accept `market`, defaulting to `US`.
   - Data upserts now persist `market` for `stocks`, `daily_bars`, and `index_bars`.
   - Group APIs and service methods accept `market`; group membership rows include market.
-  - Existing US group IDs keep working; added `us_all_market`, `us_sp500`, `us_nasdaq100`, `cn_all_a`, and `cn_hs300`.
+  - Existing US group IDs keep working; added `us_all_market`, `us_sp500`, `us_nasdaq100`, `cn_all_a`, `cn_sz50`, `cn_hs300`, `cn_zz500`, `cn_chinext`, and `cn_a_core_indices_union`.
+  - CN default group is `cn_a_core_indices_union`, the de-duplicated union of 上证50、沪深300、中证500、创业板指 constituents.
+  - CN market-level data update and stock-list refresh use `cn_a_core_indices_union` as the default universe; BaoStock full A list is not used as the default download scope.
   - Manual group validation rejects unambiguous cross-market tickers, while CN tickers keep BaoStock-native form such as `sh.600000`.
   - Added regression coverage in `tests/test_data_group_market_scope.py`.
 - CN narrow-path evidence:
@@ -305,7 +307,7 @@ This file records milestone evidence for the V2.0 A-share and ranking upgrade.
     - `cd frontend && pnpm build` passed. Vite still reports the existing dynamic-import and large-chunk warnings.
     - `git diff --check` passed.
   - Follow-up recorded:
-    - Python 3.14 `datetime.utcnow()` deprecation warnings are logged in `docs/backlog.md` as deferred technical debt.
+    - Python 3.14 UTC timestamp cleanup is tracked in `docs/backlog.md` as completed technical debt; backend code no longer calls deprecated `datetime.utcnow()` directly.
 
 - Task 13 frontend API market scope and global selector completed:
   - Added shared frontend `Market = "US" | "CN"` type and market helper exports.

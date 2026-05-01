@@ -216,12 +216,17 @@ def get_data_status(market: str | None = None) -> dict:
 
 
 @mcp.tool()
-def update_data(mode: str = "incremental", market: str | None = None) -> dict:
+def update_data(
+    mode: str = "incremental",
+    market: str | None = None,
+    history_years: int | None = None,
+) -> dict:
     """Trigger a data update task to fetch latest market data.
 
     Args:
         mode: Update mode - "incremental" (only new bars) or "full" (re-fetch all).
         market: Market scope. Defaults to "US" for compatibility.
+        history_years: Optional backfill window override for newly initialized tickers.
 
     Returns:
         Dict with task_id and status for tracking the background task.
@@ -234,7 +239,7 @@ def update_data(mode: str = "incremental", market: str | None = None) -> dict:
     task_id = executor.submit(
         task_type="data_update",
         fn=svc.update_data,
-        params={"mode": mode, "market": resolved_market},
+        params={"mode": mode, "market": resolved_market, "history_years": history_years},
         timeout=7200,
         source=TaskSource.AGENT,
     )
@@ -244,6 +249,37 @@ def update_data(mode: str = "incremental", market: str | None = None) -> dict:
         task_type="data_update",
         market=resolved_market,
         mode=mode,
+        history_years=history_years,
+    )
+
+
+@mcp.tool()
+def refresh_stock_list(market: str | None = None) -> dict:
+    """Trigger a stock-universe refresh without downloading daily bars.
+
+    Args:
+        market: Market scope. Defaults to "US" for compatibility.
+
+    Returns:
+        Dict with task_id and status for tracking the background task.
+    """
+    from backend.tasks.models import TaskSource
+    resolved_market = _resolve_market(market)
+    svc = _data_service()
+    executor = _task_executor()
+
+    task_id = executor.submit(
+        task_type="stock_list_refresh",
+        fn=svc.refresh_stock_list,
+        params={"market": resolved_market},
+        timeout=600,
+        source=TaskSource.AGENT,
+    )
+
+    return _task_response(
+        task_id=task_id,
+        task_type="stock_list_refresh",
+        market=resolved_market,
     )
 
 
@@ -772,6 +808,24 @@ def create_group(
         filter_expr=filter_expr,
         market=resolved_market,
     )
+
+
+@mcp.tool()
+def refresh_index_groups(market: str | None = None) -> list[dict]:
+    """Refresh built-in index constituent groups in one market.
+
+    For CN this builds 上证50、沪深300、中证500、创业板指 and
+    their de-duplicated union group.
+
+    Args:
+        market: Market scope. Defaults to "US" for compatibility.
+
+    Returns:
+        List of refreshed built-in index group records.
+    """
+    resolved_market = _resolve_market(market)
+    svc = _group_service()
+    return svc.refresh_index_groups(market=resolved_market)
 
 
 # ======================================================================

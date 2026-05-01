@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import math
+import threading
+import uuid
+from contextlib import contextmanager
 from datetime import date as date_type, timedelta
+from collections.abc import Iterator
 
 import numpy as np
 import pandas as pd
@@ -20,6 +24,9 @@ log = get_logger(__name__)
 
 # How many tickers to process per batch to manage memory.
 _BATCH_SIZE = 500
+
+_CACHE_LOCKS_GUARD = threading.Lock()
+_CACHE_WRITE_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 
 
 class FactorEngine:
@@ -325,14 +332,24 @@ class FactorEngine:
         if long.empty:
             return
 
-        # Single bulk upsert via DuckDB DataFrame scan
-        conn.execute("CREATE OR REPLACE TEMP TABLE _tmp_fv AS SELECT * FROM long")
-        conn.execute(
-            """INSERT OR REPLACE INTO factor_values_cache
-               (market, factor_id, ticker, date, value)
-               SELECT market, factor_id, ticker, date, value FROM _tmp_fv"""
-        )
-        conn.execute("DROP TABLE IF EXISTS _tmp_fv")
+        # DuckDB can still surface constraint conflicts when two worker
+        # threads write the same factor partition concurrently.  Serialize
+        # only that narrow partition so different factors can continue in
+        # parallel while duplicate computations remain idempotent.
+        with _factor_cache_write_lock(resolved_market, factor_id):
+            tmp_table = f"_tmp_fv_{uuid.uuid4().hex}"
+            conn.register(tmp_table, long)
+            try:
+                conn.execute(
+                    f"""INSERT OR REPLACE INTO factor_values_cache
+                       (market, factor_id, ticker, date, value)
+                       SELECT market, factor_id, ticker, date, value FROM {tmp_table}"""
+                )
+            finally:
+                try:
+                    conn.unregister(tmp_table)
+                except Exception:
+                    pass
 
         log.info(
             "factor_engine.cache.written",
@@ -423,3 +440,18 @@ class FactorEngine:
         df = pd.DataFrame(result_series)
         df.index = pd.to_datetime(df.index)
         return df
+
+
+@contextmanager
+def _factor_cache_write_lock(market: str, factor_id: str) -> Iterator[None]:
+    key = (market, factor_id)
+    with _CACHE_LOCKS_GUARD:
+        lock = _CACHE_WRITE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _CACHE_WRITE_LOCKS[key] = lock
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()

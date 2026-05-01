@@ -6,7 +6,7 @@ from datetime import date, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from backend.db import get_connection
 from backend.logger import get_logger
@@ -52,6 +52,11 @@ def _get_group_service() -> GroupService:
 
 class UpdateRequest(BaseModel):
     mode: str = "incremental"
+    market: Optional[str] = None
+    history_years: Optional[int] = Field(None, ge=1, le=30)
+
+
+class RefreshStockListRequest(BaseModel):
     market: Optional[str] = None
 
 
@@ -104,13 +109,55 @@ async def trigger_update(body: UpdateRequest) -> dict:
     task_id = executor.submit(
         task_type="data_update",
         fn=svc.update_data,
-        params={"mode": body.mode, "market": market},
+        params={"mode": body.mode, "market": market, "history_years": body.history_years},
         timeout=7200,  # 2 hours max
         source=TaskSource.UI,
     )
 
-    log.info("api.data.update_triggered", task_id=task_id, market=market, mode=body.mode)
-    return {"task_id": task_id, "status": "queued", "market": market, "mode": body.mode}
+    log.info(
+        "api.data.update_triggered",
+        task_id=task_id,
+        market=market,
+        mode=body.mode,
+        history_years=body.history_years,
+    )
+    return {
+        "task_id": task_id,
+        "status": "queued",
+        "market": market,
+        "mode": body.mode,
+        "history_years": body.history_years,
+    }
+
+
+@router.post("/data/refresh-stock-list")
+async def refresh_stock_list(body: RefreshStockListRequest) -> dict:
+    """Refresh the stock universe without downloading daily bars."""
+    try:
+        market = normalize_market(body.market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    executor = _get_executor()
+    svc = _get_service()
+
+    running_id = executor.has_running_task("stock_list_refresh")
+    if running_id:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Stock list refresh already running (task_id={running_id})",
+        )
+
+    task_id = executor.submit(
+        task_type="stock_list_refresh",
+        fn=svc.refresh_stock_list,
+        params={"market": market},
+        timeout=600,
+        source=TaskSource.UI,
+    )
+
+    log.info("api.data.refresh_stock_list_triggered", task_id=task_id, market=market)
+    return {"task_id": task_id, "status": "queued", "market": market}
 
 
 @router.post("/data/update/tickers")

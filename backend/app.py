@@ -50,6 +50,8 @@ async def lifespan(app: FastAPI):
 
     # Mark any tasks left running/queued from a previous server run as failed
     TaskStore().mark_stale_running()
+    from backend.services.data_service import DataService
+    DataService().mark_stale_running_updates()
 
     # Seed preset label definitions
     from backend.services.label_service import LabelService

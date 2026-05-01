@@ -27,6 +27,7 @@ const STATUS_TAG: Record<string, { color: string; label: string }> = {
 
 const TASK_TYPE_LABEL: Record<string, string> = {
   data_update: "数据更新",
+  stock_list_refresh: "股票池刷新",
   factor_compute: "因子计算",
   factor_evaluate: "因子评估",
   model_train: "模型训练",

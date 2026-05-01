@@ -25,6 +25,7 @@ from backend.services.market_context import normalize_market, normalize_ticker
 from backend.services.model_service import ModelService
 from backend.services.sql_filters import registered_values_table
 from backend.services.strategy_service import StrategyService
+from backend.time_utils import utc_now_naive
 from backend.strategies.base import StrategyContext
 from backend.strategies.loader import load_strategy_from_code
 
@@ -1428,7 +1429,7 @@ class SignalService:
         """Persist signal run and detail records. Returns list of signal dicts."""
         resolved_market = normalize_market(market)
         conn = get_connection()
-        now = datetime.utcnow()
+        now = utc_now_naive()
 
         # Build signal records from raw_signals DataFrame
         # raw_signals has index=ticker, columns=[signal, weight, strength]

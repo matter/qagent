@@ -24,6 +24,7 @@ from backend.services.group_service import GroupService
 from backend.services.label_service import LabelService
 from backend.services.market_context import normalize_market, normalize_ticker
 from backend.services.ranking_dataset import build_date_groups, compute_ranking_metrics
+from backend.time_utils import utc_now_iso, utc_now_naive
 
 log = get_logger(__name__)
 
@@ -241,7 +242,7 @@ class ModelService:
             if ranking_config.get("query_group", "date") != "date":
                 raise ValueError("ranking_config.query_group must be 'date' in V2.0")
             min_group_size = int(ranking_config.get("min_group_size", 5))
-            label_gain = str(ranking_config.get("label_gain", "identity"))
+            label_gain = str(ranking_config.get("label_gain", "ordinal"))
             train_rank = build_date_groups(
                 X_train,
                 y_train,
@@ -347,21 +348,32 @@ class ModelService:
 
         # Get expected features from feature set
         fs_record = self._feature_service.get_feature_set(feature_set_id, market=resolved_market)
-        expected_features = [ref["factor_id"] for ref in fs_record["factor_refs"]]
-        expected_feature_count = len(expected_features)
+        feature_lineage = self._build_feature_lineage(
+            trained_features,
+            fs_record.get("factor_refs", []),
+        )
+        undeclared_features = feature_lineage["undeclared"]
+        missing_features = feature_lineage["missing"]
 
-        if trained_feature_count != expected_feature_count:
+        if undeclared_features:
             log.warning(
                 "model.train.feature_mismatch",
                 trained=trained_feature_count,
-                expected=expected_feature_count,
-                missing=[f for f in expected_features if f not in trained_features],
+                declared=len(feature_lineage["declared"]),
+                undeclared=undeclared_features,
             )
             raise ValueError(
-                f"Feature dimension mismatch: model trained on {trained_feature_count} features "
-                f"but feature_set {feature_set_id} has {expected_feature_count} features. "
-                f"Missing features: {[f for f in expected_features if f not in trained_features]}"
+                f"Feature lineage mismatch: model trained on undeclared features "
+                f"{undeclared_features}. Check feature_set {feature_set_id} factor_names."
             )
+        if missing_features:
+            log.warning(
+                "model.train.feature_missing",
+                trained=trained_feature_count,
+                declared=len(feature_lineage["declared"]),
+                missing=missing_features,
+            )
+            eval_metrics["missing_features"] = missing_features
 
         # ---- 10. Save model file + metadata ----
         model_id = uuid.uuid4().hex[:12]
@@ -384,9 +396,10 @@ class ModelService:
             "train_config": train_config,
             "eval_metrics": eval_metrics,
             "feature_names": trained_features,
+            "feature_lineage": feature_lineage,
             "universe_group_id": universe_group_id,
             "sample_weight_config": sample_weight_config,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": utc_now_iso(),
         }
         with open(model_dir / "metadata.json", "w") as f:
             json.dump(metadata, f, indent=2, default=str)
@@ -418,6 +431,7 @@ class ModelService:
             "test_samples": len(fit_X_test),
             "features": trained_feature_count,
             "feature_names": trained_features,
+            "feature_lineage": feature_lineage,
             "eval_metrics": eval_metrics,
             "label_summary": label_summary,
         }
@@ -1043,6 +1057,44 @@ class ModelService:
         return adjusted
 
     @staticmethod
+    def _build_feature_lineage(
+        trained_features: list[str],
+        factor_refs: list[dict],
+    ) -> dict[str, list]:
+        declared: list[dict[str, str]] = []
+        by_name: dict[str, dict[str, str]] = {}
+        for ref in factor_refs or []:
+            factor_id = str(ref.get("factor_id", ""))
+            factor_name = str(ref.get("factor_name") or factor_id)
+            entry = {
+                "factor_id": factor_id,
+                "factor_name": factor_name,
+            }
+            declared.append(entry)
+            by_name[factor_name] = entry
+
+        trained: list[dict[str, str]] = []
+        undeclared: list[str] = []
+        for feature_name in trained_features:
+            entry = by_name.get(feature_name)
+            if entry is None:
+                undeclared.append(feature_name)
+                continue
+            trained.append(entry)
+
+        trained_names = set(trained_features)
+        missing = [
+            entry for entry in declared
+            if entry["factor_name"] not in trained_names
+        ]
+        return {
+            "declared": declared,
+            "trained": trained,
+            "missing": missing,
+            "undeclared": undeclared,
+        }
+
+    @staticmethod
     def _normalize_train_config(train_config: dict, market: str | None = None) -> dict:
         """Normalize train_config from various frontend formats to flat keys.
 
@@ -1312,7 +1364,7 @@ class ModelService:
         eval_metrics: dict,
     ) -> None:
         conn = get_connection()
-        now = datetime.utcnow()
+        now = utc_now_naive()
         conn.execute(
             """INSERT INTO models
                (id, market, name, feature_set_id, label_id, model_type,

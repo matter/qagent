@@ -35,6 +35,31 @@ class RankingDatasetTests(unittest.TestCase):
         self.assertEqual(grouped.y.tolist(), [0, 1, 0, 1])
         self.assertEqual(grouped.raw_y.tolist(), [0.1, 0.2, -0.1, 0.3])
 
+    def test_integer_rank_labels_are_remapped_to_dense_relevance_by_default(self):
+        idx = pd.MultiIndex.from_product(
+            [pd.to_datetime(["2024-01-02"]), ["A", "B", "C"]],
+            names=["date", "ticker"],
+        )
+        X = pd.DataFrame({"x": [1, 2, 3]}, index=idx)
+        y = pd.Series([170, 31, 5], index=idx)
+
+        grouped = build_date_groups(X, y, min_group_size=2)
+
+        self.assertEqual(grouped.y.tolist(), [2, 1, 0])
+        self.assertEqual(grouped.raw_y.tolist(), [170.0, 31.0, 5.0])
+
+    def test_identity_label_gain_requires_dense_non_negative_integer_labels(self):
+        idx = pd.MultiIndex.from_product(
+            [pd.to_datetime(["2024-01-02"]), ["A", "B", "C"]],
+            names=["date", "ticker"],
+        )
+        X = pd.DataFrame({"x": [1, 2, 3]}, index=idx)
+        y = pd.Series([170, 31, 5], index=idx)
+
+        grouped = build_date_groups(X, y, min_group_size=2, label_gain="identity")
+
+        self.assertEqual(grouped.y.tolist(), [2, 1, 0])
+
     def test_lightgbm_ranking_model_accepts_query_groups(self):
         idx = pd.MultiIndex.from_product(
             [pd.to_datetime(["2024-01-02", "2024-01-03"]), ["A", "B", "C"]],

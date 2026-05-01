@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -14,6 +13,7 @@ from backend.db import get_connection
 from backend.logger import get_logger
 from backend.services.factor_engine import FactorEngine
 from backend.services.market_context import normalize_market, normalize_ticker
+from backend.time_utils import utc_now_naive
 
 log = get_logger(__name__)
 
@@ -91,7 +91,7 @@ class FeatureService:
 
         conn = get_connection()
         fs_id = uuid.uuid4().hex[:12]
-        now = datetime.utcnow()
+        now = utc_now_naive()
 
         conn.execute(
             """INSERT INTO feature_sets
@@ -128,7 +128,7 @@ class FeatureService:
             raise ValueError(f"Feature set {fs_id} not found")
         resolved_market = existing["market"]
 
-        now = datetime.utcnow()
+        now = utc_now_naive()
         sets: list[str] = ["updated_at = ?"]
         params: list = [now]
 

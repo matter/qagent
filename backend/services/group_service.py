@@ -5,7 +5,9 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from io import StringIO
+import json
 from pathlib import Path
+import re
 
 import pandas as pd
 import requests
@@ -13,6 +15,7 @@ import requests
 from backend.db import get_connection
 from backend.logger import get_logger
 from backend.services.market_context import infer_ticker_market, normalize_market, normalize_ticker
+from backend.time_utils import utc_now_naive
 
 log = get_logger(__name__)
 
@@ -34,8 +37,25 @@ _US_ALIAS_INDEX_GROUPS = {
 
 _CN_BUILTIN_GROUPS = {
     "cn_all_a": ("A股全市场", "包含所有已录入 A 股", "status = 'active'"),
-    "cn_hs300": ("沪深300", "沪深300成分股（待接入成分股刷新）", None),
 }
+
+_CN_INDEX_GROUPS = {
+    "cn_sz50": ("上证50", "上证50成分股（BaoStock）"),
+    "cn_hs300": ("沪深300", "沪深300成分股（BaoStock）"),
+    "cn_zz500": ("中证500", "中证500成分股（BaoStock）"),
+    "cn_chinext": ("创业板指", "创业板指数成分股（新浪财经）"),
+}
+
+_CN_CORE_UNION_GROUP = "cn_a_core_indices_union"
+_CN_CORE_UNION_NAME = "A股核心指数并集"
+_CN_CORE_UNION_DESCRIPTION = "上证50、沪深300、中证500、创业板指成分股去重并集"
+_CN_INDEX_SEED_PATH = Path(__file__).resolve().parents[1] / "seeds" / "cn_core_indices_constituents.json"
+_CN_INDEX_FETCHERS = {
+    "cn_sz50": "query_sz50_stocks",
+    "cn_hs300": "query_hs300_stocks",
+    "cn_zz500": "query_zz500_stocks",
+}
+_CHINEXT_COMPONENT_URL = "https://vip.stock.finance.sina.com.cn/corp/go.php/vII_NewestComponent/indexid/399006.phtml"
 
 # Safe columns that filter expressions may reference.
 _ALLOWED_FILTER_COLUMNS = {"ticker", "name", "exchange", "sector", "status"}
@@ -128,6 +148,119 @@ def _fetch_index_tickers(index_id: str) -> list[str]:
         return []
 
 
+def _fetch_cn_index_tickers(index_id: str) -> list[str]:
+    """Fetch China index constituents for built-in CN research groups."""
+    if index_id == "cn_chinext":
+        return _fetch_chinext_tickers()
+    method = _CN_INDEX_FETCHERS.get(index_id)
+    if method is None:
+        return []
+    return _fetch_baostock_index_tickers(index_id, method)
+
+
+def _fetch_baostock_index_tickers(index_id: str, method: str) -> list[str]:
+    try:
+        import baostock as bs
+    except Exception as exc:
+        log.warning("group.cn_index_fetch.baostock_unavailable", index=index_id, error=str(exc))
+        return []
+
+    try:
+        login = bs.login()
+        if getattr(login, "error_code", "0") != "0":
+            log.warning(
+                "group.cn_index_fetch.login_failed",
+                index=index_id,
+                error=getattr(login, "error_msg", ""),
+            )
+            return []
+        result = getattr(bs, method)()
+        if getattr(result, "error_code", "0") != "0":
+            log.warning(
+                "group.cn_index_fetch.failed",
+                index=index_id,
+                error=getattr(result, "error_msg", ""),
+            )
+            return []
+        tickers = _result_tickers(result)
+        log.info("group.cn_index_fetch.done", index=index_id, count=len(tickers))
+        return tickers
+    except Exception as exc:
+        log.warning("group.cn_index_fetch.failed", index=index_id, error=str(exc))
+        return []
+    finally:
+        try:
+            bs.logout()
+        except Exception:
+            log.warning("group.cn_index_fetch.logout_failed", index=index_id)
+
+
+def _fetch_chinext_tickers() -> list[str]:
+    try:
+        resp = requests.get(_CHINEXT_COMPONENT_URL, headers=_WIKI_HEADERS, timeout=20)
+        resp.raise_for_status()
+        resp.encoding = getattr(resp, "apparent_encoding", None) or "gbk"
+        tables = pd.read_html(StringIO(resp.text))
+    except Exception as exc:
+        log.warning("group.cn_index_fetch.chinext_failed", error=str(exc))
+        return []
+
+    tickers: list[str] = []
+    for table in tables:
+        if table.empty:
+            continue
+        rows = table.astype(str).reset_index(drop=True)
+        first_row = [value.strip() for value in rows.iloc[0].tolist()]
+        if "品种代码" not in first_row:
+            continue
+
+        code_col = first_row.index("品种代码")
+        for value in rows.iloc[1:, code_col]:
+            code = _extract_cn_security_code(value)
+            if code and code.startswith("30"):
+                tickers.append(f"sz.{code}")
+
+    deduped = sorted(set(tickers))
+    log.info("group.cn_index_fetch.done", index="cn_chinext", count=len(deduped))
+    return deduped
+
+
+def _result_tickers(result) -> list[str]:
+    tickers: list[str] = []
+    fields = [str(field).lower() for field in getattr(result, "fields", [])]
+    code_index = fields.index("code") if "code" in fields else 0
+    while result.next():
+        row = result.get_row_data()
+        if code_index < len(row):
+            ticker = normalize_ticker(row[code_index], "CN")
+            if ticker:
+                tickers.append(ticker)
+    return sorted(set(tickers))
+
+
+def _extract_cn_security_code(value) -> str | None:
+    match = re.fullmatch(r"\d{6}", str(value).strip())
+    return match.group(0) if match else None
+
+
+def _load_cn_index_seed_tickers(index_id: str) -> list[str]:
+    """Load checked-in CN index constituents used when live sources are unavailable."""
+    try:
+        payload = json.loads(_CN_INDEX_SEED_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning("group.cn_index_seed.load_failed", index=index_id, error=str(exc))
+        return []
+
+    groups = payload.get("groups", {})
+    tickers = groups.get(index_id, [])
+    if not isinstance(tickers, list):
+        log.warning("group.cn_index_seed.invalid_group", index=index_id)
+        return []
+
+    normalized = [normalize_ticker(ticker, "CN") for ticker in tickers if str(ticker).strip()]
+    return sorted(set(ticker for ticker in normalized if ticker))
+
+
 class GroupService:
     """CRUD operations for stock groups."""
 
@@ -211,7 +344,15 @@ class GroupService:
 
         for group_id, (name, desc, filter_expr) in _CN_BUILTIN_GROUPS.items():
             if filter_expr:
-                self._ensure_filter_builtin(conn, group_id, resolved_market, name, desc, filter_expr)
+                self._ensure_filter_builtin(
+                    conn,
+                    group_id,
+                    resolved_market,
+                    name,
+                    desc,
+                    filter_expr,
+                    refresh_existing=True,
+                )
             else:
                 existing = conn.execute(
                     "SELECT id FROM stock_groups WHERE id = ?", [group_id]
@@ -223,6 +364,17 @@ class GroupService:
                         [group_id, resolved_market, name, desc, "builtin", None],
                     )
                     log.info("group.builtin_created", market=resolved_market, name=name, tickers=0)
+
+        for group_id, (name, desc) in _CN_INDEX_GROUPS.items():
+            self._ensure_empty_builtin(conn, group_id, resolved_market, name, desc)
+        self._ensure_empty_builtin(
+            conn,
+            _CN_CORE_UNION_GROUP,
+            resolved_market,
+            _CN_CORE_UNION_NAME,
+            _CN_CORE_UNION_DESCRIPTION,
+        )
+        self._seed_empty_cn_index_groups(resolved_market)
 
     def create_group(
         self,
@@ -237,7 +389,7 @@ class GroupService:
         resolved_market = normalize_market(market)
         conn = get_connection()
         group_id = uuid.uuid4().hex[:12]
-        now = datetime.utcnow()
+        now = utc_now_naive()
 
         if group_type == "filter":
             if not filter_expr:
@@ -278,7 +430,7 @@ class GroupService:
         if group["group_type"] == "builtin":
             raise ValueError("Cannot modify built-in groups")
 
-        now = datetime.utcnow()
+        now = utc_now_naive()
         sets: list[str] = ["updated_at = ?"]
         params: list = [now]
 
@@ -392,7 +544,7 @@ class GroupService:
         conn = get_connection()
         conn.execute(
             "UPDATE stock_groups SET updated_at = ? WHERE id = ?",
-            [datetime.utcnow(), group_id],
+            [utc_now_naive(), group_id],
         )
 
         log.info("group.filter_refreshed", id=group_id)
@@ -410,8 +562,7 @@ class GroupService:
         """
         resolved_market = normalize_market(market)
         if resolved_market != "US":
-            self.ensure_builtins(resolved_market)
-            return [self.get_group(group_id, market=resolved_market) for group_id in _CN_BUILTIN_GROUPS]
+            return self._refresh_cn_index_groups(resolved_market)
 
         conn = get_connection()
         results: list[dict] = []
@@ -434,7 +585,7 @@ class GroupService:
                 filter_expr = "exchange IN ('NYSE', 'NASDAQ') AND status = 'active'"
                 conn.execute(
                     "UPDATE stock_groups SET filter_expr = ?, description = ?, updated_at = ? WHERE id = ?",
-                    [filter_expr, desc, datetime.utcnow(), group_id],
+                    [filter_expr, desc, utc_now_naive(), group_id],
                 )
                 self._evaluate_filter(group_id, filter_expr, market=resolved_market)
                 log.info("group.index_refresh.done", index=group_id, method="filter")
@@ -444,7 +595,7 @@ class GroupService:
                     self._set_members(group_id, tickers, market=resolved_market, validate_members=False)
                     conn.execute(
                         "UPDATE stock_groups SET description = ?, updated_at = ? WHERE id = ?",
-                        [desc, datetime.utcnow(), group_id],
+                        [desc, utc_now_naive(), group_id],
                     )
                     log.info("group.index_refresh.done", index=group_id, count=len(tickers))
                 else:
@@ -452,6 +603,55 @@ class GroupService:
 
             results.append(self.get_group(group_id, market=resolved_market))
 
+        return results
+
+    def _refresh_cn_index_groups(self, market: str) -> list[dict]:
+        self.ensure_builtins(market)
+        conn = get_connection()
+        union_tickers: set[str] = set()
+        results: list[dict] = []
+
+        for group_id, (name, desc) in _CN_INDEX_GROUPS.items():
+            tickers = _fetch_cn_index_tickers(group_id)
+            if tickers:
+                self._set_members(group_id, tickers, market=market, validate_members=False)
+                conn.execute(
+                    "UPDATE stock_groups SET name = ?, description = ?, updated_at = ? WHERE id = ?",
+                    [name, desc, utc_now_naive(), group_id],
+                )
+                union_tickers.update(tickers)
+                log.info("group.cn_index_refresh.done", index=group_id, count=len(tickers))
+            else:
+                existing_tickers = self.get_group_tickers(group_id, market=market)
+                if existing_tickers:
+                    union_tickers.update(existing_tickers)
+                    log.warning("group.cn_index_refresh.fetch_failed", index=group_id)
+                else:
+                    seed_tickers = _load_cn_index_seed_tickers(group_id)
+                    if seed_tickers:
+                        self._set_members(group_id, seed_tickers, market=market, validate_members=False)
+                        conn.execute(
+                            "UPDATE stock_groups SET name = ?, description = ?, updated_at = ? WHERE id = ?",
+                            [name, desc, utc_now_naive(), group_id],
+                        )
+                        union_tickers.update(seed_tickers)
+                        log.info("group.cn_index_refresh.seed_used", index=group_id, count=len(seed_tickers))
+                    else:
+                        log.warning("group.cn_index_refresh.fetch_failed", index=group_id)
+            results.append(self.get_group(group_id, market=market))
+
+        if union_tickers:
+            self._set_members(_CN_CORE_UNION_GROUP, sorted(union_tickers), market=market, validate_members=False)
+            conn.execute(
+                "UPDATE stock_groups SET name = ?, description = ?, updated_at = ? WHERE id = ?",
+                [
+                    _CN_CORE_UNION_NAME,
+                    _CN_CORE_UNION_DESCRIPTION,
+                    utc_now_naive(),
+                    _CN_CORE_UNION_GROUP,
+                ],
+            )
+        results.append(self.get_group(_CN_CORE_UNION_GROUP, market=market))
         return results
 
     # ------------------------------------------------------------------
@@ -542,9 +742,16 @@ class GroupService:
         name: str,
         description: str,
         filter_expr: str,
+        refresh_existing: bool = False,
     ) -> None:
         existing = conn.execute("SELECT id FROM stock_groups WHERE id = ?", [group_id]).fetchone()
         if existing is not None:
+            if refresh_existing and self._filter_members_stale(conn, group_id, market, filter_expr):
+                self._evaluate_filter(group_id, filter_expr, market=market)
+                conn.execute(
+                    "UPDATE stock_groups SET updated_at = ? WHERE id = ?",
+                    [utc_now_naive(), group_id],
+                )
             return
         conn.execute(
             """INSERT INTO stock_groups (id, market, name, description, group_type, filter_expr)
@@ -553,6 +760,76 @@ class GroupService:
         )
         self._evaluate_filter(group_id, filter_expr, market=market)
         log.info("group.builtin_created", market=market, name=name)
+
+    def _ensure_empty_builtin(
+        self,
+        conn,
+        group_id: str,
+        market: str,
+        name: str,
+        description: str,
+    ) -> None:
+        existing = conn.execute(
+            "SELECT id FROM stock_groups WHERE id = ? AND market = ?",
+            [group_id, market],
+        ).fetchone()
+        if existing is not None:
+            return
+        conn.execute(
+            """INSERT INTO stock_groups (id, market, name, description, group_type, filter_expr)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            [group_id, market, name, description, "builtin", None],
+        )
+        log.info("group.builtin_created", market=market, name=name, tickers=0)
+
+    def _seed_empty_cn_index_groups(self, market: str) -> None:
+        """Populate CN index groups from checked-in seed data when they are empty."""
+        union_tickers: set[str] = set()
+        seeded_any = False
+        for group_id in _CN_INDEX_GROUPS:
+            existing = self.get_group_tickers(group_id, market=market)
+            if existing:
+                union_tickers.update(existing)
+                continue
+
+            seed_tickers = _load_cn_index_seed_tickers(group_id)
+            if not seed_tickers:
+                continue
+            self._set_members(group_id, seed_tickers, market=market, validate_members=False)
+            union_tickers.update(seed_tickers)
+            seeded_any = True
+            log.info("group.cn_index_seed.applied", index=group_id, count=len(seed_tickers))
+
+        union_existing = self.get_group_tickers(_CN_CORE_UNION_GROUP, market=market)
+        if union_existing and not seeded_any:
+            return
+        if union_tickers:
+            self._set_members(_CN_CORE_UNION_GROUP, sorted(union_tickers), market=market, validate_members=False)
+            log.info("group.cn_index_seed.union_applied", count=len(union_tickers))
+
+    def _filter_members_stale(self, conn, group_id: str, market: str, filter_expr: str) -> bool:
+        """Return True when stored filter members differ from current stocks."""
+        try:
+            missing = conn.execute(
+                f"""SELECT COUNT(*) FROM (
+                        SELECT ticker FROM stocks WHERE market = ? AND ({filter_expr})
+                        EXCEPT
+                        SELECT ticker FROM stock_group_members WHERE group_id = ? AND market = ?
+                    )""",  # noqa: S608
+                [market, group_id, market],
+            ).fetchone()[0]
+            extra = conn.execute(
+                f"""SELECT COUNT(*) FROM (
+                        SELECT ticker FROM stock_group_members WHERE group_id = ? AND market = ?
+                        EXCEPT
+                        SELECT ticker FROM stocks WHERE market = ? AND ({filter_expr})
+                    )""",  # noqa: S608
+                [group_id, market, market],
+            ).fetchone()[0]
+        except Exception as e:
+            log.error("group.filter_stale_check_error", id=group_id, error=str(e))
+            raise ValueError(f"Filter expression error: {e}") from e
+        return bool(missing or extra)
 
     def _validate_member_markets(self, tickers: list[str], market: str) -> None:
         conn = get_connection()

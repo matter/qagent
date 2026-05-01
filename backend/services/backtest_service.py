@@ -7,15 +7,19 @@ Orchestrates the full pipeline:
 from __future__ import annotations
 
 import json
+import hashlib
+import subprocess
 import uuid
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
 
+from backend.config import settings
 from backend.db import get_connection
 from backend.logger import get_logger
 from backend.services.backtest_engine import BacktestConfig, BacktestEngine, BacktestResult
+from backend.services import backtest_engine as backtest_engine_module
 from backend.services.factor_engine import FactorEngine
 from backend.services.group_service import GroupService
 from backend.services.market_context import (
@@ -26,6 +30,7 @@ from backend.services.market_context import (
 )
 from backend.services.model_service import ModelService
 from backend.services.strategy_service import StrategyService
+from backend.time_utils import utc_now_naive
 from backend.strategies.base import StrategyContext
 from backend.strategies.loader import load_strategy_from_code
 
@@ -110,6 +115,10 @@ class BacktestService:
             max_positions=config_dict.get("max_positions", 50),
             rebalance_freq=config_dict.get("rebalance_freq") or config_dict.get("rebalance_frequency", "monthly"),
             rebalance_buffer=config_dict.get("rebalance_buffer", 0.0),
+            rebalance_buffer_add=config_dict.get("rebalance_buffer_add"),
+            rebalance_buffer_reduce=config_dict.get("rebalance_buffer_reduce"),
+            rebalance_buffer_mode=config_dict.get("rebalance_buffer_mode", "all"),
+            rebalance_buffer_reference=config_dict.get("rebalance_buffer_reference", "target"),
             min_holding_days=config_dict.get("min_holding_days", 0),
             reentry_cooldown_days=config_dict.get("reentry_cooldown_days", 0),
         )
@@ -368,7 +377,24 @@ class BacktestService:
                 )
 
         # ---- 8. Run BacktestEngine ----
-        result = self._backtest_engine.run(all_weights, bt_config)
+        overlay_result = self._backtest_engine.run(all_weights, bt_config)
+        portfolio_config = config_dict.get("portfolio_overlay")
+        if portfolio_config:
+            base_result = self._run_base_portfolio_leg(
+                tickers=tickers,
+                prices_index=prices_close.index,
+                bt_config=bt_config,
+                portfolio_config=portfolio_config,
+            )
+            result = self._combine_portfolio_legs(
+                base_result=base_result,
+                overlay_result=overlay_result,
+                base_weight=float(portfolio_config.get("base_weight", 0.65)),
+                overlay_weight=float(portfolio_config.get("overlay_weight", 0.35)),
+                portfolio_config=portfolio_config,
+            )
+        else:
+            result = overlay_result
 
         # ---- 8. Determine result_level ----
         # For now, always 'exploratory' since we use yfinance
@@ -378,6 +404,11 @@ class BacktestService:
         bt_id = uuid.uuid4().hex[:12]
         config_to_save = bt_config.to_dict()
         config_to_save["universe_group_id"] = universe_group_id
+        if portfolio_config:
+            config_to_save["portfolio_overlay"] = result.config.get(
+                "portfolio_overlay",
+                portfolio_config,
+            )
         self._save_result(
             bt_id=bt_id,
             market=resolved_market,
@@ -446,6 +477,134 @@ class BacktestService:
             sharpe=result.sharpe_ratio,
         )
         return result_dict
+
+    def _run_base_portfolio_leg(
+        self,
+        *,
+        tickers: list[str],
+        prices_index,
+        bt_config: BacktestConfig,
+        portfolio_config: dict,
+    ) -> BacktestResult:
+        mode = portfolio_config.get("base_leg", "equal_weight")
+        if mode not in {"equal_weight", "core_union_equal_weight"}:
+            raise ValueError(
+                "portfolio_overlay.base_leg must be 'equal_weight' or "
+                "'core_union_equal_weight'"
+            )
+        if not tickers:
+            raise ValueError("portfolio base leg requires non-empty tickers")
+
+        base_weights = pd.DataFrame(0.0, index=prices_index, columns=tickers)
+        weight = 1.0 / len(tickers)
+        base_weights.loc[:, tickers] = weight
+        return self._backtest_engine.run(base_weights, bt_config)
+
+    def _combine_portfolio_legs(
+        self,
+        *,
+        base_result: BacktestResult,
+        overlay_result: BacktestResult,
+        base_weight: float,
+        overlay_weight: float,
+        portfolio_config: dict,
+    ) -> BacktestResult:
+        if base_weight < 0 or overlay_weight < 0:
+            raise ValueError("portfolio leg weights must be non-negative")
+        total_weight = base_weight + overlay_weight
+        if total_weight <= 0:
+            raise ValueError("portfolio leg weights must sum to a positive value")
+        base_weight = base_weight / total_weight
+        overlay_weight = overlay_weight / total_weight
+
+        common_dates = [date for date in base_result.dates if date in set(overlay_result.dates)]
+        if not common_dates:
+            raise ValueError("portfolio legs have no overlapping NAV dates")
+
+        base_nav_by_date = dict(zip(base_result.dates, base_result.nav, strict=False))
+        overlay_nav_by_date = dict(zip(overlay_result.dates, overlay_result.nav, strict=False))
+        base_initial = base_result.nav[0] if base_result.nav else 1.0
+        overlay_initial = overlay_result.nav[0] if overlay_result.nav else 1.0
+        initial_capital = float(base_result.config.get("initial_capital") or base_initial)
+
+        combined_nav = []
+        for date_key in common_dates:
+            base_ratio = base_nav_by_date[date_key] / base_initial if base_initial else 1.0
+            overlay_ratio = overlay_nav_by_date[date_key] / overlay_initial if overlay_initial else 1.0
+            combined_nav.append(
+                round(initial_capital * (base_weight * base_ratio + overlay_weight * overlay_ratio), 2)
+            )
+
+        benchmark_by_date = dict(zip(base_result.dates, base_result.benchmark_nav, strict=False))
+        benchmark_nav = [benchmark_by_date.get(date_key, initial_capital) for date_key in common_dates]
+
+        nav_arr = np.array(combined_nav, dtype=float)
+        daily_returns = np.diff(nav_arr) / nav_arr[:-1] if len(nav_arr) > 1 else np.array([])
+        daily_returns = np.where(np.isfinite(daily_returns), daily_returns, 0.0)
+        total_return = (nav_arr[-1] / initial_capital - 1.0) if len(nav_arr) > 0 else 0.0
+        years = len(nav_arr) / 252.0 if len(nav_arr) > 0 else 1.0
+        annual_return = backtest_engine_module._calc_cagr(
+            initial_capital,
+            nav_arr[-1] if len(nav_arr) > 0 else initial_capital,
+            years,
+        )
+        annual_volatility = backtest_engine_module._calc_annual_volatility(daily_returns)
+        drawdown_series = backtest_engine_module._calc_drawdown_series(nav_arr)
+        max_dd = float(np.min(drawdown_series)) if len(drawdown_series) > 0 else 0.0
+        sharpe = backtest_engine_module._calc_sharpe(annual_return, annual_volatility)
+        calmar = backtest_engine_module._calc_calmar(annual_return, max_dd)
+        sortino = backtest_engine_module._calc_sortino(daily_returns, annual_return)
+        monthly_returns = backtest_engine_module._calc_monthly_returns(common_dates, combined_nav)
+
+        base_contribution = base_weight * base_result.total_return
+        overlay_contribution = overlay_weight * overlay_result.total_return
+        trade_diagnostics = dict(overlay_result.trade_diagnostics or {})
+        trade_diagnostics["portfolio_legs"] = {
+            "base": {
+                "type": portfolio_config.get("base_leg", "equal_weight"),
+                "weight": round(base_weight, 6),
+                "total_return": base_result.total_return,
+                "contribution_return": round(base_contribution, 6),
+                "total_trades": base_result.total_trades,
+            },
+            "overlay": {
+                "strategy": portfolio_config.get("overlay_leg", "strategy"),
+                "weight": round(overlay_weight, 6),
+                "total_return": overlay_result.total_return,
+                "contribution_return": round(overlay_contribution, 6),
+                "total_trades": overlay_result.total_trades,
+            },
+        }
+
+        config = dict(overlay_result.config)
+        config["portfolio_overlay"] = {
+            **portfolio_config,
+            "base_weight": round(base_weight, 6),
+            "overlay_weight": round(overlay_weight, 6),
+        }
+
+        return BacktestResult(
+            config=config,
+            dates=common_dates,
+            nav=combined_nav,
+            benchmark_nav=benchmark_nav,
+            drawdown=[round(d, 6) for d in drawdown_series.tolist()] if len(drawdown_series) > 0 else [],
+            total_return=round(float(total_return), 6),
+            annual_return=round(float(annual_return), 6),
+            annual_volatility=round(float(annual_volatility), 6),
+            max_drawdown=round(max_dd, 6),
+            sharpe_ratio=round(float(sharpe), 4),
+            calmar_ratio=round(float(calmar), 4),
+            sortino_ratio=round(float(sortino), 4),
+            win_rate=overlay_result.win_rate,
+            profit_loss_ratio=overlay_result.profit_loss_ratio,
+            total_trades=overlay_result.total_trades,
+            annual_turnover=round(float(overlay_result.annual_turnover * overlay_weight), 4),
+            total_cost=round(float(overlay_result.total_cost * overlay_weight), 2),
+            monthly_returns=monthly_returns,
+            trades=overlay_result.trades,
+            trade_diagnostics=trade_diagnostics,
+        )
 
     # ------------------------------------------------------------------
     # CRUD for backtest results
@@ -680,6 +839,7 @@ class BacktestService:
         heavy_keys = {
             "rebalance_diagnostics",
             "leakage_warnings",
+            "reproducibility_fingerprint",
         }
         lightweight = {
             key: value
@@ -692,6 +852,12 @@ class BacktestService:
         lightweight["has_leakage_warnings"] = bool(
             summary.get("leakage_warnings")
         )
+        fingerprint = summary.get("reproducibility_fingerprint")
+        if isinstance(fingerprint, dict):
+            lightweight["reproducibility_hash"] = fingerprint.get("hash")
+            lightweight["has_reproducibility_fingerprint"] = True
+        else:
+            lightweight["has_reproducibility_fingerprint"] = False
         return lightweight
 
     @staticmethod
@@ -1174,7 +1340,7 @@ class BacktestService:
     ) -> None:
         """Persist backtest result to DuckDB."""
         conn = get_connection()
-        now = datetime.utcnow()
+        now = utc_now_naive()
 
         resolved_market = normalize_market(market)
         summary = {
@@ -1193,6 +1359,12 @@ class BacktestService:
             "total_cost": result.total_cost,
             "trade_diagnostics": result.trade_diagnostics,
         }
+        summary["reproducibility_fingerprint"] = self._build_reproducibility_fingerprint(
+            strategy_id=strategy_id,
+            market=resolved_market,
+            config=config,
+            result=result,
+        )
 
         # Build nav_series as {dates: [...], values: [...]}
         nav_series_data = {
@@ -1235,6 +1407,138 @@ class BacktestService:
         )
         log.info("backtest_service.saved", backtest_id=bt_id, market=resolved_market)
 
+    def _build_reproducibility_fingerprint(
+        self,
+        *,
+        strategy_id: str,
+        market: str,
+        config: dict,
+        result: BacktestResult,
+    ) -> dict:
+        resolved_market = normalize_market(market)
+        conn = get_connection()
+        strategy = self._strategy_service.get_strategy(strategy_id, market=resolved_market)
+        required_models = StrategyService.resolve_required_models(strategy)
+        required_factors = strategy.get("required_factors") or []
+        factor_ids = self._resolve_factor_ids(required_factors, market=resolved_market)
+
+        model_refs = []
+        for model_id in required_models:
+            try:
+                model = self._model_service.get_model(model_id, market=resolved_market)
+            except Exception:
+                model_refs.append({"id": model_id, "status": "missing"})
+                continue
+            metadata_hash = None
+            metadata_path = settings.models_dir / model_id / "metadata.json"
+            if metadata_path.exists():
+                metadata_hash = _sha256_text(metadata_path.read_text())
+            model_refs.append({
+                "id": model_id,
+                "market": model.get("market"),
+                "name": model.get("name"),
+                "feature_set_id": model.get("feature_set_id"),
+                "label_id": model.get("label_id"),
+                "model_type": model.get("model_type"),
+                "task_type": model.get("task_type"),
+                "train_config": model.get("train_config"),
+                "metadata_hash": metadata_hash,
+            })
+
+        factor_refs = []
+        for factor_name, factor_id in sorted(factor_ids.items()):
+            row = conn.execute(
+                """SELECT id, market, name, version, status, source_code, updated_at
+                   FROM factors
+                   WHERE id = ? AND market = ?""",
+                [factor_id, resolved_market],
+            ).fetchone()
+            if row:
+                factor_refs.append({
+                    "name": factor_name,
+                    "id": row[0],
+                    "market": row[1],
+                    "version": row[3],
+                    "status": row[4],
+                    "source_hash": _sha256_text(row[5] or ""),
+                    "updated_at": str(row[6]) if row[6] else None,
+                })
+            else:
+                factor_refs.append({
+                    "name": factor_name,
+                    "id": factor_id,
+                    "status": "missing",
+                })
+
+        data_watermark = conn.execute(
+            """SELECT MIN(date), MAX(date), COUNT(*), COUNT(DISTINCT ticker)
+               FROM daily_bars
+               WHERE market = ?
+                 AND date >= ?
+                 AND date <= ?""",
+            [
+                resolved_market,
+                config.get("start_date"),
+                config.get("end_date"),
+            ],
+        ).fetchone()
+        benchmark_watermark = conn.execute(
+            """SELECT MIN(date), MAX(date), COUNT(*)
+               FROM index_bars
+               WHERE market = ?
+                 AND symbol = ?
+                 AND date >= ?
+                 AND date <= ?""",
+            [
+                resolved_market,
+                normalize_ticker(config.get("benchmark"), resolved_market),
+                config.get("start_date"),
+                config.get("end_date"),
+            ],
+        ).fetchone()
+
+        payload = {
+            "schema_version": 1,
+            "service_version": _service_version(),
+            "git_commit": _git_commit_hash(),
+            "market": resolved_market,
+            "strategy": {
+                "id": strategy.get("id"),
+                "market": strategy.get("market"),
+                "name": strategy.get("name"),
+                "version": strategy.get("version"),
+                "position_sizing": strategy.get("position_sizing"),
+                "source_hash": _sha256_text(strategy.get("source_code", "")),
+                "required_factors": required_factors,
+                "required_models": required_models,
+            },
+            "dependencies": {
+                "factors": factor_refs,
+                "models": model_refs,
+            },
+            "config": _stable_json_value(config),
+            "data_watermark": {
+                "daily_bars": {
+                    "min_date": str(data_watermark[0]) if data_watermark and data_watermark[0] else None,
+                    "max_date": str(data_watermark[1]) if data_watermark and data_watermark[1] else None,
+                    "rows": int(data_watermark[2] or 0) if data_watermark else 0,
+                    "tickers": int(data_watermark[3] or 0) if data_watermark else 0,
+                },
+                "benchmark": {
+                    "symbol": normalize_ticker(config.get("benchmark"), resolved_market),
+                    "min_date": str(benchmark_watermark[0]) if benchmark_watermark and benchmark_watermark[0] else None,
+                    "max_date": str(benchmark_watermark[1]) if benchmark_watermark and benchmark_watermark[1] else None,
+                    "rows": int(benchmark_watermark[2] or 0) if benchmark_watermark else 0,
+                },
+            },
+            "result_shape": {
+                "dates": len(result.dates),
+                "trades": result.total_trades,
+            },
+        }
+        payload["hash"] = _fingerprint_hash(payload)
+        return payload
+
 
 # ------------------------------------------------------------------
 # Module-level helpers
@@ -1249,6 +1553,53 @@ def _parse_json(raw) -> dict | list:
         except (json.JSONDecodeError, TypeError):
             return {}
     return raw if raw else {}
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _fingerprint_hash(payload: dict) -> str:
+    clean = {k: v for k, v in payload.items() if k != "hash"}
+    return hashlib.sha256(
+        json.dumps(_stable_json_value(clean), sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _stable_json_value(value):
+    if isinstance(value, dict):
+        return {str(k): _stable_json_value(value[k]) for k in sorted(value)}
+    if isinstance(value, list):
+        return [_stable_json_value(v) for v in value]
+    if isinstance(value, tuple):
+        return [_stable_json_value(v) for v in value]
+    return value
+
+
+def _service_version() -> str:
+    pyproject = settings.project_root / "pyproject.toml"
+    try:
+        for line in pyproject.read_text().splitlines():
+            if line.strip().startswith("version"):
+                return line.split("=", 1)[1].strip().strip('"')
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _git_commit_hash() -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=settings.project_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return result.stdout.strip() or None
+    except Exception:
+        return None
 
 
 def _compute_stock_pnl(trades: list[dict]) -> list[dict]:

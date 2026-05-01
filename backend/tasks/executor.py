@@ -12,6 +12,7 @@ from typing import Any, Callable
 from backend.logger import get_logger
 from backend.tasks.models import TaskRecord, TaskSource, TaskStatus
 from backend.tasks.store import TaskStore
+from backend.time_utils import utc_now_naive
 
 log = get_logger(__name__)
 
@@ -106,13 +107,13 @@ class TaskExecutor:
         self._update_memory_status(
             task_id,
             TaskStatus.FAILED,
-            completed_at=datetime.utcnow(),
+            completed_at=utc_now_naive(),
             error_message="Cancelled by user",
         )
         self._store.update_status(
             task_id,
             TaskStatus.FAILED,
-            completed_at=datetime.utcnow(),
+            completed_at=utc_now_naive(),
             error_message="Cancelled by user",
         )
         log.info("task.cancelled", task_id=task_id)
@@ -182,7 +183,7 @@ class TaskExecutor:
         timeout: int,
     ) -> None:
         """Wrapper executed inside the thread pool."""
-        started = datetime.utcnow()
+        started = utc_now_naive()
         self._update_memory_status(
             task_id, TaskStatus.RUNNING, started_at=started
         )
@@ -202,7 +203,7 @@ class TaskExecutor:
             if self._is_cancelled(task_id):
                 log.info("task.cancelled_late_result_ignored", task_id=task_id)
                 return
-            completed = datetime.utcnow()
+            completed = utc_now_naive()
             summary = result if isinstance(result, dict) else {"result": result}
             self._update_memory_status(
                 task_id,
@@ -219,7 +220,7 @@ class TaskExecutor:
             log.info("task.completed", task_id=task_id)
 
         except TimeoutError:
-            completed = datetime.utcnow()
+            completed = utc_now_naive()
             self._update_memory_status(
                 task_id,
                 TaskStatus.TIMEOUT,
@@ -246,13 +247,13 @@ class TaskExecutor:
                     self._update_memory_status(
                         tid,
                         TaskStatus.COMPLETED,
-                        completed_at=datetime.utcnow(),
+                        completed_at=utc_now_naive(),
                         result_summary=summary,
                     )
                     store.update_status(
                         tid,
                         TaskStatus.COMPLETED,
-                        completed_at=datetime.utcnow(),
+                        completed_at=utc_now_naive(),
                         result_summary=summary,
                     )
                     log.info("task.late_completed", task_id=tid)
@@ -264,13 +265,13 @@ class TaskExecutor:
                     self._update_memory_status(
                         tid,
                         TaskStatus.FAILED,
-                        completed_at=datetime.utcnow(),
+                        completed_at=utc_now_naive(),
                         error_message=tb,
                     )
                     store.update_status(
                         tid,
                         TaskStatus.FAILED,
-                        completed_at=datetime.utcnow(),
+                        completed_at=utc_now_naive(),
                         error_message=tb,
                     )
                     log.error("task.late_failed", task_id=tid, error=tb)
@@ -283,7 +284,7 @@ class TaskExecutor:
             watcher.start()
 
         except Exception:
-            completed = datetime.utcnow()
+            completed = utc_now_naive()
             tb = traceback.format_exc()
             self._update_memory_status(
                 task_id,

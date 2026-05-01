@@ -92,6 +92,23 @@ async def create_strategy(body: CreateStrategyRequest) -> dict:
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        resolved_market = body.market
+        try:
+            resolved_market = normalize_market(body.market)
+        except ValueError:
+            pass
+        log.error(
+            "api.strategy.create_failed",
+            market=resolved_market,
+            name=body.name,
+            error=str(e),
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create strategy: {e}",
+        )
 
 
 @router.get("/strategies")

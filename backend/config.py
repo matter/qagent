@@ -114,7 +114,7 @@ def _build_market_configs(
             provider="baostock",
             calendar="XSHG",
             benchmark="sh.000300",
-            default_group="cn_all_a",
+            default_group="cn_a_core_indices_union",
         ),
     }
 

@@ -41,7 +41,7 @@ class MarketContextContractTests(unittest.TestCase):
         self.assertEqual(get_default_provider("CN", settings), "baostock")
         self.assertEqual(get_default_calendar("CN", settings), "XSHG")
         self.assertEqual(get_default_benchmark("CN", settings), "sh.000300")
-        self.assertEqual(get_default_group("CN", settings), "cn_all_a")
+        self.assertEqual(get_default_group("CN", settings), "cn_a_core_indices_union")
 
     def test_explicit_market_config_overrides_defaults(self):
         settings = self._load_temp_settings(
@@ -76,4 +76,3 @@ class MarketContextContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

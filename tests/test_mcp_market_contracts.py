@@ -13,6 +13,7 @@ class MCPMarketContractsTests(unittest.TestCase):
             "search_stocks",
             "get_data_status",
             "update_data",
+            "refresh_stock_list",
             "list_factors",
             "evaluate_factor",
             "create_factor",
@@ -24,6 +25,7 @@ class MCPMarketContractsTests(unittest.TestCase):
             "generate_signals",
             "list_groups",
             "create_group",
+            "refresh_index_groups",
             "list_labels",
             "create_label",
             "list_feature_sets",
@@ -68,7 +70,8 @@ class MCPMarketContractsTests(unittest.TestCase):
             )
             found = mcp_server.search_stocks(query="600000", limit=3, market="CN")
             status = mcp_server.get_data_status(market="CN")
-            update = mcp_server.update_data(mode="incremental", market="CN")
+            update = mcp_server.update_data(mode="incremental", market="CN", history_years=2)
+            refresh = mcp_server.refresh_stock_list(market="CN")
 
         self.assertEqual(fake_conn.calls[0][1], ["CN", "sh.600000", "2024-01-02", "2024-01-03"])
         self.assertEqual(fake_conn.calls[1][1][0], "CN")
@@ -76,8 +79,12 @@ class MCPMarketContractsTests(unittest.TestCase):
         self.assertEqual(found[0]["market"], "CN")
         self.assertEqual(status["market"], "CN")
         self.assertEqual(update["market"], "CN")
+        self.assertEqual(update["history_years"], 2)
         self.assertEqual(update["asset_scope"], {"market": "CN"})
-        self.assertEqual(fake_executor.params["market"], "CN")
+        self.assertEqual(refresh["task_type"], "stock_list_refresh")
+        self.assertEqual(refresh["asset_scope"], {"market": "CN"})
+        self.assertEqual(fake_executor.submissions[0]["params"]["market"], "CN")
+        self.assertEqual(fake_executor.submissions[0]["params"]["history_years"], 2)
 
     def test_models_strategies_backtests_and_signals_forward_market_to_tasks(self):
         fake_model = _FakeModelService()
@@ -159,6 +166,7 @@ class MCPMarketContractsTests(unittest.TestCase):
                 tickers=["sh.600000"],
                 market="CN",
             )
+            refreshed_groups = mcp_server.refresh_index_groups(market="CN")
             labels = mcp_server.list_labels(market="CN")
             feature_sets = mcp_server.list_feature_sets(market="CN")
             paper_sessions = mcp_server.list_paper_sessions(market="CN")
@@ -176,6 +184,7 @@ class MCPMarketContractsTests(unittest.TestCase):
 
         self.assertEqual(groups[0]["market"], "CN")
         self.assertEqual(group["market"], "CN")
+        self.assertEqual(refreshed_groups[0]["market"], "CN")
         self.assertEqual(labels[0]["market"], "CN")
         self.assertEqual(feature_sets[0]["market"], "CN")
         self.assertEqual(paper_sessions[0]["market"], "CN")
@@ -218,8 +227,11 @@ class _FakeDataService:
     def get_data_status(self, market=None):
         return {"market": market}
 
-    def update_data(self, mode="incremental", market=None):
-        return {"mode": mode, "market": market}
+    def update_data(self, mode="incremental", market=None, history_years=None):
+        return {"mode": mode, "market": market, "history_years": history_years}
+
+    def refresh_stock_list(self, market=None):
+        return {"market": market}
 
 
 class _FakeModelService:
@@ -257,6 +269,9 @@ class _FakeGroupService:
 
     def create_group(self, **kwargs):
         return {"id": "group_cn", "market": kwargs.get("market")}
+
+    def refresh_index_groups(self, market=None):
+        return [{"id": "cn_a_core_indices_union", "market": market}]
 
 
 class _FakeLabelService:

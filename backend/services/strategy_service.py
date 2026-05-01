@@ -11,6 +11,7 @@ from datetime import datetime
 from backend.db import get_connection
 from backend.logger import get_logger
 from backend.services.market_context import normalize_market
+from backend.time_utils import utc_now_naive
 from backend.strategies.loader import load_strategy_from_code
 
 log = get_logger(__name__)
@@ -56,7 +57,7 @@ class StrategyService:
             version = row[0] + 1
 
         strategy_id = uuid.uuid4().hex[:12]
-        now = datetime.utcnow()
+        now = utc_now_naive()
 
         # Extract required_factors / required_models from the instance
         required_factors = instance.required_factors()
@@ -140,7 +141,7 @@ class StrategyService:
             ).fetchone()
             new_version = (max_ver[0] or 0) + 1
             new_id = uuid.uuid4().hex[:12]
-            now = datetime.utcnow()
+            now = utc_now_naive()
 
             required_factors = instance.required_factors()
             required_models = self._merge_required_models(
@@ -196,7 +197,7 @@ class StrategyService:
             return result
 
         # Simple metadata update (no version bump)
-        now = datetime.utcnow()
+        now = utc_now_naive()
         sets: list[str] = ["updated_at = ?"]
         vals: list = [now]
 

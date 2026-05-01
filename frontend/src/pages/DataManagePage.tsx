@@ -33,7 +33,9 @@ import {
 import {
   getDataStatus,
   triggerUpdate,
+  refreshStockList,
   getUpdateProgress,
+  getTaskStatus,
   updateGroupData,
   listGroups,
   createGroup,
@@ -151,6 +153,7 @@ function DataUpdateSection() {
   const [status, setStatus] = useState<DataStatus | null>(null);
   const [progress, setProgress] = useState<UpdateProgress | null>(null);
   const [triggering, setTriggering] = useState(false);
+  const [refreshingStockList, setRefreshingStockList] = useState(false);
   const [elapsed, setElapsed] = useState("");
   const pollTimer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
   const elapsedTimer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
@@ -265,6 +268,39 @@ function DataUpdateSection() {
     }
   };
 
+  const handleRefreshStockList = async () => {
+    setRefreshingStockList(true);
+    try {
+      const task = await refreshStockList(market);
+      messageApi.success("股票池刷新已提交");
+      const poll = setInterval(async () => {
+        try {
+          const current = await getTaskStatus(task.task_id);
+          if (current.status !== "running" && current.status !== "queued") {
+            clearInterval(poll);
+            setRefreshingStockList(false);
+            if (current.status === "completed") {
+              const stockCount = current.result?.universe_count ?? current.result?.stock_count;
+              messageApi.success(
+                typeof stockCount === "number" ? `股票池刷新完成：${stockCount} 只` : "股票池刷新完成",
+              );
+              fetchStatus();
+            } else {
+              messageApi.error(current.error || "股票池刷新失败");
+            }
+          }
+        } catch {
+          clearInterval(poll);
+          setRefreshingStockList(false);
+          messageApi.error("股票池刷新状态获取失败");
+        }
+      }, 2000);
+    } catch {
+      messageApi.error("股票池刷新提交失败");
+      setRefreshingStockList(false);
+    }
+  };
+
   // Determine progress percent for visual bar
   const progressPercent = !progress
     ? 0
@@ -290,6 +326,14 @@ function DataUpdateSection() {
       {contextHolder}
       <Space orientation="vertical" style={{ width: "100%" }} size="middle">
         <Space wrap>
+          <Button
+            icon={<ReloadOutlined spin={refreshingStockList} />}
+            loading={refreshingStockList}
+            disabled={isRunning}
+            onClick={handleRefreshStockList}
+          >
+            刷新股票池
+          </Button>
           <Button
             type="primary"
             icon={<SyncOutlined spin={isRunning} />}

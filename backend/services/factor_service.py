@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime
 
 from backend.db import get_connection
 from backend.factors.builtins import TEMPLATES, get_template_names, get_template_source
 from backend.factors.loader import load_factor_from_code
 from backend.logger import get_logger
 from backend.services.market_context import normalize_market
+from backend.time_utils import utc_now_naive
 
 log = get_logger(__name__)
 
@@ -50,7 +50,7 @@ class FactorService:
                 log.warning("factor.builtin_template_invalid", name=tpl_name, error=str(exc))
                 continue
 
-            now = datetime.utcnow()
+            now = utc_now_naive()
 
             conn.execute(
                 """INSERT INTO factors
@@ -101,7 +101,7 @@ class FactorService:
             )
 
         factor_id = uuid.uuid4().hex[:12]
-        now = datetime.utcnow()
+        now = utc_now_naive()
 
         conn.execute(
             """INSERT INTO factors
@@ -154,7 +154,7 @@ class FactorService:
             ).fetchone()
             new_version = (max_ver[0] or 0) + 1
             new_id = uuid.uuid4().hex[:12]
-            now = datetime.utcnow()
+            now = utc_now_naive()
 
             conn.execute(
                 """INSERT INTO factors
@@ -178,7 +178,7 @@ class FactorService:
             return self.get_factor(new_id, market=resolved_market)
 
         # Simple metadata update (no version bump)
-        now = datetime.utcnow()
+        now = utc_now_naive()
         sets: list[str] = ["updated_at = ?"]
         vals: list = [now]
 

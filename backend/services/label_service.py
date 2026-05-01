@@ -17,6 +17,7 @@ from backend.services.market_context import (
     normalize_market,
     normalize_ticker,
 )
+from backend.time_utils import utc_now_naive
 
 log = get_logger(__name__)
 
@@ -378,7 +379,7 @@ class LabelService:
 
         conn = get_connection()
         label_id = uuid.uuid4().hex[:12]
-        now = datetime.utcnow()
+        now = utc_now_naive()
         config_json = json.dumps(config) if config else None
 
         conn.execute(
@@ -422,7 +423,7 @@ class LabelService:
         if effective_target_type in ("excess_return", "excess_binary") and not effective_benchmark:
             raise ValueError(f"benchmark is required for {effective_target_type} target_type")
 
-        now = datetime.utcnow()
+        now = utc_now_naive()
         sets: list[str] = ["updated_at = ?"]
         params: list = [now]
 

@@ -80,6 +80,15 @@ class ModelMarketScopeTests(unittest.TestCase):
 
         metadata = json.loads((self.models_dir / summary["model_id"] / "metadata.json").read_text())
         self.assertEqual(metadata["market"], "CN")
+        self.assertEqual(metadata["feature_names"], ["close"])
+        self.assertEqual(
+            metadata["feature_lineage"]["trained"],
+            [{"factor_id": "factor_close_id", "factor_name": "close"}],
+        )
+        self.assertEqual(
+            metadata["feature_lineage"]["missing"],
+            [{"factor_id": "factor_missing_id", "factor_name": "missing_factor"}],
+        )
 
         with patch("backend.services.model_service.get_connection", return_value=self.conn):
             self.assertEqual(ModelService().list_models("CN")[0]["market"], "CN")
@@ -245,7 +254,10 @@ class _FakeFeatureService:
         return {
             "id": feature_set_id,
             "market": market,
-            "factor_refs": [{"factor_id": "close"}],
+            "factor_refs": [
+                {"factor_id": "factor_close_id", "factor_name": "close"},
+                {"factor_id": "factor_missing_id", "factor_name": "missing_factor"},
+            ],
         }
 
 
