@@ -172,8 +172,35 @@ class TaskExecutor:
             return (
                 record is not None
                 and record.status == TaskStatus.FAILED
-                and record.error_message == "Cancelled by user"
+                and bool(record.error_message)
+                and record.error_message.startswith("Cancelled by user")
             )
+
+    def _mark_late_result(
+        self,
+        task_id: str,
+        result: Any,
+        *,
+        status: TaskStatus,
+        error_message: str,
+    ) -> None:
+        summary = result if isinstance(result, dict) else {"result": result}
+        late_summary = {"late_result": summary}
+        completed = utc_now_naive()
+        self._update_memory_status(
+            task_id,
+            status,
+            completed_at=completed,
+            result_summary=late_summary,
+            error_message=error_message,
+        )
+        self._store.update_status(
+            task_id,
+            status,
+            completed_at=completed,
+            result_summary=late_summary,
+            error_message=error_message,
+        )
 
     def _run(
         self,
@@ -201,7 +228,13 @@ class TaskExecutor:
         try:
             result = inner_future.result(timeout=timeout)
             if self._is_cancelled(task_id):
-                log.info("task.cancelled_late_result_ignored", task_id=task_id)
+                self._mark_late_result(
+                    task_id,
+                    result,
+                    status=TaskStatus.FAILED,
+                    error_message="Cancelled by user; late result saved",
+                )
+                log.info("task.cancelled_late_result_saved", task_id=task_id)
                 return
             completed = utc_now_naive()
             summary = result if isinstance(result, dict) else {"result": result}
@@ -241,20 +274,28 @@ class TaskExecutor:
                 try:
                     result = fut.result()  # blocks until inner completes
                     if self._is_cancelled(tid):
-                        log.info("task.cancelled_late_result_ignored", task_id=tid)
+                        self._mark_late_result(
+                            tid,
+                            result,
+                            status=TaskStatus.FAILED,
+                            error_message="Cancelled by user; late result saved",
+                        )
+                        log.info("task.cancelled_late_result_saved", task_id=tid)
                         return
                     summary = result if isinstance(result, dict) else {"result": result}
                     self._update_memory_status(
                         tid,
-                        TaskStatus.COMPLETED,
+                        TaskStatus.TIMEOUT,
                         completed_at=utc_now_naive(),
-                        result_summary=summary,
+                        result_summary={"late_result": summary},
+                        error_message=f"Task timed out after {timeout}s; late result saved",
                     )
                     store.update_status(
                         tid,
-                        TaskStatus.COMPLETED,
+                        TaskStatus.TIMEOUT,
                         completed_at=utc_now_naive(),
-                        result_summary=summary,
+                        result_summary={"late_result": summary},
+                        error_message=f"Task timed out after {timeout}s; late result saved",
                     )
                     log.info("task.late_completed", task_id=tid)
                 except Exception:

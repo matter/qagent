@@ -121,6 +121,7 @@ class BacktestService:
             rebalance_buffer_reference=config_dict.get("rebalance_buffer_reference", "target"),
             min_holding_days=config_dict.get("min_holding_days", 0),
             reentry_cooldown_days=config_dict.get("reentry_cooldown_days", 0),
+            normalize_target_weights=config_dict.get("normalize_target_weights", True),
         )
 
         position_sizing = strategy_def.get("position_sizing", "equal_weight")
@@ -404,6 +405,20 @@ class BacktestService:
         bt_id = uuid.uuid4().hex[:12]
         config_to_save = bt_config.to_dict()
         config_to_save["universe_group_id"] = universe_group_id
+        requested_start = config_dict.get("start_date", "2020-01-01")
+        requested_end = config_dict.get("end_date", "2024-12-31")
+        config_to_save["requested_start_date"] = str(requested_start)
+        config_to_save["requested_end_date"] = str(requested_end)
+        config_to_save["effective_start_date"] = str(bt_config.start_date)
+        config_to_save["effective_end_date"] = str(bt_config.end_date)
+        if str(requested_start) != str(bt_config.start_date) or str(requested_end) != str(bt_config.end_date):
+            config_to_save["date_adjustment"] = {
+                "requested_start_date": str(requested_start),
+                "effective_start_date": str(bt_config.start_date),
+                "requested_end_date": str(requested_end),
+                "effective_end_date": str(bt_config.end_date),
+                "reason": "calendar_or_data_trading_day_snap",
+            }
         if portfolio_config:
             config_to_save["portfolio_overlay"] = result.config.get(
                 "portfolio_overlay",
@@ -426,6 +441,16 @@ class BacktestService:
         result_dict["strategy_name"] = strategy_def["name"]
         result_dict["result_level"] = result_level
         result_dict["universe_group_id"] = universe_group_id
+        result_dict["config"] = config_to_save
+        for key in (
+            "requested_start_date",
+            "requested_end_date",
+            "effective_start_date",
+            "effective_end_date",
+            "date_adjustment",
+        ):
+            if key in config_to_save:
+                result_dict[key] = config_to_save[key]
         if signal_errors:
             result_dict["signal_error_count"] = len(signal_errors)
             result_dict["signal_error_samples"] = signal_errors[:5]

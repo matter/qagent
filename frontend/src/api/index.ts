@@ -278,6 +278,17 @@ export interface TaskStatus {
   created_at: string | null;
   started_at: string | null;
   completed_at: string | null;
+  source?: string;
+  late_result_id?: string;
+  late_model_id?: string;
+  late_run_id?: string;
+  late_signal_run_id?: string;
+  late_result?: Record<string, unknown>;
+  requested_start_date?: string;
+  requested_end_date?: string;
+  effective_start_date?: string;
+  effective_end_date?: string;
+  date_adjustment?: Record<string, unknown>;
 }
 
 // ---- Factor API ----

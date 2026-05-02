@@ -86,6 +86,40 @@ class DataAndGroupMarketScopeTests(unittest.TestCase):
             [("CN", "sh.000300")],
         )
 
+    def test_missing_index_history_incremental_start_uses_full_history_window(self):
+        svc = DataService(provider=_NoopProvider())
+
+        with patch("backend.services.data_service.get_connection", return_value=self.conn):
+            start = svc._get_index_incremental_start(
+                "sh.000300",
+                date(2026, 4, 30),
+                mode="incremental",
+                market="CN",
+                history_years=10,
+            )
+
+        self.assertEqual(start, date(2016, 1, 1))
+
+    def test_existing_index_history_incremental_start_continues_after_max_date(self):
+        svc = DataService(provider=_NoopProvider())
+        self.conn.execute(
+            """
+            INSERT INTO index_bars (market, symbol, date, close)
+            VALUES ('CN', 'sh.000300', DATE '2026-04-24', 3900)
+            """
+        )
+
+        with patch("backend.services.data_service.get_connection", return_value=self.conn):
+            start = svc._get_index_incremental_start(
+                "sh.000300",
+                date(2026, 4, 30),
+                mode="incremental",
+                market="CN",
+                history_years=10,
+            )
+
+        self.assertEqual(start, date(2026, 4, 25))
+
     def test_data_status_defaults_to_us_and_filters_explicit_market(self):
         self.conn.execute(
             """

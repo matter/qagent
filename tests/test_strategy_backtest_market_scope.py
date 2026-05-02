@@ -197,6 +197,50 @@ class StrategyBacktestMarketScopeTests(unittest.TestCase):
         self.assertEqual(result["market"], "CN")
         self.assertEqual(executor.params["market"], "CN")
 
+    def test_strategy_api_backtest_task_summary_includes_date_adjustment(self):
+        executor = _FakeExecutor()
+        strategy_service = _FakeStrategyService()
+        backtest_service = _FakeBacktestService(
+            result={
+                "backtest_id": "bt_cn",
+                "market": "CN",
+                "strategy_id": "strategy_cn",
+                "config": {
+                    "requested_start_date": "2026-04-06",
+                    "effective_start_date": "2026-04-07",
+                    "requested_end_date": "2026-04-24",
+                    "effective_end_date": "2026-04-24",
+                    "date_adjustment": {
+                        "requested_start_date": "2026-04-06",
+                        "effective_start_date": "2026-04-07",
+                        "reason": "calendar_or_data_trading_day_snap",
+                    },
+                },
+            },
+        )
+
+        with (
+            patch.object(strategy_api, "_get_strategy_service", return_value=strategy_service),
+            patch.object(strategy_api, "_get_backtest_service", return_value=backtest_service),
+            patch.object(strategy_api, "_get_executor", return_value=executor),
+        ):
+            asyncio.run(
+                strategy_api.run_backtest(
+                    "strategy_cn",
+                    strategy_api.RunBacktestRequest(
+                        market="CN",
+                        config={"benchmark": "sh.000300"},
+                        universe_group_id="cn_group",
+                    ),
+                )
+            )
+
+        summary = executor.fn(**executor.params)
+
+        self.assertEqual(summary["date_adjustment"]["effective_start_date"], "2026-04-07")
+        self.assertEqual(summary["requested_start_date"], "2026-04-06")
+        self.assertEqual(summary["effective_start_date"], "2026-04-07")
+
     def test_strategy_api_rejects_cross_market_benchmark_before_queueing(self):
         executor = _FakeExecutor()
         strategy_service = _FakeStrategyService()
@@ -404,8 +448,10 @@ class _FakeExecutor:
     def __init__(self):
         self._store = _FakeStore()
         self.params = None
+        self.fn = None
 
     def submit(self, task_type, fn, params, timeout, source):
+        self.fn = fn
         self.params = params
         return "task_backtest_cn"
 
@@ -421,7 +467,18 @@ class _FailingCreateStrategyService:
 
 
 class _FakeBacktestService:
+    def __init__(self, result=None):
+        self._result = result
+
     def run_backtest(self, strategy_id, config_dict, universe_group_id, market=None):
+        if self._result is not None:
+            return {
+                "strategy_id": strategy_id,
+                "strategy_name": "CN strategy",
+                "result_level": "exploratory",
+                "universe_group_id": universe_group_id,
+                **self._result,
+            }
         return {
             "backtest_id": "bt_cn",
             "strategy_id": strategy_id,

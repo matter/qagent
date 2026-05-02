@@ -309,10 +309,19 @@ async def run_backtest(strategy_id: str, body: RunBacktestRequest) -> dict:
         for key in (
             "total_return", "annual_return", "sharpe_ratio", "max_drawdown",
             "win_rate", "total_trades", "start_date", "end_date",
-            "leakage_warnings",
+            "leakage_warnings", "requested_start_date", "requested_end_date",
+            "effective_start_date", "effective_end_date", "date_adjustment",
         ):
             if key in full:
                 summary[key] = full[key]
+        config = full.get("config")
+        if isinstance(config, dict):
+            for key in (
+                "requested_start_date", "requested_end_date",
+                "effective_start_date", "effective_end_date", "date_adjustment",
+            ):
+                if key in config and key not in summary:
+                    summary[key] = config[key]
         return summary
 
     task_id = executor.submit(

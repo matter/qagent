@@ -790,7 +790,10 @@ class LabelService:
 
         if bench_df.empty:
             log.warning("label.no_benchmark_data", market=resolved_market, benchmark=benchmark)
-            return {}
+            raise ValueError(
+                f"Benchmark data missing for {benchmark} in market {resolved_market}; "
+                f"update index_bars for the requested date range before computing excess-return labels"
+            )
 
         bench_df = bench_df.sort_values("date").reset_index(drop=True)
         bench_fwd = bench_df["close"].shift(-horizon)

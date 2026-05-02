@@ -135,6 +135,27 @@ class LabelMarketScopeTests(unittest.TestCase):
         first_value = labels.sort_values("date").iloc[0]["label_value"]
         self.assertAlmostEqual(first_value, 0.0)
 
+    def test_excess_label_missing_benchmark_raises_actionable_error(self):
+        svc = LabelService()
+        self._insert_daily_bars()
+
+        with patch("backend.services.label_service.get_connection", return_value=self.conn):
+            label = svc.create_label(
+                "CN missing benchmark",
+                market="CN",
+                target_type="excess_return",
+                horizon=1,
+                benchmark="sh.000300",
+            )
+            with self.assertRaisesRegex(ValueError, "Benchmark data missing.*sh.000300.*CN"):
+                svc.compute_label_values(
+                    label["id"],
+                    ["sh.600000"],
+                    "2024-01-02",
+                    "2024-01-03",
+                    market="CN",
+                )
+
     def _insert_daily_bars(self):
         self.conn.execute(
             """

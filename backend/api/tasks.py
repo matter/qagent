@@ -30,7 +30,7 @@ def _get_store() -> TaskStore:
 
 
 def _record_to_dict(record) -> dict:
-    return {
+    result = {
         "task_id": record.id,
         "task_type": record.task_type,
         "status": record.status.value,
@@ -42,6 +42,18 @@ def _record_to_dict(record) -> dict:
         "completed_at": str(record.completed_at) if record.completed_at else None,
         "source": record.source.value,
     }
+    if record.result_summary and isinstance(record.result_summary, dict):
+        late_result = record.result_summary.get("late_result")
+        if isinstance(late_result, dict):
+            for key in ("backtest_id", "model_id", "run_id", "signal_run_id", "id"):
+                if key in late_result:
+                    payload_key = "late_result_id" if key == "id" else f"late_{key}"
+                    if payload_key == "late_backtest_id":
+                        payload_key = "late_result_id"
+                    result[payload_key] = late_result[key]
+                    break
+            result["late_result"] = late_result
+    return result
 
 
 @router.get("")

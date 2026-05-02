@@ -165,6 +165,20 @@ export default function TaskManagement() {
             </a>
           );
         }
+        if (record.late_result_id || record.late_model_id || record.late_run_id || record.late_signal_run_id) {
+          return (
+            <Text type="warning" ellipsis style={{ maxWidth: 200 }}>
+              late result: {record.late_result_id ?? record.late_model_id ?? record.late_run_id ?? record.late_signal_run_id}
+            </Text>
+          );
+        }
+        if (record.date_adjustment) {
+          return (
+            <Text type="secondary" ellipsis style={{ maxWidth: 200 }}>
+              {record.requested_start_date} -&gt; {record.effective_start_date}
+            </Text>
+          );
+        }
         if (record.result) {
           const keys = Object.keys(record.result);
           const preview = keys.slice(0, 3).map((k) => `${k}: ${record.result![k]}`).join(", ");

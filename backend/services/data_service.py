@@ -341,7 +341,13 @@ class DataService:
             benchmark = get_default_benchmark(resolved_market)
             log.info("data.update.index", market=resolved_market, symbol=benchmark)
             try:
-                idx_start = date(end_date.year - _FULL_HISTORY_YEARS, 1, 1) if mode == "full" else (end_date - timedelta(days=7))
+                idx_start = self._get_index_incremental_start(
+                    benchmark,
+                    end_date,
+                    mode=mode,
+                    market=resolved_market,
+                    history_years=history_years,
+                )
                 idx_df = provider.get_index_data(benchmark, idx_start, end_date)
                 if not idx_df.empty:
                     self._upsert_index_bars(benchmark, idx_df, market=resolved_market)
@@ -832,6 +838,38 @@ class DataService:
                 result[t] = date(end_date.year - bootstrap_years, 1, 1)
 
         return result
+
+    def _get_index_incremental_start(
+        self,
+        symbol: str,
+        end_date: date,
+        *,
+        mode: str,
+        market: str | None = None,
+        history_years: int | None = None,
+    ) -> date:
+        """Return the benchmark/index start date needed for full or incremental updates."""
+        resolved_market = normalize_market(market or self._default_market)
+        years = history_years or _FULL_HISTORY_YEARS
+        full_start = date(end_date.year - years, 1, 1)
+        if mode == "full":
+            return full_start
+
+        row = get_connection().execute(
+            """SELECT MIN(date), MAX(date)
+               FROM index_bars
+               WHERE market = ? AND symbol = ?""",
+            [resolved_market, normalize_ticker(symbol, resolved_market)],
+        ).fetchone()
+        if not row or row[0] is None or row[1] is None:
+            return full_start
+
+        max_date = row[1]
+        if isinstance(max_date, str):
+            max_date = date.fromisoformat(max_date)
+        elif hasattr(max_date, "date") and callable(max_date.date):
+            max_date = max_date.date()
+        return max_date + timedelta(days=1) if max_date < end_date else end_date
 
     @staticmethod
     def _stock_list_is_fresh(conn, market: str | None = None) -> bool:

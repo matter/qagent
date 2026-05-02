@@ -2,12 +2,14 @@
 
 本文件是 QAgent 项目的统一需求看板。Agent 在开发、研究、验收过程中发现的未闭环问题、改进需求和验收缺口都记录在这里。Human 通过 UI 和量化指标验收，agent 通过本文件维持跨会话上下文。
 
+已完成并通过验收的问题不在本文件长期堆积，按单问题归档到 `docs/archive/backlog/`。未完全修复、待 live 复验、待 UI 验收、暂缓处理的问题继续保留在本文件。
+
 ## 使用规则
 
 - 新问题先放到 `Inbox`，复现清楚后移动到 `Open`。
 - 开始修复前移动到 `In Progress`，写明负责人、分支或会话。
 - 修复完成但未验收放到 `Verify`。
-- 验收通过后移动到 `Done`，保留复验证据和 commit。
+- 验收通过后移动到 `Done`，并新建单问题归档文档保存复验证据和 commit。
 - 暂不处理但仍有价值的问题放到 `Deferred`，写明重新评估条件。
 - 不记录纯猜测。没有复现步骤的问题必须标记为 `Needs Repro`。
 - V2.0 期间凡是发现 REST、MCP、UI 对 `market`、ranking/listwise 指标、任务状态或资产 ID 的展示不一致，统一记录到本文件。
@@ -46,7 +48,43 @@
 
 ## Open
 
-暂无。
+### [2026-05-02] P2 缺陷：旧研究脚本被 Codex app-server 自动复活并持续提交 US 任务，污染 CN 研究队列
+
+- **状态**：Open
+- **来源**：agent A 股策略回测执行发现
+- **影响范围**：任务队列、`/api/tasks`、A 股回测执行稳定性、长任务研究效率
+- **复现入口**：
+  - 进程：`/Users/m/dev/atlas/tmp/research_0502_pathq_model_probe.py`
+  - 父进程：`/Applications/Codex.app/Contents/Resources/codex app-server`
+  - 污染任务示例：US `strategy_backtest`，策略 `06d72adc2abe` / `cc6b5b717da9`，`universe_group_id="sp500"`，窗口包括 `2026-01-02~2026-01-30`、`2026-02-02~2026-02-27`、`2026-01-02~2026-04-02`
+- **当前证据**：
+  - 多次 `kill` 后同一脚本被 app-server 重新拉起，形式包括 `uv run python /Users/m/dev/atlas/tmp/research_0502_pathq_model_probe.py` 和 `/Library/Frameworks/Python.framework/.../Python /Users/m/dev/atlas/tmp/research_0502_pathq_model_probe.py`。
+  - 脚本每次复活后继续提交 US 回测任务，占用 qagent executor；本轮被迫用 `pkill -STOP -f '/Users/m/dev/atlas/tmp/research_0502_pathq_model_probe.py'` 暂停进程以保护 CN 队列。
+- **期望行为**：qagent 研究任务应能按 market/来源隔离；外部旧脚本不应在用户切换到 CN 研究后持续自动恢复并提交 US 任务。至少需要任务来源、批次、owner 或 market-level 队列隔离/暂停能力。
+- **验收标准**：
+  - 可量化指标：暂停或取消某个外部研究脚本后，不再自动恢复并创建新任务。
+  - UI 验收点：任务列表能按 source/market 过滤，并支持批量暂停某来源的排队/运行任务。
+  - 命令 / API 复验：停止上述脚本后，`GET /api/tasks?limit=30` 不再出现新的 US running/queued 任务。
+
+### [2026-05-02] P2 性能：CN 9 模型 200+ 特征策略回测耗时高且会阻塞 API 响应
+
+- **状态**：Open
+- **来源**：agent A 股 200+ 特征策略回测发现
+- **影响范围**：CN 多模型策略、`strategy_backtest`、模型预测缓存、API 可用性
+- **复现入口**：
+  - 策略：`8571bb7cc7d9`、`1a5803b186d9`、`5b04a756d0a0`、`bc87585be0e2`
+  - 股票池：`cn_a_core_indices_union`
+  - 模型：9 个 CN 模型，特征集分别为 430F、273F、288F
+  - 回测窗口：`2026-01-02~2026-04-02` 或 `2026-04-06~2026-04-24`
+- **当前证据**：
+  - `8571bb7cc7d9` 主窗任务 `91cee58db6b347538e3756b8f28b1c06` 运行约 10 分钟；短窗任务 `c61b4f3213274b248e674f0edb0d15ce` 也运行约 5.5 分钟。
+  - 任务运行时 qagent 后端 worker CPU 可达约 150%，部分 `GET /api/tasks` 和 `GET /api/strategies/backtests` 请求 20 秒超时。
+  - 同一策略多窗口研究需要频繁轮询，当前体验不利于快速迭代。
+- **期望行为**：多模型预测应有按 `(model_id, market, universe, date)` 或批量日期缓存；长任务运行时 API 查询不应被阻塞，任务进度应包含当前日期/预测阶段。
+- **验收标准**：
+  - 可量化指标：同一 9 模型 CN 主窗回测耗时显著下降，重复窗口能复用预测缓存；API 任务查询 P95 保持在 2 秒以内。
+  - UI 验收点：回测任务显示进度、当前阶段、已处理日期数。
+  - 命令 / API 复验：重复运行 `8571bb7cc7d9` 主窗回测，对比首次与二次耗时，并在运行中持续调用 `/api/tasks/{task_id}`。
 
 ## In Progress
 
@@ -54,7 +92,161 @@
 
 ## Verify
 
-暂无。
+### [2026-05-02] P1 回测可靠性：持仓当日缺失行情时 NAV 将该持仓按 0 估值，导致窗口末端异常暴跌
+
+- **状态**：Verify
+- **来源**：agent US 稳健性研究 live API 复验
+- **影响范围**：US 策略回测、`BacktestEngine` 持仓估值、数据质量校验、回测指标可信度
+- **复现入口**：
+  - UI：策略回测页运行 US 策略并查看详情
+  - API / MCP：`POST /api/strategies/47425ba22837/backtest`，`market="US"`，`universe_group_id="sp500"`，窗口 `2026-04-06` 到 `2026-04-27`，配置 `rebalance_buffer=0.08`、`rebalance_buffer_mode="hold_overlap_only"`
+  - 资产 ID：策略 `47425ba22837`，异常回测 `5ada1f38a2f1`；对照正常窗口回测 `f4c90c5e3948`（`2026-04-06` 到 `2026-04-24`）
+- **当前证据**：
+  - 实际结果：`5ada1f38a2f1` 的 NAV 从 `2026-04-24` 的 `1,239,521.70` 跳到 `2026-04-27` 的 `485,821.83`，summary 显示 `total_return=-0.514178`、`max_drawdown=-0.608057`。但同一策略同一配置到 `2026-04-24` 的正常回测 `f4c90c5e3948` 为 `total_return=0.239522`、`max_drawdown=-0.018292`。
+  - 日志 / 错误：无任务错误。复验持仓发现 `STX`、`INTC`、`MCHP` 等在 `2026-04-24` 有价格但 `2026-04-27` 缺 daily bar；`BacktestEngine` 估值循环只在当日 close 存在时计入持仓价值，缺价持仓被跳过，相当于按 0 估值。
+  - 相关指标：`GET /api/data/status?market=US` 同时返回 `date_range.max=2026-04-27`、`latest_trading_day=2026-04-30`、`stale_tickers=5378`，说明数据覆盖存在大量局部陈旧，回测入口未阻断或告警。
+- **期望行为**：回测不应在持仓缺少当日价格时静默把价值归零；应使用可解释的估值策略，例如按该 ticker 最近可用 close 在有限天数内 carry-forward，或直接阻断并返回缺失持仓/日期清单。数据状态也应区分“市场日历最新日”和“可用于回测的全池覆盖日期”。
+- **验收标准**：
+  - 可量化指标：复跑上述 `2026-04-06` 到 `2026-04-27` 回测时，不再出现由缺价持仓导致的 `40%+` 单日 NAV 断崖；若选择阻断，API 返回可读错误并列出缺价持仓。
+  - UI 验收点：回测详情展示数据覆盖告警或缺失估值处理方式；异常窗口不能只显示成功指标。
+  - 命令 / API 复验：对 `STX` / `INTC` / `MCHP` 在 `2026-04-27` 缺价的持仓场景运行最小回测，确认 NAV 口径稳定或任务明确失败。
+- **修复记录**：
+  - commit：待提交
+  - 验证命令：`uv run python -m unittest tests.test_backtest_engine_contracts`；`uv run python -m unittest discover tests`；`cd frontend && pnpm build`；`git diff --check`
+  - 复验结论：代码级修复通过。`BacktestEngine` 对单只持仓缺少当日 close 的场景改为使用该 ticker 最近可用 close 估值，并在 `trade_diagnostics.missing_price_valuations` 记录日期、ticker、持仓数、carry-forward 价格和估值方式；不再把部分缺价持仓静默按 0 估值。待 live API 复跑 `47425ba22837` 的 `2026-04-06~2026-04-27` 窗口确认异常 NAV 断崖消失。
+
+### [2026-05-02] P2 任务可靠性：并发回测任务被标记为 Cancelled by user，但后台仍保存 late result
+
+- **状态**：Verify
+- **来源**：agent US 稳健性研究 live API 复验
+- **影响范围**：`TaskExecutor`、`POST /api/strategies/{strategy_id}/backtest`、批量研究任务、任务状态与 backtest 历史一致性
+- **复现入口**：
+  - UI：任务页 / 回测历史页
+  - API / MCP：短时间内并发提交多个 `strategy_backtest` 任务，策略 `47425ba22837`，`market="US"`，`universe_group_id="sp500"`，窗口包括 `2026-01-02~2026-01-30`、`2026-02-02~2026-02-27`、`2026-03-02~2026-03-31`，配置包含 `rebalance_buffer_reference="actual_open"` 与可选 `rebalance_buffer_add/reduce`
+  - 资产 ID：任务 `9511a9c90785429380cc6a56491b746c`、`7d21b45384e14b0a9bc333168c852eba`、`dcb09be316f44511a5f905cfd9435c19`；late result backtest `49a6a8e65127`、`d69e53c8526e`、`b02e477f2f4d`、`72215fc31c0d`
+- **当前证据**：
+  - 实际结果：多个任务 API 状态为 `failed`，`error="Cancelled by user"`，`result=null`；但 `logs/qagent.log` 同时出现 `backtest_service.saved` 和 `task.cancelled_late_result_ignored`，回测历史中可以查询到对应配置的 backtest 记录。
+  - 日志 / 错误：例如任务 `9511a9c90785429380cc6a56491b746c` 显示 failed/cancelled，但日志记录 `backtest_service.saved backtest_id=49a6a8e65127`，随后 `task.cancelled_late_result_ignored task_id=9511...`。
+  - 相关指标：这些 late result 的 summary 可通过 `/api/strategies/backtests/{backtest_id}` 读取，但原任务状态不会返回 backtest_id，agent 需要反查回测历史才能恢复结果。
+- **期望行为**：任务取消、失败、完成和资产落库应保持一致；如果任务已经保存 backtest，应将任务状态更新为 completed 或至少在 task result/error 中暴露 `backtest_id` 和 late-result 状态，避免研究链路误判为无结果。
+- **验收标准**：
+  - 可量化指标：并发提交同类回测任务后，任务状态与回测历史一致；不存在 `failed + result=null` 但已落库 backtest 的不可追踪状态。
+  - UI 验收点：任务页能提示 late result 或直接链接到已生成回测；回测历史不出现来源任务不可追踪的孤儿记录。
+  - 命令 / API 复验：并发提交 4 个小窗口回测，轮询 `/api/tasks/{task_id}`，确认每个已保存 backtest 的任务能返回对应 `backtest_id`。
+- **修复记录**：
+  - commit：待提交
+  - 验证命令：`uv run python -m unittest tests.test_task_executor_contracts tests.test_strategy_backtest_market_scope tests.test_mcp_market_contracts`；`uv run python -m unittest discover tests`；`cd frontend && pnpm build`；`git diff --check`
+  - 复验结论：代码级修复通过。取消后或超时后如果内部任务已经返回结果，`TaskExecutor` 不再静默忽略 late result；取消任务保持 `failed`，超时任务保持 `timeout`，并在 `result.late_result`、REST/MCP `late_result_id`、错误信息中暴露已保存资产。任务页会显示 late result 提示。待 live API 并发提交 4 个小窗口回测复验任务状态与回测历史可追踪。
+
+### [2026-05-02] P1 缺陷：CN benchmark 缺失导致 excess-return 标签无法训练
+
+- **状态**：Verify
+- **来源**：agent A 股 200+ 特征模型研究发现
+- **影响范围**：A 股模型训练、`cn_preset_fwd_excess_10d` 等超额收益标签、`/api/models/train`、后续相对沪深300的选股模型研究
+- **复现入口**：
+  - API：`POST /api/models/train`
+  - 参数：`market="CN"`、`universe_group_id="cn_a_core_indices_union"`、`benchmark="sh.000300"` 或使用默认 CN benchmark 的 excess-return 预设标签
+  - 相关日志：`label.no_benchmark_data benchmark=sh.000300 market=CN`
+- **当前证据**：
+  - 实际结果：训练任务失败，错误为 `ValueError: No aligned (date, ticker) pairs after joining features and labels`。
+  - 回测指纹也显示 `data_watermark.benchmark.symbol="sh.000300"` 但 `rows=0`、`min_date=null`、`max_date=null`，说明当前库里没有可用于标签/benchmark 的沪深300指数行情。
+  - 本轮只能改用 rank/return/path-return 标签完成 CN 200+ 模型训练，不能训练与 `sh.000300` 对齐的超额收益模型。
+- **期望行为**：CN benchmark 数据应随 CN 数据更新或内置指数同步可用；如果 benchmark 缺失，标签训练应在任务开始前返回可读错误，并提示需要更新的指数符号和日期范围。
+- **验收标准**：
+  - 可量化指标：`sh.000300` benchmark 在 CN 数据状态中有完整覆盖，excess-return 标签能产出非空样本。
+  - UI 验收点：选择 CN excess 标签时能看到 benchmark 覆盖状态；缺失时给出明确提示。
+  - 命令 / API 复验：用 `cn_a_core_indices_union` 和 `cn_preset_fwd_excess_10d` 重新提交模型训练，任务完成并生成模型，或失败为明确的 benchmark 数据缺失 4xx 校验错误。
+- **修复记录**：
+  - commit：待提交
+  - 验证命令：`uv run python -m unittest tests.test_label_market_scope tests.test_data_group_market_scope`；`uv run python -m unittest discover tests`；`cd frontend && pnpm build`；`git diff --check`
+  - 复验结论：代码级修复通过。CN/US 数据更新时 benchmark/index 增量起点不再固定为近 7 天；若 `index_bars` 没有 `sh.000300` 历史，会从 10 年窗口开始补齐。excess-return/excess-binary 标签在 benchmark 缺失时直接抛出可读 `Benchmark data missing for sh.000300 in market CN`，避免训练阶段退化为 “No aligned pairs”。待 live 执行 CN 数据增量更新并重训 `cn_preset_fwd_excess_10d` 做最终验收。
+
+### [2026-05-02] P2 缺陷：任务 cancel 接口对 running 任务不稳定，返回 not found or not cancellable
+
+- **状态**：Verify
+- **来源**：agent A 股回测执行发现
+- **影响范围**：`POST /api/tasks/{task_id}/cancel`、长任务管理、队列清理、跨市场研究隔离
+- **复现入口**：
+  - API：`POST /api/tasks/{task_id}/cancel`
+  - 示例任务：`9e898c69791442e09b9e7ec4d489902c`、`38ec25ab47c74446968849388e3a1bab`、`5a08134df84f488cae6195c83c1120ab`
+  - 任务类型：US `strategy_backtest`，状态在 `GET /api/tasks` 中显示为 `running`
+- **当前证据**：
+  - 取消接口多次返回 `{"detail":"Task not found or not cancellable"}`，但同一时间任务列表仍显示对应任务为 running，且后续会自然完成并生成 US 回测结果。
+  - 另一个 US 训练任务 `0333c556dc2f4abc9cbf9563eef521dd` 可以正常取消，说明不是接口整体不可用，而是 running backtest 状态或 executor 映射不一致。
+- **期望行为**：任务列表中显示为 running/queued 的任务应能一致取消；若底层不可中断，API 也应返回明确状态，例如 `cancel_requested`，并在任务结束时标记取消原因。
+- **验收标准**：
+  - 可量化指标：对 running backtest 调用 cancel 后，任务最终进入 `failed/cancelled`，不再落库新回测。
+  - UI 验收点：任务列表取消按钮状态与后端实际 cancellable 状态一致。
+  - 命令 / API 复验：提交一个长 backtest，立即调用 cancel，轮询 `/api/tasks/{task_id}` 验证状态和结果表。
+- **修复记录**：
+  - commit：待提交
+  - 验证命令：`uv run python -m unittest tests.test_task_executor_contracts`；`uv run python -m unittest discover tests`
+  - 复验结论：代码级修复通过。当前 Python 线程无法强杀正在执行的内部任务，因此语义调整为：取消请求会将任务置为 `failed` / `Cancelled by user`；如果内部任务之后返回结果，任务保留失败语义但补充 `late_result` 与 `late_result_id`，避免不可追踪资产。待 live 长回测取消场景复验。
+
+### [2026-05-02] P3 体验：CN 回测起始日被自动调整为下一交易日，但提交响应不提示
+
+- **状态**：Verify
+- **来源**：agent A 股对齐窗口回测发现
+- **影响范围**：`POST /api/strategies/{strategy_id}/backtest`、回测配置可解释性、防穿越审计
+- **复现入口**：
+  - 请求配置：`start_date="2026-01-02"` 或 `start_date="2026-04-06"`，`market="CN"`，`universe_group_id="cn_a_core_indices_union"`
+  - 回测结果：主窗实际保存为 `2026-01-05` 起，近端实际保存为 `2026-04-07` 起
+- **当前证据**：
+  - 提交请求返回只包含 `task_id/status/strategy_id/market`，没有说明起始日会被交易日历调整。
+  - 回测详情和 leakage warning 中显示实际 `backtest_start` 分别为 `2026-01-05` / `2026-04-07`，需要事后查询才知道。
+- **期望行为**：提交响应或任务结果应明确记录 `requested_start_date` 与 `effective_start_date`，并说明调整原因是非交易日/无数据日。
+- **验收标准**：
+  - 可量化指标：所有回测结果配置同时保留 requested/effective 日期。
+  - UI 验收点：回测详情页显示“请求日期 -> 实际交易日期”的映射。
+  - 命令 / API 复验：用非交易日提交 CN 回测，任务结果中可直接看到日期调整说明。
+- **修复记录**：
+  - commit：待提交
+  - 验证命令：`uv run python -m unittest tests.test_strategy_backtest_market_scope`；`cd frontend && pnpm build`
+  - 复验结论：代码级修复通过。回测保存配置和任务摘要现在包含 `requested_start_date`、`effective_start_date`、`requested_end_date`、`effective_end_date` 和 `date_adjustment`；任务列表会展示请求起始日到实际起始日的映射。待 UI 详情页进一步做专门展示优化。
+
+### [2026-05-02] P2 研究限制：非空目标权重会被回测引擎归一化为满仓，无法正式验证动态现金/风险预算
+
+- **状态**：Verify
+- **来源**：agent 美股 S294 风险预算与做 T 控制研究发现
+- **影响范围**：`BacktestEngine.run`、动态仓位缩放、风险预算、现金权重、vol targeting / loss cooldown 类策略研究
+- **复现入口**：
+  - 策略输出任意非空 `target_weights`，例如所有股票权重和为 `0.5`。
+  - 回测配置：`position_sizing="equal_weight"` 或策略权重经过引擎执行。
+- **当前证据**：
+  - `/Users/m/dev/qagent/backend/services/backtest_engine.py` 中 `target_weights` 在执行前只要 `weight_sum > 0` 就会归一化到 `sum=1`。
+  - 因此离线风险覆盖实验只能近似复盘，不能在正式 qagent 回测中验证“降低总仓位到 50%/70%”这类动态现金方案；除非策略返回空信号直接全空仓。
+  - 0502 美股研究中，vol target / loss cooldown 离线复盘 Sharpe 低于基线，但该类结论仍缺少正式 backtest engine 支持。
+- **期望行为**：回测引擎应支持可选的 `allow_cash_weight` / `normalize_target_weights=false`，保留策略输出的总风险预算，同时继续支持旧策略默认满仓归一化。
+- **验收标准**：
+  - 可量化指标：同一策略输出权重和 `0.5` 时，开启现金权重配置后实际持仓约 50%，NAV 中剩余现金不被强制再分配。
+  - UI 验收点：策略回测页可显示目标权重和、现金权重、是否归一化。
+  - 命令 / API 复验：构造固定 2 票各 25% 权重策略，对比默认归一化与 `normalize_target_weights=false` 的成交额和 NAV。
+- **修复记录**：
+  - commit：待提交
+  - 验证命令：`uv run python -m unittest tests.test_backtest_engine_contracts`；`uv run python -m unittest discover tests`
+  - 复验结论：代码级修复通过。新增 `BacktestConfig.normalize_target_weights`，默认 `true` 保持旧策略满仓归一化；配置为 `false` 时保留策略输出的总权重，未分配部分作为现金，并在 `trade_diagnostics.target_weight_policy` 记录是否归一化和现金权重。待 UI 回测面板增加显式开关。
+
+### [2026-05-02] P2 稳定性：被取消或本地等待中断的长任务可能已经落库结果，研究脚本必须手动从历史回填
+
+- **状态**：Verify
+- **来源**：agent 美股 path-quality model probe 研究发现
+- **影响范围**：`/api/tasks`、`strategy_backtest`、`model_train`、长任务取消/超时语义、agent 自动化研究脚本
+- **复现入口**：
+  - 模型训练任务 `0333c556dc2f4abc9cbf9563eef521dd` 显示 `failed` 且错误为 `Cancelled by user`，但模型 `7c6a99802c81` 已生成并可用于策略。
+  - 回测任务 `99c8379a70d24c3d83ee7e43a804cebb` 显示 `failed` 且错误为 `Cancelled by user`，相同窗口已有完成回测 `43610a7cb9dc` / `b9dde45bb74c`。
+  - 本地研究命令超时或 SIGTERM 后，后端任务可能已 completed 并保存 backtest，例如 S302 主窗 `08c978fbc6f3`。
+- **当前证据**：
+  - `/api/tasks` 状态与资产表/回测历史有时需要二次核对；只依赖任务状态会重复提交同一长窗口。
+  - 已在研究脚本 `/Users/m/dev/atlas/tmp/research_0502_pathq_model_probe.py` 和 `/Users/m/dev/atlas/tmp/research_0502_residual_crowding_guard.py` 中加入按 `strategy_id + window + config` 从 `/api/strategies/backtests` 回填的兜底逻辑。
+- **期望行为**：任务取消、超时、late result 的语义应统一；如果结果已经落库，任务状态或错误信息应指向对应 asset/backtest id，避免 agent 和 UI 重复运行。
+- **验收标准**：
+  - 可量化指标：取消/超时后若 late result 被保存，`/api/tasks/{task_id}` 返回可见 `late_result_id` 或状态转为可解释的 late_completed；若 late result 被忽略，则资产表不出现孤儿结果。
+  - UI 验收点：任务列表可区分“真正失败”、“用户取消但结果已保存”、“后台超时后晚完成”。
+  - 命令 / API 复验：提交长回测并在不同阶段取消/中断客户端，核对任务状态、backtest history、日志三者一致。
+- **修复记录**：
+  - commit：待提交
+  - 验证命令：`uv run python -m unittest tests.test_task_executor_contracts tests.test_mcp_market_contracts`；`uv run python -m unittest discover tests`；`cd frontend && pnpm build`
+  - 复验结论：代码级修复通过。REST/MCP 任务状态会在 late result 存在时暴露 `late_result` 和 `late_result_id`，前端任务页会显示 late result 提示。旧研究脚本仍可保留历史回填兜底，但新任务不应再出现完全不可追踪的 late result。
 
 ## Deferred
 
@@ -83,240 +275,4 @@
 
 ## Done
 
-### [2026-05-01] P1 研究链路阻断：A 股研究结果无法沉淀为 qagent 官方回测历史
-
-- **状态**：Done
-- **来源**：human 反馈 / agent live API 复验
-- **影响范围**：A 股因子研究、模型研究、策略创建、`POST /api/strategies`、`/api/strategies/backtests`、回测历史展示
-- **复现入口**：
-  - UI：策略创建页 / 策略回测页选择 CN 市场后无法完成“创建策略 -> 运行正式回测 -> 回测历史可见”的研究交付链路
-  - API / MCP：`POST /api/strategies` with `market="CN"`；后续预期使用 `cn_a_core_indices_union` 作为训练与回测股票池
-  - 资产 ID：股票池 `cn_a_core_indices_union`，临时研究脚本 `/Users/m/dev/atlas/tmp/cn_core_regime_factor_experiment.py` 仅作诊断，不满足正式交付形态
-- **当前证据**：
-  - 实际结果：A 股核心指数并集研究目前只能通过本地脚本输出 JSON / 报告，无法创建 CN 策略资产，因此无法在 qagent 的 backtest history 中形成可直接复用、可比较、可验收的记录。
-  - 日志 / 错误：极简 no-op 策略用 `market="CN"` 调用 `POST /api/strategies` 返回 HTTP `500 Internal Server Error`，响应体只有 `Internal Server Error`；`logs/qagent.log` 未记录可读异常栈。相同极简策略使用 `market="US"` 可成功创建，说明不是策略源码语法通用问题。
-  - 相关指标：临时研究中 `65%` 核心指数并集等权底仓 + `35%` 周频 guarded top80 增强组合 Sharpe `1.8874`、最大回撤 `-13.49%`、日胜率 `57.28%`，但该结果尚未进入 qagent 官方回测历史，不能作为最终研究产物交付。
-- **期望行为**：A 股研究必须能在 qagent 内完成正式资产闭环：因子 / 模型 / 策略资产可创建，策略回测必须限定在 `cn_a_core_indices_union`，并把无未来函数、无数据穿越的回测结果保存到回测历史，供 UI 和 API 直接复验。
-- **验收标准**：
-  - 可量化指标：极简 CN 策略创建返回 HTTP 200；基于 `cn_a_core_indices_union` 的 CN 策略回测能生成正式 backtest record；回测 summary、NAV、交易明细、股票池 ID、参数和数据窗口都可追溯。
-  - UI 验收点：策略创建页能保存 CN 策略；策略回测页选择 `cn_a_core_indices_union` 后能运行并在回测历史看到记录；详情页展示股票池、调仓频率、交易成本、胜率、Sharpe、最大回撤和交易明细。
-  - 命令 / API 复验：`POST /api/strategies` 创建极简 CN 策略后，调用正式回测接口，确认 `GET /api/strategies/backtests?market=CN` 或对应详情接口能返回该记录；错误路径必须返回可读 `detail` 并写入结构化日志。
-- **修复记录**：
-  - commit：本次提交
-  - 验证命令：`uv run python -m unittest tests.test_schema_migrations tests.test_strategy_backtest_market_scope`；live API CN 策略创建 / 回测 / 删除 smoke。
-  - 复验结论：通过。新增策略表 market 唯一约束迁移，修复 legacy `UNIQUE(name, version)` 在 CN 查询/写入路径触发的内部错误；API 500 路径补充结构化日志和可读 detail。CN 极简策略可创建，`cn_a_core_indices_union` 官方回测可完成并写入 `backtest_results`，临时 smoke 资产已删除。
-
-### [2026-05-01] P3 研究功能：正式 CN 策略回测需要支持组合底仓 + 增强卫星的组合层回测
-
-- **状态**：Done
-- **来源**：agent A 股核心指数并集研究
-- **影响范围**：CN 策略研究、组合层回测、`/api/strategies/backtests`、后续 UI 展示
-- **复现入口**：
-  - UI：策略回测页暂无组合底仓 + 策略增强的配置入口
-  - API / MCP：当前正式 backtest 以单个 strategy 为核心，缺少把 `cn_a_core_indices_union` 等权底仓与一个增强策略按固定比例合成的持久化资产
-  - 资产 ID：临时研究脚本 `/Users/m/dev/atlas/tmp/cn_core_regime_factor_experiment.py`
-- **当前证据**：
-  - 实际结果：本轮临时向量化研究显示，`65%` 核心并集等权底仓 + `35%` `legacy_weekly_guarded_top80_equal` 增强的 Sharpe 为 `1.8874`，高于纯核心并集等权代理 `1.8022`，最大回撤 `-13.49%` 接近等权代理 `-12.53%`；但该结果暂时不能作为 qagent 正式 backtest asset 保存。
-  - 日志 / 错误：无异常，属于研究能力缺口。
-  - 相关指标：报告见 `docs/reports/2026-05-01-cn-core-index-union-factor-study.md`。
-- **期望行为**：正式 qagent 能支持组合层配置，例如 `base_leg=cn_a_core_indices_union_equal_weight`、`overlay_strategy_id=<id>`、`base_weight=0.65`、`overlay_weight=0.35`，并保存组合 NAV、回撤、交易成本和底仓/增强贡献。
-- **验收标准**：
-  - 可量化指标：同一 CN 日期窗口下，正式组合回测指标能复现临时脚本的组合层 NAV 口径，误差在可解释范围内。
-  - UI 验收点：策略回测页或组合页能展示底仓、增强腿、权重、总 NAV、分腿收益贡献。
-  - 命令 / API 复验：创建一个 CN 增强策略后，用组合配置运行回测，读取 backtest detail，确认包含组合层 summary 和分腿明细。
-- **修复记录**：
-  - commit：本次提交
-  - 验证命令：`uv run python -m unittest tests.test_backtest_diagnostics_contracts`；live API CN `portfolio_overlay` 回测 smoke。
-  - 复验结论：通过。`BacktestService.run_backtest` 支持 `config.portfolio_overlay`，可将 `core_union_equal_weight` / `equal_weight` base leg 与策略 overlay 按权重合成，详情保留 `config.portfolio_overlay`、`summary.trade_diagnostics.portfolio_legs` 和总 NAV 指标。live smoke 返回 `CONFIG_OVERLAY {"base_leg":"core_union_equal_weight","base_weight":0.65,"overlay_weight":0.35}`，临时回测和策略已删除。
-
-### [2026-05-01] P2 可复现性：US 历史最优 S271 回测无法用同策略同配置复现
-
-- **状态**：Done
-- **来源**：agent live API 复验
-- **影响范围**：US 策略研究链路、`POST /api/strategies/{strategy_id}/backtest`、回测资产可复现性、历史 backtest 对比
-- **复现入口**：
-  - UI：策略回测页选择 US 策略 `M0428_S271_S262_ENTRYSWAP_DDHEAVY_PRETRADE4_R1`
-  - API / MCP：`POST /api/strategies/357056b76e3c/backtest` with `market=US`、`universe_group_id=sp500`
-  - 资产 ID：历史 backtest `12d7b159c3ad`，当前复跑 backtest `99824267db46`
-- **当前证据**：
-  - 实际结果：历史 `12d7b159c3ad` 创建于 `2026-04-28 02:44:26`，配置为 `2026-01-02` 至 `2026-04-02`、`rebalance_freq=daily`、`rebalance_buffer=0.03`、`min_holding_days=0`、`reentry_cooldown_days=5`，指标为 `return=0.640948`、`Sharpe=18.1147`、`MaxDD=-0.056262`、`trades=125`。当前同一策略同一窗口同一交易配置复跑得到 `99824267db46`，指标为 `return=0.379284`、`Sharpe=7.7531`、`MaxDD=-0.065806`、`trades=125`。
-  - 日志 / 错误：无任务错误；两次回测都完成，但交易序列和 NAV 明显不同。例如 `2026-04-02` NAV 从历史 `1640948.5` 降到复跑 `1379283.85`；交易 hash 分别为 `e38161984daf3a46` 和 `ffe930fc52bc09ce`。
-  - 相关指标：当前策略源码 hash 为 `1ecfaa8f6796e1720eba47bcdff24f2757103be26750b47613041f2931f9fcfa`；历史 backtest 未保存策略源码、模型预测快照、因子值快照或数据版本，无法直接判断漂移来自代码、数据、模型资产还是执行语义变化。
-- **期望行为**：历史 backtest 应保存足够快照或版本指纹，使 agent 能判断同配置复跑是否可比；如果数据/模型/服务版本已变化，UI/API 应暴露差异，而不是只给最终指标。
-- **验收标准**：
-  - 可量化指标：新 backtest summary 至少记录 strategy source hash、required model ids 和 model version/hash、factor cache/data watermark、qagent git commit/service version；同配置复跑时能输出可比性诊断。
-  - UI 验收点：回测详情页显示“复现指纹/可比性”区域，能解释历史结果与当前复跑是否使用同一输入。
-  - 命令 / API 复验：对 `357056b76e3c` 同配置连续复跑两次，API 返回相同交易 hash；修改数据或模型后，回测详情能显示指纹差异。
-- **修复记录**：
-  - commit：本次提交
-  - 验证命令：`uv run python -m unittest tests.test_backtest_diagnostics_contracts`；live API CN 回测 smoke 检查 `summary.reproducibility_fingerprint.hash`。
-  - 复验结论：通过。新回测会持久化复现指纹，包含 service/schema 版本、git commit、market、strategy source hash、required factors/models、factor source hash、model metadata hash、config、data watermark、result shape 和稳定 hash；列表接口只暴露轻量 `reproducibility_hash` / `has_reproducibility_fingerprint`。旧历史回测无法补回当时缺失的快照，后续结果已具备可比性诊断基础。
-
-### [2026-05-01] P1 可靠性：CN 并发模型训练会并发写同一因子缓存并触发主键冲突
-
-- **状态**：Done
-- **来源**：agent live API 复验
-- **影响范围**：`/api/models/train`、`FeatureService.compute_features`、`FactorEngine.compute_factor`、`factor_values_cache`、CN 多模型研究链路
-- **复现入口**：
-  - UI：模型训练页同时提交两个使用同一 CN feature set 的训练任务
-  - API / MCP：
-    - `POST /api/models/train`，任务 `fff2674c0c6f45d9898ea684299f9910`
-    - `POST /api/models/train`，任务 `a9014886d61d49b8a5d2e199d772eee5`
-  - 资产 ID：feature set `05821b6c142f`，group `cn_a_core_indices_union`
-- **当前证据**：
-  - 实际结果：两个训练任务并发运行时，多次同时计算同一 CN 因子并写入 `factor_values_cache`；其中一个路径出现唯一键冲突后，`FeatureService` 将该因子记为 `factor_failed`，训练可能继续但特征口径不可比。
-  - 日志 / 错误：`logs/qagent.log` 多次出现 `TransactionContext Error: Failed to commit: PRIMARY KEY or UNIQUE constraint violation`，例如 `duplicate key "cn_builtin_obv_slope_20, sh.600219, 2020-01-02"`、`cn_builtin_rsi_14`、`cn_builtin_volatility_20`、`cn_builtin_统计_rank_20` 等。
-  - 相关指标：两个任务已由 agent 取消，`GET /api/tasks/{task_id}` 返回 `status=failed` 且无 `error_message`，这也降低了问题可诊断性。
-- **期望行为**：同一 market/factor/ticker/date 的缓存写入应并发安全；重复计算时应使用幂等 upsert、任务级锁、或因子级互斥，不能让一个训练任务因为另一个任务先写缓存而丢因子继续训练。
-- **验收标准**：
-  - 可量化指标：并发提交两个使用同一 CN feature set 的训练任务，不出现 factor cache 主键冲突；两个任务使用完整相同的 feature set 或明确失败。
-  - UI 验收点：模型训练任务失败时展示可读错误，而不是 `failed` 但 `error_message=null`。
-  - 命令 / API 复验：并发提交两个小窗口 CN 训练任务并轮询完成；检查日志无 `factor_failed`/`PRIMARY KEY` 冲突。
-- **修复记录**：
-  - commit：本次提交
-  - 验证命令：`uv run python -m unittest tests.test_factor_feature_market_scope`
-  - 复验结论：通过。`FactorEngine` 对 `(market, factor_id)` 的缓存写入加进程内 keyed lock，缓存写入使用唯一临时 relation 名并通过 `conn.register()` 批量写入，避免并发任务互相覆盖固定 `_tmp_fv` 或抢写同一主键。
-
-### [2026-05-01] P2 功能缺失：CN 缺少核心指数成分并集股票池
-
-- **状态**：Done
-- **来源**：human 反馈
-- **影响范围**：A 股研究股票池构建、`/api/groups`、MCP group tools、`GroupService`、`DataService`、后续模型训练与回测链路
-- **复现入口**：
-  - UI：数据管理页 / 股票分组区域点击“刷新指数成分”
-  - API / MCP：
-    - `GET /api/groups?market=CN`
-    - `POST /api/groups/refresh-indices?market=CN`
-    - MCP `refresh_index_groups(market="CN")`
-  - 资产 ID：`cn_sz50`、`cn_hs300`、`cn_zz500`、`cn_chinext`、`cn_a_core_indices_union`
-- **当前证据**：
-  - 实际结果：旧实现只提供 `cn_all_a` 和 `cn_hs300`；之后新增核心指数分组后，外部成分源未刷新或返回空时，`cn_a_core_indices_union` 仍可能保持空成员。
-  - 日志 / 错误：无错误，属于能力缺口。
-  - 相关指标：BaoStock 提供 `query_sz50_stocks`、`query_hs300_stocks`、`query_zz500_stocks`；创业板指成分需走独立公开页面抓取；当前真实种子文件包含上证50 `50` 支、沪深300 `300` 支、中证500 `500` 支、创业板指 `100` 支，去重并集 `806` 支。
-- **期望行为**：提供可复现的 CN 指数成分分组构建能力，支持创建/刷新上证50、沪深300、中证500、创业板指，以及它们的去重并集 `cn_a_core_indices_union`。
-- **验收标准**：
-  - 可量化指标：`GET /api/groups?market=CN` 能看到上述分组；`cn_a_core_indices_union` 成员为四个来源去重并集且全部为 CN ticker；CN 默认 group 和市场级数据更新都使用该 group。
-  - UI 验收点：数据管理页能刷新股票池和指数成分，并显示该并集股票池的名称、来源指数、成员数和刷新时间。
-  - 命令 / API 复验：
-    - `GET /api/groups/cn_a_core_indices_union?market=CN`
-    - `POST /api/groups/refresh-indices?market=CN`
-    - `POST /api/data/update` with `{"market":"CN","mode":"incremental"}` 只对 `cn_a_core_indices_union` 成员增量更新。
-- **修复记录**：
-  - commit：本次提交
-  - 验证命令：`uv run python -m unittest tests.test_data_group_market_scope`；`uv run python -m unittest discover tests`；`cd frontend && pnpm build`；`git diff --check`；`GET /api/groups/{group_id}?market=CN`。
-  - 复验结论：通过；新增真实成分种子 `backend/seeds/cn_core_indices_constituents.json`，`ensure_builtins("CN")` 首次创建时会填充核心指数与并集，`refresh_index_groups("CN")` 在外部源为空且本地无成员时会用种子兜底。后端全量 `96` 个 unittest 通过，前端构建通过，diff whitespace 检查通过；当前运行库 API 返回 `cn_sz50=50`、`cn_hs300=300`、`cn_zz500=500`、`cn_chinext=100`、`cn_a_core_indices_union=806`。BaoStock provider 下载性能/可靠性逻辑未改动，`backend/providers/baostock_provider.py` 无差异。
-
-### [2026-05-01] P2 缺陷：CN listwise 排序训练使用 rank 标签触发 LightGBM label mapping 错误
-
-- **状态**：Done
-- **来源**：agent 研究发现
-- **影响范围**：A 股排序模型训练、`/api/models/train`、`ModelService.train_model`、LightGBM rank/listwise 目标、后续模型驱动策略研究
-- **复现入口**：
-  - API：`POST /api/models/train`
-  - 参数：`market="CN"`、`feature_set_id="05821b6c142f"`、`label_id="cn_preset_fwd_rank_20d"`、`universe_group_id="cn_a_core_indices_union"`、`objective_type="listwise"`、`ranking_config={"query_group":"date","eval_at":[5,10,20],"min_group_size":20}`
-  - 任务 ID：`b174e4c04e9444e0b03acc77760e69b7`
-- **当前证据**：
-  - 实际结果：任务失败，未生成可用 CN 模型。
-  - 日志 / 错误：`lightgbm.basic.LightGBMError: Label 170 is not less than the number of label mappings (31)`。
-  - 相关指标：训练股票池为 `cn_a_core_indices_union`，成员数 `806`；训练窗口为 `2020-01-02` 至 `2023-12-29`，验证窗口为 `2024-01-02` 至 `2024-06-28`，测试窗口为 `2024-07-01` 至 `2024-12-31`，`purge_gap_days=20`。
-- **期望行为**：CN 排序标签在进入 LightGBM ranking/listwise 目标前应被转换为合法的 relevance label，或者 API 明确拒绝不兼容标签/目标组合并提示可修复字段；不应到 LightGBM 底层才失败。
-- **验收标准**：
-  - 可量化指标：同一请求能够成功训练排序模型，或返回 HTTP 400 且错误信息说明标签映射要求。
-  - UI 验收点：模型训练页面选择 CN rank 标签和 listwise/pairwise 目标时，能提示兼容性或完成训练。
-  - 命令 / API 复验：使用上述参数重新提交训练任务，轮询 `/api/tasks/{task_id}`；失败时错误必须为可理解的参数校验，成功时模型 metrics 和 metadata 记录 ranking label 映射。
-- **修复记录**：
-  - commit：本次提交
-  - 验证命令：`uv run python -m unittest tests.test_ranking_dataset tests.test_model_market_scope`
-  - 复验结论：通过。ranking/listwise 默认 `label_gain="ordinal"`，rank 原始标签进入 LightGBM 前会按同日分组转换为 dense non-negative relevance label；`identity` 仅接受已经 dense 的非负整数标签。模型 metadata 记录 `ranking_config.label_gain`，避免 rank 值如 `170` 直接触发 LightGBM label mapping 错误。
-
-### [2026-05-01] P2 缺陷：CN 模型训练完成后因 feature_id / factor_name 校验错配导致无法落库
-
-- **状态**：Done
-- **来源**：agent 研究发现
-- **影响范围**：A 股模型训练、`FeatureService.compute_features`、`ModelService.train_model`、模型资产保存、模型驱动策略回测
-- **复现入口**：
-  - API：`POST /api/models/train`
-  - 参数：`market="CN"`、`feature_set_id="05821b6c142f"`、`label_id="cn_preset_path_return_20d"`、`universe_group_id="cn_a_core_indices_union"`、`model_type="lightgbm"`
-  - 任务 ID：`a9014886d61d49b8a5d2e199d772eee5`
-- **当前证据**：
-  - 实际结果：LightGBM 已训练并输出 metrics，但保存模型前抛出 `ValueError`，导致没有模型落库。
-  - 日志 / 错误：`model.train.metrics` 显示 `valid_ic=0.196119`、`test_ic=0.160735`、`test_daily_ic.mean_ic=0.180602`、`ir=0.773334`；随后 `model.train.feature_mismatch` 显示 `trained=13`、`expected=24`，错误信息列出全部 `factor_id` 为 missing。
-  - 初步根因：`FeatureService.compute_features` 返回 `dict[factor_name -> DataFrame]`，`ModelService` 的 `trained_features` 也是因子名；但持久化前 `expected_features = [ref["factor_id"] ...]`，导致因子名与因子 ID 必然错配。另有 24 因子中仅 13 个进入矩阵的问题需要单独诊断覆盖率/缓存。
-- **期望行为**：模型训练保存前的特征维度校验应使用同一命名空间，或 metadata 同时记录 `factor_id` 与 `factor_name` 映射；不应在训练和评估已完成后误判全部因子缺失。
-- **验收标准**：
-  - 可量化指标：同一训练请求能成功生成模型资产，`GET /api/models?market=CN` 能看到模型；metadata 中 `feature_names` 与模型实际列一致，并可追溯到 `factor_id`。
-  - UI 验收点：CN 模型训练任务成功后，模型列表展示 metrics、特征重要性和 market。
-  - 命令 / API 复验：提交上述训练请求并轮询 `/api/tasks/{task_id}`；完成后调用 `GET /api/models/{model_id}?market=CN` 和一次预测接口。
-- **修复记录**：
-  - commit：本次提交
-  - 验证命令：`uv run python -m unittest tests.test_model_market_scope`
-  - 复验结论：通过。模型落库前校验改为基于训练列的 `factor_name` 命名空间，同时 metadata 新增 `feature_lineage` 记录 `factor_id`、`factor_name`、训练列、缺失声明因子和未声明训练列。未声明训练列仍会阻断保存；声明但训练窗口无有效覆盖的因子会进入 metrics/metadata，而不再误判全部 factor_id 缺失。
-
-### [2026-05-01] P2 缺陷：REST 创建 CN 策略返回 500 且无可读错误
-
-- **状态**：Done
-- **来源**：agent 研究发现
-- **影响范围**：A 股策略研究、`POST /api/strategies`、`StrategyService.create_strategy`、前端策略创建页、后续回测链路
-- **复现入口**：
-  - API：`POST /api/strategies`
-  - 成功对照：相同极简策略使用 `market="US"` 返回 HTTP 200 并生成策略 `56634ff0fe0d`。
-  - 失败请求：相同极简策略使用 `market="CN"`，或 `CN_CORE_MOM_RANK_BASELINE_V1` 策略使用 `market="CN"`。
-- **当前证据**：
-  - 实际结果：HTTP `500 Internal Server Error`，响应体只有 `Internal Server Error`；`GET /api/strategies?market=CN` 返回空数组。
-  - 日志 / 错误：`logs/qagent.log` 未记录对应 CN 策略创建异常栈；只能通过 API 响应看到 500。服务进程仍正常，US 策略创建与 US 回测可继续运行。2026-05-01 复验：带 `from __future__ import annotations` 的极简策略会被策略沙箱以 HTTP 400 正常拒绝；去掉该 import、仅使用允许的 `pandas` / `backend.strategies.base` 后，同一 CN 极简 no-op 策略仍返回 HTTP 500，响应体仍只有 `Internal Server Error`。
-  - 已排除项：策略源码可通过 `backend.strategies.loader.load_strategy_from_code` 正常加载；US 极简策略可创建，说明不是通用策略语法或策略创建接口整体不可用。
-- **期望行为**：CN 策略创建应与 US 一致成功；如果失败，应由 API 返回 HTTP 400/409 等可读错误，并把异常上下文写入结构化日志。
-- **验收标准**：
-  - 可量化指标：极简 CN 策略创建返回 HTTP 200，`GET /api/strategies?market=CN` 可见新增策略；或错误响应包含明确 `detail`。
-  - UI 验收点：策略创建页选择 CN 后能保存策略，错误时显示可修复信息。
-  - 命令 / API 复验：用极简 CN 策略 JSON 调用 `POST /api/strategies`，随后调用 `GET /api/strategies?market=CN`。
-- **修复记录**：
-  - commit：本次提交
-  - 验证命令：`uv run python -m unittest tests.test_schema_migrations tests.test_strategy_backtest_market_scope`；live API CN 策略创建 smoke。
-  - 复验结论：通过。根因是 legacy 策略表约束没有 market 维度；迁移会重建为 `UNIQUE(market, name, version)`，并保留行数校验。CN 策略创建失败时 API 会写入 `api.strategy.create_failed` 结构化日志并返回可读 detail。
-
-### [2026-04-30] P3 技术债：Python 3.14 `datetime.utcnow()` 废弃警告
-
-- **状态**：Done
-- **来源**：agent 发现
-- **影响范围**：backend services、tasks、部分测试 fixture
-- **复现入口**：
-  - UI：无
-  - API / MCP：无直接入口
-  - 资产 ID：无
-- **当前证据**：
-  - 实际结果：`uv run python -m unittest discover tests` 通过，但输出多处 `DeprecationWarning: datetime.datetime.utcnow() is deprecated`。
-  - 日志 / 错误：涉及 `backend/services/data_service.py`、`factor_service.py`、`model_service.py`、`paper_trading_service.py`、`signal_service.py`、`strategy_service.py`、`backend/tasks/executor.py` 和相关测试。
-  - 相关指标：`rg -n "datetime\\.utcnow|utcnow\\(" backend tests` 当前约 `48` 处。
-- **期望行为**：时间戳写入保持兼容，同时测试输出不再被 Python 3.14 deprecation warnings 污染。
-- **验收标准**：
-  - 可量化指标：全量测试不再出现 `datetime.utcnow()` deprecation warning。
-  - UI 验收点：无。
-  - 命令 / API 复验：`uv run python -m unittest discover tests`。
-- **修复记录**：
-  - commit：本次提交
-  - 验证命令：`uv run python -m unittest tests.test_time_utils tests.test_data_group_market_scope`
-  - 复验结论：通过。新增 `backend/time_utils.py`，统一提供 `utc_now_naive()` 和 `utc_now_iso()`；服务层和 task 时间戳写入保持 DuckDB 既有 naive UTC 存储契约，后端源码不再直接调用废弃的 `datetime.utcnow()`。新增测试防止 backend 重新引入 `.utcnow(`。
-
-### [2026-04-30] P3 UI：Ant Design 废弃属性警告
-
-- **状态**：Done
-- **来源**：UI 验收
-- **影响范围**：`frontend/src/pages/MarketPage.tsx` 及复用旧 AntD 写法的前端页面/组件
-- **复现入口**：
-  - UI：`http://127.0.0.1:5173/market`、`/data`、`/models`
-  - API / MCP：无
-  - 资产 ID：无
-- **当前证据**：
-  - 实际结果：Task 14 页面可正常渲染，Playwright console 捕获到 `0` 条 Ant Design warning。
-  - 日志 / 错误：已移除 `bodyStyle`、`Spin tip`、`Space direction`、`Modal destroyOnClose`、`Statistic valueStyle`、`Input addonBefore` 废弃用法。
-  - 相关指标：`rg -n "valueStyle|addonBefore|direction=|destroyOnClose|bodyStyle|tip=" frontend/src` 无命中。
-- **期望行为**：页面不使用 AntD 已废弃 props，dev console 保持低噪音。
-- **验收标准**：
-  - 可量化指标：打开 `/market`、切换 CN、进入 `/data` 和 `/models` 不再出现 AntD warning。
-  - UI 验收点：行情页加载、图表 loading、卡片样式、数据概览、模型训练目标选择和模型指标展示保持一致。
-  - 命令 / API 复验：`cd frontend && pnpm build`；Playwright 浏览器 smoke。
-- **修复记录**：
-  - commit：待提交于 Task 14
-  - 验证命令：`cd frontend && pnpm build`；Playwright console capture。
-  - 复验结论：通过，Task 14 提交后闭环。
+已验收通过的问题已按单问题归档到 `docs/archive/backlog/`，本文件不再保留完整正文。

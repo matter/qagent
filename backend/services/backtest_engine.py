@@ -50,6 +50,7 @@ class BacktestConfig:
     rebalance_buffer_reference: str = "target"  # target / actual_open
     min_holding_days: int = 0           # don't sell a position before N trading days
     reentry_cooldown_days: int = 0      # after selling, wait N days before re-buying
+    normalize_target_weights: bool = True  # legacy default: invest non-empty targets fully
 
     def __post_init__(self) -> None:
         self.market = normalize_market(self.market)
@@ -83,6 +84,7 @@ class BacktestConfig:
             "rebalance_buffer_reference": self.rebalance_buffer_reference,
             "min_holding_days": self.min_holding_days,
             "reentry_cooldown_days": self.reentry_cooldown_days,
+            "normalize_target_weights": self.normalize_target_weights,
         }
 
 
@@ -216,6 +218,9 @@ class BacktestEngine:
         total_cost = 0.0
         total_weight_turnover = 0.0
         num_rebalance_periods = 0
+        last_close_by_ticker: dict[str, float] = {}
+        missing_price_valuations: list[dict[str, Any]] = []
+        last_cash_weight: float | None = None
 
         for day_idx, trade_date in enumerate(all_trading_days):
             trade_date_ts = pd.Timestamp(trade_date)
@@ -248,12 +253,14 @@ class BacktestEngine:
                         )
                         target_weights = dict(sorted_tw[: config.max_positions])
 
-                    # Normalize weights to sum to 1
+                    # Normalize weights to sum to 1 unless the strategy is
+                    # explicitly allowed to hold cash.
                     weight_sum = sum(target_weights.values())
-                    if weight_sum > 0:
+                    if weight_sum > 0 and config.normalize_target_weights:
                         target_weights = {
                             t: w / weight_sum for t, w in target_weights.items()
                         }
+                    last_cash_weight = max(0.0, 1.0 - sum(target_weights.values()))
 
                     # Calculate portfolio value BEFORE rebalance (at today's open)
                     portfolio_value = cash + self._calc_portfolio_value_at_open(
@@ -325,10 +332,19 @@ class BacktestEngine:
                         # preserve existing position sizes, so normalizing would
                         # reintroduce the same add/reduce trades it just blocked.
                         eff_sum = sum(w for w in effective_targets.values() if w > 0)
-                        if eff_sum > 0 and config.rebalance_buffer_mode != "hold_overlap_only":
+                        if (
+                            eff_sum > 0
+                            and config.normalize_target_weights
+                            and config.rebalance_buffer_mode != "hold_overlap_only"
+                        ):
                             effective_targets = {
                                 t: w / eff_sum for t, w in effective_targets.items() if w > 0
                             }
+                        if not config.normalize_target_weights:
+                            last_cash_weight = max(
+                                0.0,
+                                1.0 - sum(w for w in effective_targets.values() if w > 0),
+                            )
 
                     all_involved_tickers = set(current_weights.keys()) | set(
                         effective_targets.keys()
@@ -430,14 +446,30 @@ class BacktestEngine:
             portfolio_value = cash
             valued_positions = 0
             for ticker, shares in holdings.items():
+                used_price: float | None = None
+                valuation_method = "close"
                 if (
                     trade_date_ts in prices_close.index
                     and ticker in prices_close.columns
                 ):
                     close_price = prices_close.loc[trade_date_ts, ticker]
                     if pd.notna(close_price) and close_price > 0:
-                        portfolio_value += shares * close_price
-                        valued_positions += 1
+                        used_price = float(close_price)
+                        last_close_by_ticker[ticker] = used_price
+                if used_price is None:
+                    used_price = last_close_by_ticker.get(ticker)
+                    valuation_method = "last_close_carry_forward"
+                if used_price is not None and used_price > 0:
+                    portfolio_value += shares * used_price
+                    valued_positions += 1
+                    if valuation_method != "close":
+                        missing_price_valuations.append({
+                            "date": str(trade_date_ts.date()),
+                            "ticker": ticker,
+                            "shares": round(float(shares), 8),
+                            "price": round(float(used_price), 6),
+                            "valuation_method": valuation_method,
+                        })
 
             if holdings and valued_positions == 0:
                 # If we can't value, carry forward the last known NAV
@@ -481,6 +513,12 @@ class BacktestEngine:
 
         # Compute trade diagnostics
         trade_diagnostics = _calc_trade_diagnostics(trade_log)
+        trade_diagnostics["missing_price_valuations"] = missing_price_valuations[:1000]
+        trade_diagnostics["missing_price_valuation_count"] = len(missing_price_valuations)
+        trade_diagnostics["target_weight_policy"] = {
+            "normalized": bool(config.normalize_target_weights),
+            "last_cash_weight": round(float(last_cash_weight or 0.0), 6),
+        }
 
         result = BacktestResult(
             config=config.to_dict(),

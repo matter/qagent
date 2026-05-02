@@ -722,7 +722,7 @@ def get_task_status(task_id: str) -> dict:
     if record is None:
         return {"error": f"Task {task_id} not found"}
 
-    return {
+    result = {
         "task_id": record.id,
         "task_type": record.task_type,
         "status": record.status.value,
@@ -733,6 +733,15 @@ def get_task_status(task_id: str) -> dict:
         "started_at": str(record.started_at) if record.started_at else None,
         "completed_at": str(record.completed_at) if record.completed_at else None,
     }
+    if record.result_summary and isinstance(record.result_summary, dict):
+        late_result = record.result_summary.get("late_result")
+        if isinstance(late_result, dict):
+            for key in ("backtest_id", "model_id", "run_id", "signal_run_id", "id"):
+                if key in late_result:
+                    result["late_result_id"] = late_result[key]
+                    break
+            result["late_result"] = late_result
+    return result
 
 
 @mcp.tool()
