@@ -3,7 +3,7 @@ import { Card, Col, Row, Statistic, Table, Tag, Select, Typography } from "antd"
 import type { ColumnsType } from "antd/es/table";
 import ReactECharts from "echarts-for-react";
 import type { EChartsOption } from "echarts";
-import type { TradeRecord, StockPnL } from "../../api";
+import type { RebalanceDiagnostic, TradeRecord, StockPnL } from "../../api";
 import StockTradeChart from "./StockTradeChart";
 
 const { Text } = Typography;
@@ -501,6 +501,82 @@ export function TradeLogTable({ trades }: TradeLogProps) {
         rowKey={(_, idx) => String(idx)}
         size="small"
         pagination={{ pageSize: 20, showSizeChanger: true, pageSizeOptions: [20, 50, 100] }}
+      />
+    </Card>
+  );
+}
+
+// ---- Rebalance Diagnostics ----
+
+interface RebalanceDiagnosticsTableProps {
+  diagnostics?: RebalanceDiagnostic[] | null;
+}
+
+function compactValue(value: unknown): string {
+  if (value === null || value === undefined) return "-";
+  if (Array.isArray(value)) return value.length <= 4 ? value.join(", ") : `${value.length} 项`;
+  if (typeof value === "object") {
+    return Object.entries(value as Record<string, unknown>)
+      .slice(0, 6)
+      .map(([k, v]) => `${k}:${v}`)
+      .join("  ");
+  }
+  return String(value);
+}
+
+export function RebalanceDiagnosticsTable({ diagnostics }: RebalanceDiagnosticsTableProps) {
+  if (!diagnostics || diagnostics.length === 0) return null;
+
+  const columns: ColumnsType<RebalanceDiagnostic> = [
+    {
+      title: "日期",
+      dataIndex: "date",
+      key: "date",
+      width: 110,
+      sorter: (a, b) => String(a.date ?? "").localeCompare(String(b.date ?? "")),
+    },
+    {
+      title: "市场状态",
+      dataIndex: "market_state",
+      key: "market_state",
+      width: 110,
+      render: (v: unknown) => compactValue(v),
+    },
+    {
+      title: "召回分布",
+      dataIndex: "lane_counts",
+      key: "lane_counts",
+      ellipsis: true,
+      render: (v: unknown) => compactValue(v),
+    },
+    {
+      title: "涨停阻断",
+      dataIndex: "blocked_buy_limit_up",
+      key: "blocked_buy_limit_up",
+      width: 100,
+      render: (v: unknown) => compactValue(v),
+    },
+    {
+      title: "跌停保留",
+      dataIndex: "kept_due_limit_down",
+      key: "kept_due_limit_down",
+      width: 100,
+      render: (v: unknown) => compactValue(v),
+    },
+  ];
+
+  return (
+    <Card
+      title={`调仓诊断 (${diagnostics.length} 条)`}
+      size="small"
+      style={{ background: "rgba(0,0,0,0.2)" }}
+    >
+      <Table
+        dataSource={diagnostics}
+        columns={columns}
+        rowKey={(record, idx) => `${record.date ?? "rebalance"}-${idx}`}
+        size="small"
+        pagination={{ pageSize: 10, showSizeChanger: true, pageSizeOptions: [10, 20, 50] }}
       />
     </Card>
   );

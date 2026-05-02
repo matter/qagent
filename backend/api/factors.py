@@ -96,6 +96,10 @@ class EvaluateFactorRequest(BaseModel):
     end_date: str
 
 
+class EvaluateFactorByBodyRequest(EvaluateFactorRequest):
+    factor_id: str
+
+
 # ------------------------------------------------------------------
 # CRUD Endpoints
 # ------------------------------------------------------------------
@@ -344,6 +348,23 @@ async def evaluate_factor(factor_id: str, body: EvaluateFactorRequest) -> dict:
         market=body.market or "US",
     )
     return {"task_id": task_id, "status": "queued", "factor_id": factor_id, "market": body.market or "US"}
+
+
+@router.post("/factors/evaluate")
+async def evaluate_factor_by_body(body: EvaluateFactorByBodyRequest) -> dict:
+    """Trigger factor evaluation with factor_id in the request body.
+
+    This avoids URL-encoding pitfalls for non-ASCII factor IDs used by some
+    built-in CN statistical factors while preserving the legacy path endpoint.
+    """
+    request = EvaluateFactorRequest(
+        market=body.market,
+        label_id=body.label_id,
+        universe_group_id=body.universe_group_id,
+        start_date=body.start_date,
+        end_date=body.end_date,
+    )
+    return await evaluate_factor(body.factor_id, request)
 
 
 @router.get("/factors/{factor_id}/evaluations")

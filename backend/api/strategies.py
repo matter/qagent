@@ -167,6 +167,26 @@ async def get_backtest(
         raise HTTPException(status_code=404, detail=str(e))
 
 
+@router.get("/strategies/backtests/{backtest_id}/rebalance-diagnostics")
+async def get_backtest_rebalance_diagnostics(
+    backtest_id: str,
+    market: Optional[str] = Query(None),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(200, ge=1, le=1000),
+) -> dict:
+    """Get paginated per-rebalance diagnostics for a backtest."""
+    svc = _get_backtest_service()
+    try:
+        return svc.get_rebalance_diagnostics(
+            backtest_id,
+            market=market,
+            offset=offset,
+            limit=limit,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 @router.delete("/strategies/backtests/{backtest_id}")
 async def delete_backtest(
     backtest_id: str,

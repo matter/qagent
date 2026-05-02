@@ -49,8 +49,13 @@ cd frontend && pnpm dev
 - UI: `http://localhost:5173`
 - MCP: `http://127.0.0.1:8000/mcp/`
 - 任务轮询: `GET /api/tasks/{task_id}`
+- 任务筛选: `GET /api/tasks?source=agent&market=CN&task_type=strategy_backtest`
+- 批量取消: `POST /api/tasks/bulk-cancel`
+- 暂停匹配的新任务提交: `POST /api/tasks/pause-rules`
 
 长任务必须走 `TaskExecutor`，返回 `task_id` 后轮询 `/api/tasks/{task_id}`。不要在 API handler、MCP tool 或前端请求里同步阻塞训练、回测、因子计算、信号诊断、paper trading 推进。
+
+如果外部旧脚本持续污染队列，先按实际 `source`、`market`、`task_type` 过滤任务，再批量取消并建立暂停规则。暂停规则只阻断 qagent 的后续任务入队，不负责杀死外部进程；外部进程仍需在运行环境侧停止。
 
 ## 4. Agent 标准研究链路
 
@@ -164,6 +169,23 @@ evaluate_factor(
 )
 ```
 
+中文或其他非 ASCII `factor_id` 推荐使用 body 版 REST 入口，避免客户端路径编码差异：
+
+```http
+POST /api/factors/evaluate
+```
+
+```json
+{
+  "factor_id": "cn_builtin_统计_roc_std_60",
+  "label_id": "cn_preset_fwd_rank_5d",
+  "universe_group_id": "cn_a_core_indices_union",
+  "start_date": "2024-01-02",
+  "end_date": "2025-11-28",
+  "market": "CN"
+}
+```
+
 验收点：
 
 - factor、label、feature set 都返回 `market="CN"`。
@@ -271,6 +293,7 @@ run_backtest(
 - 任务完成后有 `backtest_id`。
 - `GET /api/strategies/backtests?market=CN` 能看到记录。
 - `GET /api/strategies/backtests/{backtest_id}?market=CN` 返回 summary、NAV、drawdown、trades、config。
+- 调仓诊断可通过详情顶层 `rebalance_diagnostics` 或 `GET /api/strategies/backtests/{backtest_id}/rebalance-diagnostics?market=CN` 读取，UI 回测详情会显示调仓诊断表。
 - config 中能追溯 `universe_group_id="cn_a_core_indices_union"`、benchmark、日期窗口、交易成本和调仓频率。
 - summary 中包含 `reproducibility_fingerprint`，列表接口暴露轻量 `reproducibility_hash`，用于比较同配置复跑是否可比。
 
@@ -324,8 +347,16 @@ UI 变更需要浏览器验收；后端逻辑变更需要 API 或服务层测试
 
 - `failed` 任务必须读取 `error`，不要重试到覆盖原始错误。
 - MCP 输入校验错误应包含可修复字段信息；例如非法 `market` 会返回 `Invalid MCP request` 并提示允许值 `US, CN`。
-- 数据锁或 DuckDB 写锁问题优先确认是否已有服务进程在运行。
+- 数据锁或 DuckDB 写锁问题不要直接连接运行中的主库文件；优先使用官方只读诊断接口。
 - 缺数据时先缩小股票池和日期窗口复现，再决定是否补数。
+
+只读诊断入口：
+
+- `GET /api/data/index-bars/{symbol}?market=CN&start=YYYY-MM-DD&end=YYYY-MM-DD`
+- `GET /api/data/groups/{group_id}/daily-snapshot?market=CN&date=YYYY-MM-DD`
+- `GET /api/strategies/backtests/{backtest_id}/rebalance-diagnostics?market=CN`
+
+这些入口覆盖指数行情、股票池横截面覆盖和回测调仓诊断。Data 管理页的“只读诊断”面板可用于 human 验收。
 
 ### 7.1 MCP 常用示例
 

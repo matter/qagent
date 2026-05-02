@@ -11,6 +11,7 @@ import {
   Tag,
   Typography,
   Statistic,
+  DatePicker,
   Row,
   Col,
   message,
@@ -36,6 +37,8 @@ import {
   refreshStockList,
   getUpdateProgress,
   getTaskStatus,
+  getGroupDailySnapshot,
+  getIndexBars,
   updateGroupData,
   listGroups,
   createGroup,
@@ -411,6 +414,107 @@ function DataUpdateSection() {
           />
         )}
       </Space>
+    </Card>
+  );
+}
+
+// ---- Data Diagnostics Section ----
+
+function DataDiagnosticsSection() {
+  const market = getActiveMarket();
+  const [indexSymbol, setIndexSymbol] = useState(market === "CN" ? "sh.000300" : "SPY");
+  const [groupId, setGroupId] = useState(market === "CN" ? "cn_a_core_indices_union" : "sp500");
+  const [targetDate, setTargetDate] = useState<string | undefined>(undefined);
+  const [loadingIndex, setLoadingIndex] = useState(false);
+  const [loadingSnapshot, setLoadingSnapshot] = useState(false);
+  const [indexBars, setIndexBars] = useState<Array<{ date: string; close: number; volume: number }>>([]);
+  const [snapshot, setSnapshot] = useState<{
+    total_tickers: number;
+    tickers_with_bars: number;
+    missing_count: number;
+    missing_tickers: string[];
+  } | null>(null);
+  const [messageApi, contextHolder] = message.useMessage();
+
+  useEffect(() => {
+    setIndexSymbol(market === "CN" ? "sh.000300" : "SPY");
+    setGroupId(market === "CN" ? "cn_a_core_indices_union" : "sp500");
+    setIndexBars([]);
+    setSnapshot(null);
+  }, [market]);
+
+  const fetchIndex = async () => {
+    setLoadingIndex(true);
+    try {
+      const rows = await getIndexBars(indexSymbol, undefined, undefined, market);
+      setIndexBars(rows.slice(-20));
+    } catch {
+      messageApi.error("指数行情读取失败");
+    } finally {
+      setLoadingIndex(false);
+    }
+  };
+
+  const fetchSnapshot = async () => {
+    if (!targetDate) {
+      messageApi.warning("请选择诊断日期");
+      return;
+    }
+    setLoadingSnapshot(true);
+    try {
+      setSnapshot(await getGroupDailySnapshot(groupId, targetDate, market));
+    } catch {
+      messageApi.error("横截面诊断读取失败");
+    } finally {
+      setLoadingSnapshot(false);
+    }
+  };
+
+  return (
+    <Card title={<Space size={8}><span>只读诊断</span><Tag color={market === "CN" ? "red" : "blue"}>{market}</Tag></Space>}>
+      {contextHolder}
+      <Row gutter={[16, 16]}>
+        <Col xs={24} lg={12}>
+          <Space direction="vertical" style={{ width: "100%" }}>
+            <Space.Compact style={{ width: "100%" }}>
+              <Input value={indexSymbol} onChange={(e) => setIndexSymbol(e.target.value)} />
+              <Button loading={loadingIndex} onClick={fetchIndex}>读取指数</Button>
+            </Space.Compact>
+            <Table
+              dataSource={indexBars}
+              rowKey="date"
+              size="small"
+              pagination={false}
+              columns={[
+                { title: "日期", dataIndex: "date", key: "date" },
+                { title: "收盘", dataIndex: "close", key: "close", align: "right" as const },
+                { title: "成交量", dataIndex: "volume", key: "volume", align: "right" as const },
+              ]}
+            />
+          </Space>
+        </Col>
+        <Col xs={24} lg={12}>
+          <Space direction="vertical" style={{ width: "100%" }}>
+            <Space.Compact style={{ width: "100%" }}>
+              <Input value={groupId} onChange={(e) => setGroupId(e.target.value)} />
+              <DatePicker style={{ width: 150 }} onChange={(_, dateString) => setTargetDate(Array.isArray(dateString) ? dateString[0] : dateString)} />
+              <Button loading={loadingSnapshot} onClick={fetchSnapshot}>横截面</Button>
+            </Space.Compact>
+            {snapshot ? (
+              <Descriptions size="small" column={2} bordered>
+                <Descriptions.Item label="股票数">{snapshot.total_tickers}</Descriptions.Item>
+                <Descriptions.Item label="有行情">{snapshot.tickers_with_bars}</Descriptions.Item>
+                <Descriptions.Item label="缺失数">{snapshot.missing_count}</Descriptions.Item>
+                <Descriptions.Item label="缺失样例">
+                  {snapshot.missing_tickers.slice(0, 8).join(", ") || "-"}
+                </Descriptions.Item>
+              </Descriptions>
+            ) : (
+              <Text type="secondary">选择日期后读取股票池当日行情覆盖。</Text>
+            )}
+          </Space>
+        </Col>
+      </Row>
     </Card>
   );
 }
@@ -821,6 +925,7 @@ export default function DataManagePage() {
     <Space orientation="vertical" style={{ width: "100%" }} size="middle">
       <DataStatusSection />
       <DataUpdateSection />
+      <DataDiagnosticsSection />
       <StockGroupsSection />
     </Space>
   );

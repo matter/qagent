@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Any, Callable
 
 from backend.logger import get_logger
+from backend.services.market_context import normalize_market
 from backend.tasks.models import TaskRecord, TaskSource, TaskStatus
 from backend.tasks.store import TaskStore
 from backend.time_utils import utc_now_naive
@@ -19,6 +20,10 @@ log = get_logger(__name__)
 # Default timeout in seconds if none specified.
 DEFAULT_TIMEOUT = 300
 MAX_WORKERS = 6
+
+
+class TaskSubmissionPaused(ValueError):
+    """Raised when a task submission matches an active pause rule."""
 
 
 class TaskExecutor:
@@ -55,6 +60,22 @@ class TaskExecutor:
         """
         tid = task_id or uuid.uuid4().hex
         timeout = timeout or DEFAULT_TIMEOUT
+        market = self._pause_rule_market(params)
+        pause_rule = self._get_matching_pause_rule(
+            task_type=task_type,
+            source=source,
+            market=market,
+        )
+        if pause_rule:
+            detail = (
+                f"Task submission paused by rule {pause_rule['id']}: "
+                f"task_type={pause_rule.get('task_type') or '*'}, "
+                f"source={pause_rule.get('source') or '*'}, "
+                f"market={pause_rule.get('market') or '*'}"
+            )
+            if pause_rule.get("reason"):
+                detail = f"{detail}; reason={pause_rule['reason']}"
+            raise TaskSubmissionPaused(detail)
 
         record = TaskRecord(
             id=tid,
@@ -71,6 +92,27 @@ class TaskExecutor:
         self._futures[tid] = future
         log.info("task.submitted", task_id=tid, task_type=task_type)
         return tid
+
+    def _get_matching_pause_rule(
+        self,
+        *,
+        task_type: str,
+        source: TaskSource,
+        market: str | None,
+    ) -> dict[str, Any] | None:
+        get_rule = getattr(self._store, "get_matching_pause_rule", None)
+        if get_rule is None:
+            return None
+        return get_rule(task_type=task_type, source=source, market=market)
+
+    @staticmethod
+    def _pause_rule_market(params: dict[str, Any] | None) -> str | None:
+        if params is None:
+            return "US"
+        try:
+            return normalize_market(params.get("market"))
+        except ValueError:
+            return str(params.get("market")) if params.get("market") else None
 
     def retry(self, task_id: str, fn: Callable[..., Any]) -> str:
         """Re-run a previously failed/timed-out task with the same params."""
@@ -118,6 +160,28 @@ class TaskExecutor:
         )
         log.info("task.cancelled", task_id=task_id)
         return True
+
+    def cancel_matching(
+        self,
+        *,
+        task_type: str | None = None,
+        source: TaskSource | None = None,
+        market: str | None = None,
+    ) -> list[str]:
+        """Cancel in-memory tasks matching optional filters."""
+        cancelled: list[str] = []
+        for task_id, record in list(self._records.items()):
+            if record.status not in (TaskStatus.QUEUED, TaskStatus.RUNNING):
+                continue
+            if task_type and record.task_type != task_type:
+                continue
+            if source and record.source != source:
+                continue
+            if market and self._pause_rule_market(record.params) != normalize_market(market):
+                continue
+            if self.cancel(task_id):
+                cancelled.append(task_id)
+        return cancelled
 
     def has_running_task(self, task_type: str) -> str | None:
         """Return task_id if there's a running/queued task of this type, else None."""

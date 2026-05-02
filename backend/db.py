@@ -32,6 +32,18 @@ CREATE TABLE IF NOT EXISTS task_runs (
 );
 """
 
+_TASK_PAUSE_RULES_DDL = """\
+CREATE TABLE IF NOT EXISTS task_pause_rules (
+    id          VARCHAR PRIMARY KEY,
+    task_type   VARCHAR,
+    source      VARCHAR,
+    market      VARCHAR,
+    reason      TEXT,
+    active      BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMP NOT NULL DEFAULT current_timestamp
+);
+"""
+
 _STOCKS_DDL = """\
 CREATE TABLE IF NOT EXISTS stocks (
     market      VARCHAR NOT NULL DEFAULT 'US',
@@ -335,6 +347,7 @@ def init_db() -> None:
     conn = get_connection()
     for name, ddl in (
         ("task_runs", _TASK_RUNS_DDL),
+        ("task_pause_rules", _TASK_PAUSE_RULES_DDL),
         ("stocks", _STOCKS_DDL),
         ("daily_bars", _DAILY_BARS_DDL),
         ("index_bars", _INDEX_BARS_DDL),

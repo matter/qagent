@@ -5,10 +5,12 @@ from __future__ import annotations
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
 
 from backend.logger import get_logger
+from backend.services.market_context import normalize_market
 from backend.tasks.executor import TaskExecutor, get_task_executor
-from backend.tasks.models import TaskStatus
+from backend.tasks.models import TaskSource, TaskStatus
 from backend.tasks.store import TaskStore
 
 log = get_logger(__name__)
@@ -56,17 +58,106 @@ def _record_to_dict(record) -> dict:
     return result
 
 
+class BulkCancelTasksRequest(BaseModel):
+    task_type: Optional[str] = None
+    status: Optional[str] = None
+    source: Optional[TaskSource] = None
+    market: Optional[str] = None
+
+
+class PauseRuleRequest(BaseModel):
+    task_type: Optional[str] = None
+    source: Optional[TaskSource] = None
+    market: Optional[str] = None
+    reason: Optional[str] = None
+
+
+def _validate_market(market: str | None) -> str | None:
+    if market is None:
+        return None
+    try:
+        return normalize_market(market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.get("")
 async def list_tasks(
     task_type: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
+    source: Optional[TaskSource] = Query(None),
+    market: Optional[str] = Query(None),
     limit: int = Query(100, ge=1, le=500),
 ) -> list[dict]:
     """List all tasks, optionally filtered by type and status."""
     store = _get_store()
     task_status = TaskStatus(status) if status else None
-    records = store.list_tasks(task_type=task_type, status=task_status, limit=limit)
+    resolved_market = _validate_market(market)
+    records = store.list_tasks(
+        task_type=task_type,
+        status=task_status,
+        source=source,
+        market=resolved_market,
+        limit=limit,
+    )
     return [_record_to_dict(r) for r in records]
+
+
+@router.post("/bulk-cancel")
+async def bulk_cancel_tasks(body: BulkCancelTasksRequest) -> dict:
+    """Cancel queued/running tasks matching source, market, and type filters."""
+    if body.status and body.status not in {"queued", "running"}:
+        raise HTTPException(
+            status_code=400,
+            detail="bulk cancel only supports queued/running tasks",
+        )
+    resolved_market = _validate_market(body.market)
+    executor = _get_executor()
+    store = _get_store()
+    cancelled = set(
+        executor.cancel_matching(
+            task_type=body.task_type,
+            source=body.source,
+            market=resolved_market,
+        )
+    )
+    for task_id in store.mark_matching_active_cancelled(
+        task_type=body.task_type,
+        source=body.source,
+        market=resolved_market,
+    ):
+        cancelled.add(task_id)
+    return {
+        "status": "cancelled",
+        "cancelled_count": len(cancelled),
+        "task_ids": sorted(cancelled),
+    }
+
+
+@router.get("/pause-rules")
+async def list_pause_rules(active_only: bool = Query(True)) -> list[dict]:
+    """List task submission pause rules."""
+    return _get_store().list_pause_rules(active_only=active_only)
+
+
+@router.post("/pause-rules")
+async def create_pause_rule(body: PauseRuleRequest) -> dict:
+    """Pause future task submissions matching optional type/source/market filters."""
+    return _get_store().create_pause_rule(
+        task_type=body.task_type,
+        source=body.source,
+        market=_validate_market(body.market),
+        reason=body.reason,
+    )
+
+
+@router.delete("/pause-rules/{rule_id}")
+async def delete_pause_rule(rule_id: str) -> dict:
+    """Deactivate a task submission pause rule."""
+    ok = _get_store().delete_pause_rule(rule_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Pause rule not found")
+    return {"id": rule_id, "status": "deleted"}
 
 
 @router.post("/{task_id}/cancel")

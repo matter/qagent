@@ -27,7 +27,7 @@ import {
   listGroups,
   createFactor,
   updateFactor,
-  evaluateFactor,
+  evaluateFactorByBody,
   getTaskStatus,
   getEvaluation,
 } from "../../api";
@@ -234,7 +234,8 @@ export default function FactorEditor({ editingFactor, evalConfig, onFactorSaved 
       }
 
       // Trigger evaluation
-      const { task_id } = await evaluateFactor(factor.id, {
+      const { task_id } = await evaluateFactorByBody({
+        factor_id: factor.id,
         label_id: selectedLabel,
         universe_group_id: selectedGroup,
         start_date: dateRange[0].format("YYYY-MM-DD"),

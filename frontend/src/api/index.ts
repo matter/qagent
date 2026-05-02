@@ -33,6 +33,28 @@ export interface DailyBar {
   adj_factor: number;
 }
 
+export interface IndexBar {
+  market: Market;
+  symbol: string;
+  date: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+export interface GroupDailySnapshot {
+  market: Market;
+  group_id: string;
+  date: string;
+  total_tickers: number;
+  tickers_with_bars: number;
+  missing_count: number;
+  missing_tickers: string[];
+  items: Array<DailyBar & { has_bar: boolean }>;
+}
+
 export interface DataStatus {
   market?: Market;
   stock_count: number;
@@ -88,6 +110,30 @@ export async function getDailyBars(
 ): Promise<DailyBar[]> {
   const { data } = await client.get<DailyBar[]>(`/stocks/${ticker}/daily`, {
     params: { start, end, market: market || undefined },
+  });
+  return data;
+}
+
+export async function getIndexBars(
+  symbol: string,
+  start?: string,
+  end?: string,
+  market?: Market,
+): Promise<IndexBar[]> {
+  const { data } = await client.get<IndexBar[]>(`/data/index-bars/${symbol}`, {
+    params: { start, end, market: market || undefined },
+  });
+  return data;
+}
+
+export async function getGroupDailySnapshot(
+  groupId: string,
+  targetDate: string,
+  market?: Market,
+  limit = 500,
+): Promise<GroupDailySnapshot> {
+  const { data } = await client.get<GroupDailySnapshot>(`/data/groups/${groupId}/daily-snapshot`, {
+    params: { date: targetDate, market: market || undefined, limit },
   });
   return data;
 }
@@ -367,6 +413,20 @@ export async function evaluateFactor(
   return data;
 }
 
+export async function evaluateFactorByBody(
+  body: {
+    factor_id: string;
+    market?: string;
+    label_id: string;
+    universe_group_id: string;
+    start_date: string;
+    end_date: string;
+  },
+): Promise<{ task_id: string; factor_id: string; market?: string }> {
+  const { data } = await client.post<{ task_id: string; factor_id: string; market?: string }>("/factors/evaluate", body);
+  return data;
+}
+
 export async function listEvaluations(factorId: string, market?: string): Promise<FactorEvalRecord[]> {
   const { data } = await client.get<FactorEvalRecord[]>(`/factors/${factorId}/evaluations`, {
     params: { market: market || undefined },
@@ -411,6 +471,8 @@ export async function getTaskStatus(taskId: string): Promise<TaskStatus> {
 export async function listTasks(params?: {
   task_type?: string;
   status?: string;
+  source?: string;
+  market?: string;
   limit?: number;
 }): Promise<TaskStatus[]> {
   const { data } = await client.get<TaskStatus[]>("/tasks", { params });
@@ -419,6 +481,51 @@ export async function listTasks(params?: {
 
 export async function cancelTask(taskId: string): Promise<{ task_id: string; status: string }> {
   const { data } = await client.post<{ task_id: string; status: string }>(`/tasks/${taskId}/cancel`, {});
+  return data;
+}
+
+export async function bulkCancelTasks(params: {
+  task_type?: string;
+  status?: string;
+  source?: string;
+  market?: string;
+}): Promise<{ status: string; cancelled_count: number; task_ids: string[] }> {
+  const { data } = await client.post<{ status: string; cancelled_count: number; task_ids: string[] }>(
+    "/tasks/bulk-cancel",
+    params,
+  );
+  return data;
+}
+
+export interface TaskPauseRule {
+  id: string;
+  task_type: string | null;
+  source: string | null;
+  market: string | null;
+  reason: string | null;
+  active: boolean;
+  created_at: string | null;
+}
+
+export async function listTaskPauseRules(activeOnly = true): Promise<TaskPauseRule[]> {
+  const { data } = await client.get<TaskPauseRule[]>("/tasks/pause-rules", {
+    params: { active_only: activeOnly },
+  });
+  return data;
+}
+
+export async function createTaskPauseRule(params: {
+  task_type?: string;
+  source?: string;
+  market?: string;
+  reason?: string;
+}): Promise<TaskPauseRule> {
+  const { data } = await client.post<TaskPauseRule>("/tasks/pause-rules", params);
+  return data;
+}
+
+export async function deleteTaskPauseRule(ruleId: string): Promise<{ id: string; status: string }> {
+  const { data } = await client.delete<{ id: string; status: string }>(`/tasks/pause-rules/${ruleId}`);
   return data;
 }
 
@@ -576,6 +683,17 @@ export interface BacktestResultDetail extends BacktestResultSummary {
   monthly_returns: Record<string, Record<string, number>> | null;
   trades: TradeRecord[] | null;
   stock_pnl: StockPnL[] | null;
+  rebalance_diagnostics?: RebalanceDiagnostic[] | null;
+  rebalance_diagnostics_count?: number;
+}
+
+export interface RebalanceDiagnostic {
+  date?: string;
+  market_state?: string;
+  lane_counts?: Record<string, number>;
+  blocked_buy_limit_up?: number | string[] | null;
+  kept_due_limit_down?: number | string[] | null;
+  [key: string]: unknown;
 }
 
 export interface TradeRecord {

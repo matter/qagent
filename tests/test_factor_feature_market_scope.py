@@ -202,10 +202,14 @@ class FactorFeatureMarketScopeTests(unittest.TestCase):
     def test_factor_api_forwards_market_scope(self):
         fake_service = _FakeFactorService()
         fake_eval_service = _FakeFactorEvalService()
+        fake_group_service = _FakeGroupService()
+        fake_executor = _FakeExecutor()
 
         with (
             patch.object(factor_api, "_service", fake_service),
             patch.object(factor_api, "_eval_service", fake_eval_service),
+            patch.object(factor_api, "_group_service", fake_group_service),
+            patch.object(factor_api, "_get_executor", return_value=fake_executor),
         ):
             created = _run_async(
                 factor_api.create_factor(
@@ -219,12 +223,34 @@ class FactorFeatureMarketScopeTests(unittest.TestCase):
             listed = _run_async(factor_api.list_factors(market="CN"))
             detail = _run_async(factor_api.get_factor("factor_cn", market="CN"))
             evaluations = _run_async(factor_api.list_all_evaluations(market="CN"))
+            evaluate_task = _run_async(
+                factor_api.evaluate_factor_by_body(
+                    factor_api.EvaluateFactorByBodyRequest(
+                        factor_id="cn_builtin_统计_roc_std_60",
+                        label_id="cn_preset_fwd_rank_5d",
+                        universe_group_id="cn_a_core_indices_union",
+                        start_date="2024-01-02",
+                        end_date="2025-11-28",
+                        market="CN",
+                    )
+                )
+            )
 
         self.assertEqual(created["market"], "CN")
         self.assertEqual(listed[0]["market"], "CN")
         self.assertEqual(detail["market"], "CN")
         self.assertEqual(evaluations[0]["market"], "CN")
-        self.assertEqual(fake_service.calls, [("create", "CN"), ("list", "CN"), ("get", "CN")])
+        self.assertEqual(evaluate_task["factor_id"], "cn_builtin_统计_roc_std_60")
+        self.assertEqual(fake_executor.params["factor_id"], "cn_builtin_统计_roc_std_60")
+        self.assertEqual(
+            fake_service.calls,
+            [
+                ("create", "CN"),
+                ("list", "CN"),
+                ("get", "CN"),
+                ("get", "CN"),
+            ],
+        )
         self.assertEqual(fake_eval_service.calls, [("list_all", "CN")])
 
     def test_feature_api_forwards_market_scope(self):
@@ -453,6 +479,20 @@ class _FakeFeatureService:
     def get_feature_set(self, fs_id, market=None):
         self.calls.append(("get", market))
         return {"id": fs_id, "market": market}
+
+
+class _FakeGroupService:
+    def get_group_tickers(self, group_id, market=None):
+        return ["sh.600000"]
+
+
+class _FakeExecutor:
+    def __init__(self):
+        self.params = None
+
+    def submit(self, task_type, fn, params, timeout, source):
+        self.params = params
+        return "task_factor_eval"
 
 
 if __name__ == "__main__":

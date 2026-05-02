@@ -694,13 +694,19 @@ class BacktestService:
             raise ValueError(f"Backtest {backtest_id} not found")
 
         trades = _parse_json(row[12]) if row[12] else []
+        summary = _parse_json(row[4])
+        rebalance_diagnostics = []
+        if isinstance(summary, dict):
+            raw_diagnostics = summary.get("rebalance_diagnostics")
+            if isinstance(raw_diagnostics, list):
+                rebalance_diagnostics = raw_diagnostics
 
-        return {
+        detail = {
             "id": row[0],
             "market": row[1],
             "strategy_id": row[2],
             "config": _parse_json(row[3]),
-            "summary": _parse_json(row[4]),
+            "summary": summary,
             "nav_series": _parse_json(row[5]),
             "benchmark_nav": _parse_json(row[6]),
             "drawdown_series": _parse_json(row[7]),
@@ -710,6 +716,47 @@ class BacktestService:
             "created_at": str(row[11]) if row[11] else None,
             "trades": trades,
             "stock_pnl": _compute_stock_pnl(trades if isinstance(trades, list) else []),
+        }
+        if rebalance_diagnostics:
+            detail["rebalance_diagnostics"] = rebalance_diagnostics
+            detail["rebalance_diagnostics_count"] = len(rebalance_diagnostics)
+        return detail
+
+    def get_rebalance_diagnostics(
+        self,
+        backtest_id: str,
+        market: str | None = None,
+        *,
+        offset: int = 0,
+        limit: int = 200,
+    ) -> dict:
+        """Return paginated per-rebalance diagnostics for a backtest."""
+        resolved_market = normalize_market(market)
+        safe_offset = max(0, int(offset))
+        safe_limit = min(max(1, int(limit)), 1000)
+        conn = get_connection()
+        row = conn.execute(
+            """SELECT market, summary
+               FROM backtest_results
+               WHERE id = ? AND market = ?""",
+            [backtest_id, resolved_market],
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Backtest {backtest_id} not found")
+
+        summary = _parse_json(row[1])
+        diagnostics = []
+        if isinstance(summary, dict) and isinstance(summary.get("rebalance_diagnostics"), list):
+            diagnostics = summary["rebalance_diagnostics"]
+        total = len(diagnostics)
+        items = diagnostics[safe_offset:safe_offset + safe_limit]
+        return {
+            "backtest_id": backtest_id,
+            "market": row[0],
+            "total": total,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "items": items,
         }
 
     def delete_backtest(self, backtest_id: str, market: str | None = None) -> None:
@@ -1042,6 +1089,7 @@ class BacktestService:
         resolved_market = normalize_market(market)
         result: dict[str, dict[str, pd.Series]] = {}
         failed_models: list[tuple[str, str]] = []
+        feature_matrix_cache: dict[str, pd.DataFrame] = {}
 
         for model_id in model_ids:
             try:
@@ -1051,22 +1099,26 @@ class BacktestService:
                 )
                 fs_id = record["feature_set_id"]
 
-                # Compute features for full date range (use bulk cache path)
-                feature_data = self._model_service._feature_service.compute_features_from_cache(
-                    fs_id, tickers, start_date, end_date, market=resolved_market
-                )
+                if fs_id in feature_matrix_cache:
+                    X = feature_matrix_cache[fs_id]
+                else:
+                    # Compute features for full date range (use bulk cache path)
+                    feature_data = self._model_service._feature_service.compute_features_from_cache(
+                        fs_id, tickers, start_date, end_date, market=resolved_market
+                    )
 
-                # Build full X matrix: (date, ticker) x factors
-                X, _ = ModelService._build_Xy(
-                    feature_data,
-                    # Dummy label_df: we only need X, not y
-                    pd.DataFrame(columns=["ticker", "date", "label_value"]),
-                )
+                    # Build full X matrix: (date, ticker) x factors
+                    X, _ = ModelService._build_Xy(
+                        feature_data,
+                        # Dummy label_df: we only need X, not y
+                        pd.DataFrame(columns=["ticker", "date", "label_value"]),
+                    )
 
-                # _build_Xy returns empty if no labels overlap.
-                # Instead, build X directly from feature_data.
-                if X.empty:
-                    X = self._build_full_X(feature_data)
+                    # _build_Xy returns empty if no labels overlap.
+                    # Instead, build X directly from feature_data.
+                    if X.empty:
+                        X = self._build_full_X(feature_data)
+                    feature_matrix_cache[fs_id] = X
 
                 if X.empty:
                     log.warning("backtest_service.batch_predict.empty_X", model_id=model_id)

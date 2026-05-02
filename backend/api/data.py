@@ -6,6 +6,7 @@ from datetime import date, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.params import Query as QueryParam
 from pydantic import BaseModel, Field
 
 from backend.db import get_connection
@@ -390,3 +391,118 @@ async def get_daily_bars(
         }
         for r in rows
     ]
+
+
+@router.get("/data/index-bars/{symbol}")
+async def get_index_bars(
+    symbol: str,
+    start: Optional[date] = Query(None),
+    end: Optional[date] = Query(None),
+    market: Optional[str] = Query(None),
+) -> list[dict]:
+    """Get daily bars for a benchmark/index symbol."""
+    try:
+        resolved_market = normalize_market(market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if end is None:
+        end = date.today()
+    if start is None:
+        start = end - timedelta(days=365)
+
+    conn = get_connection()
+    resolved_symbol = normalize_ticker(symbol, resolved_market)
+    rows = conn.execute(
+        """SELECT date, open, high, low, close, volume
+           FROM index_bars
+           WHERE market = ? AND symbol = ? AND date BETWEEN ? AND ?
+           ORDER BY date""",
+        [resolved_market, resolved_symbol, start, end],
+    ).fetchall()
+
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"No index data found for {symbol}")
+
+    return [
+        {
+            "market": resolved_market,
+            "symbol": resolved_symbol,
+            "date": str(r[0]),
+            "open": r[1],
+            "high": r[2],
+            "low": r[3],
+            "close": r[4],
+            "volume": r[5],
+        }
+        for r in rows
+    ]
+
+
+@router.get("/data/groups/{group_id}/daily-snapshot")
+async def get_group_daily_snapshot(
+    group_id: str,
+    target_date: date = Query(..., alias="date"),
+    market: Optional[str] = Query(None),
+    limit: int = Query(500, ge=1, le=5000),
+) -> dict:
+    """Return market-scoped group bar coverage for one date."""
+    try:
+        resolved_market = normalize_market(market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if isinstance(limit, QueryParam):
+        limit = 500
+
+    conn = get_connection()
+    group_exists = conn.execute(
+        "SELECT 1 FROM stock_groups WHERE id = ? AND market = ?",
+        [group_id, resolved_market],
+    ).fetchone()
+    if group_exists is None:
+        raise HTTPException(status_code=404, detail=f"Group {group_id} not found")
+
+    rows = conn.execute(
+        """SELECT m.ticker,
+                  b.open,
+                  b.high,
+                  b.low,
+                  b.close,
+                  b.volume,
+                  b.adj_factor
+           FROM stock_group_members m
+           LEFT JOIN daily_bars b
+             ON b.market = m.market
+            AND b.ticker = m.ticker
+            AND b.date = ?
+           WHERE m.group_id = ? AND m.market = ?
+           ORDER BY m.ticker
+           LIMIT ?""",
+        [target_date, group_id, resolved_market, limit],
+    ).fetchall()
+
+    items = [
+        {
+            "market": resolved_market,
+            "ticker": row[0],
+            "date": str(target_date),
+            "has_bar": row[4] is not None,
+            "open": row[1],
+            "high": row[2],
+            "low": row[3],
+            "close": row[4],
+            "volume": row[5],
+            "adj_factor": row[6],
+        }
+        for row in rows
+    ]
+    missing = [item["ticker"] for item in items if not item["has_bar"]]
+    return {
+        "market": resolved_market,
+        "group_id": group_id,
+        "date": str(target_date),
+        "total_tickers": len(items),
+        "tickers_with_bars": len(items) - len(missing),
+        "missing_count": len(missing),
+        "missing_tickers": missing,
+        "items": items,
+    }

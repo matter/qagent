@@ -11,7 +11,7 @@ import pandas as pd
 from backend.time_utils import utc_now_naive
 from backend.services.data_service import DataService
 from backend.services.group_service import GroupService, _fetch_chinext_tickers
-from backend.api.data import search_stocks
+from backend.api.data import get_group_daily_snapshot, get_index_bars, search_stocks
 
 
 class DataAndGroupMarketScopeTests(unittest.TestCase):
@@ -211,6 +211,81 @@ class DataAndGroupMarketScopeTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["market"], "CN")
         self.assertEqual(rows[0]["ticker"], "sh.600000")
+
+    def test_index_bars_api_reads_market_scoped_index_history(self):
+        self.conn.execute(
+            """
+            INSERT INTO index_bars (market, symbol, date, open, high, low, close, volume)
+            VALUES
+                ('CN', 'sh.000300', DATE '2024-01-02', 3300, 3310, 3290, 3305, 2000),
+                ('US', 'sh.000300', DATE '2024-01-02', 4300, 4310, 4290, 4305, 3000)
+            """
+        )
+
+        with patch("backend.api.data.get_connection", return_value=self.conn):
+            rows = asyncio.run(
+                get_index_bars(
+                    symbol="sh.000300",
+                    start=date(2024, 1, 1),
+                    end=date(2024, 1, 3),
+                    market="CN",
+                )
+            )
+
+        self.assertEqual(rows, [
+            {
+                "market": "CN",
+                "symbol": "sh.000300",
+                "date": "2024-01-02",
+                "open": 3300.0,
+                "high": 3310.0,
+                "low": 3290.0,
+                "close": 3305.0,
+                "volume": 2000,
+            }
+        ])
+
+    def test_group_daily_snapshot_reports_missing_bars_without_duckdb_access(self):
+        self.conn.execute(
+            """
+            INSERT INTO stock_groups (id, market, name, group_type)
+            VALUES ('cn_group', 'CN', 'CN Group', 'custom')
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO stock_group_members (group_id, market, ticker)
+            VALUES
+                ('cn_group', 'CN', 'sh.600000'),
+                ('cn_group', 'CN', 'sh.600001')
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO daily_bars (market, ticker, date, open, high, low, close, volume, adj_factor)
+            VALUES ('CN', 'sh.600000', DATE '2024-01-02', 10, 11, 9, 10.5, 1000, 1)
+            """
+        )
+
+        with patch("backend.api.data.get_connection", return_value=self.conn):
+            snapshot = asyncio.run(
+                get_group_daily_snapshot(
+                    group_id="cn_group",
+                    target_date=date(2024, 1, 2),
+                    market="CN",
+                )
+            )
+
+        self.assertEqual(snapshot["market"], "CN")
+        self.assertEqual(snapshot["group_id"], "cn_group")
+        self.assertEqual(snapshot["date"], "2024-01-02")
+        self.assertEqual(snapshot["total_tickers"], 2)
+        self.assertEqual(snapshot["tickers_with_bars"], 1)
+        self.assertEqual(snapshot["missing_count"], 1)
+        self.assertEqual(snapshot["missing_tickers"], ["sh.600001"])
+        self.assertEqual(snapshot["items"][0]["ticker"], "sh.600000")
+        self.assertTrue(snapshot["items"][0]["has_bar"])
+        self.assertFalse(snapshot["items"][1]["has_bar"])
 
     def test_incremental_update_does_not_skip_empty_market(self):
         provider = _OneCnProvider()

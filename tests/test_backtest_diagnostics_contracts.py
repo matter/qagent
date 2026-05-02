@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import patch
 
+import pandas as pd
+
 from backend.services.backtest_engine import BacktestResult
 from backend.services.backtest_service import BacktestService
 
@@ -41,6 +43,65 @@ class BacktestDiagnosticsContractTests(unittest.TestCase):
         self.assertNotIn("leakage_warnings", lightweight)
         self.assertIn("has_rebalance_diagnostics", lightweight)
         self.assertTrue(lightweight["has_rebalance_diagnostics"])
+
+    def test_get_backtest_promotes_rebalance_diagnostics_to_top_level(self):
+        svc = BacktestService()
+        conn = _BacktestDetailConnection(
+            summary={
+                "total_return": 0.12,
+                "rebalance_diagnostics": [
+                    {
+                        "date": "2026-04-10",
+                        "lane_counts": {"core": 10},
+                        "market_state": "risk_on",
+                    }
+                ],
+            }
+        )
+
+        with patch("backend.services.backtest_service.get_connection", return_value=conn):
+            detail = svc.get_backtest("bt_diag", market="CN")
+
+        self.assertEqual(detail["rebalance_diagnostics"][0]["date"], "2026-04-10")
+        self.assertEqual(detail["rebalance_diagnostics"][0]["lane_counts"], {"core": 10})
+
+    def test_get_rebalance_diagnostics_returns_paginated_payload(self):
+        svc = BacktestService()
+        conn = _BacktestDiagnosticsConnection(
+            diagnostics=[
+                {"date": "2026-04-10", "lane_counts": {"core": 10}},
+                {"date": "2026-04-13", "lane_counts": {"core": 8}},
+                {"date": "2026-04-14", "lane_counts": {"core": 6}},
+            ]
+        )
+
+        with patch("backend.services.backtest_service.get_connection", return_value=conn):
+            payload = svc.get_rebalance_diagnostics("bt_diag", market="CN", offset=1, limit=1)
+
+        self.assertEqual(payload["backtest_id"], "bt_diag")
+        self.assertEqual(payload["market"], "CN")
+        self.assertEqual(payload["total"], 3)
+        self.assertEqual(payload["offset"], 1)
+        self.assertEqual(payload["limit"], 1)
+        self.assertEqual(payload["items"], [{"date": "2026-04-13", "lane_counts": {"core": 8}}])
+
+    def test_batch_predict_reuses_feature_matrix_for_models_sharing_feature_set(self):
+        svc = BacktestService()
+        svc._model_service = _SharedFeatureModelService()
+
+        result = svc._batch_predict_all_dates(
+            ["model_a", "model_b"],
+            tickers=["sh.600000", "sh.600001"],
+            start_date="2024-01-02",
+            end_date="2024-01-03",
+            rebalance_days=["2024-01-03"],
+            market="CN",
+        )
+
+        self.assertEqual(svc._model_service.feature_compute_calls, 1)
+        self.assertEqual(svc._model_service.load_model_calls, ["model_a", "model_b"])
+        self.assertIn("model_a", result["2024-01-03"])
+        self.assertIn("model_b", result["2024-01-03"])
 
     def test_save_result_persists_reproducibility_fingerprint(self):
         svc = BacktestService()
@@ -173,6 +234,87 @@ class _BacktestSaveConnection:
             parsed[4] = json.loads(parsed[4])
             self.insert_params = parsed
         return self
+
+
+class _BacktestDetailConnection:
+    def __init__(self, summary):
+        self.summary = summary
+
+    def execute(self, sql, params=None):
+        import json
+
+        self.row = (
+            "bt_diag",
+            "CN",
+            "strategy_cn",
+            json.dumps({"start_date": "2026-04-01", "end_date": "2026-04-30"}),
+            json.dumps(self.summary),
+            json.dumps({"2026-04-10": 1.0}),
+            json.dumps({}),
+            json.dumps({}),
+            json.dumps([]),
+            0,
+            "exploratory",
+            "2026-05-02 12:00:00",
+            json.dumps([]),
+        )
+        return self
+
+    def fetchone(self):
+        return self.row
+
+
+class _BacktestDiagnosticsConnection:
+    def __init__(self, diagnostics):
+        self.diagnostics = diagnostics
+
+    def execute(self, sql, params=None):
+        import json
+
+        self.row = ("CN", json.dumps({"rebalance_diagnostics": self.diagnostics}))
+        return self
+
+    def fetchone(self):
+        return self.row
+
+
+class _SharedFeatureModelService:
+    def __init__(self):
+        self.feature_compute_calls = 0
+        self.load_model_calls = []
+        self._feature_service = self
+
+    def get_model(self, model_id, market=None):
+        return {"id": model_id, "feature_set_id": "shared_fs"}
+
+    def load_model(self, model_id, market=None):
+        self.load_model_calls.append(model_id)
+        return _LinearPredictModel(model_id)
+
+    def compute_features_from_cache(self, fs_id, tickers, start_date, end_date, market=None):
+        self.feature_compute_calls += 1
+        index = pd.to_datetime(["2024-01-02", "2024-01-03"])
+        return {
+            "close": pd.DataFrame(
+                {
+                    "sh.600000": [10.0, 11.0],
+                    "sh.600001": [20.0, 21.0],
+                },
+                index=index,
+            )
+        }
+
+    def _break_prediction_ties(self, preds):
+        return preds
+
+
+class _LinearPredictModel:
+    def __init__(self, model_id):
+        self.model_id = model_id
+
+    def predict(self, X):
+        base = 1.0 if self.model_id == "model_a" else 2.0
+        return pd.Series(base + X["close"].astype(float), index=X.index)
 
 
 if __name__ == "__main__":

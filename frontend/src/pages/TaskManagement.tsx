@@ -11,9 +11,16 @@ import {
   Tag,
   Typography,
 } from "antd";
-import { ReloadOutlined, StopOutlined } from "@ant-design/icons";
-import { listTasks, cancelTask } from "../api";
-import type { TaskStatus as TaskStatusType } from "../api";
+import { DeleteOutlined, PauseCircleOutlined, ReloadOutlined, StopOutlined } from "@ant-design/icons";
+import {
+  bulkCancelTasks,
+  cancelTask,
+  createTaskPauseRule,
+  deleteTaskPauseRule,
+  listTaskPauseRules,
+  listTasks,
+} from "../api";
+import type { TaskPauseRule, TaskStatus as TaskStatusType } from "../api";
 
 const { Text, Paragraph } = Typography;
 
@@ -40,6 +47,10 @@ export default function TaskManagement() {
   const [loading, setLoading] = useState(false);
   const [statusFilter, setStatusFilter] = useState<string | undefined>(undefined);
   const [typeFilter, setTypeFilter] = useState<string | undefined>(undefined);
+  const [sourceFilter, setSourceFilter] = useState<string | undefined>(undefined);
+  const [marketFilter, setMarketFilter] = useState<string | undefined>(undefined);
+  const [pauseRules, setPauseRules] = useState<TaskPauseRule[]>([]);
+  const [pauseRuleLoading, setPauseRuleLoading] = useState(false);
   const [errorModal, setErrorModal] = useState<{ open: boolean; error: string; taskId: string }>({
     open: false,
     error: "",
@@ -54,6 +65,8 @@ export default function TaskManagement() {
       const data = await listTasks({
         status: statusFilter,
         task_type: typeFilter,
+        source: sourceFilter,
+        market: marketFilter,
         limit: 200,
       });
       setTasks(data);
@@ -62,11 +75,23 @@ export default function TaskManagement() {
     } finally {
       setLoading(false);
     }
-  }, [messageApi, statusFilter, typeFilter]);
+  }, [messageApi, statusFilter, typeFilter, sourceFilter, marketFilter]);
+
+  const fetchPauseRules = useCallback(async () => {
+    setPauseRuleLoading(true);
+    try {
+      setPauseRules(await listTaskPauseRules(true));
+    } catch {
+      messageApi.error("加载暂停规则失败");
+    } finally {
+      setPauseRuleLoading(false);
+    }
+  }, [messageApi]);
 
   useEffect(() => {
     fetchTasks();
-  }, [fetchTasks]);
+    fetchPauseRules();
+  }, [fetchTasks, fetchPauseRules]);
 
   // Auto-refresh every 5s if there are running/queued tasks
   useEffect(() => {
@@ -86,6 +111,50 @@ export default function TaskManagement() {
       fetchTasks();
     } catch {
       messageApi.error("取消失败");
+    }
+  };
+
+  const handleBulkCancel = async () => {
+    try {
+      const result = await bulkCancelTasks({
+        status: statusFilter,
+        task_type: typeFilter,
+        source: sourceFilter,
+        market: marketFilter,
+      });
+      messageApi.success(`已取消 ${result.cancelled_count} 个任务`);
+      fetchTasks();
+    } catch {
+      messageApi.error("批量取消失败");
+    }
+  };
+
+  const handleCreatePauseRule = async () => {
+    if (!typeFilter && !sourceFilter && !marketFilter) {
+      messageApi.warning("请至少选择任务类型、来源或市场之一");
+      return;
+    }
+    try {
+      await createTaskPauseRule({
+        task_type: typeFilter,
+        source: sourceFilter,
+        market: marketFilter,
+        reason: "created from task management page",
+      });
+      messageApi.success("已暂停匹配的新任务提交");
+      fetchPauseRules();
+    } catch {
+      messageApi.error("创建暂停规则失败");
+    }
+  };
+
+  const handleDeletePauseRule = async (ruleId: string) => {
+    try {
+      await deleteTaskPauseRule(ruleId);
+      messageApi.success("暂停规则已删除");
+      fetchPauseRules();
+    } catch {
+      messageApi.error("删除暂停规则失败");
     }
   };
 
@@ -262,6 +331,39 @@ export default function TaskManagement() {
                 onChange={setStatusFilter}
                 options={Object.entries(STATUS_TAG).map(([k, v]) => ({ value: k, label: v.label }))}
               />
+              <Select
+                allowClear
+                placeholder="来源"
+                style={{ width: 90 }}
+                value={sourceFilter}
+                onChange={setSourceFilter}
+                options={[
+                  { value: "ui", label: "UI" },
+                  { value: "agent", label: "Agent" },
+                  { value: "system", label: "System" },
+                ]}
+              />
+              <Select
+                allowClear
+                placeholder="市场"
+                style={{ width: 90 }}
+                value={marketFilter}
+                onChange={setMarketFilter}
+                options={[
+                  { value: "US", label: "US" },
+                  { value: "CN", label: "CN" },
+                ]}
+              />
+              <Popconfirm title="按当前筛选批量取消排队/运行任务?" onConfirm={handleBulkCancel}>
+                <Button icon={<StopOutlined />} size="small" danger>
+                  批量取消
+                </Button>
+              </Popconfirm>
+              <Popconfirm title="暂停匹配当前筛选的新任务提交?" onConfirm={handleCreatePauseRule}>
+                <Button icon={<PauseCircleOutlined />} size="small">
+                  暂停提交
+                </Button>
+              </Popconfirm>
               <Button icon={<ReloadOutlined />} size="small" onClick={fetchTasks}>
                 刷新
               </Button>
@@ -276,6 +378,52 @@ export default function TaskManagement() {
             size="small"
             pagination={{ pageSize: 30 }}
             scroll={{ x: 1200 }}
+          />
+        </Card>
+
+        <Card title="任务提交暂停规则" size="small">
+          <Table
+            dataSource={pauseRules}
+            rowKey="id"
+            loading={pauseRuleLoading}
+            size="small"
+            pagination={false}
+            columns={[
+              {
+                title: "任务类型",
+                dataIndex: "task_type",
+                key: "task_type",
+                render: (v: string | null) => v ? (TASK_TYPE_LABEL[v] ?? v) : "全部",
+              },
+              {
+                title: "来源",
+                dataIndex: "source",
+                key: "source",
+                render: (v: string | null) => v ?? "全部",
+              },
+              {
+                title: "市场",
+                dataIndex: "market",
+                key: "market",
+                render: (v: string | null) => v ?? "全部",
+              },
+              {
+                title: "原因",
+                dataIndex: "reason",
+                key: "reason",
+                ellipsis: true,
+              },
+              {
+                title: "操作",
+                key: "action",
+                width: 90,
+                render: (_: unknown, record: TaskPauseRule) => (
+                  <Popconfirm title="删除此暂停规则?" onConfirm={() => handleDeletePauseRule(record.id)}>
+                    <Button size="small" icon={<DeleteOutlined />} />
+                  </Popconfirm>
+                ),
+              },
+            ]}
           />
         </Card>
       </Space>

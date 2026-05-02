@@ -34,6 +34,7 @@ import {
   NavCurveChart,
   DrawdownChart,
   MonthlyReturnsHeatmap,
+  RebalanceDiagnosticsTable,
   TradeLogTable,
   StockPnLTable,
 } from "./BacktestCharts";
@@ -382,6 +383,7 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
             <NavCurveChart navSeries={result.nav_series} benchmarkNav={result.benchmark_nav} />
             <DrawdownChart drawdownSeries={result.drawdown_series} />
             <MonthlyReturnsHeatmap monthlyReturns={result.monthly_returns} />
+            <RebalanceDiagnosticsTable diagnostics={result.rebalance_diagnostics} />
             <StockPnLTable stockPnl={result.stock_pnl ?? null} backtestId={result.id} />
             <TradeLogTable trades={result.trades ?? null} />
           </Space>
