@@ -45,6 +45,14 @@ def _record_to_dict(record) -> dict:
         "source": record.source.value,
     }
     if record.result_summary and isinstance(record.result_summary, dict):
+        if record.result_summary.get("interrupted"):
+            result["interrupted"] = True
+        if record.result_summary.get("retryable"):
+            result["retryable"] = True
+        if record.result_summary.get("cancel_requested"):
+            result["cancel_requested"] = True
+        if record.result_summary.get("compute_may_continue"):
+            result["compute_may_continue"] = True
         late_result = record.result_summary.get("late_result")
         if isinstance(late_result, dict):
             for key in ("backtest_id", "model_id", "run_id", "signal_run_id", "id"):

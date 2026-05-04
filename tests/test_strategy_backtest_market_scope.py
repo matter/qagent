@@ -5,9 +5,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 import duckdb
+import pandas as pd
 
 from backend.api import strategies as strategy_api
-from backend.services.backtest_engine import BacktestEngine
+from backend.services.backtest_engine import BacktestEngine, BacktestResult
 from backend.services.backtest_service import BacktestService
 from backend.services.strategy_service import StrategyService
 
@@ -141,6 +142,116 @@ class StrategyBacktestMarketScopeTests(unittest.TestCase):
         self.assertEqual(open_df.loc["2024-01-02", "sh.600000"], 10)
         self.assertEqual(float(benchmark.iloc[0]), 3000.5)
 
+    def test_raw_weight_position_sizing_preserves_strategy_cash_budget(self):
+        raw_signals = pd.DataFrame(
+            {
+                "signal": [1, 1, 1],
+                "weight": [0.45, 0.20, 0.10],
+                "strength": [0.9, 0.8, 0.7],
+            },
+            index=["AAA", "BBB", "CCC"],
+        )
+
+        weights = BacktestService._apply_position_sizing(
+            raw_signals,
+            "raw_weight",
+            max_positions=2,
+        )
+
+        self.assertEqual(weights, {"AAA": 0.45, "BBB": 0.20})
+        self.assertLess(sum(weights.values()), 1.0)
+
+    def test_raw_weight_backtest_config_disables_target_normalization_by_default(self):
+        captured = {}
+        svc = BacktestService.__new__(BacktestService)
+        svc._strategy_service = unittest.mock.Mock()
+        svc._strategy_service.get_strategy.return_value = {
+            "id": "strategy-raw",
+            "name": "Raw Weight Strategy",
+            "version": 1,
+            "source_code": _BASIC_STRATEGY_SOURCE,
+            "required_factors": [],
+            "required_models": [],
+            "position_sizing": "raw_weight",
+        }
+        svc._group_service = unittest.mock.Mock()
+        svc._group_service.get_group_tickers.return_value = ["AAA"]
+        svc._model_service = unittest.mock.Mock()
+        svc._feature_service = unittest.mock.Mock()
+        svc._factor_service = unittest.mock.Mock()
+        svc._label_service = unittest.mock.Mock()
+        svc._factor_engine = unittest.mock.Mock()
+        svc._backtest_engine = BacktestEngine()
+
+        def fake_run(weights, config):
+            captured["weights"] = weights
+            captured["config"] = config
+            return BacktestResult(
+                config=config.to_dict(),
+                dates=["2026-04-06", "2026-04-07"],
+                nav=[1000.0, 1000.0],
+                benchmark_nav=[1000.0, 1000.0],
+                drawdown=[0.0, 0.0],
+                total_return=0.0,
+                annual_return=0.0,
+                annual_volatility=0.0,
+                max_drawdown=0.0,
+                sharpe_ratio=0.0,
+                calmar_ratio=0.0,
+                sortino_ratio=0.0,
+                win_rate=0.0,
+                profit_loss_ratio=0.0,
+                total_trades=0,
+                annual_turnover=0.0,
+                total_cost=0.0,
+                monthly_returns=[],
+                trades=[],
+                trade_diagnostics={},
+            )
+
+        dates = pd.to_datetime(["2026-04-06", "2026-04-07"])
+        prices = pd.DataFrame({"AAA": [10.0, 10.0]}, index=dates)
+        empty_prices = pd.DataFrame({"AAA": [0.0, 0.0]}, index=dates)
+
+        with (
+            patch("backend.services.backtest_service.load_strategy_from_code") as load_strategy,
+            patch.object(BacktestService, "_validate_benchmark_market"),
+            patch.object(StrategyService, "_validate_dependencies"),
+            patch.object(
+                svc._backtest_engine,
+                "_load_prices",
+                return_value=(prices, prices, empty_prices, empty_prices, empty_prices),
+            ),
+            patch.object(BacktestService, "_resolve_factor_ids", return_value={}),
+            patch.object(BacktestService, "_batch_predict_all_dates", return_value={}),
+            patch.object(BacktestService, "_save_result"),
+            patch.object(BacktestService, "_build_reproducibility_fingerprint", return_value={}),
+            patch.object(BacktestService, "_check_data_leakage", return_value=[]),
+            patch("backend.services.backtest_service.get_connection", return_value=self.conn),
+            patch.object(BacktestEngine, "run", side_effect=fake_run),
+        ):
+            strategy_instance = unittest.mock.Mock()
+            strategy_instance.required_factors.return_value = []
+            strategy_instance.generate_signals.return_value = pd.DataFrame(
+                {"signal": [1], "weight": [0.5], "strength": [1.0]},
+                index=["AAA"],
+            )
+            load_strategy.return_value = strategy_instance
+            svc.run_backtest(
+                "strategy-raw",
+                {
+                    "start_date": "2026-04-06",
+                    "end_date": "2026-04-07",
+                    "benchmark": "SPY",
+                    "rebalance_freq": "daily",
+                },
+                "sp500",
+                market="US",
+            )
+
+        self.assertFalse(captured["config"].normalize_target_weights)
+        self.assertEqual(float(captured["weights"].loc[pd.Timestamp("2026-04-06"), "AAA"]), 0.5)
+
     def test_cn_backtest_rejects_us_benchmark_before_loading_prices(self):
         with self._patch_connections():
             strategy = StrategyService().create_strategy(
@@ -240,6 +351,19 @@ class StrategyBacktestMarketScopeTests(unittest.TestCase):
         self.assertEqual(summary["date_adjustment"]["effective_start_date"], "2026-04-07")
         self.assertEqual(summary["requested_start_date"], "2026-04-06")
         self.assertEqual(summary["effective_start_date"], "2026-04-07")
+
+    def test_strategy_api_rejects_flattened_backtest_config_fields(self):
+        from pydantic import ValidationError
+
+        with self.assertRaises(ValidationError):
+            strategy_api.RunBacktestRequest.model_validate(
+                {
+                    "market": "CN",
+                    "universe_group_id": "cn_a_core_indices_union",
+                    "start_date": "2026-01-02",
+                    "end_date": "2026-04-02",
+                }
+            )
 
     def test_strategy_api_rejects_cross_market_benchmark_before_queueing(self):
         executor = _FakeExecutor()

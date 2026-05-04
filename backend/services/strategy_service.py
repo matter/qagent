@@ -30,6 +30,7 @@ class StrategyService:
         source_code: str,
         description: str | None = None,
         position_sizing: str = "equal_weight",
+        constraint_config: dict | None = None,
         market: str | None = None,
     ) -> dict:
         """Create a new strategy (auto-versioned).
@@ -46,6 +47,7 @@ class StrategyService:
             raise ValueError(f"Invalid strategy source code: {exc}") from exc
 
         conn = get_connection()
+        self._ensure_constraint_config_column(conn)
 
         # Auto-version: find max version for this market/name pair
         row = conn.execute(
@@ -81,8 +83,8 @@ class StrategyService:
             """INSERT INTO strategies
                (id, market, name, version, description, source_code,
                 required_factors, required_models, position_sizing,
-                status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)""",
+                constraint_config, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)""",
             [
                 strategy_id,
                 resolved_market,
@@ -93,6 +95,7 @@ class StrategyService:
                 json.dumps(required_factors),
                 json.dumps(required_models),
                 position_sizing,
+                json.dumps(constraint_config or {}, default=str) if constraint_config else None,
                 now,
                 now,
             ],
@@ -117,11 +120,13 @@ class StrategyService:
         source_code: str | None = None,
         description: str | None = None,
         position_sizing: str | None = None,
+        constraint_config: dict | None = None,
         status: str | None = None,
         market: str | None = None,
     ) -> dict:
         """Update a strategy -- if source_code changes, create a new version."""
         conn = get_connection()
+        self._ensure_constraint_config_column(conn)
         resolved_market = normalize_market(market)
         existing = self._fetch_row(strategy_id, market=resolved_market)
         if existing is None:
@@ -165,8 +170,8 @@ class StrategyService:
                 """INSERT INTO strategies
                    (id, market, name, version, description, source_code,
                     required_factors, required_models, position_sizing,
-                    status, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    constraint_config, status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     new_id,
                     existing["market"],
@@ -177,6 +182,12 @@ class StrategyService:
                     json.dumps(required_factors),
                     json.dumps(required_models),
                     position_sizing or existing["position_sizing"],
+                    json.dumps(
+                        constraint_config
+                        if constraint_config is not None
+                        else existing.get("constraint_config") or {},
+                        default=str,
+                    ),
                     status or "draft",
                     now,
                     now,
@@ -204,6 +215,12 @@ class StrategyService:
         for col, val in [
             ("description", description),
             ("position_sizing", position_sizing),
+            (
+                "constraint_config",
+                json.dumps(constraint_config, default=str)
+                if constraint_config is not None
+                else None,
+            ),
             ("status", status),
         ]:
             if val is not None:
@@ -222,6 +239,7 @@ class StrategyService:
     def delete_strategy(self, strategy_id: str, market: str | None = None) -> None:
         """Delete a strategy definition."""
         conn = get_connection()
+        self._ensure_constraint_config_column(conn)
         resolved_market = normalize_market(market)
         existing = self._fetch_row(strategy_id, market=resolved_market)
         if existing is None:
@@ -244,10 +262,11 @@ class StrategyService:
         """List all strategies."""
         resolved_market = normalize_market(market)
         conn = get_connection()
+        self._ensure_constraint_config_column(conn)
         rows = conn.execute(
             """SELECT id, market, name, version, description, source_code,
                       required_factors, required_models, position_sizing,
-                      status, created_at, updated_at
+                      constraint_config, status, created_at, updated_at
                FROM strategies
                WHERE market = ?
                ORDER BY name, version DESC""",
@@ -497,16 +516,17 @@ class StrategyService:
             f"策略使用 position_sizing='equal_weight'，但源码中包含自定义 weight 赋值逻辑"
             f"（如 `{sample}`）。在 equal_weight 模式下，执行层会将所有持仓权重覆盖为 1/n，"
             f"策略输出的自定义权重不会生效。"
-            f"如需权重生效，请将 position_sizing 改为 'signal_weight' 或 'max_position'。"
+            f"如需权重生效，请将 position_sizing 改为 'signal_weight'、'max_position' 或 'raw_weight'。"
         ]
 
     def _fetch_row(self, strategy_id: str, market: str | None = None) -> dict | None:
         resolved_market = normalize_market(market)
         conn = get_connection()
+        self._ensure_constraint_config_column(conn)
         row = conn.execute(
             """SELECT id, market, name, version, description, source_code,
                       required_factors, required_models, position_sizing,
-                      status, created_at, updated_at
+                      constraint_config, status, created_at, updated_at
                FROM strategies WHERE id = ? AND market = ?""",
             [strategy_id, resolved_market],
         ).fetchone()
@@ -515,14 +535,29 @@ class StrategyService:
         return self._row_to_dict(row)
 
     @staticmethod
+    def _ensure_constraint_config_column(conn) -> None:
+        """Ensure old local DBs/tests have the optional strategy constraints column."""
+        try:
+            exists = conn.execute(
+                """SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = 'main'
+                     AND table_name = 'strategies'
+                     AND column_name = 'constraint_config'"""
+            ).fetchone()
+            if not exists:
+                conn.execute("ALTER TABLE strategies ADD COLUMN constraint_config JSON")
+        except Exception:
+            pass
+
+    @staticmethod
     def _row_to_dict(row) -> dict:
-        def _parse_json(raw):
+        def _parse_json(raw, default):
             if isinstance(raw, str):
                 try:
                     return json.loads(raw)
                 except (json.JSONDecodeError, TypeError):
-                    return []
-            return raw if raw else []
+                    return default
+            return raw if raw else default
 
         return {
             "id": row[0],
@@ -531,10 +566,11 @@ class StrategyService:
             "version": row[3],
             "description": row[4],
             "source_code": row[5],
-            "required_factors": _parse_json(row[6]),
-            "required_models": _parse_json(row[7]),
+            "required_factors": _parse_json(row[6], []),
+            "required_models": _parse_json(row[7], []),
             "position_sizing": row[8],
-            "status": row[9],
-            "created_at": str(row[10]) if row[10] else None,
-            "updated_at": str(row[11]) if row[11] else None,
+            "constraint_config": _parse_json(row[9], {}) if row[9] else {},
+            "status": row[10],
+            "created_at": str(row[11]) if row[11] else None,
+            "updated_at": str(row[12]) if row[12] else None,
         }

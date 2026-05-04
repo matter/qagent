@@ -138,6 +138,29 @@ export async function getGroupDailySnapshot(
   return data;
 }
 
+export async function getDiagnosticDailyBars(
+  tickers: string[],
+  targetDate: string,
+  market?: Market,
+) {
+  const { data } = await client.get("/diagnostics/daily-bars", {
+    params: { tickers, date: targetDate, market: market || undefined },
+  });
+  return data;
+}
+
+export async function getDiagnosticFactorValues(
+  factorId: string,
+  tickers: string[],
+  targetDate: string,
+  market?: Market,
+) {
+  const { data } = await client.get("/diagnostics/factor-values", {
+    params: { factor_id: factorId, tickers, date: targetDate, market: market || undefined },
+  });
+  return data;
+}
+
 export async function getDataStatus(market?: Market): Promise<DataStatus> {
   const { data } = await client.get<DataStatus>("/data/status", {
     params: { market: market || undefined },
@@ -335,6 +358,10 @@ export interface TaskStatus {
   effective_start_date?: string;
   effective_end_date?: string;
   date_adjustment?: Record<string, unknown>;
+  interrupted?: boolean;
+  retryable?: boolean;
+  cancel_requested?: boolean;
+  compute_may_continue?: boolean;
 }
 
 // ---- Factor API ----
@@ -656,6 +683,7 @@ export interface Strategy {
   required_factors: string[] | null;
   required_models: string[] | null;
   position_sizing: string;
+  constraint_config?: Record<string, unknown> | null;
   status: string;
   created_at: string;
 }
@@ -670,7 +698,7 @@ export interface BacktestResultSummary {
   market: Market;
   strategy_id: string;
   config: Record<string, unknown> | null;
-  summary: Record<string, number> | null;
+  summary: Record<string, unknown> | null;
   result_level: string | null;
   trade_count: number | null;
   created_at: string;
@@ -732,6 +760,7 @@ export async function createStrategy(params: {
   source_code: string;
   description?: string;
   position_sizing?: string;
+  constraint_config?: Record<string, unknown>;
 }): Promise<Strategy> {
   const { data } = await client.post<Strategy>("/strategies", params);
   return data;
@@ -758,6 +787,7 @@ export async function updateStrategy(
     source_code?: string;
     description?: string;
     position_sizing?: string;
+    constraint_config?: Record<string, unknown>;
     status?: string;
   },
 ): Promise<Strategy> {
@@ -850,6 +880,7 @@ export async function generateSignals(body: {
   strategy_id: string;
   target_date: string;
   universe_group_id: string;
+  constraint_config?: Record<string, unknown>;
 }): Promise<{ task_id: string; market?: string }> {
   const { data } = await client.post<{ task_id: string; market?: string }>("/signals/generate", body);
   return data;

@@ -24,6 +24,7 @@ from backend.services.factor_engine import FactorEngine
 from backend.services.feature_service import FeatureService
 from backend.services.model_service import ModelService
 from backend.services.sql_filters import registered_values_table
+from backend.services.backtest_service import BacktestService
 from backend.time_utils import utc_now_naive
 from backend.strategies.base import StrategyContext
 
@@ -68,7 +69,24 @@ class PaperTradingService:
         if not tickers:
             raise ValueError(f"Universe group '{universe_group_id}' has no members")
 
-        config = config or {}
+        config = dict(config or {})
+        strategy_constraints = strategy.get("constraint_config") or {}
+        constraint_config = BacktestService._merge_constraint_config(
+            strategy_constraints,
+            config.get("constraint_config"),
+        )
+        if constraint_config:
+            config["constraint_config"] = constraint_config
+            if "rebalance_buffer" not in config and constraint_config.get("rebalance_drift_buffer") is not None:
+                config["rebalance_buffer"] = float(constraint_config["rebalance_drift_buffer"])
+                config.setdefault("rebalance_buffer_reference", "actual_open")
+            holding = constraint_config.get("holding_period")
+            if isinstance(holding, dict):
+                config.setdefault("min_holding_days", int(holding.get("min_days") or 0))
+                if holding.get("max_days") is not None:
+                    config.setdefault("max_holding_days", int(holding["max_days"]))
+            if constraint_config.get("max_single_name_weight") is not None:
+                config["max_single_name_weight"] = float(constraint_config["max_single_name_weight"])
         initial_capital = config.get("initial_capital", 1_000_000.0)
 
         session_id = uuid.uuid4().hex[:12]
@@ -388,6 +406,16 @@ class PaperTradingService:
         )
         position_sizing = strategy_def.get("position_sizing", "equal_weight")
         max_position_pct = config.get("max_position_pct", 0.10)
+        constraint_config = BacktestService._merge_constraint_config(
+            strategy_def.get("constraint_config"),
+            config.get("constraint_config"),
+        )
+        if constraint_config.get("max_single_name_weight") is not None:
+            max_position_pct = float(constraint_config["max_single_name_weight"])
+        max_holding_days = config.get("max_holding_days")
+        holding_cfg = constraint_config.get("holding_period")
+        if max_holding_days is None and isinstance(holding_cfg, dict) and holding_cfg.get("max_days") is not None:
+            max_holding_days = int(holding_cfg["max_days"])
 
         # Warn if strategy has custom weight logic under equal_weight sizing
         weight_warnings = StrategyService._validate_weight_effectiveness(
@@ -536,6 +564,10 @@ class PaperTradingService:
             target_weights = self._apply_position_sizing_from_signals(
                 signals, position_sizing, max_positions, max_position_pct,
             )
+            target_weights, _constraint_actions = BacktestService._apply_weight_constraints(
+                target_weights,
+                constraint_config,
+            )
             self._update_strategy_state_from_targets(
                 target_weights,
                 signal_date,
@@ -576,14 +608,29 @@ class PaperTradingService:
                             effective_targets.pop(ticker, None)
                             continue
 
-                # Re-normalize if constraints altered the weights
+                    if max_holding_days is not None and old_w > 0:
+                        days_held = ticker_holding_days.get(ticker, 0)
+                        if days_held >= int(max_holding_days):
+                            effective_targets.pop(ticker, None)
+                            continue
+
+                # Re-normalize if constraints altered the weights. raw_weight
+                # strategies intentionally preserve a cash budget.
                 eff_sum = sum(w for w in effective_targets.values() if w > 0)
-                if eff_sum > 0:
+                if eff_sum > 0 and position_sizing != "raw_weight":
                     target_weights = {
                         t: w / eff_sum for t, w in effective_targets.items() if w > 0
                     }
+                elif eff_sum > 0:
+                    target_weights = {
+                        t: w for t, w in effective_targets.items() if w > 0
+                    }
                 else:
                     target_weights = {}
+                target_weights, _constraint_actions = BacktestService._apply_weight_constraints(
+                    target_weights,
+                    constraint_config,
+                )
 
             no_trade_tickers = {
                 ticker
@@ -1778,7 +1825,7 @@ class PaperTradingService:
 
         Args:
             signals: List of signal dicts with ticker, signal, target_weight, strength.
-            method: One of 'equal_weight', 'signal_weight', 'max_position'.
+            method: One of 'equal_weight', 'signal_weight', 'max_position', 'raw_weight'.
             max_positions: Maximum number of positions.
             max_position_pct: Maximum weight per position.
 
@@ -1836,6 +1883,13 @@ class PaperTradingService:
                             uncapped[t] += excess * (uncapped[t] / uncapped_sum)
             capped.update(uncapped)
             return capped
+
+        elif method == "raw_weight":
+            return {
+                s["ticker"]: max(0.0, float(s.get("target_weight", 0.0)))
+                for s in buys
+                if float(s.get("target_weight", 0.0)) > 0
+            }
 
         else:
             # Default to equal weight

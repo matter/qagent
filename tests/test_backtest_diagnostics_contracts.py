@@ -26,6 +26,138 @@ class BacktestDiagnosticsContractTests(unittest.TestCase):
         self.assertAlmostEqual(diag["turnover"], 1.2)
         self.assertEqual(diag["candidate_pool"], ["MSFT", "NVDA"])
 
+    def test_portfolio_compliance_metrics_flag_concentration_and_holding_violations(self):
+        metrics = BacktestService._build_portfolio_compliance_metrics(
+            rebalance_diagnostics=[
+                {"date": "2026-01-05", "positions_after": {"AAPL": 1.0}},
+                {"date": "2026-01-06", "positions_after": {"AAPL": 0.5, "MSFT": 0.5}},
+            ],
+            trades=[
+                {"date": "2026-01-05", "ticker": "AAPL", "action": "buy", "holding_days": 0},
+                {"date": "2026-02-20", "ticker": "AAPL", "action": "sell", "holding_days": 41},
+            ],
+        )
+
+        self.assertEqual(metrics["min_position_count"], 1)
+        self.assertEqual(metrics["max_trade_holding_days"], 41)
+        self.assertEqual(metrics["max_target_weight"], 1.0)
+        self.assertFalse(metrics["compliance_pass"])
+        self.assertIn("min_position_count", metrics["violations"])
+        self.assertIn("max_trade_holding_days", metrics["violations"])
+
+    def test_portfolio_compliance_metrics_pass_for_diversified_short_hold_portfolio(self):
+        metrics = BacktestService._build_portfolio_compliance_metrics(
+            rebalance_diagnostics=[
+                {
+                    "date": "2026-01-05",
+                    "positions_after": {
+                        "A": 0.15,
+                        "B": 0.15,
+                        "C": 0.15,
+                        "D": 0.15,
+                        "E": 0.15,
+                        "F": 0.15,
+                        "G": 0.10,
+                    },
+                }
+            ],
+            trades=[
+                {"date": "2026-01-05", "ticker": "A", "action": "buy", "holding_days": 0},
+                {"date": "2026-01-24", "ticker": "A", "action": "sell", "holding_days": 19},
+            ],
+        )
+
+        self.assertEqual(metrics["min_position_count"], 7)
+        self.assertEqual(metrics["max_trade_holding_days"], 19)
+        self.assertLessEqual(metrics["max_target_weight"], 0.15)
+        self.assertTrue(metrics["compliance_pass"])
+
+    def test_constraint_config_caps_weights_and_reports_weekly_failures(self):
+        constraints = BacktestService._merge_constraint_config(
+            {"max_single_name_weight": 0.20, "weekly_turnover_floor": 0.30},
+            {"max_single_name_weight": 0.15},
+        )
+
+        weights, actions = BacktestService._apply_weight_constraints(
+            {"AAPL": 0.40, "MSFT": 0.25, "NVDA": 0.10},
+            constraints,
+        )
+        report = BacktestService._build_constraint_report(
+            constraint_config=constraints,
+            rebalance_diagnostics=[
+                {"date": "2026-01-09", "positions_after": weights, "turnover": 0.0},
+                {"date": "2026-01-16", "positions_after": weights, "turnover": 0.20},
+                {"date": "2026-01-23", "positions_after": weights, "turnover": 0.42},
+            ],
+            trades=[],
+            startup_state_report=None,
+        )
+
+        self.assertLessEqual(max(weights.values()), 0.15)
+        self.assertEqual(actions["clipped"], {"AAPL": {"raw": 0.4, "clipped": 0.15}, "MSFT": {"raw": 0.25, "clipped": 0.15}})
+        self.assertFalse(report["constraint_pass"])
+        self.assertIn("weekly_turnover_floor", report["failed_constraints"])
+        self.assertEqual(report["weekly_turnover"]["weeks"][1]["pass"], False)
+
+    def test_evaluation_slice_rebases_nav_and_excludes_warmup_trades(self):
+        full = BacktestResult(
+            config={"initial_capital": 1000.0, "start_date": "2025-12-15", "end_date": "2026-01-09"},
+            dates=["2025-12-15", "2025-12-16", "2026-01-05", "2026-01-06", "2026-01-09"],
+            nav=[1000.0, 1020.0, 1100.0, 1210.0, 1155.0],
+            benchmark_nav=[1000.0, 1010.0, 1040.0, 1050.0, 1060.0],
+            drawdown=[0.0, 0.0, 0.0, 0.0, -0.045455],
+            total_return=0.155,
+            annual_return=0.0,
+            annual_volatility=0.0,
+            max_drawdown=-0.045455,
+            sharpe_ratio=0.0,
+            calmar_ratio=0.0,
+            sortino_ratio=0.0,
+            win_rate=0.0,
+            profit_loss_ratio=0.0,
+            total_trades=2,
+            annual_turnover=9.9,
+            total_cost=4.0,
+            monthly_returns=[],
+            trades=[
+                {"date": "2025-12-16", "ticker": "AAPL", "action": "buy", "shares": 10, "price": 10, "cost": 1.0},
+                {"date": "2026-01-06", "ticker": "AAPL", "action": "sell", "shares": 5, "price": 12, "cost": 2.0},
+            ],
+            trade_diagnostics={},
+        )
+
+        sliced = BacktestService._slice_result_to_evaluation(
+            full,
+            evaluation_start_date="2026-01-05",
+            evaluation_end_date="2026-01-09",
+            initial_capital=1000.0,
+        )
+
+        self.assertEqual(sliced.dates, ["2026-01-05", "2026-01-06", "2026-01-09"])
+        self.assertEqual(sliced.nav[0], 1000.0)
+        self.assertEqual(sliced.total_trades, 1)
+        self.assertEqual(sliced.trades[0]["date"], "2026-01-06")
+        self.assertEqual(sliced.total_cost, 2.0)
+        self.assertEqual(sliced.config["evaluation_start_date"], "2026-01-05")
+        self.assertTrue(sliced.trade_diagnostics["evaluation_slice"]["warmup_trades_excluded"])
+
+    def test_startup_state_report_flags_missing_warmup_state_for_evaluation(self):
+        report = BacktestService._build_startup_state_report(
+            rebalance_diagnostics=[
+                {"date": "2025-12-19", "phase": "warmup", "positions_after": {"AAPL": 0.15}},
+                {"date": "2026-01-09", "phase": "evaluation", "positions_before": {}, "positions_after": {}, "wait_for_anchor": True},
+            ],
+            warmup_start_date="2025-12-15",
+            evaluation_start_date="2026-01-05",
+            initial_entry_policy="require_warmup_state",
+        )
+
+        self.assertEqual(report["first_evaluation_rebalance_date"], "2026-01-09")
+        self.assertEqual(report["evaluation_start_position_count"], 1)
+        self.assertEqual(report["first_evaluation_positions_before_count"], 0)
+        self.assertTrue(report["startup_silence_violation"])
+        self.assertEqual(report["anchor_blocked_count"], 1)
+
     def test_list_summary_strips_heavy_diagnostics(self):
         summary = {
             "total_return": 0.12,

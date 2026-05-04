@@ -26,6 +26,9 @@ const STATUS_TAG: Record<string, { color: string; label: string }> = {
 
 const SIZING_LABEL: Record<string, string> = {
   equal_weight: "等权",
+  signal_weight: "信号权重",
+  max_position: "单票上限",
+  raw_weight: "原始权重",
   value_weight: "市值加权",
   risk_parity: "风险平价",
   custom: "自定义",

@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import patch
 
+import pandas as pd
+
 from backend.services.signal_service import SignalService
 
 
@@ -137,6 +139,98 @@ class SignalServiceContractTests(unittest.TestCase):
         self.assertEqual(diagnostics["current_selected_meta"][0]["ticker"], "AAA")
         self.assertEqual(diagnostics["top_conversion_detail"][0]["ticker"], "CCC")
         self.assertTrue(diagnostics["top_conversion_detail"][0]["blocked_by_full_current_book"])
+
+    def test_backtest_replay_state_uses_rebalance_positions_after_when_available(self):
+        svc = SignalService.__new__(SignalService)
+        prices = __import__("pandas").DataFrame(
+            {
+                "AAA": [10.0],
+                "BBB": [20.0],
+            },
+            index=__import__("pandas").to_datetime(["2026-01-30"]),
+        )
+        conn = _BacktestReplayDiagnosticsConnection()
+
+        with patch("backend.services.signal_service.get_connection", return_value=conn):
+            state = svc._reconstruct_portfolio_state(
+                "bt_replay",
+                "2026-01-30",
+                prices,
+                market="US",
+            )
+
+        self.assertEqual(state["current_weights"], {"AAA": 0.4, "BBB": 0.6})
+        self.assertEqual(state["replay_positions_after"], {"AAA": 0.4, "BBB": 0.6})
+        self.assertEqual(state["holding_days"], {})
+
+    def test_backtest_replay_overlay_returns_saved_positions_as_canonical_signals(self):
+        svc = SignalService.__new__(SignalService)
+
+        signals, signal_tickers, replay = svc._apply_backtest_replay_overlay(
+            generated_signals=[
+                {"ticker": "AAA", "signal": "buy", "target_weight": 0.25, "strength": 0.7},
+                {"ticker": "CCC", "signal": "buy", "target_weight": 0.75, "strength": 0.9},
+            ],
+            portfolio_state={
+                "replay_positions_after": {"AAA": 0.4, "BBB": 0.6},
+            },
+            backtest_id="bt_replay",
+            target_date="2026-01-30",
+        )
+
+        self.assertEqual([item["ticker"] for item in signals], ["BBB", "AAA"])
+        self.assertEqual(signal_tickers, {"AAA", "BBB"})
+        self.assertEqual(signals[0]["signal"], "backtest_replay")
+        self.assertEqual(replay["source"], "backtest:bt_replay")
+        self.assertFalse(replay["ticker_match"])
+        self.assertEqual(replay["missing_from_generated"], ["BBB"])
+        self.assertEqual(replay["extra_in_generated"], ["CCC"])
+        self.assertEqual(replay["replay_positions_after"], {"AAA": 0.4, "BBB": 0.6})
+        self.assertEqual(replay["generated_weights"], {"AAA": 0.25, "CCC": 0.75})
+
+    def test_signal_constraints_apply_position_sizing_and_report_clipped_orders(self):
+        raw = pd.DataFrame(
+            {
+                "signal": [1, 1],
+                "weight": [0.9, 0.1],
+                "strength": [0.9, 0.1],
+            },
+            index=["AAA", "BBB"],
+        )
+
+        adjusted, report = SignalService._apply_constraint_config_to_signals(
+            raw,
+            position_sizing="raw_weight",
+            max_positions=5,
+            max_position_pct=0.10,
+            constraint_config={"max_single_name_weight": 0.15},
+        )
+
+        self.assertEqual(float(adjusted.loc["AAA", "weight"]), 0.15)
+        self.assertEqual(float(adjusted.loc["BBB", "weight"]), 0.10)
+        self.assertEqual(report["clipped_orders"][0]["ticker"], "AAA")
+        self.assertTrue(report["constraint_pass"])
+
+class _BacktestReplayDiagnosticsConnection:
+    def execute(self, query, params=None):
+        self.query = query
+        return self
+
+    def fetchone(self):
+        import json
+
+        return (
+            json.dumps([]),
+            json.dumps({"initial_capital": 1000}),
+            json.dumps({
+                "rebalance_diagnostics": [
+                    {
+                        "date": "2026-01-30",
+                        "positions_after": {"AAA": 0.4, "BBB": 0.6},
+                    }
+                ]
+            }),
+        )
 
 
 if __name__ == "__main__":

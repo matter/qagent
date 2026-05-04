@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import {
+  Alert,
   Button,
   Card,
   Col,
@@ -25,6 +26,9 @@ const { Text } = Typography;
 
 const POSITION_OPTIONS = [
   { value: "equal_weight", label: "等权 (Equal Weight)" },
+  { value: "signal_weight", label: "信号权重 (Signal Weight)" },
+  { value: "max_position", label: "单票上限 (Max Position)" },
+  { value: "raw_weight", label: "原始权重 (Raw Weight)" },
   { value: "value_weight", label: "市值加权 (Value Weight)" },
   { value: "risk_parity", label: "风险平价 (Risk Parity)" },
   { value: "custom", label: "自定义 (Custom)" },
@@ -43,6 +47,7 @@ export default function StrategyEditorPanel({
   const [strategyName, setStrategyName] = useState("");
   const [description, setDescription] = useState("");
   const [positionSizing, setPositionSizing] = useState("equal_weight");
+  const [constraintConfigText, setConstraintConfigText] = useState("{}");
   const [templates, setTemplates] = useState<StrategyTemplate[]>([]);
   const [saving, setSaving] = useState(false);
   const [currentStrategy, setCurrentStrategy] = useState<Strategy | null>(null);
@@ -58,9 +63,20 @@ export default function StrategyEditorPanel({
       setStrategyName(editingStrategy.name);
       setDescription(editingStrategy.description ?? "");
       setPositionSizing(editingStrategy.position_sizing);
+      setConstraintConfigText(JSON.stringify(editingStrategy.constraint_config ?? {}, null, 2));
       setCurrentStrategy(editingStrategy);
     }
   }, [editingStrategy]);
+
+  const parseConstraintConfig = () => {
+    const raw = constraintConfigText.trim();
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
+      throw new Error("硬限制配置必须是 JSON object");
+    }
+    return parsed;
+  };
 
   const handleTemplateSelect = useCallback(
     async (templateName: string) => {
@@ -88,11 +104,13 @@ export default function StrategyEditorPanel({
 
     setSaving(true);
     try {
+      const constraintConfig = parseConstraintConfig();
       if (currentStrategy) {
         const updated = await updateStrategy(currentStrategy.id, {
           source_code: code,
           description: description || undefined,
           position_sizing: positionSizing,
+          constraint_config: constraintConfig,
         });
         setCurrentStrategy(updated);
       } else {
@@ -103,6 +121,7 @@ export default function StrategyEditorPanel({
             source_code: code,
             description: description || undefined,
             position_sizing: positionSizing,
+            constraint_config: constraintConfig,
           });
           setCurrentStrategy(created);
         } catch {
@@ -113,6 +132,7 @@ export default function StrategyEditorPanel({
               source_code: code,
               description: description || undefined,
               position_sizing: positionSizing,
+              constraint_config: constraintConfig,
             });
             setCurrentStrategy(updated);
           } else {
@@ -145,12 +165,14 @@ export default function StrategyEditorPanel({
 
     setSaving(true);
     try {
+      const constraintConfig = parseConstraintConfig();
       try {
         const created = await createStrategy({
           name: newName,
           source_code: code,
           description: description || undefined,
           position_sizing: positionSizing,
+          constraint_config: constraintConfig,
         });
         setCurrentStrategy(created);
       } catch {
@@ -161,6 +183,7 @@ export default function StrategyEditorPanel({
             source_code: code,
             description: description || undefined,
             position_sizing: positionSizing,
+            constraint_config: constraintConfig,
           });
           setCurrentStrategy(updated);
         } else {
@@ -245,6 +268,22 @@ export default function StrategyEditorPanel({
                     value={positionSizing}
                     onChange={setPositionSizing}
                     options={POSITION_OPTIONS}
+                  />
+                </div>
+                <div>
+                  <Text type="secondary" style={{ fontSize: 12 }}>硬限制 JSON</Text>
+                  <Input.TextArea
+                    value={constraintConfigText}
+                    onChange={(e) => setConstraintConfigText(e.target.value)}
+                    rows={8}
+                    spellCheck={false}
+                    style={{ fontFamily: "monospace", fontSize: 12 }}
+                  />
+                  <Alert
+                    style={{ marginTop: 8 }}
+                    type="info"
+                    showIcon
+                    message="支持 max_single_name_weight、weekly_turnover_floor、rebalance_drift_buffer、holding_period。"
                   />
                 </div>
               </Space>

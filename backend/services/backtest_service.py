@@ -10,7 +10,7 @@ import json
 import hashlib
 import subprocess
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
@@ -35,6 +35,14 @@ from backend.strategies.base import StrategyContext
 from backend.strategies.loader import load_strategy_from_code
 
 log = get_logger(__name__)
+
+
+_INITIAL_ENTRY_POLICIES = {
+    "wait_for_anchor",
+    "open_immediately",
+    "bootstrap_from_history",
+    "require_warmup_state",
+}
 
 
 class BacktestService:
@@ -101,12 +109,30 @@ class BacktestService:
             raise ValueError(f"Universe group '{universe_group_id}' has no members")
         tickers = [normalize_ticker(t, resolved_market) for t in tickers]
 
+        position_sizing = strategy_def.get("position_sizing", "equal_weight")
+
         # ---- 3. Build config ----
         benchmark = config_dict.get("benchmark") or get_default_benchmark(resolved_market)
         self._validate_benchmark_market(benchmark, resolved_market)
+        constraint_config = self._merge_constraint_config(
+            strategy_def.get("constraint_config"),
+            config_dict.get("constraint_config"),
+        )
+        warmup_start_date = config_dict.get("warmup_start_date")
+        evaluation_start_date = config_dict.get("evaluation_start_date")
+        initial_entry_policy = config_dict.get("initial_entry_policy", "wait_for_anchor")
+        if initial_entry_policy not in _INITIAL_ENTRY_POLICIES:
+            raise ValueError(
+                "initial_entry_policy must be one of "
+                f"{sorted(_INITIAL_ENTRY_POLICIES)}"
+            )
+        simulation_start_date = warmup_start_date or config_dict.get("start_date", "2020-01-01")
+        normalize_target_weights = config_dict.get("normalize_target_weights", True)
+        if position_sizing == "raw_weight" and "normalize_target_weights" not in config_dict:
+            normalize_target_weights = False
         bt_config = BacktestConfig(
             initial_capital=config_dict.get("initial_capital", 1_000_000),
-            start_date=config_dict.get("start_date", "2020-01-01"),
+            start_date=simulation_start_date,
             end_date=config_dict.get("end_date", "2024-12-31"),
             market=resolved_market,
             benchmark=benchmark,
@@ -114,18 +140,24 @@ class BacktestService:
             slippage_rate=config_dict.get("slippage_rate", 0.001),
             max_positions=config_dict.get("max_positions", 50),
             rebalance_freq=config_dict.get("rebalance_freq") or config_dict.get("rebalance_frequency", "monthly"),
-            rebalance_buffer=config_dict.get("rebalance_buffer", 0.0),
+            rebalance_buffer=self._resolve_rebalance_buffer(config_dict, constraint_config),
             rebalance_buffer_add=config_dict.get("rebalance_buffer_add"),
             rebalance_buffer_reduce=config_dict.get("rebalance_buffer_reduce"),
             rebalance_buffer_mode=config_dict.get("rebalance_buffer_mode", "all"),
-            rebalance_buffer_reference=config_dict.get("rebalance_buffer_reference", "target"),
-            min_holding_days=config_dict.get("min_holding_days", 0),
+            rebalance_buffer_reference=self._resolve_rebalance_buffer_reference(
+                config_dict,
+                constraint_config,
+            ),
+            min_holding_days=self._resolve_min_holding_days(config_dict, constraint_config),
             reentry_cooldown_days=config_dict.get("reentry_cooldown_days", 0),
-            normalize_target_weights=config_dict.get("normalize_target_weights", True),
+            normalize_target_weights=normalize_target_weights,
+            max_single_name_weight=constraint_config.get("max_single_name_weight"),
+            max_holding_days=self._resolve_max_holding_days(constraint_config),
         )
 
-        position_sizing = strategy_def.get("position_sizing", "equal_weight")
         max_position_pct = config_dict.get("max_position_pct", 0.10)
+        if constraint_config.get("max_single_name_weight") is not None:
+            max_position_pct = float(constraint_config["max_single_name_weight"])
 
         # Warn if strategy has custom weight logic under equal_weight sizing
         weight_warnings = StrategyService._validate_weight_effectiveness(
@@ -313,6 +345,10 @@ class BacktestService:
                     positions_after={},
                     strategy_diagnostics=context.diagnostics,
                 )
+                diag_entry["phase"] = self._diagnostic_phase(
+                    date_key,
+                    evaluation_start_date,
+                )
                 rebalance_diagnostics.append(diag_entry)
                 port_weights.clear()
                 port_holding_days.clear()
@@ -325,6 +361,10 @@ class BacktestService:
                 position_sizing,
                 bt_config.max_positions,
                 max_position_pct,
+            )
+            weights, constraint_actions = self._apply_weight_constraints(
+                weights,
+                constraint_config,
             )
 
             # Write weights for this date
@@ -364,6 +404,12 @@ class BacktestService:
                 positions_after=port_weights,
                 strategy_diagnostics=context.diagnostics,
             )
+            diag_entry["phase"] = self._diagnostic_phase(
+                date_key,
+                evaluation_start_date,
+            )
+            if constraint_actions:
+                diag_entry["constraint_actions"] = constraint_actions
             rebalance_diagnostics.append(diag_entry)
 
         # ---- 7. Check for pervasive signal errors ----
@@ -396,6 +442,19 @@ class BacktestService:
             )
         else:
             result = overlay_result
+        startup_state_report = self._build_startup_state_report(
+            rebalance_diagnostics=rebalance_diagnostics,
+            warmup_start_date=str(warmup_start_date) if warmup_start_date else None,
+            evaluation_start_date=str(evaluation_start_date) if evaluation_start_date else None,
+            initial_entry_policy=initial_entry_policy,
+        )
+        if evaluation_start_date:
+            result = self._slice_result_to_evaluation(
+                result,
+                evaluation_start_date=str(evaluation_start_date),
+                evaluation_end_date=str(config_dict.get("end_date", bt_config.end_date)),
+                initial_capital=float(bt_config.initial_capital),
+            )
 
         # ---- 8. Determine result_level ----
         # For now, always 'exploratory' since we use yfinance
@@ -405,6 +464,14 @@ class BacktestService:
         bt_id = uuid.uuid4().hex[:12]
         config_to_save = bt_config.to_dict()
         config_to_save["universe_group_id"] = universe_group_id
+        if constraint_config:
+            config_to_save["constraint_config"] = constraint_config
+        config_to_save["initial_entry_policy"] = initial_entry_policy
+        if warmup_start_date:
+            config_to_save["warmup_start_date"] = str(warmup_start_date)
+            config_to_save["simulation_start_date"] = str(bt_config.start_date)
+        if evaluation_start_date:
+            config_to_save["evaluation_start_date"] = str(evaluation_start_date)
         requested_start = config_dict.get("start_date", "2020-01-01")
         requested_end = config_dict.get("end_date", "2024-12-31")
         config_to_save["requested_start_date"] = str(requested_start)
@@ -448,14 +515,38 @@ class BacktestService:
             "effective_start_date",
             "effective_end_date",
             "date_adjustment",
+            "evaluation_start_date",
+            "warmup_start_date",
+            "simulation_start_date",
         ):
             if key in config_to_save:
                 result_dict[key] = config_to_save[key]
         if signal_errors:
             result_dict["signal_error_count"] = len(signal_errors)
             result_dict["signal_error_samples"] = signal_errors[:5]
+        constraint_report = self._build_constraint_report(
+            constraint_config=constraint_config,
+            rebalance_diagnostics=rebalance_diagnostics,
+            trades=result.trades,
+            startup_state_report=startup_state_report,
+        )
+        result_dict["constraint_report"] = constraint_report
+        result_dict["constraint_pass"] = constraint_report["constraint_pass"]
+        result_dict["failed_constraints"] = constraint_report["failed_constraints"]
+        if startup_state_report:
+            result_dict["startup_state_report"] = startup_state_report
+        if evaluation_start_date:
+            result_dict["evaluation_start_date"] = str(evaluation_start_date)
+        if warmup_start_date:
+            result_dict["warmup_start_date"] = str(warmup_start_date)
         if rebalance_diagnostics:
             result_dict["rebalance_diagnostics"] = rebalance_diagnostics
+            portfolio_compliance = self._build_portfolio_compliance_metrics(
+                rebalance_diagnostics=rebalance_diagnostics,
+                trades=result.trades,
+                config=config_to_save,
+            )
+            result_dict["portfolio_compliance"] = portfolio_compliance
             # Persist diagnostics into stored summary
             conn = get_connection()
             row = conn.execute(
@@ -465,10 +556,27 @@ class BacktestService:
             if row:
                 summary_data = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
                 summary_data["rebalance_diagnostics"] = rebalance_diagnostics
+                summary_data["portfolio_compliance"] = portfolio_compliance
+                summary_data["constraint_report"] = constraint_report
+                summary_data["constraint_pass"] = constraint_report["constraint_pass"]
+                summary_data["failed_constraints"] = constraint_report["failed_constraints"]
+                if startup_state_report:
+                    summary_data["startup_state_report"] = startup_state_report
                 conn.execute(
                     "UPDATE backtest_results SET summary = ? WHERE id = ? AND market = ?",
                     [json.dumps(summary_data, default=str), bt_id, resolved_market],
                 )
+        else:
+            self._update_result_summary(
+                bt_id=bt_id,
+                market=resolved_market,
+                updates={
+                    "constraint_report": constraint_report,
+                    "constraint_pass": constraint_report["constraint_pass"],
+                    "failed_constraints": constraint_report["failed_constraints"],
+                    **({"startup_state_report": startup_state_report} if startup_state_report else {}),
+                },
+            )
 
         # ---- 11. Check for data leakage ----
         leakage_warnings = self._check_data_leakage(
@@ -995,6 +1103,94 @@ class BacktestService:
         return diag
 
     @staticmethod
+    def _build_portfolio_compliance_metrics(
+        *,
+        rebalance_diagnostics: list[dict],
+        trades: list[dict],
+        config: dict | None = None,
+    ) -> dict:
+        """Summarize portfolio concentration and holding-period compliance."""
+        position_counts: list[int] = []
+        target_sums: list[float] = []
+        max_target_weight = 0.0
+        max_trade_holding_days = 0
+
+        for diag in rebalance_diagnostics or []:
+            positions = diag.get("positions_after") or {}
+            if not isinstance(positions, dict):
+                continue
+            weights = [
+                abs(float(weight))
+                for weight in positions.values()
+                if weight is not None and abs(float(weight)) > 1e-8
+            ]
+            position_counts.append(len(weights))
+            target_sum = float(sum(weights))
+            target_sums.append(target_sum)
+            if weights:
+                max_target_weight = max(max_target_weight, max(weights))
+
+        for trade in trades or []:
+            if str(trade.get("action", "")).lower() != "sell":
+                continue
+            holding_days = trade.get("holding_days")
+            if holding_days is None:
+                continue
+            try:
+                max_trade_holding_days = max(max_trade_holding_days, int(holding_days))
+            except (TypeError, ValueError):
+                continue
+
+        config = config or {}
+        thresholds = {
+            "min_position_count": int(config.get("compliance_min_positions", 5)),
+            "max_target_weight": float(config.get("compliance_max_target_weight", 0.20)),
+            "max_trade_holding_days": int(config.get("compliance_max_holding_days", 21)),
+            "max_target_sum": float(config.get("compliance_max_target_sum", 1.000001)),
+        }
+
+        min_position_count = min(position_counts) if position_counts else 0
+        avg_position_count = (
+            sum(position_counts) / len(position_counts) if position_counts else 0.0
+        )
+        max_target_sum = max(target_sums) if target_sums else 0.0
+        avg_target_sum = sum(target_sums) / len(target_sums) if target_sums else 0.0
+
+        violations: dict[str, dict[str, float | int]] = {}
+        if position_counts and min_position_count < thresholds["min_position_count"]:
+            violations["min_position_count"] = {
+                "actual": min_position_count,
+                "required": thresholds["min_position_count"],
+            }
+        if max_target_weight > thresholds["max_target_weight"] + 1e-8:
+            violations["max_target_weight"] = {
+                "actual": round(max_target_weight, 6),
+                "limit": thresholds["max_target_weight"],
+            }
+        if max_trade_holding_days > thresholds["max_trade_holding_days"]:
+            violations["max_trade_holding_days"] = {
+                "actual": max_trade_holding_days,
+                "limit": thresholds["max_trade_holding_days"],
+            }
+        if max_target_sum > thresholds["max_target_sum"] + 1e-8:
+            violations["max_target_sum"] = {
+                "actual": round(max_target_sum, 6),
+                "limit": thresholds["max_target_sum"],
+            }
+
+        return {
+            "min_position_count": min_position_count,
+            "avg_position_count": round(float(avg_position_count), 3),
+            "max_target_weight": round(float(max_target_weight), 6),
+            "max_trade_holding_days": max_trade_holding_days,
+            "max_target_sum": round(float(max_target_sum), 6),
+            "avg_target_sum": round(float(avg_target_sum), 6),
+            "thresholds": thresholds,
+            "violations": violations,
+            "compliance_pass": not violations,
+        }
+
+    @staticmethod
     def _apply_position_sizing(
         raw_signals: pd.DataFrame,
         method: str,
@@ -1005,7 +1201,7 @@ class BacktestService:
 
         Args:
             raw_signals: DataFrame with index=ticker, columns=[signal, weight, strength].
-            method: One of 'equal_weight', 'signal_weight', 'max_position'.
+            method: One of 'equal_weight', 'signal_weight', 'max_position', 'raw_weight'.
             max_positions: Maximum number of positions.
             max_position_pct: Maximum weight per position (for 'max_position' method).
 
@@ -1051,12 +1247,463 @@ class BacktestService:
             # redistribute excess to uncapped positions.
             weights = _cap_weights(raw_weights, max_position_pct)
 
+        elif method == "raw_weight":
+            weights = {
+                ticker: max(0.0, float(weight))
+                for ticker, weight in buys["weight"].astype(float).items()
+                if pd.notna(weight) and float(weight) > 0
+            }
+
         else:
             # Default to equal weight
             n = len(buys)
             weights = {ticker: 1.0 / n for ticker in buys.index}
 
         return weights
+
+    @staticmethod
+    def _merge_constraint_config(
+        strategy_config: dict | None,
+        run_config: dict | None,
+    ) -> dict:
+        """Merge strategy default constraints with per-run overrides."""
+        def _clean(raw: dict | None) -> dict:
+            return dict(raw) if isinstance(raw, dict) else {}
+
+        def _deep_merge(base: dict, override: dict) -> dict:
+            merged = dict(base)
+            for key, value in override.items():
+                if value is None:
+                    continue
+                if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                    merged[key] = _deep_merge(merged[key], value)
+                else:
+                    merged[key] = value
+            return merged
+
+        merged = _deep_merge(_clean(strategy_config), _clean(run_config))
+        normalized: dict = {}
+        for key, value in merged.items():
+            if value is None:
+                continue
+            if key in {
+                "max_single_name_weight",
+                "weekly_turnover_floor",
+                "rebalance_drift_buffer",
+            }:
+                normalized[key] = float(value)
+            elif key == "holding_period" and isinstance(value, dict):
+                holding: dict = {}
+                for hp_key, hp_value in value.items():
+                    if hp_value is None:
+                        continue
+                    if hp_key in {"min_days", "max_days"}:
+                        holding[hp_key] = int(hp_value)
+                    else:
+                        holding[hp_key] = hp_value
+                if holding:
+                    normalized[key] = holding
+            else:
+                normalized[key] = value
+        return normalized
+
+    @staticmethod
+    def _resolve_rebalance_buffer(config_dict: dict, constraint_config: dict) -> float:
+        if "rebalance_buffer" in config_dict:
+            return float(config_dict.get("rebalance_buffer") or 0.0)
+        if "rebalance_drift_buffer" in constraint_config:
+            return float(constraint_config.get("rebalance_drift_buffer") or 0.0)
+        return 0.0
+
+    @staticmethod
+    def _resolve_rebalance_buffer_reference(
+        config_dict: dict,
+        constraint_config: dict,
+    ) -> str:
+        if "rebalance_buffer_reference" in config_dict:
+            return str(config_dict.get("rebalance_buffer_reference") or "target")
+        if "rebalance_drift_buffer" in constraint_config:
+            return "actual_open"
+        return "target"
+
+    @staticmethod
+    def _resolve_min_holding_days(config_dict: dict, constraint_config: dict) -> int:
+        if "min_holding_days" in config_dict:
+            return int(config_dict.get("min_holding_days") or 0)
+        holding = constraint_config.get("holding_period")
+        if isinstance(holding, dict):
+            return int(holding.get("min_days") or 0)
+        return 0
+
+    @staticmethod
+    def _resolve_max_holding_days(constraint_config: dict) -> int | None:
+        holding = constraint_config.get("holding_period")
+        if isinstance(holding, dict) and holding.get("max_days") is not None:
+            return int(holding["max_days"])
+        return None
+
+    @staticmethod
+    def _apply_weight_constraints(
+        weights: dict[str, float],
+        constraint_config: dict | None,
+    ) -> tuple[dict[str, float], dict]:
+        """Apply target-level hard constraints and return audit actions."""
+        if not weights:
+            return {}, {}
+        config = constraint_config if isinstance(constraint_config, dict) else {}
+        max_weight = config.get("max_single_name_weight")
+        if max_weight is None:
+            return dict(weights), {}
+
+        limit = float(max_weight)
+        clipped: dict[str, dict[str, float]] = {}
+        constrained: dict[str, float] = {}
+        for ticker, weight in weights.items():
+            raw = max(0.0, float(weight))
+            capped = min(raw, limit)
+            if raw > limit + 1e-10:
+                clipped[str(ticker)] = {
+                    "raw": round(raw, 6),
+                    "clipped": round(capped, 6),
+                }
+            if capped > 1e-8:
+                constrained[str(ticker)] = capped
+
+        actions = {
+            "max_single_name_weight": limit,
+            "clipped": clipped,
+        } if clipped else {}
+        return constrained, actions
+
+    @staticmethod
+    def _diagnostic_phase(date_key: str, evaluation_start_date: str | None) -> str:
+        if not evaluation_start_date:
+            return "evaluation"
+        try:
+            return "warmup" if date.fromisoformat(str(date_key)[:10]) < date.fromisoformat(str(evaluation_start_date)[:10]) else "evaluation"
+        except ValueError:
+            return "evaluation"
+
+    @staticmethod
+    def _build_constraint_report(
+        *,
+        constraint_config: dict | None,
+        rebalance_diagnostics: list[dict],
+        trades: list[dict],
+        startup_state_report: dict | None,
+    ) -> dict:
+        """Build a compact hard-constraint report for backtest summaries."""
+        config = constraint_config if isinstance(constraint_config, dict) else {}
+        failed: list[str] = []
+
+        max_observed_weight = 0.0
+        clipped_events = 0
+        for diag in rebalance_diagnostics or []:
+            positions = diag.get("positions_after") or {}
+            if isinstance(positions, dict):
+                for weight in positions.values():
+                    try:
+                        max_observed_weight = max(max_observed_weight, abs(float(weight)))
+                    except (TypeError, ValueError):
+                        pass
+            actions = diag.get("constraint_actions") or {}
+            if isinstance(actions, dict):
+                clipped = actions.get("clipped") or {}
+                if isinstance(clipped, dict):
+                    clipped_events += len(clipped)
+
+        max_single_report = None
+        if config.get("max_single_name_weight") is not None:
+            limit = float(config["max_single_name_weight"])
+            max_single_report = {
+                "limit": limit,
+                "max_observed": round(float(max_observed_weight), 6),
+                "clipped_events": clipped_events,
+                "pass": max_observed_weight <= limit + 1e-8,
+            }
+            if not max_single_report["pass"]:
+                failed.append("max_single_name_weight")
+
+        weekly_report = None
+        if config.get("weekly_turnover_floor") is not None:
+            floor = float(config["weekly_turnover_floor"])
+            exclude_initial = bool(config.get("weekly_turnover_exclude_initial", True))
+            weekly: dict[tuple[int, int], float] = {}
+            for diag in rebalance_diagnostics or []:
+                if diag.get("phase") == "warmup":
+                    continue
+                try:
+                    d = date.fromisoformat(str(diag.get("date"))[:10])
+                except ValueError:
+                    continue
+                iso = d.isocalendar()
+                key = (iso.year, iso.week)
+                weekly[key] = weekly.get(key, 0.0) + float(diag.get("turnover") or 0.0)
+            weeks = []
+            for idx, key in enumerate(sorted(weekly)):
+                excluded = exclude_initial and idx == 0
+                turnover = weekly[key]
+                passed = excluded or turnover >= floor - 1e-8
+                weeks.append({
+                    "year": key[0],
+                    "week": key[1],
+                    "turnover": round(float(turnover), 6),
+                    "excluded": excluded,
+                    "pass": passed,
+                })
+            weekly_report = {
+                "floor": floor,
+                "exclude_initial": exclude_initial,
+                "weeks": weeks,
+                "pass": all(item["pass"] for item in weeks),
+            }
+            if not weekly_report["pass"]:
+                failed.append("weekly_turnover_floor")
+
+        holding_report = None
+        holding_cfg = config.get("holding_period")
+        if isinstance(holding_cfg, dict):
+            sell_holding_days: list[int] = []
+            for trade in trades or []:
+                if str(trade.get("action", "")).lower() != "sell":
+                    continue
+                try:
+                    sell_holding_days.append(int(trade.get("holding_days") or 0))
+                except (TypeError, ValueError):
+                    pass
+            min_days = holding_cfg.get("min_days")
+            max_days = holding_cfg.get("max_days")
+            min_violation = (
+                min_days is not None
+                and any(days < int(min_days) for days in sell_holding_days)
+            )
+            max_violation = (
+                max_days is not None
+                and any(days > int(max_days) for days in sell_holding_days)
+            )
+            holding_report = {
+                "min_days": min_days,
+                "max_days": max_days,
+                "target_bucket": holding_cfg.get("target_bucket"),
+                "position_level": {
+                    "sell_count": len(sell_holding_days),
+                    "min_observed": min(sell_holding_days) if sell_holding_days else None,
+                    "max_observed": max(sell_holding_days) if sell_holding_days else None,
+                },
+                "lot_level": {
+                    "status": "approximated_from_engine_trade_log",
+                },
+                "pass": not (min_violation or max_violation),
+            }
+            if not holding_report["pass"]:
+                failed.append("holding_period")
+
+        startup_report = startup_state_report if isinstance(startup_state_report, dict) else None
+        if startup_report and startup_report.get("startup_silence_violation"):
+            failed.append("startup_silence")
+
+        return {
+            "constraint_pass": not failed,
+            "failed_constraints": failed,
+            "max_single_name_weight": max_single_report,
+            "weekly_turnover": weekly_report,
+            "holding_period": holding_report,
+            "rebalance_drift_buffer": config.get("rebalance_drift_buffer"),
+            "startup_state_report": startup_report,
+        }
+
+    @staticmethod
+    def _build_startup_state_report(
+        *,
+        rebalance_diagnostics: list[dict],
+        warmup_start_date: str | None,
+        evaluation_start_date: str | None,
+        initial_entry_policy: str,
+    ) -> dict | None:
+        if not evaluation_start_date:
+            return None
+
+        eval_start = date.fromisoformat(str(evaluation_start_date)[:10])
+        last_before_eval: dict | None = None
+        first_eval: dict | None = None
+        empty_wait_count = 0
+        anchor_blocked_count = 0
+
+        for diag in rebalance_diagnostics or []:
+            try:
+                diag_date = date.fromisoformat(str(diag.get("date"))[:10])
+            except ValueError:
+                continue
+            if diag_date < eval_start:
+                last_before_eval = diag
+                continue
+            if first_eval is None:
+                first_eval = diag
+            before = diag.get("positions_before") or {}
+            after = diag.get("positions_after") or {}
+            if not before and not after:
+                empty_wait_count += 1
+            if diag.get("wait_for_anchor") or diag.get("reason") == "wait_for_anchor":
+                anchor_blocked_count += 1
+
+        start_positions = (
+            last_before_eval.get("positions_after")
+            if isinstance(last_before_eval, dict)
+            else {}
+        ) or {}
+        first_before = (
+            first_eval.get("positions_before")
+            if isinstance(first_eval, dict)
+            else {}
+        ) or {}
+        first_after = (
+            first_eval.get("positions_after")
+            if isinstance(first_eval, dict)
+            else {}
+        ) or {}
+
+        first_before_count = len(first_before) if isinstance(first_before, dict) else 0
+        startup_silence_violation = False
+        if initial_entry_policy == "require_warmup_state":
+            startup_silence_violation = first_before_count == 0
+        elif empty_wait_count > 0 and initial_entry_policy in {"bootstrap_from_history", "open_immediately"}:
+            startup_silence_violation = True
+
+        return {
+            "warmup_start_date": warmup_start_date,
+            "evaluation_start_date": evaluation_start_date,
+            "initial_entry_policy": initial_entry_policy,
+            "evaluation_start_position_count": len(start_positions) if isinstance(start_positions, dict) else 0,
+            "first_evaluation_rebalance_date": first_eval.get("date") if isinstance(first_eval, dict) else None,
+            "first_evaluation_positions_before_count": first_before_count,
+            "first_evaluation_positions_after_count": len(first_after) if isinstance(first_after, dict) else 0,
+            "first_evaluation_turnover": first_eval.get("turnover") if isinstance(first_eval, dict) else None,
+            "empty_wait_rebalance_count": empty_wait_count,
+            "anchor_blocked_count": anchor_blocked_count,
+            "startup_silence_violation": startup_silence_violation,
+        }
+
+    @staticmethod
+    def _slice_result_to_evaluation(
+        result: BacktestResult,
+        *,
+        evaluation_start_date: str,
+        evaluation_end_date: str | None,
+        initial_capital: float,
+    ) -> BacktestResult:
+        eval_start = date.fromisoformat(str(evaluation_start_date)[:10])
+        eval_end = date.fromisoformat(str(evaluation_end_date)[:10]) if evaluation_end_date else None
+        keep_indices: list[int] = []
+        for idx, date_key in enumerate(result.dates):
+            try:
+                d = date.fromisoformat(str(date_key)[:10])
+            except ValueError:
+                continue
+            if d < eval_start:
+                continue
+            if eval_end and d > eval_end:
+                continue
+            keep_indices.append(idx)
+
+        if not keep_indices:
+            return result
+
+        dates = [result.dates[idx] for idx in keep_indices]
+        base_nav = float(result.nav[keep_indices[0]]) if result.nav else initial_capital
+        base_benchmark = (
+            float(result.benchmark_nav[keep_indices[0]])
+            if result.benchmark_nav and len(result.benchmark_nav) > keep_indices[0]
+            else initial_capital
+        )
+        nav = [
+            round(float(result.nav[idx]) / base_nav * initial_capital, 2)
+            if base_nav
+            else initial_capital
+            for idx in keep_indices
+        ]
+        benchmark_nav = [
+            round(float(result.benchmark_nav[idx]) / base_benchmark * initial_capital, 2)
+            if base_benchmark and result.benchmark_nav and len(result.benchmark_nav) > idx
+            else initial_capital
+            for idx in keep_indices
+        ]
+
+        nav_arr = np.array(nav, dtype=float)
+        daily_returns = np.diff(nav_arr) / nav_arr[:-1] if len(nav_arr) > 1 else np.array([])
+        daily_returns = np.where(np.isfinite(daily_returns), daily_returns, 0.0)
+        total_return = (nav_arr[-1] / initial_capital - 1.0) if len(nav_arr) > 0 else 0.0
+        years = len(nav_arr) / 252.0 if len(nav_arr) > 0 else 1.0
+        annual_return = backtest_engine_module._calc_cagr(
+            initial_capital,
+            nav_arr[-1] if len(nav_arr) > 0 else initial_capital,
+            years,
+        )
+        annual_volatility = backtest_engine_module._calc_annual_volatility(daily_returns)
+        drawdown_series = backtest_engine_module._calc_drawdown_series(nav_arr)
+        max_dd = float(np.min(drawdown_series)) if len(drawdown_series) > 0 else 0.0
+        sharpe = backtest_engine_module._calc_sharpe(annual_return, annual_volatility)
+        calmar = backtest_engine_module._calc_calmar(annual_return, max_dd)
+        sortino = backtest_engine_module._calc_sortino(daily_returns, annual_return)
+
+        eval_trades = []
+        warmup_trades_excluded = False
+        for trade in result.trades or []:
+            try:
+                trade_date = date.fromisoformat(str(trade.get("date"))[:10])
+            except ValueError:
+                continue
+            if trade_date < eval_start:
+                warmup_trades_excluded = True
+                continue
+            if eval_end and trade_date > eval_end:
+                continue
+            eval_trades.append(trade)
+
+        win_rate, pl_ratio = backtest_engine_module._calc_trade_stats(eval_trades)
+        total_cost = sum(float(t.get("cost") or 0.0) for t in eval_trades)
+        trade_value = sum(
+            abs(float(t.get("shares") or 0.0) * float(t.get("price") or 0.0))
+            for t in eval_trades
+        )
+        annual_turnover = (trade_value / initial_capital / years) if years > 0 and initial_capital > 0 else 0.0
+        trade_diagnostics = backtest_engine_module._calc_trade_diagnostics(eval_trades)
+        trade_diagnostics["evaluation_slice"] = {
+            "warmup_start_date": result.config.get("start_date"),
+            "evaluation_start_date": evaluation_start_date,
+            "evaluation_end_date": str(evaluation_end_date) if evaluation_end_date else None,
+            "warmup_trades_excluded": warmup_trades_excluded,
+        }
+        if isinstance(result.trade_diagnostics, dict) and "target_weight_policy" in result.trade_diagnostics:
+            trade_diagnostics["target_weight_policy"] = result.trade_diagnostics["target_weight_policy"]
+
+        config = dict(result.config)
+        config["evaluation_start_date"] = evaluation_start_date
+        if evaluation_end_date:
+            config["evaluation_end_date"] = str(evaluation_end_date)
+        config["evaluation_slice_applied"] = True
+
+        return BacktestResult(
+            config=config,
+            dates=dates,
+            nav=nav,
+            benchmark_nav=benchmark_nav,
+            drawdown=[round(d, 6) for d in drawdown_series.tolist()] if len(drawdown_series) > 0 else [],
+            total_return=round(float(total_return), 6),
+            annual_return=round(float(annual_return), 6),
+            annual_volatility=round(float(annual_volatility), 6),
+            max_drawdown=round(max_dd, 6),
+            sharpe_ratio=round(float(sharpe), 4),
+            calmar_ratio=round(float(calmar), 4),
+            sortino_ratio=round(float(sortino), 4),
+            win_rate=round(float(win_rate), 4),
+            profit_loss_ratio=round(float(pl_ratio), 4),
+            total_trades=len(eval_trades),
+            annual_turnover=round(float(annual_turnover), 4),
+            total_cost=round(float(total_cost), 2),
+            monthly_returns=backtest_engine_module._calc_monthly_returns(dates, nav),
+            trades=eval_trades,
+            trade_diagnostics=trade_diagnostics,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1615,6 +2262,27 @@ class BacktestService:
         }
         payload["hash"] = _fingerprint_hash(payload)
         return payload
+
+    @staticmethod
+    def _update_result_summary(
+        *,
+        bt_id: str,
+        market: str,
+        updates: dict,
+    ) -> None:
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT summary FROM backtest_results WHERE id = ? AND market = ?",
+            [bt_id, market],
+        ).fetchone()
+        if not row:
+            return
+        summary_data = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
+        summary_data.update(updates)
+        conn.execute(
+            "UPDATE backtest_results SET summary = ? WHERE id = ? AND market = ?",
+            [json.dumps(summary_data, default=str), bt_id, market],
+        )
 
 
 # ------------------------------------------------------------------

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from backend.logger import get_logger
 from backend.services.backtest_service import BacktestService
@@ -52,6 +52,7 @@ class CreateStrategyRequest(BaseModel):
     source_code: str
     description: Optional[str] = None
     position_sizing: str = "equal_weight"
+    constraint_config: dict | None = None
 
 
 class UpdateStrategyRequest(BaseModel):
@@ -59,10 +60,13 @@ class UpdateStrategyRequest(BaseModel):
     source_code: Optional[str] = None
     description: Optional[str] = None
     position_sizing: Optional[str] = None
+    constraint_config: dict | None = None
     status: Optional[str] = None
 
 
 class RunBacktestRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     market: Optional[str] = None
     config: dict = {}
     universe_group_id: str
@@ -88,6 +92,7 @@ async def create_strategy(body: CreateStrategyRequest) -> dict:
             source_code=body.source_code,
             description=body.description,
             position_sizing=body.position_sizing,
+            constraint_config=body.constraint_config,
             market=body.market,
         )
     except ValueError as e:
@@ -249,6 +254,7 @@ async def update_strategy(strategy_id: str, body: UpdateStrategyRequest) -> dict
             source_code=body.source_code,
             description=body.description,
             position_sizing=body.position_sizing,
+            constraint_config=body.constraint_config,
             status=body.status,
             market=body.market,
         )
@@ -331,6 +337,8 @@ async def run_backtest(strategy_id: str, body: RunBacktestRequest) -> dict:
             "win_rate", "total_trades", "start_date", "end_date",
             "leakage_warnings", "requested_start_date", "requested_end_date",
             "effective_start_date", "effective_end_date", "date_adjustment",
+            "constraint_pass", "failed_constraints", "constraint_report",
+            "startup_state_report", "evaluation_start_date", "warmup_start_date",
         ):
             if key in full:
                 summary[key] = full[key]

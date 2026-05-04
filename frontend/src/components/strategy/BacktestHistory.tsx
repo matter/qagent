@@ -37,6 +37,17 @@ const LEVEL_TAG: Record<string, { color: string; label: string }> = {
   poor: { color: "error", label: "较差" },
 };
 
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function compliancePass(summary: Record<string, unknown> | null | undefined): boolean | undefined {
+  const constraintPass = summary?.constraint_pass as boolean | undefined;
+  if (constraintPass === false) return false;
+  const compliance = summary?.portfolio_compliance as Record<string, unknown> | undefined;
+  return compliance?.compliance_pass as boolean | undefined;
+}
+
 interface BacktestRow extends BacktestResultSummary {
   strategy_name?: string;
 }
@@ -169,9 +180,10 @@ export default function BacktestHistory({ refreshKey, onRestoreConfig }: Backtes
       title: "年化收益",
       key: "annual_return",
       width: 110,
-      sorter: (a: BacktestRow, b: BacktestRow) => (a.summary?.annual_return ?? 0) - (b.summary?.annual_return ?? 0),
+      sorter: (a: BacktestRow, b: BacktestRow) =>
+        (numberValue(a.summary?.annual_return) ?? 0) - (numberValue(b.summary?.annual_return) ?? 0),
       render: (_: unknown, r: BacktestRow) => {
-        const v = r.summary?.annual_return;
+        const v = numberValue(r.summary?.annual_return);
         if (v === undefined || v === null) return "-";
         return (
           <Text style={{ color: v > 0 ? "#52c41a" : "#ff4d4f" }}>
@@ -184,9 +196,11 @@ export default function BacktestHistory({ refreshKey, onRestoreConfig }: Backtes
       title: "Sharpe",
       key: "sharpe",
       width: 80,
-      sorter: (a: BacktestRow, b: BacktestRow) => ((a.summary?.sharpe ?? a.summary?.sharpe_ratio ?? 0) as number) - ((b.summary?.sharpe ?? b.summary?.sharpe_ratio ?? 0) as number),
+      sorter: (a: BacktestRow, b: BacktestRow) =>
+        ((numberValue(a.summary?.sharpe) ?? numberValue(a.summary?.sharpe_ratio) ?? 0)
+          - (numberValue(b.summary?.sharpe) ?? numberValue(b.summary?.sharpe_ratio) ?? 0)),
       render: (_: unknown, r: BacktestRow) => {
-        const v = r.summary?.sharpe ?? r.summary?.sharpe_ratio;
+        const v = numberValue(r.summary?.sharpe) ?? numberValue(r.summary?.sharpe_ratio);
         if (v === undefined || v === null) return "-";
         return (
           <Text style={{ color: v > 1 ? "#52c41a" : v > 0 ? "#1677ff" : "#ff4d4f" }}>
@@ -199,15 +213,36 @@ export default function BacktestHistory({ refreshKey, onRestoreConfig }: Backtes
       title: "最大回撤",
       key: "max_drawdown",
       width: 100,
-      sorter: (a: BacktestRow, b: BacktestRow) => (a.summary?.max_drawdown ?? 0) - (b.summary?.max_drawdown ?? 0),
+      sorter: (a: BacktestRow, b: BacktestRow) =>
+        (numberValue(a.summary?.max_drawdown) ?? 0) - (numberValue(b.summary?.max_drawdown) ?? 0),
       render: (_: unknown, r: BacktestRow) => {
-        const v = r.summary?.max_drawdown;
+        const v = numberValue(r.summary?.max_drawdown);
         if (v === undefined || v === null) return "-";
         return (
           <Text style={{ color: "#ff4d4f" }}>
             {(v * 100).toFixed(2)}%
           </Text>
         );
+      },
+    },
+    {
+      title: "合规",
+      key: "compliance",
+      width: 80,
+      filters: [
+        { text: "通过", value: "pass" },
+        { text: "违规", value: "fail" },
+      ],
+      onFilter: (value: boolean | React.Key, record: BacktestRow) => {
+        const pass = compliancePass(record.summary);
+        if (value === "pass") return pass === true;
+        if (value === "fail") return pass === false;
+        return false;
+      },
+      render: (_: unknown, r: BacktestRow) => {
+        const pass = compliancePass(r.summary);
+        if (pass === undefined) return <Text type="secondary">-</Text>;
+        return <Tag color={pass ? "success" : "error"}>{pass ? "通过" : "违规"}</Tag>;
       },
     },
     {

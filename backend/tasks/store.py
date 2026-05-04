@@ -81,25 +81,26 @@ class TaskStore:
         log.debug("task.updated", task_id=task_id, status=status.value)
 
     def mark_stale_running(self) -> int:
-        """Mark any 'queued' or 'running' tasks as 'failed' (stale from previous run).
-
-        Returns the number of rows affected.
-        """
-        conn = get_connection()
-        result = conn.execute(
-            """UPDATE task_runs
-               SET status = 'failed',
-                   completed_at = CURRENT_TIMESTAMP,
-                   error_message = 'Marked as failed: server restarted while task was in progress'
-               WHERE status IN ('queued', 'running')"""
-        )
-        count = result.fetchone()[0] if result.description else 0
-        # DuckDB doesn't return affected rows easily; query instead
-        count = conn.execute(
-            """SELECT COUNT(*) FROM task_runs
-               WHERE error_message = 'Marked as failed: server restarted while task was in progress'
-                 AND completed_at > CURRENT_TIMESTAMP - INTERVAL 5 SECOND"""
-        ).fetchone()[0]
+        """Mark queued/running tasks from a previous server run as retryable failures."""
+        stale_records = self.list_matching_active(limit=5000)
+        interrupted_summary = {
+            "interrupted": True,
+            "retryable": True,
+            "reason": "server_restarted",
+            "message": "Server restarted while task was in progress; rerun with the same params.",
+        }
+        for record in stale_records:
+            self.update_status(
+                record.id,
+                TaskStatus.FAILED,
+                completed_at=utc_now_naive(),
+                result_summary=interrupted_summary,
+                error_message=(
+                    "Interrupted by server restart; retryable=true; "
+                    "rerun with the same params."
+                ),
+            )
+        count = len(stale_records)
         if count > 0:
             log.info("task.stale_cleaned", count=count)
         return count

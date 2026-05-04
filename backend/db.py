@@ -229,6 +229,7 @@ CREATE TABLE IF NOT EXISTS strategies (
     required_factors JSON,
     required_models  JSON,
     position_sizing VARCHAR DEFAULT 'equal_weight',
+    constraint_config JSON,
     status          VARCHAR DEFAULT 'draft',
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -388,6 +389,17 @@ def _run_migrations(conn) -> None:
             log.info("db.migration", action="added label_definitions.config column")
     except Exception:
         pass  # Table may not exist yet (handled by DDL above)
+
+    try:
+        cols = conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'strategies' AND column_name = 'constraint_config'"
+        ).fetchall()
+        if not cols:
+            conn.execute("ALTER TABLE strategies ADD COLUMN constraint_config JSON")
+            log.info("db.migration", action="added strategies.constraint_config column")
+    except Exception:
+        pass
 
     try:
         report = migrate_market_schema(conn)

@@ -51,6 +51,8 @@ class BacktestConfig:
     min_holding_days: int = 0           # don't sell a position before N trading days
     reentry_cooldown_days: int = 0      # after selling, wait N days before re-buying
     normalize_target_weights: bool = True  # legacy default: invest non-empty targets fully
+    max_single_name_weight: float | None = None  # absolute per-name target/order cap
+    max_holding_days: int | None = None           # force exit after N holding days
 
     def __post_init__(self) -> None:
         self.market = normalize_market(self.market)
@@ -85,6 +87,8 @@ class BacktestConfig:
             "min_holding_days": self.min_holding_days,
             "reentry_cooldown_days": self.reentry_cooldown_days,
             "normalize_target_weights": self.normalize_target_weights,
+            "max_single_name_weight": self.max_single_name_weight,
+            "max_holding_days": self.max_holding_days,
         }
 
 
@@ -260,6 +264,11 @@ class BacktestEngine:
                         target_weights = {
                             t: w / weight_sum for t, w in target_weights.items()
                         }
+                    if config.max_single_name_weight is not None:
+                        target_weights = _cap_absolute_weights(
+                            target_weights,
+                            float(config.max_single_name_weight),
+                        )
                     last_cash_weight = max(0.0, 1.0 - sum(target_weights.values()))
 
                     # Calculate portfolio value BEFORE rebalance (at today's open)
@@ -327,6 +336,14 @@ class BacktestEngine:
                                     effective_targets.pop(ticker, None)
                                     continue
 
+                            # Max holding days: force an exit once the position
+                            # has aged past the configured hard cap.
+                            if config.max_holding_days is not None and reference_w > 0:
+                                days_held = ticker_holding_days.get(ticker, 0)
+                                if days_held >= int(config.max_holding_days):
+                                    effective_targets.pop(ticker, None)
+                                    continue
+
                         # Re-normalize if constraints altered the weights. In
                         # hold-overlap mode the buffer is specifically meant to
                         # preserve existing position sizes, so normalizing would
@@ -345,6 +362,16 @@ class BacktestEngine:
                                 0.0,
                                 1.0 - sum(w for w in effective_targets.values() if w > 0),
                             )
+
+                    if config.max_single_name_weight is not None:
+                        effective_targets = _cap_absolute_weights(
+                            effective_targets,
+                            float(config.max_single_name_weight),
+                        )
+                        last_cash_weight = max(
+                            0.0,
+                            1.0 - sum(w for w in effective_targets.values() if w > 0),
+                        )
 
                     all_involved_tickers = set(current_weights.keys()) | set(
                         effective_targets.keys()
@@ -716,6 +743,17 @@ class BacktestEngine:
 # ------------------------------------------------------------------
 # Metrics calculation helpers
 # ------------------------------------------------------------------
+
+
+def _cap_absolute_weights(weights: dict[str, float], max_weight: float) -> dict[str, float]:
+    """Apply an absolute per-name cap without redistributing clipped cash."""
+    if max_weight <= 0:
+        return {}
+    return {
+        ticker: min(float(weight), float(max_weight))
+        for ticker, weight in weights.items()
+        if float(weight) > 1e-8
+    }
 
 
 def _calc_cagr(initial: float, final: float, years: float) -> float:

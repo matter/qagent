@@ -547,6 +547,7 @@ def create_strategy(
     source_code: str,
     description: str | None = None,
     position_sizing: str = "equal_weight",
+    constraint_config: dict | None = None,
     market: str | None = None,
 ) -> dict:
     """Create a market-scoped strategy definition.
@@ -555,7 +556,7 @@ def create_strategy(
         name: Strategy name.
         source_code: Python source implementing StrategyBase.
         description: Optional description.
-        position_sizing: Position sizing mode.
+        position_sizing: Position sizing mode: equal_weight, signal_weight, max_position, or raw_weight.
         market: Market scope. Defaults to "US" for compatibility.
 
     Returns:
@@ -568,6 +569,7 @@ def create_strategy(
         source_code=source_code,
         description=description,
         position_sizing=position_sizing,
+        constraint_config=constraint_config,
         market=resolved_market,
     )
 
@@ -644,6 +646,7 @@ def generate_signals(
     strategy_id: str,
     target_date: str,
     universe_group_id: str,
+    constraint_config: dict | None = None,
     market: str | None = None,
 ) -> dict:
     """Trigger signal generation for a strategy as a background task.
@@ -671,12 +674,14 @@ def generate_signals(
         target_date: str,
         universe_group_id: str,
         market: str,
+        constraint_config: dict | None,
     ) -> dict:
         return sig_svc.generate_signals(
             strategy_id=strategy_id,
             target_date=target_date,
             universe_group_id=universe_group_id,
             market=market,
+            constraint_config=constraint_config,
         )
 
     task_id = executor.submit(
@@ -687,6 +692,7 @@ def generate_signals(
             "target_date": target_date,
             "universe_group_id": universe_group_id,
             "market": resolved_market,
+            "constraint_config": constraint_config,
         },
         timeout=3600,
         source=TaskSource.AGENT,

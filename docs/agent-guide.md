@@ -1,46 +1,75 @@
-# QAgent Agent 使用说明与最佳实践
+# QAgent Agent 使用手册
 
-本文面向调用 QAgent 的 coding / research agent。QAgent 的定位是本地优先、单用户、低频量化研究执行引擎：agent 通过 REST API 或 MCP 工具完成研究链路，human 通过 React UI 对结果做可视化和量化验收。V2.0 支持 `US` 和 A 股 `CN` 两个 market；旧调用不传 `market` 时必须按 `US` 处理。
+本文面向在 QAgent 中执行开发、研究和验收的 agent。QAgent 是本地优先、单用户、低频量化研究系统；human 主要通过 React UI 看可视化和指标，agent 主要通过 REST API、MCP 工具和服务层测试完成研究链路。所有入口必须共享后端服务层，不能让 REST、MCP、UI 形成三套行为。
 
-## 1. 工作边界
+当前系统处于 V2.0 分支语义：默认兼容 US，美股仍是 legacy/default；新增 `market` 隔离后支持 A 股 `CN`。所有新调用都应显式传 `market`，只有验证旧兼容性时才依赖缺省 `US`。
+
+## 1. 系统定位与边界
 
 QAgent 负责：
 
-- 行情数据管理、股票池管理、因子研究、特征工程、标签定义、模型训练、策略回测、信号生成、模拟交易。
-- 保存可复现的研究资产，包括源码、配置、依赖、指标、诊断和任务结果。
-- 提供 REST API、MCP 工具和 React UI，三者必须共享同一套后端服务层。
+- 行情数据、股票池、因子、特征集、标签、模型、策略、回测、信号生成、模拟交易。
+- 保存可复现研究资产，包括源码、参数、依赖快照、训练/回测窗口、指标、诊断和任务结果。
+- 让 agent 通过 REST/MCP 执行，让 human 通过 UI 验收；二者看到的资产、状态和指标必须一致。
 
 QAgent 不负责：
 
-- 实盘券商下单、撮合所级别仿真、高频交易、多人协作权限系统。
-- 用界面绕过服务层写入数据。
-- 用随机 K-Fold 等不适合时序金融数据的验证方式制造虚假指标。
+- 券商实盘下单、交易所级撮合仿真、高频或日内策略、多用户权限。
+- 让策略代码绕过服务层直接写库、读外部文件、调网络接口。
+- 用随机 K-Fold 之类不适合市场时间序列的验证方式制造指标。
 
-## 2. Market Scope 规则
+系统优先级：
 
-所有 agent 调用都应显式带 `market`，除非正在验证旧系统兼容性。
+1. 时间序列正确性：不引入 look-ahead bias。
+2. 可复现：每个资产都能追溯配置和依赖。
+3. 市场隔离：US/CN 资产不能混用。
+4. agent 友好：长任务可轮询，诊断可读，错误可复现。
+5. human 可验收：UI 能看到关键指标、图表、诊断和历史记录。
 
-- `market="US"`：美股，默认数据源为 yfinance，常用 benchmark 为 `SPY`。
-- `market="CN"`：A 股，当前数据源为 BaoStock，ticker 使用 BaoStock 原生代码，如 `sh.600000`、`sz.000001`，默认 benchmark 为 `sh.000300`，默认股票池为 `cn_a_core_indices_union`。
-- CN 默认股票池由上证50、沪深300、中证500、创业板指成分股去重并集构成。`update_data(mode="incremental", market="CN")` 和 `refresh_stock_list(market="CN")` 都以这个并集为市场级 universe，不使用 BaoStock 全 A 列表作为默认下载范围。
-- 不允许把 US group / factor / label / feature set / model / strategy / benchmark 用在 CN 回测、信号或 paper trading 中。
-- 所有长任务返回 `task_id` 后，通过 `/api/tasks/{task_id}` 轮询；MCP 工具会尽量返回 `market`、`asset_scope`、`poll_url`，agent 应记录这些字段。
-- 发现 REST、MCP、UI 入口 market 行为不一致时，优先记录到 `docs/backlog.md`，再修服务层。
+## 2. Market Scope
 
-## 3. 启动与健康检查
+所有 V2 REST 和 MCP 调用都应携带 `market`。
 
-优先使用项目脚本：
+- `US`：美股，默认数据源 yfinance，常用 benchmark 为 `SPY`。
+- `CN`：A 股，数据源 BaoStock，ticker 使用 BaoStock 格式，如 `sh.600000`、`sz.000001`，默认 benchmark 为 `sh.000300`。
+- 缺省 `market` 按 `US` 处理，仅用于向后兼容。
+
+隔离规则：
+
+- group、factor、label、feature set、model、strategy、backtest、signal run、paper session 都按 market 解析。
+- CN 策略不能依赖 US factor/model，US 回测不能使用 CN benchmark 或 CN 股票池。
+- benchmark 会做市场校验；CN 应使用 `sh.000300` 这类 BaoStock 指数代码。
+- 发现 REST、MCP、UI 对 market 的行为不一致，先记录到 `docs/backlog.md`，再修服务层。
+
+CN 默认股票池：
+
+- 当前 A 股默认研究 universe 是 `cn_a_core_indices_union`。
+- 它由上证50、沪深300、中证500、创业板指成分股去重并集构成。
+- 这不是 BaoStock 全 A 列表；除非任务明确要求全市场扫描，否则不要改用全 A。
+- 正常情况下该 group 成员数应大于 700，当前种子并集约 806 支。
+
+## 3. 启动、停止与健康检查
+
+开发环境：
 
 ```bash
 scripts/start.sh
 scripts/stop.sh
 ```
 
-分别启动时：
+分别启动：
 
 ```bash
 uv run uvicorn backend.app:app --host 127.0.0.1 --port 8000 --reload
 cd frontend && pnpm dev
+```
+
+agent 需要后台服务时：
+
+```bash
+scripts/start_detached.sh
+scripts/status.sh
+scripts/stop.sh
 ```
 
 常用入口：
@@ -48,88 +77,150 @@ cd frontend && pnpm dev
 - API: `http://127.0.0.1:8000/api`
 - UI: `http://localhost:5173`
 - MCP: `http://127.0.0.1:8000/mcp/`
-- 任务轮询: `GET /api/tasks/{task_id}`
-- 任务筛选: `GET /api/tasks?source=agent&market=CN&task_type=strategy_backtest`
-- 批量取消: `POST /api/tasks/bulk-cancel`
-- 暂停匹配的新任务提交: `POST /api/tasks/pause-rules`
+- 任务详情: `GET /api/tasks/{task_id}`
+- 任务列表: `GET /api/tasks?source=agent&market=CN&task_type=strategy_backtest`
 
-长任务必须走 `TaskExecutor`，返回 `task_id` 后轮询 `/api/tasks/{task_id}`。不要在 API handler、MCP tool 或前端请求里同步阻塞训练、回测、因子计算、信号诊断、paper trading 推进。
+健康检查建议：
 
-如果外部旧脚本持续污染队列，先按实际 `source`、`market`、`task_type` 过滤任务，再批量取消并建立暂停规则。暂停规则只阻断 qagent 的后续任务入队，不负责杀死外部进程；外部进程仍需在运行环境侧停止。
+- backend reload 或数据任务刚启动时，health check 短时超时先退避重试。
+- 连续失败再看 `scripts/status.sh`、`logs/backend-detached.log`、`logs/qagent.log`。
+- 不要直接打开运行中的 `data/qagent.duckdb` 做诊断；优先使用官方只读 API，避免 DuckDB 文件锁。
 
-## 4. Agent 标准研究链路
+## 4. 任务系统
 
-### 4.1 数据就绪
+长任务必须走 `TaskExecutor`，返回 `task_id` 后轮询 `/api/tasks/{task_id}`。不要在 API handler、MCP tool 或前端请求里同步阻塞数据更新、因子评估、模型训练、回测、信号诊断或 paper trading 推进。
 
-先确认本地数据覆盖目标股票池和日期窗口。优先小范围补数，不要默认全量刷新。
+标准异步模式：
 
-验收要点：
+1. 调用 REST endpoint 或 MCP tool。
+2. 保存返回的 `task_id`、`task_type`、`market`、`poll_url`。
+3. 轮询 `GET /api/tasks/{task_id}`。
+4. `completed` 后读取持久化资产详情。
+5. 在结论中记录资产 ID、配置、指标和复验入口。
 
-- 数据截止日期覆盖回测 / 信号目标日期。
-- 股票池成分不为空。
-- 缺失、停牌、异常价格有明确处理方式。
+任务控制：
 
-### 4.2 因子与特征
+- `GET /api/tasks`
+- `GET /api/tasks/{task_id}`
+- `POST /api/tasks/{task_id}/cancel`
+- `POST /api/tasks/bulk-cancel`
+- `GET /api/tasks/pause-rules`
+- `POST /api/tasks/pause-rules`
+- `DELETE /api/tasks/pause-rules/{rule_id}`
 
-自定义因子必须继承 `FactorBase`，实现 `compute(data: pd.DataFrame) -> pd.Series`。因子计算和评估应通过服务层和任务系统执行。
+使用原则：
 
-验收要点：
+- 批量取消前先用 `source`、`market`、`task_type` 缩小范围。
+- pause rule 只阻止 qagent 后续任务入队，不负责杀死外部脚本或旧进程。
+- `failed` 任务要读取 `error`，不要盲目重试覆盖原始现场。
+- 被取消或中断的任务如果生成了局部结果，要看任务 result/error 和对应服务是否明确标记。
 
-- 因子无未来函数，窗口只使用决策日可见数据。
-- 因子评估保留 IC、IR、分组收益、覆盖率等结果。
-- 特征集记录因子引用、预处理配置和依赖快照。
+## 5. 能自由实现什么，不能自由实现什么
 
-### 4.3 模型训练
+### 5.1 因子
 
-训练前确认标签定义、时间切分、股票池和特征集。市场时序任务不得使用随机 K-Fold。
+因子是受控代码插件。可以自由写计算逻辑，但必须继承 `FactorBase` 并实现：
 
-验收要点：
+```python
+def compute(self, data: pd.DataFrame) -> pd.Series:
+    ...
+```
 
-- 使用 time split、rolling、expanding、purge-gap 或 calendar-aware 方案。
-- 模型资产保留训练配置、特征集、标签、数据窗口和评估指标。
-- 模型 metadata 保留 `feature_lineage`，用训练列名追溯到 `factor_id` / `factor_name`。声明但因覆盖率不足未进入矩阵的因子会记录为 missing；训练列未在 feature set 声明时必须阻断保存。
-- 模型预测失败、缺失或依赖不完整时要显式报错或在诊断里暴露，不能静默 no-op。
-- 同日候选竞争模型使用 `objective_type="ranking"`、`"pairwise"` 或 `"listwise"`。V2.0 中 `pairwise` 是 LambdaRank 支撑的用户目标别名，模型 metadata 应记录 `pairwise_mode="lambdarank"`；不要声称已经实现 true pair-sampling learner，除非另有明确实现和验证。ranking/listwise 的默认 `label_gain` 为 `ordinal`，会把同日 rank 标签映射为 dense non-negative relevance label；只有已经是 dense relevance label 时才使用 `label_gain="identity"`。
+输入是单只股票的 `open/high/low/close/volume` 时间序列，输出是同 index 的因子值序列。loader 只允许 `pandas`、`numpy`、`math`、`backend.indicators` 等白名单模块；禁止相对导入、文件访问、网络访问、数据库访问和任意第三方库。
 
-### 4.4 策略与回测
+影响：
 
-自定义策略必须继承 `StrategyBase`，输出以 ticker 为 index 的 DataFrame，列包含 `signal`、`weight`、`strength`。
+- 适合技术因子、滚动统计、单标的价量特征。
+- 不适合直接在因子源码内实现横截面分位数、行业排名、全市场同日排序。
+- 需要横截面特征时，应在 feature/model 服务层扩展，而不是放宽因子沙箱。
 
-验收要点：
+### 5.2 模型
 
-- 策略声明 `required_factors()` 和 `required_models()`；源码中直接引用的 model id 也应被系统解析、注入和校验。
-- 回测遵循 T+1 / open-price 执行语义。
-- 回测保存 trades、NAV、drawdown、summary、rebalance diagnostics。
-- 对 stateful 策略，重点检查当前持仓、holding days、unrealized PnL 是否按同一语义传给 strategy context。
+模型层当前不是自由代码插件。`model_type` 注册表目前只有 `lightgbm`。可以配置 `model_params`、标签、特征集、时间切分和目标类型，但不能通过 UI/MCP 上传任意 PyTorch、XGBoost、sklearn 自定义 estimator。
 
-### 4.5 信号诊断
+支持的 `objective_type`：
 
-信号生成用于生产候选结果，`diagnose_signals` 用于解释为什么某票进入或没有进入组合。
+- `regression`
+- `classification`
+- `ranking`
+- `pairwise`
+- `listwise`
 
-验收要点：
+V2.0 中 `pairwise` 是基于 LightGBM LambdaRank 的用户目标别名，不是独立 pair-sampling learner。ranking/listwise 当前强制 `ranking_config.query_group="date"`，用于同日候选竞争。
 
-- `model_diagnostics` 能看到 required / injected / missing 模型状态。
-- `strategy_diagnostics` 能看到候选池、选中项、当前持仓占位、转换候选、阻塞原因。
-- focus ticker 的模型分数、因子快照、候选池成员关系可直接定位问题。
+影响：
 
-### 4.6 模拟交易与对账
+- 想新增模型类型，需要在后端实现 `ModelBase` 并注册到模型 registry。
+- 训练强制使用时间切分、purge gap、同 market feature/label/group。
+- 保存模型时会记录 `feature_lineage`；训练列未在 feature set 声明会阻断保存，声明但覆盖不足的 feature 会进入 missing 记录。
 
-paper trading 是 live-like forward test，不是另一个策略实现。它必须复用同一服务层、同一策略执行语义和同一 T+1/open-price 规则。
+### 5.3 策略
 
-验收要点：
+策略是受控代码插件。必须继承 `StrategyBase`，实现：
 
-- 新 session 第一天只记录 baseline，首笔交易在下一个可执行交易日。
-- `GET /api/paper-trading/sessions/{id}/daily` 返回 NAV、cash、position_count、trade_count。
-- `GET /api/paper-trading/sessions/{id}/positions?date=YYYY-MM-DD` 能回看历史持仓快照。
-- `GET /api/paper-trading/sessions/{id}/compare-backtest/{backtest_id}` 能逐日对齐 paper 和 backtest 的交易、目标仓位、NAV 差异。
+```python
+def generate_signals(self, context: StrategyContext) -> pd.DataFrame:
+    ...
+```
 
-## 5. A 股研究全流程
+返回 DataFrame 以 ticker 为 index，列包含：
 
-A 股链路使用 `market="CN"`，默认 universe 是 `cn_a_core_indices_union`。这组股票池由上证50、沪深300、中证500、创业板指去重得到，当前种子并集为 `806` 支。Agent 做 A 股研究时不要改用 `cn_all_a`，除非任务明确要求全市场扫描。
+- `signal`: `1` 买入、`-1` 卖出、`0` 持有。
+- `weight`: 策略建议目标权重。
+- `strength`: 排序和 sizing 用信号强度。
 
-### 5.1 数据和股票池
+策略 loader 只允许 `pandas`、`numpy`、`math`、`backend.strategies.base`。策略依赖通过 `required_factors()` 和 `required_models()` 声明；源码中直接访问 `context.model_predictions["model_id"]` 也会被静态解析并合并校验。
 
-先刷新股票池，再做数据更新：
+影响：
+
+- 策略可以写候选池、打分、模型融合、换手控制、持仓状态逻辑。
+- 不能直接查库、联网、读取本地文件或跨 market 使用资产。
+- 策略输出不是最终订单；回测、信号和 paper trading 会再执行 position sizing 与约束。
+
+## 6. 策略权重、约束和执行语义
+
+策略输出经过 `position_sizing` 后才进入回测/信号/paper trading。
+
+可选 sizing：
+
+- `equal_weight`：只看买入候选，等权；会忽略策略自定义 `weight`。
+- `signal_weight`：按 `strength` 归一化。
+- `max_position`：按 strength 分配后做单票上限。
+- `raw_weight`：读取策略输出的 `weight`；如未显式设置 `normalize_target_weights`，系统默认不再归一化，允许留现金。
+
+通用执行约束：
+
+- T+1 open 执行：T 日生成目标，T+1 开盘成交。
+- 交易成本包括 commission 和 slippage。
+- `max_positions` 会截断持仓数量。
+- `normalize_target_weights=true` 时非空目标会归一到满仓。
+- `max_single_name_weight` 会裁剪单票权重。
+- `rebalance_drift_buffer`、`holding_period.min_days`、`holding_period.max_days`、`reentry_cooldown_days` 会改变实际交易。
+
+`constraint_config` 可保存在策略上，也可在单次回测、信号、paper trading 中覆盖：
+
+```json
+{
+  "max_single_name_weight": 0.15,
+  "weekly_turnover_floor": 0.30,
+  "rebalance_drift_buffer": 0.05,
+  "holding_period": {"min_days": 1, "max_days": 21}
+}
+```
+
+验收口径：
+
+- 要验证策略自定义权重，使用 `position_sizing="raw_weight"`。
+- 要验证是否留现金，确认 `normalize_target_weights=false`。
+- 不要只看策略源码判断最终仓位，必须看回测 summary、trades、rebalance diagnostics 和 `constraint_report`。
+
+## 7. 标准研究链路
+
+### 7.1 数据和股票池
+
+先检查数据覆盖，再补数。优先小股票池、短窗口验证，不默认全量刷新。
+
+CN 常用 MCP：
 
 ```python
 refresh_index_groups(market="CN")
@@ -139,29 +230,21 @@ update_data(mode="incremental", market="CN")
 
 验收点：
 
-- `GET /api/groups/cn_a_core_indices_union?market=CN` 的 `member_count` 大于 `700`，当前正常值为 `806`。
-- 股票代码保持 BaoStock 格式，例如 `sh.600519`、`sz.300750`。
-- `update_data(mode="incremental", market="CN")` 对新股票回补 10 年数据，对已有股票从本地最新交易日后增量补齐。
+- group 成员不为空，CN 核心并集大于 700。
+- 行情覆盖研究起止日期。
+- ticker 规范正确：US 如 `AAPL`，CN 如 `sh.600519`。
+- 缺数据、停牌、异常价格有可解释诊断。
 
-如果 BaoStock 或创业板页面临时不可用，`GroupService` 会用内置真实种子填充核心指数分组。不要因为外部源短时失败就把 CN 股票池改成全 A。
+### 7.2 因子和特征集
 
-### 5.2 A 股因子
+因子创建后应先小范围计算/评估，再进入正式 feature set。
 
-A 股因子和美股因子共用 `FactorBase` 协议，但资产必须按 market 隔离。创建或评估因子时都传 `market="CN"`，股票池用 `cn_a_core_indices_union`。
-
-推荐顺序：
-
-1. 用短窗口和少量 ticker 验证因子无未来函数。
-2. 创建 CN factor asset。
-3. 用 CN label 做因子评估。
-4. 再把稳定因子加入 CN feature set。
-
-REST / MCP 评估示例：
+因子评估示例：
 
 ```python
 evaluate_factor(
-    factor_id="<cn_factor_id>",
-    label_id="<cn_label_id>",
+    factor_id="<factor_id>",
+    label_id="<label_id>",
     universe_group_id="cn_a_core_indices_union",
     start_date="2024-01-02",
     end_date="2024-06-28",
@@ -169,63 +252,38 @@ evaluate_factor(
 )
 ```
 
-中文或其他非 ASCII `factor_id` 推荐使用 body 版 REST 入口，避免客户端路径编码差异：
+中文或非 ASCII `factor_id` 推荐使用 body 版 REST：
 
 ```http
 POST /api/factors/evaluate
 ```
 
-```json
-{
-  "factor_id": "cn_builtin_统计_roc_std_60",
-  "label_id": "cn_preset_fwd_rank_5d",
-  "universe_group_id": "cn_a_core_indices_union",
-  "start_date": "2024-01-02",
-  "end_date": "2025-11-28",
-  "market": "CN"
-}
-```
+验收点：
+
+- factor、label、feature set 的 `market` 一致。
+- 因子值无未来函数，warm-up 区间处理明确。
+- 评估结果包含覆盖率、IC/IR、分组收益等。
+- feature set 记录 factor 引用和预处理配置。
+
+### 7.3 标签
+
+标签必须按 market 创建或读取 preset。ranking/listwise 任务优先使用能表达同日候选优劣的标签，例如 forward return rank、top quantile、路径质量或其他同日可排序标签。
 
 验收点：
 
-- factor、label、feature set 都返回 `market="CN"`。
-- 评估结果写入 CN 范围，不混用 US label 或 US group。
-- 因子覆盖率和 IC 序列可在 UI 或 API 中复验。
+- 标签 horizon 不越过训练/测试窗口边界。
+- 标签生成使用未来收益时，只作为训练标签，不得进入决策日特征。
+- ranking 标签进入模型时，默认用 `label_gain="ordinal"` 做 dense relevance 映射。
 
-### 5.3 A 股模型
+### 7.4 模型训练
 
-模型训练必须显式传 `market="CN"`、`universe_group_id="cn_a_core_indices_union"`。时间切分使用交易日顺序，保留 purge gap；不要用随机 K-Fold。
-
-回归 / 分类模型示例：
-
-```python
-train_model(
-    name="cn_baseline_lgbm_v1",
-    feature_set_id="<cn_feature_set_id>",
-    label_id="<cn_return_or_binary_label_id>",
-    model_type="lightgbm",
-    model_params={},
-    train_config={
-        "train_start": "2020-01-02",
-        "train_end": "2023-12-29",
-        "valid_start": "2024-01-02",
-        "valid_end": "2024-06-28",
-        "test_start": "2024-07-01",
-        "test_end": "2024-12-31",
-        "purge_gap": 20,
-    },
-    universe_group_id="cn_a_core_indices_union",
-    market="CN",
-)
-```
-
-同日候选竞争模型使用 ranking 目标：
+训练示例：
 
 ```python
 train_model(
     name="cn_ranker_v1",
     feature_set_id="<cn_feature_set_id>",
-    label_id="<cn_rank_or_return_label_id>",
+    label_id="<cn_label_id>",
     model_type="lightgbm",
     model_params={},
     train_config={
@@ -235,49 +293,66 @@ train_model(
         "valid_end": "2024-06-28",
         "test_start": "2024-07-01",
         "test_end": "2024-12-31",
-        "purge_gap": 20,
+        "purge_gap": 20
     },
     universe_group_id="cn_a_core_indices_union",
     market="CN",
     objective_type="listwise",
-    ranking_config={"query_group": "date", "eval_at": [5, 10, 20], "min_group_size": 20},
+    ranking_config={
+        "query_group": "date",
+        "eval_at": [5, 10, 20],
+        "min_group_size": 20,
+        "label_gain": "ordinal"
+    },
 )
 ```
 
-ranking/listwise 默认使用 `label_gain="ordinal"`，rank 类标签会先按同日候选池转成 dense relevance label，再交给 LightGBM。只有当标签本身已经是 `0..N` 的 dense 非负整数 relevance label 时，才显式设置 `ranking_config={"label_gain":"identity"}`。
+验收点：
+
+- 任务完成后能读取 `model_id`。
+- metadata 包含 feature set、label、universe、train_config、ranking_config、feature_lineage。
+- valid/test 指标存在；ranking 任务至少看 NDCG、hit/rank 相关指标和样本组数量。
+- 缺模型预测时，策略/信号/回测必须显式报错或诊断显示 missing，不接受静默 0 trades。
+
+### 7.5 策略创建
+
+创建策略时明确 market、position sizing 和默认约束。
+
+```python
+create_strategy(
+    name="cn_rank_weekly_v1",
+    source_code="<strategy source>",
+    position_sizing="raw_weight",
+    market="CN",
+    constraint_config={
+        "max_single_name_weight": 0.15,
+        "rebalance_drift_buffer": 0.05,
+        "holding_period": {"min_days": 1, "max_days": 21}
+    },
+)
+```
+
+策略源码建议使用 `StageTracer` 暴露决策过程：
+
+```python
+tracer = StageTracer(context)
+tracer.log("candidate_pool", sorted(candidates))
+tracer.log("score_map", scores)
+tracer.log("selected_set", sorted(selected))
+```
 
 验收点：
 
-- `/api/tasks/{task_id}` 返回 `completed`，且 `GET /api/models/{model_id}?market=CN` 可读取模型。
-- metadata 记录 feature set、label、股票池、训练窗口、ranking_config、`feature_lineage` 和评估指标。
-- 模型预测缺失时策略、信号、回测必须显式暴露 missing model，不允许静默退化。
+- `GET /api/strategies?market=CN` 能看到策略。
+- `required_factors()` 和 `required_models()` 完整。
+- 如果源码自定义权重，避免使用 `equal_weight`。
+- 策略 diagnostics 能解释候选池、打分、入选、剔除和持仓状态。
 
-### 5.4 A 股策略
+### 7.6 回测
 
-策略源码仍继承 `StrategyBase`。CN 策略创建必须传 `market="CN"`，策略依赖的因子名和模型 id 也必须属于 CN。
+正式回测必须通过服务层保存到 `backtest_results`，不能只用临时脚本 JSON 作为交付。
 
-极简 no-op 策略可作为创建链路 smoke test：
-
-```python
-class NoopCnStrategy(StrategyBase):
-    def generate_signals(self, context):
-        return pd.DataFrame(columns=["signal", "weight", "strength"])
-```
-
-创建后应能通过：
-
-```text
-GET /api/strategies?market=CN
-GET /api/strategies/{strategy_id}?market=CN
-```
-
-CN 策略创建已经走正式 `strategies` 表 market 隔离约束，策略名版本唯一性按 `(market, name, version)` 判定。正式交付必须有 `strategy_id` 和后续 `backtest_id`；临时脚本只能作为诊断材料。
-
-### 5.5 A 股回测
-
-正式 CN 回测必须使用服务层保存到 `backtest_results`，不接受只输出本地 JSON 的临时研究结果作为最终产物。
-
-回测示例：
+基础回测：
 
 ```python
 run_backtest(
@@ -288,16 +363,25 @@ run_backtest(
 )
 ```
 
-验收点：
+warm-up / evaluation split：
 
-- 任务完成后有 `backtest_id`。
-- `GET /api/strategies/backtests?market=CN` 能看到记录。
-- `GET /api/strategies/backtests/{backtest_id}?market=CN` 返回 summary、NAV、drawdown、trades、config。
-- 调仓诊断可通过详情顶层 `rebalance_diagnostics` 或 `GET /api/strategies/backtests/{backtest_id}/rebalance-diagnostics?market=CN` 读取，UI 回测详情会显示调仓诊断表。
-- config 中能追溯 `universe_group_id="cn_a_core_indices_union"`、benchmark、日期窗口、交易成本和调仓频率。
-- summary 中包含 `reproducibility_fingerprint`，列表接口暴露轻量 `reproducibility_hash`，用于比较同配置复跑是否可比。
+```python
+run_backtest(
+    strategy_id="<cn_strategy_id>",
+    universe_group_id="cn_a_core_indices_union",
+    market="CN",
+    config_json='{"warmup_start_date":"2025-12-15","start_date":"2026-01-05","evaluation_start_date":"2026-01-05","end_date":"2026-04-01","benchmark":"sh.000300","rebalance_freq":"weekly","initial_entry_policy":"require_warmup_state"}',
+)
+```
 
-组合底仓 + 增强卫星使用 `portfolio_overlay` 配置。当前支持 `base_leg="equal_weight"` 和 `base_leg="core_union_equal_weight"`，系统会用同一股票池构建等权底仓，再与策略 overlay NAV 按权重合成，并在回测详情中保存 base leg、overlay leg、权重、总 NAV 和分腿贡献。
+`initial_entry_policy` 支持：
+
+- `wait_for_anchor`
+- `open_immediately`
+- `bootstrap_from_history`
+- `require_warmup_state`
+
+组合层回测：
 
 ```python
 run_backtest(
@@ -308,183 +392,224 @@ run_backtest(
 )
 ```
 
-### 5.6 A 股交付材料
+验收点：
 
-A 股研究交付至少包含：
+- 任务完成后有 `backtest_id`。
+- `GET /api/strategies/backtests/{backtest_id}?market=CN` 返回 summary、NAV、drawdown、trades、config。
+- `GET /api/strategies/backtests/{backtest_id}/rebalance-diagnostics?market=CN` 能读取调仓诊断。
+- summary 包含 `portfolio_compliance`、`constraint_report`、`reproducibility_fingerprint`。
+- 列表接口应暴露轻量 `reproducibility_hash`。
+- warm-up split 时主窗口指标只统计 `evaluation_start_date` 后，诊断中 `phase` 标记 `warmup/evaluation`。
 
-- `group_id`: 固定为 `cn_a_core_indices_union`，并记录成员数。
-- `factor_id` / `feature_set_id` / `label_id` / `model_id` / `strategy_id` / `backtest_id`。
-- 数据窗口、训练窗口、回测窗口、benchmark、成本、调仓频率。
-- 因子 IC/IR、模型 ranking 或回归指标、回测 Sharpe、最大回撤、总收益、交易数。
-- UI 或 API 复验入口。
-- 如果某一步被 backlog 阻断，明确写出 backlog 条目标题和可复现命令。
+`portfolio_compliance` 是 human 验收持仓分散度和约束执行的优先口径。关键字段包括：
 
-## 6. Human 验收方式
+- `min_position_count`
+- `avg_position_count`
+- `max_target_weight`
+- `max_trade_holding_days`
+- `max_target_sum`
+- `compliance_pass`
+- `violations`
 
-Human 不直接相信 agent 的文字结论，优先看 UI 和可量化证据。Agent 完成一次研究或修复后，应给出以下验收材料：
+高收益但 `compliance_pass=false` 的结果不能直接作为交付最优。
 
-- 资产 ID：factor_id、feature_set_id、label_id、model_id、strategy_id、backtest_id、paper_session_id、task_id。
-- 配置快照：股票池、日期窗口、资金、成本、rebalance frequency、max_positions、模型/标签/特征配置。
-- 核心指标：IC/IR、AUC、Sharpe、max drawdown、annual turnover、total return、trade count、final NAV、paper/backtest delta。
-- 诊断入口：相关 UI 页面、API endpoint、对账接口、focus ticker 诊断结果。
-- 验证命令：至少包含后端单元测试、前端构建或对应的 live API 复验。
+### 7.7 信号生成和诊断
 
-UI 变更需要浏览器验收；后端逻辑变更需要 API 或服务层测试；数据敏感变更需要用真实本地数据做窄范围复验。
-
-## 7. API/MCP 调用规范
-
-优先调用高层服务入口，不要直接写 DuckDB 绕过服务层。
-
-通用异步模式：
-
-1. 调用创建/执行 endpoint 或 MCP tool。
-2. 获取 `task_id`。
-3. 轮询 `/api/tasks/{task_id}`。
-4. 状态为 `completed` 后读取持久化资产详情。
-5. 把资产 ID、配置和指标写入结论。
-
-错误处理：
-
-- `failed` 任务必须读取 `error`，不要重试到覆盖原始错误。
-- MCP 输入校验错误应包含可修复字段信息；例如非法 `market` 会返回 `Invalid MCP request` 并提示允许值 `US, CN`。
-- 数据锁或 DuckDB 写锁问题不要直接连接运行中的主库文件；优先使用官方只读诊断接口。
-- 缺数据时先缩小股票池和日期窗口复现，再决定是否补数。
-
-只读诊断入口：
-
-- `GET /api/data/index-bars/{symbol}?market=CN&start=YYYY-MM-DD&end=YYYY-MM-DD`
-- `GET /api/data/groups/{group_id}/daily-snapshot?market=CN&date=YYYY-MM-DD`
-- `GET /api/strategies/backtests/{backtest_id}/rebalance-diagnostics?market=CN`
-
-这些入口覆盖指数行情、股票池横截面覆盖和回测调仓诊断。Data 管理页的“只读诊断”面板可用于 human 验收。
-
-### 7.1 MCP 常用示例
-
-CN 数据更新：
+信号生成：
 
 ```python
-update_data(mode="incremental", market="CN")
-```
-
-CN 核心股票池刷新：
-
-```python
-refresh_stock_list(market="CN")
-refresh_index_groups(market="CN")
-```
-
-CN 因子评估：
-
-```python
-evaluate_factor(
-    factor_id="<cn_factor_id>",
-    label_id="<cn_label_id>",
+generate_signals(
+    strategy_id="<strategy_id>",
+    target_date="2026-04-30",
     universe_group_id="cn_a_core_indices_union",
-    start_date="2024-01-02",
-    end_date="2024-03-29",
     market="CN",
 )
 ```
 
-CN ranking / listwise 模型训练：
+REST：
+
+- `POST /api/signals/generate`
+- `POST /api/signals/diagnose`
+- `GET /api/signals?market=CN`
+- `GET /api/signals/{run_id}?market=CN`
+- `GET /api/signals/{run_id}/export?market=CN`
+
+验收点：
+
+- `dependency_snapshot` 记录 factor、model、strategy、constraint。
+- `model_diagnostics` 能看到 required / injected / missing 模型状态。
+- `strategy_diagnostics` 能看到候选池、选中项、gate、stage trace。
+- `auto_stage_trace` 可用于 focus ticker 定位进入/退出原因。
+- constraint_config 会应用到最终 signal weights，并保存 `constraint_report`。
+
+### 7.8 Paper Trading
+
+paper trading 是 live-like forward test，必须复用策略、回测和信号语义。
+
+MCP：
 
 ```python
-train_model(
-    name="cn_ranker_v1",
-    feature_set_id="<cn_feature_set_id>",
-    label_id="<cn_rank_label_id>",
-    model_type="lightgbm",
-    model_params={},
-    train_config={
-        "train_start": "2024-01-02",
-        "train_end": "2024-06-28",
-        "valid_start": "2024-07-01",
-        "valid_end": "2024-08-30",
-        "test_start": "2024-09-02",
-        "test_end": "2024-10-31",
-    },
-    universe_group_id="cn_a_core_indices_union",
+create_paper_session(
+    name="cn_rank_forward_v1",
+    strategy_id="<strategy_id>",
+    start_date="2026-01-05",
+    initial_capital=1000000,
+    config={"universe_group_id": "cn_a_core_indices_union", "rebalance_freq": "weekly"},
     market="CN",
-    objective_type="listwise",
-    ranking_config={
-        "query_group": "date",
-        "eval_at": [5, 10],
-        "min_group_size": 5,
-        "label_gain": "ordinal",
-    },
 )
+
+advance_paper_session(session_id="<session_id>", to_date="2026-04-30", market="CN")
 ```
 
-CN 回测：
+验收点：
 
-```python
-run_backtest(
-    strategy_id="<cn_strategy_id>",
-    universe_group_id="cn_a_core_indices_union",
-    market="CN",
-    config_json='{"start_date":"2024-01-02","end_date":"2024-12-31","benchmark":"sh.000300"}',
-)
+- 新 session 第一天只记录 baseline，首笔交易在下一个可执行交易日。
+- 与回测一致使用 T+1/open-price、position sizing、constraint_config。
+- `GET /api/paper-trading/sessions/{id}/daily` 返回 NAV、cash、position_count、trade_count。
+- `GET /api/paper-trading/sessions/{id}/positions?date=YYYY-MM-DD` 可回看历史持仓。
+- `GET /api/paper-trading/sessions/{id}/compare-backtest/{backtest_id}` 可对齐 paper/backtest 差异。
+
+## 8. 只读诊断 API
+
+这些接口用于 agent 在 backend 运行时安全读取小样本数据，不直接碰 DuckDB 文件。
+
+```http
+GET /api/diagnostics/daily-bars?market=CN&date=2026-04-30&tickers=sh.600000&tickers=sz.000001
+GET /api/diagnostics/factor-values?market=CN&date=2026-04-30&factor_id=<factor_id>&tickers=sh.600000
 ```
 
-CN 组合层回测：
+其他常用诊断：
 
-```python
-run_backtest(
-    strategy_id="<cn_strategy_id>",
-    universe_group_id="cn_a_core_indices_union",
-    market="CN",
-    config_json='{"start_date":"2024-01-02","end_date":"2024-12-31","benchmark":"sh.000300","portfolio_overlay":{"base_leg":"core_union_equal_weight","base_weight":0.65,"overlay_weight":0.35}}',
-)
+```http
+GET /api/data/index-bars/{symbol}?market=CN&start=YYYY-MM-DD&end=YYYY-MM-DD
+GET /api/data/groups/{group_id}/daily-snapshot?market=CN&date=YYYY-MM-DD
+GET /api/strategies/backtests/{backtest_id}/rebalance-diagnostics?market=CN
+GET /api/strategies/backtests/{backtest_id}/stock/{ticker}?market=CN
 ```
 
-## 8. 开发最佳实践
+使用原则：
 
-### 8.1 服务层优先
+- 单次诊断 ticker 数量保持小样本；`diagnostics` 接口最多支持 200 个 ticker。
+- 先用诊断 API 证明缺数据或错配，再决定是否补数或修代码。
+- 不把诊断接口当批量导出工具。
 
-涉及 REST、MCP、UI 多入口的行为，先改 `backend/services/`，再让 API、MCP、前端共享同一服务方法。不要在路由层复制业务逻辑。
+## 9. REST 和 MCP 调用规范
 
-### 8.2 时间序列正确性优先
+MCP 常用工具：
 
-- 不引入 look-ahead bias。
-- 决策日只能使用当时可见数据。
-- 回测、信号、paper trading 的执行日和价格语义必须一致。
-- 对 stateful 策略要明确区分策略目标仓位、实际成交仓位和估值权重。
+- `get_stock_data`
+- `search_stocks`
+- `get_data_status`
+- `update_data`
+- `refresh_stock_list`
+- `refresh_index_groups`
+- `list_groups`
+- `create_group`
+- `list_factors`
+- `create_factor`
+- `evaluate_factor`
+- `list_labels`
+- `create_label`
+- `list_feature_sets`
+- `create_feature_set`
+- `list_models`
+- `train_model`
+- `list_strategies`
+- `create_strategy`
+- `run_backtest`
+- `generate_signals`
+- `get_task_status`
+- `cancel_task`
+- `list_paper_sessions`
+- `create_paper_session`
+- `advance_paper_session`
 
-### 8.3 可复现优先
+规范：
 
-每个研究产物都应能回答：
+- 新调用显式传 `market`。
+- 长任务保存 `task_id`，不要只保存即时返回。
+- 资产创建后用 list/get 接口复验。
+- API response 新增字段时，同步 `frontend/src/api/index.ts` 和相关 UI。
+- MCP 输入错误应返回可修复字段信息，例如非法 market 应提示允许值 `US, CN`。
 
-- 用了哪些数据窗口和股票池？
-- 用了哪些因子、特征、标签、模型和策略源码？
-- 当时的配置是什么？
-- 哪个任务生成了它？
-- human 可以在哪个 UI 页面复验？
+## 10. Human 验收材料
 
-### 8.4 小范围复验优先
+agent 交付研究或修复时，不只写结论。至少给出：
 
-先用少量 ticker、短日期窗口、单个策略或单个 focus ticker 定位问题。只有明确需要时才做全量数据更新、全股票池训练或长窗口回测。
+- 资产 ID：`factor_id`、`feature_set_id`、`label_id`、`model_id`、`strategy_id`、`backtest_id`、`signal_run_id`、`paper_session_id`、`task_id`。
+- 配置快照：market、股票池、日期窗口、benchmark、资金、成本、调仓频率、max_positions、position_sizing、constraint_config。
+- 核心指标：IC/IR、AUC 或 ranking 指标、Sharpe、max drawdown、total return、turnover、trade count、final NAV、paper/backtest delta。
+- 诊断入口：UI 页面、API endpoint、rebalance diagnostics、signal diagnose、focus ticker 结果。
+- 验证命令：后端测试、前端构建、live API 复验。
 
-### 8.5 前端类型同步
+human UI 验收优先看：
 
-新增或修改 API response 字段时，同步更新 `frontend/src/api/index.ts` 和相关组件。前端 TypeScript 开启 strict、noUnusedLocals、noUnusedParameters，必须跑 `cd frontend && pnpm build`。
+- 数据覆盖和股票池成员数。
+- 因子评估图和覆盖率。
+- 模型训练指标和 feature importance。
+- 回测 NAV/drawdown/trades/rebalance diagnostics。
+- `portfolio_compliance` 和 `constraint_report`。
+- signal run 的 dependency snapshot 与候选明细。
+- paper trading 的 daily NAV、持仓和 backtest compare。
 
-## 9. 问题和需求记录位置
+## 11. 开发最佳实践
 
-所有未闭环问题、需求、验收缺口统一记录到：
+服务层优先：
+
+- 共享行为先改 `backend/services/`。
+- REST 只做请求/响应整形。
+- MCP 调同一服务方法。
+- UI 只消费 API，不复制业务逻辑。
+
+时间序列正确性：
+
+- 决策日只使用当时可见数据。
+- 标签可以用未来收益，但只能作为训练监督信号。
+- 回测、信号、paper trading 的 T+1/open-price 语义必须一致。
+- 对 stateful 策略区分目标仓位、实际成交仓位、估值权重、holding days。
+
+数据库升级：
+
+- schema 变更放在 `backend/db.py` 或 `backend/services/schema_migrations.py` 的无损迁移里。
+- 新字段要兼容旧数据库，缺省值不破坏 US legacy。
+- 不删除用户已有研究资产，除非 human 明确要求。
+
+性能：
+
+- 使用批量 SQL、DataFrame/DuckDB 操作，避免 ticker/date 双层小查询。
+- 数据更新和全量训练昂贵，先窄范围复验。
+- 性能问题如果由本机资源限制导致，记录证据后可归档，不做无意义重构。
+
+前端：
+
+- TypeScript strict，更新 API 字段必须同步类型。
+- UI 保持 Ant Design dark layout 和现有路由风格。
+- human 验收界面重视表格、图表、筛选、诊断详情，不做营销页。
+
+## 12. Backlog 和归档
+
+统一看板：
 
 ```text
 docs/backlog.md
 ```
 
-记录规则：
+使用规则：
 
-- 发现问题后先复现，再记录；不能只写猜测。
-- 每条记录必须包含日期、类型、优先级、影响范围、复现步骤、当前证据、期望行为、验收标准。
-- 如果问题来自 human 反馈，保留原始表达和具体页面 / API / 资产 ID。
-- 如果临时不修，明确写入原因和重新评估条件。
-- 修复后不要直接删除记录，先移动到 Done，并补充 commit、验证命令和复验证据。
+- 未闭环问题、需求和验收缺口都记录到 backlog。
+- 当前已修复并通过验证的问题不长期留在 backlog。
+- 每个已完成问题单独归档到 `docs/archive/backlog/`，保留复现、修复、验证和 commit。
+- 当前 backlog 文件只保存未修复或待验证的问题；如果没有未修复问题，明确写“暂无”。
 
-## 10. 交付前检查清单
+记录要求：
+
+- 写清楚 market、入口、资产 ID、请求参数、页面路径。
+- 写实际结果、错误、日志或指标，不写纯猜测。
+- 给出期望行为和可量化验收标准。
+- human 反馈保留原始问题表达。
+- 暂不处理的问题放 Deferred，并写重新评估条件。
+
+## 13. 交付前验证
 
 后端或服务层变更：
 
@@ -506,4 +631,12 @@ git diff --check
 git status --short
 ```
 
-需要 live 复验时，启动本地服务后用 API 或 UI 验证原始问题。最终回复必须说明实际跑过的命令、结果、残余风险和相关资产 ID。
+需要 live 复验时：
+
+1. 启动 backend/frontend。
+2. 用窄范围 API 或 UI 复现原问题。
+3. 跑对应任务并轮询完成。
+4. 读取持久化资产详情。
+5. 记录命令、结果、资产 ID 和残余风险。
+
+最终回复不要只说“已修复”或“已验证”。必须说明实际修改的文件、跑过的验证、结果和还没覆盖的风险。

@@ -12,6 +12,7 @@ import {
   Select,
   Space,
   Spin,
+  Switch,
   Typography,
 } from "antd";
 import { PlayCircleOutlined } from "@ant-design/icons";
@@ -65,6 +66,14 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
   const [rebalanceBuffer, setRebalanceBuffer] = useState<number>(0);
   const [minHoldingDays, setMinHoldingDays] = useState<number>(0);
   const [reentryCooldownDays, setReentryCooldownDays] = useState<number>(0);
+  const [normalizeTargetWeights, setNormalizeTargetWeights] = useState<boolean>(true);
+  const [warmupStartDate, setWarmupStartDate] = useState<Dayjs | null>(null);
+  const [evaluationStartDate, setEvaluationStartDate] = useState<Dayjs | null>(null);
+  const [initialEntryPolicy, setInitialEntryPolicy] = useState("wait_for_anchor");
+  const [maxSingleNameWeight, setMaxSingleNameWeight] = useState<number | null>(null);
+  const [weeklyTurnoverFloor, setWeeklyTurnoverFloor] = useState<number | null>(null);
+  const [constraintDriftBuffer, setConstraintDriftBuffer] = useState<number | null>(null);
+  const [maxHoldingDays, setMaxHoldingDays] = useState<number | null>(null);
 
   const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
@@ -121,6 +130,9 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
         config: {
           start_date: startDate.format("YYYY-MM-DD"),
           end_date: endDate.format("YYYY-MM-DD"),
+          warmup_start_date: warmupStartDate ? warmupStartDate.format("YYYY-MM-DD") : undefined,
+          evaluation_start_date: evaluationStartDate ? evaluationStartDate.format("YYYY-MM-DD") : undefined,
+          initial_entry_policy: initialEntryPolicy,
           initial_capital: initialCapital,
           commission_rate: commission,
           slippage_rate: slippage,
@@ -130,6 +142,18 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
           rebalance_buffer: rebalanceBuffer,
           min_holding_days: minHoldingDays,
           reentry_cooldown_days: reentryCooldownDays,
+          normalize_target_weights: normalizeTargetWeights,
+          constraint_config: {
+            ...(maxSingleNameWeight != null ? { max_single_name_weight: maxSingleNameWeight } : {}),
+            ...(weeklyTurnoverFloor != null ? { weekly_turnover_floor: weeklyTurnoverFloor } : {}),
+            ...(constraintDriftBuffer != null ? { rebalance_drift_buffer: constraintDriftBuffer } : {}),
+            ...(maxHoldingDays != null || minHoldingDays > 0 ? {
+              holding_period: {
+                min_days: minHoldingDays,
+                ...(maxHoldingDays != null ? { max_days: maxHoldingDays } : {}),
+              },
+            } : {}),
+          },
         },
         universe_group_id: selectedGroup,
       });
@@ -258,6 +282,41 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
 
             <Row gutter={12}>
               <Col span={6}>
+                <Text type="secondary" style={{ fontSize: 12 }}>Warm-up 起点</Text>
+                <DatePicker
+                  style={{ width: "100%" }}
+                  value={warmupStartDate}
+                  onChange={setWarmupStartDate}
+                  allowClear
+                />
+              </Col>
+              <Col span={6}>
+                <Text type="secondary" style={{ fontSize: 12 }}>统计起点</Text>
+                <DatePicker
+                  style={{ width: "100%" }}
+                  value={evaluationStartDate}
+                  onChange={setEvaluationStartDate}
+                  allowClear
+                />
+              </Col>
+              <Col span={12}>
+                <Text type="secondary" style={{ fontSize: 12 }}>开局策略</Text>
+                <Select
+                  style={{ width: "100%" }}
+                  value={initialEntryPolicy}
+                  onChange={setInitialEntryPolicy}
+                  options={[
+                    { value: "wait_for_anchor", label: "等待锚点" },
+                    { value: "open_immediately", label: "立即建仓" },
+                    { value: "bootstrap_from_history", label: "历史状态启动" },
+                    { value: "require_warmup_state", label: "要求 warm-up 持仓" },
+                  ]}
+                />
+              </Col>
+            </Row>
+
+            <Row gutter={12}>
+              <Col span={6}>
                 <Text type="secondary" style={{ fontSize: 12 }}>佣金费率</Text>
                 <InputNumber
                   style={{ width: "100%" }}
@@ -337,6 +396,69 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
                   onChange={(v) => setReentryCooldownDays(v ?? 0)}
                   min={0}
                   max={60}
+                />
+              </Col>
+            </Row>
+
+            <Row gutter={12}>
+              <Col span={8}>
+                <Text type="secondary" style={{ fontSize: 12 }}>目标权重归一化</Text>
+                <div style={{ marginTop: 4 }}>
+                  <Switch
+                    checked={normalizeTargetWeights}
+                    onChange={setNormalizeTargetWeights}
+                    checkedChildren="满仓"
+                    unCheckedChildren="保留现金"
+                  />
+                </div>
+              </Col>
+            </Row>
+
+            <Row gutter={12}>
+              <Col span={6}>
+                <Text type="secondary" style={{ fontSize: 12 }}>单票硬上限</Text>
+                <InputNumber
+                  style={{ width: "100%" }}
+                  value={maxSingleNameWeight}
+                  onChange={setMaxSingleNameWeight}
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  placeholder="0.15"
+                />
+              </Col>
+              <Col span={6}>
+                <Text type="secondary" style={{ fontSize: 12 }}>周换手下限</Text>
+                <InputNumber
+                  style={{ width: "100%" }}
+                  value={weeklyTurnoverFloor}
+                  onChange={setWeeklyTurnoverFloor}
+                  min={0}
+                  max={2}
+                  step={0.05}
+                  placeholder="0.30"
+                />
+              </Col>
+              <Col span={6}>
+                <Text type="secondary" style={{ fontSize: 12 }}>实际偏离缓冲</Text>
+                <InputNumber
+                  style={{ width: "100%" }}
+                  value={constraintDriftBuffer}
+                  onChange={setConstraintDriftBuffer}
+                  min={0}
+                  max={0.5}
+                  step={0.01}
+                  placeholder="0.05"
+                />
+              </Col>
+              <Col span={6}>
+                <Text type="secondary" style={{ fontSize: 12 }}>最大持仓天数</Text>
+                <InputNumber
+                  style={{ width: "100%" }}
+                  value={maxHoldingDays}
+                  onChange={setMaxHoldingDays}
+                  min={0}
+                  max={252}
                 />
               </Col>
             </Row>

@@ -418,6 +418,20 @@ class PaperTradingServiceContractTests(unittest.TestCase):
         self.assertEqual(execute.call_args.args[3], date(2026, 4, 13))
         self.assertEqual(len(fake_conn.snapshots), len(trading_days))
 
+    def test_paper_raw_weight_position_sizing_preserves_cash_budget(self):
+        weights = PaperTradingService._apply_position_sizing_from_signals(
+            [
+                {"ticker": "AAA", "signal": 1, "target_weight": 0.45, "strength": 0.9},
+                {"ticker": "BBB", "signal": 1, "target_weight": 0.20, "strength": 0.8},
+                {"ticker": "CCC", "signal": 1, "target_weight": 0.10, "strength": 0.7},
+            ],
+            "raw_weight",
+            max_positions=2,
+        )
+
+        self.assertEqual(weights, {"AAA": 0.45, "BBB": 0.20})
+        self.assertLess(sum(weights.values()), 1.0)
+
     def test_advance_uses_strategy_target_state_for_next_signal_context(self):
         class FakeResult:
             def __init__(self, row=None, rows=None):

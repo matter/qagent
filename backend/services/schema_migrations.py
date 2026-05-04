@@ -297,6 +297,7 @@ def _strategy_constraints_are_market_aware(conn) -> bool:
 
 def _rebuild_strategies_table(conn) -> None:
     row_count_before = conn.execute("SELECT COUNT(*) FROM strategies").fetchone()[0]
+    has_constraint_config = _column_exists(conn, "strategies", "constraint_config")
     conn.execute("DROP TABLE IF EXISTS strategies__v2_market_unique")
     conn.execute(
         """
@@ -310,6 +311,7 @@ def _rebuild_strategies_table(conn) -> None:
             required_factors JSON,
             required_models  JSON,
             position_sizing VARCHAR DEFAULT 'equal_weight',
+            constraint_config JSON,
             status          VARCHAR DEFAULT 'draft',
             created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -317,16 +319,17 @@ def _rebuild_strategies_table(conn) -> None:
         )
         """
     )
+    constraint_select = "constraint_config" if has_constraint_config else "NULL"
     conn.execute(
-        """
+        f"""
         INSERT INTO strategies__v2_market_unique (
             id, market, name, version, description, source_code,
-            required_factors, required_models, position_sizing,
+            required_factors, required_models, position_sizing, constraint_config,
             status, created_at, updated_at
         )
         SELECT
             id, COALESCE(market, 'US'), name, version, description, source_code,
-            required_factors, required_models, position_sizing,
+            required_factors, required_models, position_sizing, {constraint_select},
             status, created_at, updated_at
         FROM strategies
         """

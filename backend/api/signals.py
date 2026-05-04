@@ -45,6 +45,7 @@ class GenerateSignalsRequest(BaseModel):
     strategy_id: str
     target_date: str
     universe_group_id: str
+    constraint_config: dict | None = None
 
 
 class DiagnoseSignalsRequest(BaseModel):
@@ -88,12 +89,14 @@ async def generate_signals(body: GenerateSignalsRequest) -> dict:
         target_date: str,
         universe_group_id: str,
         market: str,
+        constraint_config: dict | None,
     ) -> dict:
         return svc.generate_signals(
             strategy_id=strategy_id,
             target_date=target_date,
             universe_group_id=universe_group_id,
             market=market,
+            constraint_config=constraint_config,
         )
 
     task_id = executor.submit(
@@ -104,6 +107,7 @@ async def generate_signals(body: GenerateSignalsRequest) -> dict:
             "market": resolved_market,
             "target_date": body.target_date,
             "universe_group_id": body.universe_group_id,
+            "constraint_config": body.constraint_config,
         },
         timeout=3600,  # 1 hour max
         source=TaskSource.UI,

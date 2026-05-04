@@ -112,6 +112,58 @@ class TaskExecutorContractTests(unittest.TestCase):
         self.assertEqual(record.error_message, "Cancelled by user; late result saved")
         self.assertEqual(record.result_summary["late_result"]["backtest_id"], "bt_late")
 
+    def test_cancelled_running_task_warns_compute_may_continue(self):
+        store = MemoryOnlyStore()
+        executor = TaskExecutor(store=store, max_workers=1)
+        started = threading.Event()
+        gate = threading.Event()
+
+        def work():
+            started.set()
+            gate.wait(timeout=1)
+            return {"backtest_id": "bt_late", "market": "US"}
+
+        task_id = executor.submit("slow_test", fn=work, params={})
+        try:
+            self.assertTrue(started.wait(timeout=1))
+            self.assertTrue(executor.cancel(task_id))
+            record = executor.get_task(task_id)
+        finally:
+            gate.set()
+            executor.shutdown(wait=True)
+
+        self.assertEqual(record.status.value, "failed")
+        self.assertTrue(record.result_summary["cancel_requested"])
+        self.assertTrue(record.result_summary["compute_may_continue"])
+        self.assertEqual(record.result_summary["reason"], "cancelled_running_thread")
+
+    def test_cancelled_queued_task_does_not_warn_compute_may_continue(self):
+        store = MemoryOnlyStore()
+        executor = TaskExecutor(store=store, max_workers=1)
+        blocker = threading.Event()
+        second_started = threading.Event()
+
+        first_id = executor.submit("slow_test", fn=lambda: blocker.wait(timeout=1), params={})
+        second_id = executor.submit(
+            "queued_test",
+            fn=lambda: second_started.set(),
+            params={},
+        )
+
+        try:
+            self.assertTrue(executor.cancel(second_id))
+            record = executor.get_task(second_id)
+        finally:
+            blocker.set()
+            executor.shutdown(wait=True)
+
+        self.assertEqual(record.status.value, "failed")
+        self.assertTrue(record.result_summary["cancel_requested"])
+        self.assertFalse(record.result_summary["compute_may_continue"])
+        self.assertEqual(record.result_summary["reason"], "cancelled_before_worker_started")
+        self.assertFalse(second_started.is_set())
+        self.assertNotEqual(first_id, second_id)
+
     def test_timed_out_task_exposes_late_result(self):
         store = MemoryOnlyStore()
         executor = TaskExecutor(store=store, max_workers=1)
@@ -266,10 +318,27 @@ class TaskExecutorContractTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.status_code, 400)
 
+    def test_stale_running_tasks_are_marked_retryable_interrupted(self):
+        store = StaleRecordingStore()
 
-if __name__ == "__main__":
-    unittest.main()
+        count = store.mark_stale_running()
 
+        self.assertEqual(count, 2)
+        self.assertEqual(store.status, TaskStatus.FAILED)
+        self.assertEqual(store.result_summary["interrupted"], True)
+        self.assertEqual(store.result_summary["retryable"], True)
+        self.assertIn("retryable", store.error_message)
+
+    def test_cn_model_and_backtest_share_heavy_serial_key(self):
+        self.assertEqual(
+            TaskExecutor._serial_key("strategy_backtest", {"market": "CN"}),
+            "CN:heavy-research",
+        )
+        self.assertEqual(
+            TaskExecutor._serial_key("model_train", {"market": "CN"}),
+            "CN:heavy-research",
+        )
+        self.assertIsNone(TaskExecutor._serial_key("strategy_backtest", {"market": "US"}))
 
 class QueryRecordingStore(TaskStore):
     def __init__(self, active_records=None):
@@ -302,3 +371,25 @@ class PauseAwareMemoryStore(MemoryOnlyStore):
                 "reason": "protect CN queue from stale script",
             }
         return None
+
+
+class StaleRecordingStore(TaskStore):
+    def __init__(self):
+        self.status = None
+        self.result_summary = None
+        self.error_message = None
+
+    def list_matching_active(self, **kwargs):
+        return [
+            TaskRecord(id="task_cn", task_type="strategy_backtest", params={"market": "CN"}),
+            TaskRecord(id="task_model", task_type="model_train", params={"market": "CN"}),
+        ]
+
+    def update_status(self, task_id, status, **kwargs):
+        self.status = status
+        self.result_summary = kwargs.get("result_summary")
+        self.error_message = kwargs.get("error_message")
+
+
+if __name__ == "__main__":
+    unittest.main()

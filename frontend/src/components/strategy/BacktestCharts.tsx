@@ -41,20 +41,37 @@ function normalizeMonthlyReturns(input: MonthlyInput): Record<string, Record<str
 }
 
 // Normalize summary keys (API uses sharpe_ratio, calmar_ratio, etc.)
-function normalizeSummaryKey(summary: Record<string, number>, key: string): number | undefined {
-  if (summary[key] !== undefined) return summary[key];
+type BacktestSummary = Record<string, unknown>;
+
+function asNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function normalizeSummaryKey(summary: BacktestSummary, key: string): number | undefined {
+  const direct = asNumber(summary[key]);
+  if (direct !== undefined) return direct;
   // Try _ratio suffix
-  if (summary[key + "_ratio"] !== undefined) return summary[key + "_ratio"];
-  return undefined;
+  return asNumber(summary[key + "_ratio"]);
 }
 
 // ---- Summary Cards ----
 
 interface BacktestSummaryCardsProps {
-  summary: Record<string, number>;
+  summary: BacktestSummary;
 }
 
 export function BacktestSummaryCards({ summary }: BacktestSummaryCardsProps) {
+  const compliance = summary.portfolio_compliance as Record<string, unknown> | undefined;
+  const constraintReport = summary.constraint_report as Record<string, unknown> | undefined;
+  const startupState = (
+    summary.startup_state_report
+    || constraintReport?.startup_state_report
+  ) as Record<string, unknown> | undefined;
+  const compliancePass = compliance?.compliance_pass as boolean | undefined;
+  const constraintPass = summary.constraint_pass as boolean | undefined;
+  const minPositionCount = asNumber(compliance?.min_position_count);
+  const maxTargetWeight = asNumber(compliance?.max_target_weight);
+  const maxHoldingDays = asNumber(compliance?.max_trade_holding_days);
   const items: Array<{
     key: string;
     title: string;
@@ -118,6 +135,50 @@ export function BacktestSummaryCards({ summary }: BacktestSummaryCardsProps) {
 
   return (
     <Row gutter={[12, 12]}>
+      {compliance && (
+        <Col xs={12} sm={8} md={6} lg={3}>
+          <Card size="small">
+            <Statistic
+              title="组合合规"
+              value={compliancePass ? "通过" : "违规"}
+              valueStyle={{ fontSize: 18, color: compliancePass ? "#52c41a" : "#ff4d4f" }}
+            />
+            <Text type="secondary" style={{ fontSize: 11 }}>
+              {`持仓 ${minPositionCount ?? "-"} / 权重 ${maxTargetWeight != null ? (maxTargetWeight * 100).toFixed(1) + "%" : "-"} / 天数 ${maxHoldingDays ?? "-"}`}
+            </Text>
+          </Card>
+        </Col>
+      )}
+      {constraintReport && (
+        <Col xs={12} sm={8} md={6} lg={3}>
+          <Card size="small">
+            <Statistic
+              title="硬限制"
+              value={constraintPass === false ? "违规" : "通过"}
+              valueStyle={{ fontSize: 18, color: constraintPass === false ? "#ff4d4f" : "#52c41a" }}
+            />
+            <Text type="secondary" style={{ fontSize: 11 }}>
+              {Array.isArray(summary.failed_constraints) && summary.failed_constraints.length > 0
+                ? `${summary.failed_constraints.length} 项失败`
+                : "无失败项"}
+            </Text>
+          </Card>
+        </Col>
+      )}
+      {startupState && (
+        <Col xs={12} sm={8} md={6} lg={3}>
+          <Card size="small">
+            <Statistic
+              title="开局状态"
+              value={startupState.startup_silence_violation ? "空窗" : "有状态"}
+              valueStyle={{ fontSize: 18, color: startupState.startup_silence_violation ? "#ff4d4f" : "#52c41a" }}
+            />
+            <Text type="secondary" style={{ fontSize: 11 }}>
+              {`首评估持仓 ${startupState.first_evaluation_positions_before_count ?? "-"}`}
+            </Text>
+          </Card>
+        </Col>
+      )}
       {items.map((item) => {
         const raw = normalizeSummaryKey(summary, item.key);
         if (raw === undefined || raw === null) return null;
@@ -536,6 +597,13 @@ export function RebalanceDiagnosticsTable({ diagnostics }: RebalanceDiagnosticsT
       sorter: (a, b) => String(a.date ?? "").localeCompare(String(b.date ?? "")),
     },
     {
+      title: "阶段",
+      dataIndex: "phase",
+      key: "phase",
+      width: 90,
+      render: (v: unknown) => compactValue(v),
+    },
+    {
       title: "市场状态",
       dataIndex: "market_state",
       key: "market_state",
@@ -561,6 +629,13 @@ export function RebalanceDiagnosticsTable({ diagnostics }: RebalanceDiagnosticsT
       dataIndex: "kept_due_limit_down",
       key: "kept_due_limit_down",
       width: 100,
+      render: (v: unknown) => compactValue(v),
+    },
+    {
+      title: "硬限制",
+      dataIndex: "constraint_actions",
+      key: "constraint_actions",
+      width: 120,
       render: (v: unknown) => compactValue(v),
     },
   ];

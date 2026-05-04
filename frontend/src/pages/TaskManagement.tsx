@@ -222,6 +222,20 @@ export default function TaskManagement() {
       ellipsis: true,
       render: (_: unknown, record: TaskStatusType) => {
         if (record.error) {
+          if (record.cancel_requested && record.compute_may_continue) {
+            return (
+              <Text type="warning" ellipsis style={{ maxWidth: 200 }}>
+                已请求取消，后台计算可能仍在收尾
+              </Text>
+            );
+          }
+          if (record.interrupted && record.retryable) {
+            return (
+              <Text type="warning" ellipsis style={{ maxWidth: 200 }}>
+                服务重启中断，可用相同参数重跑
+              </Text>
+            );
+          }
           return (
             <a
               onClick={() =>

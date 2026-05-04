@@ -39,6 +39,8 @@ class TaskExecutor:
         self._futures: dict[str, Future] = {}
         self._records: dict[str, TaskRecord] = {}
         self._records_lock = threading.Lock()
+        self._serial_locks: dict[str, threading.Lock] = {}
+        self._serial_locks_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public API
@@ -114,6 +116,21 @@ class TaskExecutor:
         except ValueError:
             return str(params.get("market")) if params.get("market") else None
 
+    @staticmethod
+    def _serial_key(task_type: str, params: dict[str, Any] | None) -> str | None:
+        market = TaskExecutor._pause_rule_market(params)
+        if market == "CN" and task_type in {"strategy_backtest", "model_train"}:
+            return "CN:heavy-research"
+        return None
+
+    def _get_serial_lock(self, key: str) -> threading.Lock:
+        with self._serial_locks_lock:
+            lock = self._serial_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._serial_locks[key] = lock
+            return lock
+
     def retry(self, task_id: str, fn: Callable[..., Any]) -> str:
         """Re-run a previously failed/timed-out task with the same params."""
         old = self._store.get(task_id)
@@ -143,19 +160,39 @@ class TaskExecutor:
             return False
 
         future = self._futures.get(task_id)
+        future_cancelled = False
         if future is not None:
-            future.cancel()
+            future_cancelled = future.cancel()
+        compute_may_continue = record.status == TaskStatus.RUNNING or not future_cancelled
+        cancel_summary = {
+            "cancel_requested": True,
+            "compute_may_continue": compute_may_continue,
+            "reason": (
+                "cancelled_running_thread"
+                if compute_may_continue
+                else "cancelled_before_worker_started"
+            ),
+            "message": (
+                "Cancellation was requested. Python cannot interrupt an "
+                "already-running worker thread, so compute may continue "
+                "until the callable returns."
+                if compute_may_continue
+                else "Cancellation was requested before worker execution started."
+            ),
+        }
 
         self._update_memory_status(
             task_id,
             TaskStatus.FAILED,
             completed_at=utc_now_naive(),
+            result_summary=cancel_summary,
             error_message="Cancelled by user",
         )
         self._store.update_status(
             task_id,
             TaskStatus.FAILED,
             completed_at=utc_now_naive(),
+            result_summary=cancel_summary,
             error_message="Cancelled by user",
         )
         log.info("task.cancelled", task_id=task_id)
@@ -249,7 +286,11 @@ class TaskExecutor:
         error_message: str,
     ) -> None:
         summary = result if isinstance(result, dict) else {"result": result}
-        late_summary = {"late_result": summary}
+        existing = self.get_task(task_id)
+        late_summary: dict[str, Any] = {}
+        if existing and isinstance(existing.result_summary, dict):
+            late_summary.update(existing.result_summary)
+        late_summary["late_result"] = summary
         completed = utc_now_naive()
         self._update_memory_status(
             task_id,
@@ -283,11 +324,26 @@ class TaskExecutor:
         )
         log.info("task.running", task_id=task_id)
 
+        serial_key = self._serial_key(
+            self.get_task(task_id).task_type if self.get_task(task_id) else "",
+            params,
+        )
+        serial_lock = self._get_serial_lock(serial_key) if serial_key else None
+        if serial_lock is not None:
+            log.info("task.serial_wait", task_id=task_id, serial_key=serial_key)
+            serial_lock.acquire()
+            log.info("task.serial_acquired", task_id=task_id, serial_key=serial_key)
+            if self._is_cancelled(task_id):
+                log.info("task.cancelled_before_serial_work", task_id=task_id)
+                serial_lock.release()
+                return
+
         # We run fn in a *nested* future so we can enforce a timeout from
         # the calling thread.  The outer thread-pool thread blocks here
         # until the inner future completes or times out.
         inner_pool = ThreadPoolExecutor(max_workers=1)
         inner_future = inner_pool.submit(fn, **params)
+        release_serial_in_finally = True
 
         try:
             result = inner_future.result(timeout=timeout)
@@ -334,7 +390,12 @@ class TaskExecutor:
 
             # The inner thread is still running (cancel() is a no-op for running threads).
             # Spawn a lightweight watcher that updates status if/when the task completes.
-            def _watch_completion(fut: Future, tid: str, store: TaskStore) -> None:
+            def _watch_completion(
+                fut: Future,
+                tid: str,
+                store: TaskStore,
+                serial_release_lock: threading.Lock | None,
+            ) -> None:
                 try:
                     result = fut.result()  # blocks until inner completes
                     if self._is_cancelled(tid):
@@ -380,10 +441,14 @@ class TaskExecutor:
                         error_message=tb,
                     )
                     log.error("task.late_failed", task_id=tid, error=tb)
+                finally:
+                    if serial_release_lock is not None:
+                        serial_release_lock.release()
 
+            release_serial_in_finally = False
             watcher = threading.Thread(
                 target=_watch_completion,
-                args=(inner_future, task_id, self._store),
+                args=(inner_future, task_id, self._store, serial_lock),
                 daemon=True,
             )
             watcher.start()
@@ -406,6 +471,8 @@ class TaskExecutor:
             log.error("task.failed", task_id=task_id, error=tb)
 
         finally:
+            if serial_lock is not None and release_serial_in_finally:
+                serial_lock.release()
             inner_pool.shutdown(wait=False)
 
 

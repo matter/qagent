@@ -25,6 +25,7 @@ from backend.services.market_context import normalize_market, normalize_ticker
 from backend.services.model_service import ModelService
 from backend.services.sql_filters import registered_values_table
 from backend.services.strategy_service import StrategyService
+from backend.services.backtest_service import BacktestService
 from backend.time_utils import utc_now_naive
 from backend.strategies.base import StrategyContext
 from backend.strategies.loader import load_strategy_from_code
@@ -63,6 +64,7 @@ class SignalService:
         target_date: str,
         universe_group_id: str,
         market: str | None = None,
+        constraint_config: dict | None = None,
     ) -> dict:
         """Full signal generation pipeline.
 
@@ -86,6 +88,10 @@ class SignalService:
         # ---- 1. Load strategy ----
         strategy_def = self._strategy_service.get_strategy(strategy_id, market=resolved_market)
         strategy_instance = load_strategy_from_code(strategy_def["source_code"])
+        constraint_config = BacktestService._merge_constraint_config(
+            strategy_def.get("constraint_config"),
+            constraint_config,
+        )
         StrategyService._validate_dependencies(
             strategy_def.get("required_factors", []),
             StrategyService.resolve_required_models(strategy_def),
@@ -269,12 +275,22 @@ class SignalService:
 
         # ---- 9. Determine result_level ----
         result_level = self._determine_result_level(validation)
+        raw_signals, constraint_report = self._apply_constraint_config_to_signals(
+            raw_signals,
+            position_sizing=strategy_def.get("position_sizing", "equal_weight"),
+            max_positions=int(constraint_config.get("max_positions") or len(raw_signals) or 50),
+            max_position_pct=float(constraint_config.get("max_single_name_weight") or 0.10),
+            constraint_config=constraint_config,
+        )
 
         # ---- 10. Build dependency_snapshot ----
         dependency_snapshot = self._build_dependency_snapshot(
             strategy_def, required_factors, required_models, target_date, validation,
             market=resolved_market,
         )
+        if constraint_config:
+            dependency_snapshot["constraint_config"] = constraint_config
+            dependency_snapshot["constraint_report"] = constraint_report
 
         # ---- 11. Save to DB ----
         run_id = uuid.uuid4().hex[:12]
@@ -305,6 +321,11 @@ class SignalService:
             "signals": signal_records,
             "dependency_snapshot": dependency_snapshot,
         }
+        if constraint_config:
+            result["constraint_config"] = constraint_config
+            result["constraint_report"] = constraint_report
+            result["constraint_pass"] = constraint_report["constraint_pass"]
+            result["failed_constraints"] = constraint_report["failed_constraints"]
 
         log.info(
             "signal_service.done",
@@ -710,6 +731,15 @@ class SignalService:
                 })
             signals_list.sort(key=lambda x: -x["target_weight"])
 
+        backtest_replay = None
+        if backtest_id:
+            signals_list, signal_tickers, backtest_replay = self._apply_backtest_replay_overlay(
+                generated_signals=signals_list,
+                portfolio_state=portfolio_state,
+                backtest_id=backtest_id,
+                target_date=target_date,
+            )
+
         eliminated = sorted(has_price - signal_tickers)
 
         # Build per-ticker elimination reasons
@@ -1024,6 +1054,7 @@ class SignalService:
             "stage_trace": strategy_diagnostics.get("stage_trace") or None,
             "auto_stage_trace": auto_trace,
             "focus_ticker_snapshots": focus_snapshot if focus_snapshot else None,
+            "backtest_replay": backtest_replay,
             "portfolio_state": {
                 "source": replay_source,
                 "current_weights": portfolio_state.get("current_weights"),
@@ -1339,6 +1370,58 @@ class SignalService:
         # (per requirements section 2.5: "first phase uses yfinance,
         #  all results default to exploratory")
         return "exploratory"
+
+    @staticmethod
+    def _apply_constraint_config_to_signals(
+        raw_signals: pd.DataFrame,
+        *,
+        position_sizing: str,
+        max_positions: int,
+        max_position_pct: float,
+        constraint_config: dict | None,
+    ) -> tuple[pd.DataFrame, dict]:
+        """Apply execution-style hard constraints to persisted signal weights."""
+        if raw_signals.empty:
+            return raw_signals, {
+                "constraint_pass": True,
+                "failed_constraints": [],
+                "clipped_orders": [],
+            }
+
+        weights = BacktestService._apply_position_sizing(
+            raw_signals,
+            position_sizing,
+            max_positions,
+            max_position_pct,
+        )
+        constrained, actions = BacktestService._apply_weight_constraints(
+            weights,
+            constraint_config or {},
+        )
+
+        adjusted = raw_signals.copy()
+        adjusted["weight"] = 0.0
+        adjusted["signal"] = 0
+        for ticker, weight in constrained.items():
+            if ticker in adjusted.index:
+                adjusted.loc[ticker, "weight"] = float(weight)
+                adjusted.loc[ticker, "signal"] = 1
+
+        clipped_orders = []
+        clipped = actions.get("clipped") if isinstance(actions, dict) else {}
+        if isinstance(clipped, dict):
+            clipped_orders = [
+                {"ticker": ticker, **detail}
+                for ticker, detail in sorted(clipped.items())
+                if isinstance(detail, dict)
+            ]
+
+        return adjusted, {
+            "constraint_pass": True,
+            "failed_constraints": [],
+            "clipped_orders": clipped_orders,
+            "max_single_name_weight": (constraint_config or {}).get("max_single_name_weight"),
+        }
 
     def _build_dependency_snapshot(
         self,
@@ -1703,6 +1786,70 @@ class SignalService:
 
         return model_predictions, model_snapshot
 
+    @staticmethod
+    def _apply_backtest_replay_overlay(
+        *,
+        generated_signals: list[dict],
+        portfolio_state: dict,
+        backtest_id: str,
+        target_date: str,
+    ) -> tuple[list[dict], set[str], dict | None]:
+        """Use saved backtest positions as canonical diagnose signals when present."""
+        replay_positions = portfolio_state.get("replay_positions_after")
+        if not isinstance(replay_positions, dict):
+            return generated_signals, {
+                str(item.get("ticker"))
+                for item in generated_signals
+                if item.get("ticker")
+            }, None
+
+        generated_weights = {
+            str(item["ticker"]): float(item.get("target_weight", 0.0) or 0.0)
+            for item in generated_signals
+            if item.get("ticker")
+        }
+        replay_weights = {
+            str(ticker): float(weight)
+            for ticker, weight in replay_positions.items()
+            if weight is not None and abs(float(weight)) > 1e-8
+        }
+        replay_signals = [
+            {
+                "ticker": ticker,
+                "signal": "backtest_replay",
+                "target_weight": round(float(weight), 6),
+                "strength": round(abs(float(weight)), 6),
+            }
+            for ticker, weight in sorted(
+                replay_weights.items(),
+                key=lambda item: (-abs(float(item[1])), item[0]),
+            )
+        ]
+        replay_tickers = set(replay_weights)
+        generated_tickers = set(generated_weights)
+        common = replay_tickers & generated_tickers
+        max_weight_diff = max(
+            [
+                abs(replay_weights[ticker] - generated_weights[ticker])
+                for ticker in common
+            ]
+            or [0.0]
+        )
+
+        replay_summary = {
+            "source": f"backtest:{backtest_id}",
+            "target_date": target_date,
+            "canonical": True,
+            "signal_source": "rebalance_diagnostics.positions_after",
+            "replay_positions_after": replay_weights,
+            "generated_weights": generated_weights,
+            "ticker_match": replay_tickers == generated_tickers,
+            "missing_from_generated": sorted(replay_tickers - generated_tickers),
+            "extra_in_generated": sorted(generated_tickers - replay_tickers),
+            "max_weight_diff": round(float(max_weight_diff), 8),
+        }
+        return replay_signals, replay_tickers, replay_summary
+
     def _build_auto_stage_trace(
         self,
         *,
@@ -2035,7 +2182,7 @@ class SignalService:
         resolved_market = normalize_market(market)
         conn = get_connection()
         row = conn.execute(
-            "SELECT trades, config FROM backtest_results WHERE id = ? AND market = ?",
+            "SELECT trades, config, summary FROM backtest_results WHERE id = ? AND market = ?",
             [backtest_id, resolved_market],
         ).fetchone()
         if row is None:
@@ -2043,7 +2190,18 @@ class SignalService:
 
         trades_raw = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or [])
         config_raw = json.loads(row[1]) if isinstance(row[1], str) else (row[1] or {})
+        summary_raw = json.loads(row[2]) if isinstance(row[2], str) else (row[2] or {})
         initial_capital = config_raw.get("initial_capital", 1_000_000)
+
+        replay_positions = self._find_rebalance_positions_after(summary_raw, target_date)
+        if replay_positions is not None:
+            return {
+                "current_weights": replay_positions,
+                "holding_days": {},
+                "avg_entry_price": {},
+                "unrealized_pnl": {},
+                "replay_positions_after": replay_positions,
+            }
 
         # Build position state by replaying trades strictly before target_date
         positions: dict[str, float] = {}   # ticker -> shares
@@ -2146,6 +2304,26 @@ class SignalService:
             "avg_entry_price": {t: entry_prices[t] for t in held},
             "unrealized_pnl": unrealized_out,
         }
+
+    @staticmethod
+    def _find_rebalance_positions_after(summary: dict, target_date: str) -> dict[str, float] | None:
+        diagnostics = summary.get("rebalance_diagnostics") if isinstance(summary, dict) else None
+        if not isinstance(diagnostics, list):
+            return None
+        for diag in diagnostics:
+            if not isinstance(diag, dict):
+                continue
+            if str(diag.get("date", ""))[:10] != str(target_date)[:10]:
+                continue
+            positions = diag.get("positions_after")
+            if not isinstance(positions, dict):
+                return {}
+            return {
+                str(ticker): float(weight)
+                for ticker, weight in positions.items()
+                if weight is not None and abs(float(weight)) > 1e-8
+            }
+        return None
 
     def _resolve_factor_ids(
         self,
