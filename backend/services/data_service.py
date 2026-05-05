@@ -43,6 +43,14 @@ def _resolve_history_years(value: int | None) -> int | None:
     return years
 
 
+def _resolve_start_date(value: date | str | None) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value))
+
+
 def _exchange_from_ticker(ticker: str) -> str:
     prefix = str(ticker).split(".", 1)[0].upper()
     return prefix if prefix in {"SH", "SZ", "BJ"} else ""
@@ -135,18 +143,22 @@ class DataService:
         mode: str = "incremental",
         market: str | None = None,
         history_years: int | None = None,
+        start_date: date | str | None = None,
     ) -> dict:
         """Main entry point: fetch and store market data.
 
         Args:
             mode: 'incremental' (fetch only new bars) or 'full' (10-year refetch).
             history_years: Optional override for backfill window.
+            start_date: Optional explicit backfill start date for full refreshes and
+                newly initialized tickers.
 
         Returns:
             Summary dict with total, success, failed, duration.
         """
         resolved_market = normalize_market(market or self._default_market)
         history_years = _resolve_history_years(history_years)
+        explicit_start_date = _resolve_start_date(start_date)
         provider = self._provider_for(resolved_market)
         run_id = uuid.uuid4().hex
         started_at = utc_now_naive()
@@ -186,6 +198,7 @@ class DataService:
                     "run_id": run_id,
                     "mode": mode,
                     "history_years": history_years,
+                    "start_date": str(explicit_start_date) if explicit_start_date else None,
                     "total": 0,
                     "success": 0,
                     "failed": 0,
@@ -224,14 +237,15 @@ class DataService:
             # --- Step 2: Determine date ranges ---
             end_date = get_latest_trading_day(resolved_market)
             if mode == "full":
-                start_date = date(end_date.year - (history_years or _FULL_HISTORY_YEARS), 1, 1)
-                ticker_starts = {t: start_date for t in tickers}
+                backfill_start = explicit_start_date or date(end_date.year - (history_years or _FULL_HISTORY_YEARS), 1, 1)
+                ticker_starts = {t: backfill_start for t in tickers}
             else:
                 ticker_starts = self._get_incremental_starts(
                     tickers,
                     end_date,
                     market=resolved_market,
                     history_years=history_years,
+                    start_date=explicit_start_date,
                 )
 
             tickers_to_update = [t for t in tickers if t in ticker_starts]
@@ -252,6 +266,7 @@ class DataService:
                     "market": resolved_market,
                     "run_id": run_id, "mode": mode,
                     "history_years": history_years,
+                    "start_date": str(explicit_start_date) if explicit_start_date else None,
                     "total": 0, "success": 0, "failed": 0,
                     "duration_seconds": 0.0,
                     "message": "Data is already up to date",
@@ -272,6 +287,7 @@ class DataService:
                 tickers=len(tickers_to_update),
                 batches=len(batches),
                 history_years=history_years,
+                start_date=str(explicit_start_date) if explicit_start_date else None,
             )
 
             success_count = 0
@@ -327,6 +343,7 @@ class DataService:
                     "market": resolved_market,
                     "mode": mode,
                     "history_years": history_years,
+                    "start_date": str(explicit_start_date) if explicit_start_date else None,
                     "completed_batches": list(completed_batches),
                     "success_count": success_count,
                     "fail_count": fail_count,
@@ -347,6 +364,7 @@ class DataService:
                     mode=mode,
                     market=resolved_market,
                     history_years=history_years,
+                    start_date=explicit_start_date,
                 )
                 idx_df = provider.get_index_data(benchmark, idx_start, end_date)
                 if not idx_df.empty:
@@ -380,6 +398,7 @@ class DataService:
                 "run_id": run_id,
                 "mode": mode,
                 "history_years": history_years,
+                "start_date": str(explicit_start_date) if explicit_start_date else None,
                 "total": len(tickers_to_update),
                 "success": success_count,
                 "failed": fail_count,
@@ -399,6 +418,53 @@ class DataService:
             )
             log.error("data.update.fatal", error=str(e))
             raise
+
+    def update_markets(
+        self,
+        markets: list[str],
+        mode: str = "incremental",
+        history_years: int | None = None,
+        start_date: date | str | None = None,
+    ) -> dict:
+        """Run market data updates sequentially for multiple markets."""
+        if not markets:
+            raise ValueError("markets must not be empty")
+
+        resolved_markets: list[str] = []
+        for market in markets:
+            resolved_market = normalize_market(market)
+            if resolved_market not in resolved_markets:
+                resolved_markets.append(resolved_market)
+
+        summaries: list[dict] = []
+        failed: list[dict] = []
+        for market in resolved_markets:
+            try:
+                summaries.append(
+                    self.update_data(
+                        mode=mode,
+                        market=market,
+                        history_years=history_years,
+                        start_date=start_date,
+                    )
+                )
+            except Exception as exc:
+                log.error("data.update_markets.market_failed", market=market, error=str(exc))
+                failed.append({"market": market, "error": str(exc)})
+
+        if failed:
+            raise RuntimeError(json.dumps({"completed": summaries, "failed": failed}, ensure_ascii=False))
+
+        return {
+            "mode": mode,
+            "markets": resolved_markets,
+            "history_years": history_years,
+            "start_date": str(_resolve_start_date(start_date)) if start_date else None,
+            "total": sum(int(summary.get("total") or 0) for summary in summaries),
+            "success": sum(int(summary.get("success") or 0) for summary in summaries),
+            "failed": sum(int(summary.get("failed") or 0) for summary in summaries),
+            "summaries": summaries,
+        }
 
     def refresh_stock_list(self, market: str | None = None) -> dict:
         """Refresh the stock universe without downloading daily bars."""
@@ -802,6 +868,7 @@ class DataService:
         end_date: date,
         market: str | None = None,
         history_years: int | None = None,
+        start_date: date | str | None = None,
     ) -> dict[str, date]:
         """For each ticker, find what date to start fetching from.
 
@@ -809,6 +876,7 @@ class DataService:
         """
         resolved_market = normalize_market(market or self._default_market)
         history_years = _resolve_history_years(history_years)
+        explicit_start_date = _resolve_start_date(start_date)
         tickers = [normalize_ticker(t, resolved_market) for t in tickers]
         conn = get_connection()
         # Get max date per ticker
@@ -835,7 +903,7 @@ class DataService:
             else:
                 # New ticker with no local data: fetch full history
                 bootstrap_years = history_years or _FULL_HISTORY_YEARS
-                result[t] = date(end_date.year - bootstrap_years, 1, 1)
+                result[t] = explicit_start_date or date(end_date.year - bootstrap_years, 1, 1)
 
         return result
 
@@ -847,11 +915,13 @@ class DataService:
         mode: str,
         market: str | None = None,
         history_years: int | None = None,
+        start_date: date | str | None = None,
     ) -> date:
         """Return the benchmark/index start date needed for full or incremental updates."""
         resolved_market = normalize_market(market or self._default_market)
+        explicit_start_date = _resolve_start_date(start_date)
         years = history_years or _FULL_HISTORY_YEARS
-        full_start = date(end_date.year - years, 1, 1)
+        full_start = explicit_start_date or date(end_date.year - years, 1, 1)
         if mode == "full":
             return full_start
 

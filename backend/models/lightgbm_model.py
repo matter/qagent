@@ -49,6 +49,8 @@ class LightGBMModel(ModelBase):
                 f"task must be 'regression', 'classification', or 'ranking', got '{task}'"
             )
         self.task = task
+        self._backend = "lightgbm"
+        self._fallback_reason: str | None = None
 
         # Merge user params on top of defaults
         merged = dict(_DEFAULT_PARAMS)
@@ -67,8 +69,10 @@ class LightGBMModel(ModelBase):
 
         fit_kwargs: dict[str, Any] = {}
 
-        # If caller provides eval_set for early stopping
-        if "eval_set" in kwargs:
+        # If caller provides eval_set for early stopping and the backend is
+        # actually LightGBM, wire through its native callbacks.  The sklearn
+        # fallback does not support these arguments.
+        if "eval_set" in kwargs and self._backend == "lightgbm":
             fit_kwargs["eval_set"] = kwargs["eval_set"]
             fit_kwargs["callbacks"] = [
                 _early_stopping_callback(50),
@@ -78,9 +82,9 @@ class LightGBMModel(ModelBase):
         # Pass sample_weight if provided
         if "sample_weight" in kwargs:
             fit_kwargs["sample_weight"] = kwargs["sample_weight"]
-        if "group" in kwargs:
+        if "group" in kwargs and self._backend == "lightgbm":
             fit_kwargs["group"] = kwargs["group"]
-        if "eval_group" in kwargs:
+        if "eval_group" in kwargs and self._backend == "lightgbm":
             fit_kwargs["eval_group"] = kwargs["eval_group"]
 
         self._model.fit(X, y, **fit_kwargs)
@@ -98,10 +102,21 @@ class LightGBMModel(ModelBase):
 
     def predict_raw(self, X: pd.DataFrame) -> pd.Series:
         """Return raw leaf/margin values before sigmoid transform."""
-        raw = self._model.predict(X, raw_score=True)
         import numpy as np
-        if isinstance(raw, np.ndarray) and raw.ndim == 2:
-            raw = raw[:, 1] if raw.shape[1] > 1 else raw[:, 0]
+
+        if self._backend == "lightgbm":
+            raw = self._model.predict(X, raw_score=True)
+            if isinstance(raw, np.ndarray) and raw.ndim == 2:
+                raw = raw[:, 1] if raw.shape[1] > 1 else raw[:, 0]
+            return pd.Series(raw, index=X.index, name="raw_score")
+
+        if self.task == "classification" and hasattr(self._model, "decision_function"):
+            raw = self._model.decision_function(X)
+            if isinstance(raw, np.ndarray) and raw.ndim == 2:
+                raw = raw[:, 1] if raw.shape[1] > 1 else raw[:, 0]
+            return pd.Series(raw, index=X.index, name="raw_score")
+
+        raw = self._model.predict(X)
         return pd.Series(raw, index=X.index, name="raw_score")
 
     @property
@@ -126,16 +141,51 @@ class LightGBMModel(ModelBase):
     # ------------------------------------------------------------------
 
     def _build_estimator(self, params: dict):
-        import lightgbm as lgb
+        try:
+            import lightgbm as lgb
+        except Exception as exc:
+            self._backend = "sklearn_fallback"
+            self._fallback_reason = str(exc)
+            return self._build_fallback_estimator(params)
 
         constructor_params = dict(params)
+        try:
+            if self.task == "classification":
+                return lgb.LGBMClassifier(**constructor_params)
+            if self.task == "ranking":
+                constructor_params.setdefault("objective", "lambdarank")
+                constructor_params.setdefault("metric", "ndcg")
+                return lgb.LGBMRanker(**constructor_params)
+            return lgb.LGBMRegressor(**constructor_params)
+        except Exception as exc:
+            self._backend = "sklearn_fallback"
+            self._fallback_reason = str(exc)
+            return self._build_fallback_estimator(params)
+
+    def _build_fallback_estimator(self, params: dict):
+        from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
+
+        fallback_params = self._map_fallback_params(params)
         if self.task == "classification":
-            return lgb.LGBMClassifier(**constructor_params)
-        if self.task == "ranking":
-            constructor_params.setdefault("objective", "lambdarank")
-            constructor_params.setdefault("metric", "ndcg")
-            return lgb.LGBMRanker(**constructor_params)
-        return lgb.LGBMRegressor(**constructor_params)
+            return GradientBoostingClassifier(**fallback_params)
+        return GradientBoostingRegressor(**fallback_params)
+
+    @staticmethod
+    def _map_fallback_params(params: dict[str, Any]) -> dict[str, Any]:
+        allowed = {
+            "learning_rate",
+            "n_estimators",
+            "subsample",
+            "max_depth",
+            "min_samples_split",
+            "min_samples_leaf",
+            "max_features",
+            "random_state",
+        }
+        mapped = {k: v for k, v in params.items() if k in allowed}
+        # Keep behavior reasonably close to the lightgbm defaults.
+        mapped.setdefault("random_state", 42)
+        return mapped
 
 
 def _early_stopping_callback(stopping_rounds: int):

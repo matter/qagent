@@ -89,6 +89,70 @@ restore_order = [
     "signal_details",
     # Tasks
     "task_runs",
+    # 3.0 research kernel
+    "research_projects",
+    "research_runs",
+    "artifacts",
+    "lineage_edges",
+    # 3.0 market foundation
+    "market_profiles",
+    "data_policies",
+    "trading_rule_sets",
+    "cost_models",
+    "benchmark_policies",
+    "assets",
+    "asset_identifiers",
+    "asset_lifecycle",
+    "market_data_snapshots",
+    "trade_status",
+    "corporate_actions",
+    # 3.0 universe/dataset engine
+    "universes",
+    "universe_memberships",
+    "feature_pipelines",
+    "feature_pipeline_nodes",
+    "label_specs",
+    "label_runs",
+    "datasets",
+    "dataset_columns",
+    "dataset_profiles",
+    # 3.0 factor engine
+    "factor_specs",
+    "factor_runs",
+    "factor_values",
+    "factor_signals",
+    # 3.0 model experiment/package engine
+    "model_specs",
+    "model_experiments",
+    "prediction_runs",
+    "model_packages",
+    "promotion_records",
+    "model_signals",
+    # 3.0 portfolio/risk/execution assets
+    "portfolio_construction_specs",
+    "risk_control_specs",
+    "rebalance_policy_specs",
+    "execution_policy_specs",
+    "state_policy_specs",
+    "portfolio_runs",
+    # 3.0 strategy graph runtime
+    "strategy_graphs",
+    "strategy_nodes",
+    "strategy_signals",
+    "backtest_runs",
+    "backtest_daily",
+    "backtest_trades",
+    # 3.0 production signal/paper
+    "production_signal_runs",
+    "paper_sessions",
+    "paper_daily",
+    "reproducibility_bundles",
+    # 3.0 agent research QA/playbooks
+    "agent_research_plans",
+    "agent_research_trials",
+    "qa_gate_results",
+    "promotion_policies",
+    "research_playbooks",
 ]
 
 total_rows = 0
@@ -124,6 +188,8 @@ factors = conn.execute("SELECT COUNT(*) FROM factors").fetchone()[0]
 models = conn.execute("SELECT COUNT(*) FROM models").fetchone()[0]
 strategies = conn.execute("SELECT COUNT(*) FROM strategies").fetchone()[0]
 backtests = conn.execute("SELECT COUNT(*) FROM backtest_results").fetchone()[0]
+research_runs = conn.execute("SELECT COUNT(*) FROM research_runs").fetchone()[0]
+artifacts = conn.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0]
 
 print(f"\nData summary:")
 print(f"  Stocks:     {stocks:,}")
@@ -134,6 +200,8 @@ print(f"  Factors:    {factors}")
 print(f"  Models:     {models}")
 print(f"  Strategies: {strategies}")
 print(f"  Backtests:  {backtests}")
+print(f"  Research runs: {research_runs}")
+print(f"  Artifacts:  {artifacts}")
 PYEOF
 
 # Restore model files

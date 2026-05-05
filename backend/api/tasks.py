@@ -34,6 +34,7 @@ def _get_store() -> TaskStore:
 def _record_to_dict(record) -> dict:
     result = {
         "task_id": record.id,
+        "run_id": record.run_id,
         "task_type": record.task_type,
         "status": record.status.value,
         "params": record.params,

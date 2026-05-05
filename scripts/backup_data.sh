@@ -66,6 +66,70 @@ tables = {
     "signal_details": "SELECT * FROM signal_details",
     # Tasks
     "task_runs": "SELECT * FROM task_runs",
+    # 3.0 research kernel
+    "research_projects": "SELECT * FROM research_projects",
+    "research_runs": "SELECT * FROM research_runs",
+    "artifacts": "SELECT * FROM artifacts",
+    "lineage_edges": "SELECT * FROM lineage_edges",
+    # 3.0 market foundation
+    "market_profiles": "SELECT * FROM market_profiles",
+    "data_policies": "SELECT * FROM data_policies",
+    "trading_rule_sets": "SELECT * FROM trading_rule_sets",
+    "cost_models": "SELECT * FROM cost_models",
+    "benchmark_policies": "SELECT * FROM benchmark_policies",
+    "assets": "SELECT * FROM assets",
+    "asset_identifiers": "SELECT * FROM asset_identifiers",
+    "asset_lifecycle": "SELECT * FROM asset_lifecycle",
+    "market_data_snapshots": "SELECT * FROM market_data_snapshots",
+    "trade_status": "SELECT * FROM trade_status",
+    "corporate_actions": "SELECT * FROM corporate_actions",
+    # 3.0 universe/dataset engine
+    "universes": "SELECT * FROM universes",
+    "universe_memberships": "SELECT * FROM universe_memberships",
+    "feature_pipelines": "SELECT * FROM feature_pipelines",
+    "feature_pipeline_nodes": "SELECT * FROM feature_pipeline_nodes",
+    "label_specs": "SELECT * FROM label_specs",
+    "label_runs": "SELECT * FROM label_runs",
+    "datasets": "SELECT * FROM datasets",
+    "dataset_columns": "SELECT * FROM dataset_columns",
+    "dataset_profiles": "SELECT * FROM dataset_profiles",
+    # 3.0 factor engine
+    "factor_specs": "SELECT * FROM factor_specs",
+    "factor_runs": "SELECT * FROM factor_runs",
+    "factor_values": "SELECT * FROM factor_values",
+    "factor_signals": "SELECT * FROM factor_signals",
+    # 3.0 model experiment/package engine
+    "model_specs": "SELECT * FROM model_specs",
+    "model_experiments": "SELECT * FROM model_experiments",
+    "prediction_runs": "SELECT * FROM prediction_runs",
+    "model_packages": "SELECT * FROM model_packages",
+    "promotion_records": "SELECT * FROM promotion_records",
+    "model_signals": "SELECT * FROM model_signals",
+    # 3.0 portfolio/risk/execution assets
+    "portfolio_construction_specs": "SELECT * FROM portfolio_construction_specs",
+    "risk_control_specs": "SELECT * FROM risk_control_specs",
+    "rebalance_policy_specs": "SELECT * FROM rebalance_policy_specs",
+    "execution_policy_specs": "SELECT * FROM execution_policy_specs",
+    "state_policy_specs": "SELECT * FROM state_policy_specs",
+    "portfolio_runs": "SELECT * FROM portfolio_runs",
+    # 3.0 strategy graph runtime
+    "strategy_graphs": "SELECT * FROM strategy_graphs",
+    "strategy_nodes": "SELECT * FROM strategy_nodes",
+    "strategy_signals": "SELECT * FROM strategy_signals",
+    "backtest_runs": "SELECT * FROM backtest_runs",
+    "backtest_daily": "SELECT * FROM backtest_daily",
+    "backtest_trades": "SELECT * FROM backtest_trades",
+    # 3.0 production signal/paper
+    "production_signal_runs": "SELECT * FROM production_signal_runs",
+    "paper_sessions": "SELECT * FROM paper_sessions",
+    "paper_daily": "SELECT * FROM paper_daily",
+    "reproducibility_bundles": "SELECT * FROM reproducibility_bundles",
+    # 3.0 agent research QA/playbooks
+    "agent_research_plans": "SELECT * FROM agent_research_plans",
+    "agent_research_trials": "SELECT * FROM agent_research_trials",
+    "qa_gate_results": "SELECT * FROM qa_gate_results",
+    "promotion_policies": "SELECT * FROM promotion_policies",
+    "research_playbooks": "SELECT * FROM research_playbooks",
 }
 
 total_rows = 0

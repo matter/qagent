@@ -1,0 +1,127 @@
+{
+  "generated_at": "2026-05-04T16:50:57.789557+00:00",
+  "db_path": "/Users/m/workspace/qagent/data/qagent.duckdb",
+  "db_bytes": 12288,
+  "tables": {
+    "stocks": {
+      "exists": true,
+      "rows": 0
+    },
+    "daily_bars": {
+      "exists": true,
+      "rows": 0
+    },
+    "index_bars": {
+      "exists": true,
+      "rows": 0
+    },
+    "stock_groups": {
+      "exists": true,
+      "rows": 0
+    },
+    "stock_group_members": {
+      "exists": true,
+      "rows": 0
+    },
+    "data_update_log": {
+      "exists": true,
+      "rows": 0
+    },
+    "label_definitions": {
+      "exists": true,
+      "rows": 26
+    },
+    "factors": {
+      "exists": true,
+      "rows": 119
+    },
+    "factor_values_cache": {
+      "exists": true,
+      "rows": 0
+    },
+    "factor_eval_results": {
+      "exists": true,
+      "rows": 0
+    },
+    "feature_sets": {
+      "exists": true,
+      "rows": 0
+    },
+    "models": {
+      "exists": true,
+      "rows": 0
+    },
+    "strategies": {
+      "exists": true,
+      "rows": 0
+    },
+    "backtest_results": {
+      "exists": true,
+      "rows": 0
+    },
+    "signal_runs": {
+      "exists": true,
+      "rows": 0
+    },
+    "signal_details": {
+      "exists": true,
+      "rows": 0
+    },
+    "paper_trading_sessions": {
+      "exists": true,
+      "rows": 0
+    },
+    "paper_trading_daily": {
+      "exists": true,
+      "rows": 0
+    },
+    "paper_trading_signal_cache": {
+      "exists": true,
+      "rows": 0
+    },
+    "task_runs": {
+      "exists": true,
+      "rows": 0
+    }
+  },
+  "market_counts": {
+    "stocks": {},
+    "daily_bars": {},
+    "factors": {
+      "US": 119
+    },
+    "models": {},
+    "strategies": {}
+  },
+  "date_ranges": {
+    "daily_bars": {
+      "min_date": "None",
+      "max_date": "None"
+    },
+    "index_bars": {
+      "min_date": "None",
+      "max_date": "None"
+    },
+    "factor_values_cache": {
+      "min_date": "None",
+      "max_date": "None"
+    }
+  },
+  "directories": {
+    "data/models": {
+      "exists": true,
+      "files": 0,
+      "bytes": 0
+    },
+    "data/factors": {
+      "exists": true,
+      "files": 0,
+      "bytes": 0
+    },
+    "data/strategies": {
+      "exists": true,
+      "files": 0,
+      "bytes": 0
+    }
+  }
+}

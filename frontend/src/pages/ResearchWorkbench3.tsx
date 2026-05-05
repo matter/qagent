@@ -1,0 +1,690 @@
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  Alert,
+  Button,
+  Descriptions,
+  Drawer,
+  Empty,
+  message,
+  Popconfirm,
+  Space,
+  Spin,
+  Statistic,
+  Table,
+  Tabs,
+  Tag,
+  Typography,
+} from "antd";
+import {
+  AuditOutlined,
+  BranchesOutlined,
+  CheckCircleOutlined,
+  ClearOutlined,
+  DatabaseOutlined,
+  ExperimentOutlined,
+  FileSearchOutlined,
+  ReloadOutlined,
+} from "@ant-design/icons";
+import type { ColumnsType } from "antd/es/table";
+import {
+  archiveResearchArtifact3,
+  evaluatePromotion3,
+  getBootstrapProject3,
+  getProjectDataStatus3,
+  getResearchLineage3,
+  listAgentPlaybooks3,
+  listAgentResearchPlans3,
+  listDatasets3,
+  listPaperSessions3,
+  listProductionSignalRuns3,
+  listPromotionRecords3,
+  listQaReports3,
+  listResearchArtifacts3,
+  listResearchRuns3,
+  listStrategyGraphs3,
+  listUniverses3,
+  previewArtifactCleanup3,
+} from "../api";
+import type {
+  AgentPlaybook3,
+  AgentResearchPlan3,
+  CleanupPreview3,
+  Dataset3,
+  PaperSession3,
+  ProductionSignalRun3,
+  ProjectDataStatus3,
+  PromotionRecord3,
+  QaReport3,
+  ResearchArtifact3,
+  ResearchLineage3,
+  ResearchProject3,
+  ResearchRun3,
+  StrategyGraph3,
+  Universe3,
+} from "../api";
+
+const { Text, Paragraph } = Typography;
+
+interface WorkbenchState {
+  project: ResearchProject3 | null;
+  dataStatus: ProjectDataStatus3 | null;
+  runs: ResearchRun3[];
+  artifacts: ResearchArtifact3[];
+  playbooks: AgentPlaybook3[];
+  plans: AgentResearchPlan3[];
+  qaReports: QaReport3[];
+  promotions: PromotionRecord3[];
+  universes: Universe3[];
+  datasets: Dataset3[];
+  strategyGraphs: StrategyGraph3[];
+  productionSignals: ProductionSignalRun3[];
+  paperSessions: PaperSession3[];
+}
+
+const emptyState: WorkbenchState = {
+  project: null,
+  dataStatus: null,
+  runs: [],
+  artifacts: [],
+  playbooks: [],
+  plans: [],
+  qaReports: [],
+  promotions: [],
+  universes: [],
+  datasets: [],
+  strategyGraphs: [],
+  productionSignals: [],
+  paperSessions: [],
+};
+
+function statusColor(status: string) {
+  if (["completed", "pass", "promoted", "active", "published", "validated"].includes(status)) return "success";
+  if (["running", "queued", "warning", "candidate", "draft"].includes(status)) return "processing";
+  if (["failed", "fail", "rejected"].includes(status)) return "error";
+  if (["archived", "scratch"].includes(status)) return "default";
+  return "blue";
+}
+
+function shortJson(value: unknown) {
+  if (value == null) return "-";
+  const text = JSON.stringify(value);
+  return text.length > 180 ? `${text.slice(0, 180)}...` : text;
+}
+
+function timeText(value: string | null | undefined) {
+  return value ? value.slice(0, 19) : "-";
+}
+
+function bytesText(value: number) {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
+export default function ResearchWorkbench3() {
+  const [state, setState] = useState<WorkbenchState>(emptyState);
+  const [loading, setLoading] = useState(false);
+  const [selectedRun, setSelectedRun] = useState<ResearchRun3 | null>(null);
+  const [selectedArtifact, setSelectedArtifact] = useState<ResearchArtifact3 | null>(null);
+  const [selectedQa, setSelectedQa] = useState<QaReport3 | null>(null);
+  const [lineage, setLineage] = useState<ResearchLineage3 | null>(null);
+  const [cleanupPreview, setCleanupPreview] = useState<CleanupPreview3 | null>(null);
+  const [actionLoading, setActionLoading] = useState(false);
+  const [messageApi, contextHolder] = message.useMessage();
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const project = await getBootstrapProject3();
+      const [
+        dataStatus,
+        runs,
+        artifacts,
+        playbooks,
+        plans,
+        qaReports,
+        promotions,
+        universes,
+        datasets,
+        strategyGraphs,
+        productionSignals,
+        paperSessions,
+      ] = await Promise.all([
+        getProjectDataStatus3(project.id).catch(() => null),
+        listResearchRuns3({ project_id: project.id, limit: 50 }),
+        listResearchArtifacts3({ project_id: project.id, limit: 50 }),
+        listAgentPlaybooks3(),
+        listAgentResearchPlans3({ project_id: project.id, limit: 50 }),
+        listQaReports3({ limit: 50 }),
+        listPromotionRecords3({ project_id: project.id, limit: 50 }),
+        listUniverses3({ project_id: project.id, limit: 50 }),
+        listDatasets3({ project_id: project.id, limit: 50 }),
+        listStrategyGraphs3({ project_id: project.id }),
+        listProductionSignalRuns3({ limit: 20 }),
+        listPaperSessions3({ limit: 20 }),
+      ]);
+      setState({
+        project,
+        dataStatus,
+        runs,
+        artifacts,
+        playbooks,
+        plans,
+        qaReports,
+        promotions,
+        universes,
+        datasets,
+        strategyGraphs,
+        productionSignals,
+        paperSessions,
+      });
+    } catch {
+      messageApi.error("加载研究工作台失败");
+    } finally {
+      setLoading(false);
+    }
+  }, [messageApi]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const openRun = async (run: ResearchRun3) => {
+    setSelectedRun(run);
+    setLineage(null);
+    try {
+      setLineage(await getResearchLineage3(run.id));
+    } catch {
+      messageApi.warning("Lineage 加载失败");
+    }
+  };
+
+  const openArtifact = (artifact: ResearchArtifact3) => {
+    setSelectedArtifact(artifact);
+  };
+
+  const archiveArtifact = async (artifact: ResearchArtifact3) => {
+    setActionLoading(true);
+    try {
+      const archived = await archiveResearchArtifact3(artifact.id, {
+        archive_reason: "archived from research workbench",
+      });
+      messageApi.success("Artifact 已归档");
+      setSelectedArtifact(archived);
+      await load();
+    } catch {
+      messageApi.error("归档失败");
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const previewCleanup = async () => {
+    if (!state.project) return;
+    setActionLoading(true);
+    try {
+      setCleanupPreview(await previewArtifactCleanup3({
+        project_id: state.project.id,
+        lifecycle_stage: "scratch",
+        retention_class: "scratch",
+        limit: 100,
+      }));
+    } catch {
+      messageApi.error("清理预览失败");
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const promoteQaSource = async (qa: QaReport3) => {
+    setActionLoading(true);
+    try {
+      const record = await evaluatePromotion3({
+        source_type: qa.source_type,
+        source_id: qa.source_id,
+        qa_report_id: qa.id,
+        metrics: qa.metrics,
+        approved_by: "ui",
+        rationale: "reviewed from research workbench",
+      });
+      messageApi.success(record.decision === "promoted" ? "已通过 Promotion" : "Promotion 未通过");
+      await load();
+    } catch {
+      messageApi.error("Promotion 评估失败");
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const summary = useMemo(() => {
+    const protectedArtifacts = state.artifacts.filter((item) =>
+      ["validated", "published"].includes(item.lifecycle_stage),
+    ).length;
+    return {
+      runCount: state.runs.length,
+      artifactCount: state.artifacts.length,
+      protectedArtifacts,
+      qaBlocking: state.qaReports.filter((item) => item.blocking).length,
+      strategyCount: state.strategyGraphs.length,
+      signalCount: state.productionSignals.length,
+    };
+  }, [state]);
+
+  const runColumns: ColumnsType<ResearchRun3> = [
+    {
+      title: "Run",
+      dataIndex: "id",
+      width: 110,
+      render: (value: string, row) => <Button type="link" size="small" onClick={() => openRun(row)}>{value}</Button>,
+    },
+    { title: "类型", dataIndex: "run_type", width: 190 },
+    {
+      title: "状态",
+      dataIndex: "status",
+      width: 100,
+      render: (value: string) => <Tag color={statusColor(value)}>{value}</Tag>,
+    },
+    {
+      title: "阶段",
+      dataIndex: "lifecycle_stage",
+      width: 110,
+      render: (value: string) => <Tag>{value}</Tag>,
+    },
+    { title: "来源", dataIndex: "created_by", width: 140 },
+    { title: "创建时间", dataIndex: "created_at", width: 170, render: timeText },
+  ];
+
+  const artifactColumns: ColumnsType<ResearchArtifact3> = [
+    {
+      title: "Artifact",
+      dataIndex: "id",
+      width: 110,
+      render: (value: string, row) => <Button type="link" size="small" onClick={() => openArtifact(row)}>{value}</Button>,
+    },
+    { title: "类型", dataIndex: "artifact_type", width: 180 },
+    {
+      title: "阶段",
+      dataIndex: "lifecycle_stage",
+      width: 110,
+      render: (value: string) => <Tag color={statusColor(value)}>{value}</Tag>,
+    },
+    { title: "保留", dataIndex: "retention_class", width: 110 },
+    { title: "大小", dataIndex: "byte_size", width: 100, render: bytesText },
+    { title: "创建时间", dataIndex: "created_at", width: 170, render: timeText },
+  ];
+
+  const qaColumns: ColumnsType<QaReport3> = [
+    {
+      title: "QA",
+      dataIndex: "id",
+      width: 110,
+      render: (value: string, row) => <Button type="link" size="small" onClick={() => setSelectedQa(row)}>{value}</Button>,
+    },
+    { title: "来源", dataIndex: "source_type", width: 160 },
+    { title: "Source ID", dataIndex: "source_id", width: 150 },
+    {
+      title: "状态",
+      dataIndex: "status",
+      width: 90,
+      render: (value: string) => <Tag color={statusColor(value)}>{value}</Tag>,
+    },
+    {
+      title: "阻断",
+      dataIndex: "blocking",
+      width: 90,
+      render: (value: boolean) => <Tag color={value ? "error" : "success"}>{value ? "yes" : "no"}</Tag>,
+    },
+    { title: "创建时间", dataIndex: "created_at", width: 170, render: timeText },
+  ];
+
+  return (
+    <Spin spinning={loading}>
+      {contextHolder}
+      <Space orientation="vertical" size={16} style={{ width: "100%" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16 }}>
+          <Space orientation="vertical" size={2}>
+            <Text strong style={{ fontSize: 18 }}>3.0 Research Workbench</Text>
+            <Text type="secondary">
+              {state.project ? `${state.project.name} / ${state.project.market_profile_id}` : "loading project"}
+            </Text>
+          </Space>
+          <Space>
+            <Button icon={<ClearOutlined />} onClick={previewCleanup} loading={actionLoading}>
+              清理预览
+            </Button>
+            <Button type="primary" icon={<ReloadOutlined />} onClick={load}>
+              刷新
+            </Button>
+          </Space>
+        </div>
+
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+            gap: 12,
+          }}
+        >
+          <Statistic title="Runs" value={summary.runCount} prefix={<ExperimentOutlined />} />
+          <Statistic title="Artifacts" value={summary.artifactCount} prefix={<FileSearchOutlined />} />
+          <Statistic title="Protected" value={summary.protectedArtifacts} prefix={<CheckCircleOutlined />} />
+          <Statistic title="QA Blocking" value={summary.qaBlocking} prefix={<AuditOutlined />} />
+          <Statistic title="Strategy Graphs" value={summary.strategyCount} prefix={<BranchesOutlined />} />
+          <Statistic title="Signals" value={summary.signalCount} prefix={<DatabaseOutlined />} />
+        </div>
+
+        {state.dataStatus ? (
+          <Alert
+            type="info"
+            showIcon
+            title={`数据覆盖：${state.dataStatus.coverage.asset_count} assets / ${state.dataStatus.coverage.total_bars} bars`}
+            description={`Latest trading day: ${state.dataStatus.latest_trading_day}; provider: ${state.dataStatus.provider}`}
+          />
+        ) : null}
+
+        <Tabs
+          items={[
+            {
+              key: "runs",
+              label: "Runs",
+              children: (
+                <Table
+                  rowKey="id"
+                  size="small"
+                  columns={runColumns}
+                  dataSource={state.runs}
+                  pagination={{ pageSize: 10 }}
+                  scroll={{ x: 900 }}
+                />
+              ),
+            },
+            {
+              key: "artifacts",
+              label: "Artifacts",
+              children: (
+                <Table
+                  rowKey="id"
+                  size="small"
+                  columns={artifactColumns}
+                  dataSource={state.artifacts}
+                  pagination={{ pageSize: 10 }}
+                  scroll={{ x: 820 }}
+                />
+              ),
+            },
+            {
+              key: "qa",
+              label: "QA / Promotion",
+              children: (
+                <Space orientation="vertical" size={12} style={{ width: "100%" }}>
+                  <Table
+                    rowKey="id"
+                    size="small"
+                    columns={qaColumns}
+                    dataSource={state.qaReports}
+                    pagination={{ pageSize: 8 }}
+                    scroll={{ x: 820 }}
+                  />
+                  <SimpleList title="Promotion Records" empty={state.promotions.length === 0}>
+                    {state.promotions.map((item) => (
+                      <SimpleListItem key={item.id}>
+                        <Space wrap>
+                          <Tag color={statusColor(item.decision)}>{item.decision}</Tag>
+                          <Text>{item.source_type}</Text>
+                          <Text code>{item.source_id}</Text>
+                          <Text type="secondary">{timeText(item.created_at)}</Text>
+                        </Space>
+                      </SimpleListItem>
+                    ))}
+                  </SimpleList>
+                </Space>
+              ),
+            },
+            {
+              key: "assets",
+              label: "Assets",
+              children: (
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 12 }}>
+                  <AssetList title="Universes" items={state.universes.map((item) => [item.name, item.status, item.id])} />
+                  <AssetList title="Datasets" items={state.datasets.map((item) => [item.name, item.status, item.id])} />
+                  <AssetList title="Strategy Graphs" items={state.strategyGraphs.map((item) => [item.name, item.status, item.id])} />
+                  <AssetList title="Production Signals" items={state.productionSignals.map((item) => [item.strategy_graph_id, item.status, item.id])} />
+                  <AssetList title="Paper Sessions" items={state.paperSessions.map((item) => [item.name, item.status, item.id])} />
+                </div>
+              ),
+            },
+            {
+              key: "agent",
+              label: "Agent Plans",
+              children: (
+                <div style={{ display: "grid", gridTemplateColumns: "minmax(320px, 1fr) minmax(320px, 1fr)", gap: 12 }}>
+                  <SimpleList title="Research Plans" empty={state.plans.length === 0}>
+                    {state.plans.map((item) => (
+                      <SimpleListItem key={item.id}>
+                        <Space orientation="vertical" size={2} style={{ width: "100%" }}>
+                          <Space wrap>
+                            <Tag color={statusColor(item.status)}>{item.status}</Tag>
+                            <Text code>{item.id}</Text>
+                            <Text type="secondary">
+                              trials {Number(item.budget_state?.used_trials ?? 0)} / {Number(item.budget_state?.max_trials ?? 0)}
+                            </Text>
+                          </Space>
+                          <Paragraph ellipsis={{ rows: 2 }} style={{ margin: 0 }}>
+                            {item.hypothesis}
+                          </Paragraph>
+                        </Space>
+                      </SimpleListItem>
+                    ))}
+                  </SimpleList>
+                  <SimpleList title="Playbooks" empty={state.playbooks.length === 0}>
+                    {state.playbooks.map((item) => (
+                      <SimpleListItem key={item.id}>
+                        <Space orientation="vertical" size={2}>
+                          <Space wrap>
+                            <Tag>{item.category}</Tag>
+                            <Text strong>{item.name}</Text>
+                          </Space>
+                          <Text type="secondary">{item.description}</Text>
+                        </Space>
+                      </SimpleListItem>
+                    ))}
+                  </SimpleList>
+                </div>
+              ),
+            },
+          ]}
+        />
+      </Space>
+
+      <Drawer
+        title={selectedRun ? `Run ${selectedRun.id}` : "Run"}
+        open={!!selectedRun}
+        onClose={() => setSelectedRun(null)}
+        size={720}
+      >
+        {selectedRun ? (
+          <Space orientation="vertical" size={16} style={{ width: "100%" }}>
+            <Descriptions size="small" bordered column={1}>
+              <Descriptions.Item label="Type">{selectedRun.run_type}</Descriptions.Item>
+              <Descriptions.Item label="Status"><Tag color={statusColor(selectedRun.status)}>{selectedRun.status}</Tag></Descriptions.Item>
+              <Descriptions.Item label="Lifecycle">{selectedRun.lifecycle_stage}</Descriptions.Item>
+              <Descriptions.Item label="Params">{shortJson(selectedRun.params)}</Descriptions.Item>
+              <Descriptions.Item label="Metrics">{shortJson(selectedRun.metrics_summary)}</Descriptions.Item>
+            </Descriptions>
+            <SimpleList title="Lineage" empty={(lineage?.edges ?? []).length === 0}>
+              {(lineage?.edges ?? []).map((item) => (
+                <SimpleListItem key={item.id}>
+                  <Text>{item.from_type}:{item.from_id} -&gt; {item.to_type}:{item.to_id}</Text>
+                </SimpleListItem>
+              ))}
+            </SimpleList>
+          </Space>
+        ) : null}
+      </Drawer>
+
+      <Drawer
+        title={selectedArtifact ? `Artifact ${selectedArtifact.id}` : "Artifact"}
+        open={!!selectedArtifact}
+        onClose={() => setSelectedArtifact(null)}
+        size={720}
+        extra={
+          selectedArtifact && selectedArtifact.lifecycle_stage !== "archived" ? (
+            <Popconfirm
+              title="确认归档这个 artifact？"
+              onConfirm={() => archiveArtifact(selectedArtifact)}
+            >
+              <Button danger loading={actionLoading}>归档</Button>
+            </Popconfirm>
+          ) : null
+        }
+      >
+        {selectedArtifact ? (
+          <Descriptions size="small" bordered column={1}>
+            <Descriptions.Item label="Type">{selectedArtifact.artifact_type}</Descriptions.Item>
+            <Descriptions.Item label="Lifecycle"><Tag color={statusColor(selectedArtifact.lifecycle_stage)}>{selectedArtifact.lifecycle_stage}</Tag></Descriptions.Item>
+            <Descriptions.Item label="Retention">{selectedArtifact.retention_class}</Descriptions.Item>
+            <Descriptions.Item label="Size">{bytesText(selectedArtifact.byte_size)}</Descriptions.Item>
+            <Descriptions.Item label="URI">{selectedArtifact.uri}</Descriptions.Item>
+            <Descriptions.Item label="Metadata">{shortJson(selectedArtifact.metadata)}</Descriptions.Item>
+          </Descriptions>
+        ) : null}
+      </Drawer>
+
+      <Drawer
+        title={selectedQa ? `QA ${selectedQa.id}` : "QA"}
+        open={!!selectedQa}
+        onClose={() => setSelectedQa(null)}
+        size={720}
+        extra={
+          selectedQa && !selectedQa.blocking ? (
+            <Button type="primary" loading={actionLoading} onClick={() => promoteQaSource(selectedQa)}>
+              Promotion 评估
+            </Button>
+          ) : null
+        }
+      >
+        {selectedQa ? (
+          <Space orientation="vertical" size={16} style={{ width: "100%" }}>
+            <Descriptions size="small" bordered column={1}>
+              <Descriptions.Item label="Source">{selectedQa.source_type}:{selectedQa.source_id}</Descriptions.Item>
+              <Descriptions.Item label="Status"><Tag color={statusColor(selectedQa.status)}>{selectedQa.status}</Tag></Descriptions.Item>
+              <Descriptions.Item label="Blocking">{selectedQa.blocking ? "yes" : "no"}</Descriptions.Item>
+              <Descriptions.Item label="Metrics">{shortJson(selectedQa.metrics)}</Descriptions.Item>
+            </Descriptions>
+            <SimpleList title="Findings" empty={selectedQa.findings.length === 0}>
+              {selectedQa.findings.map((item, index) => (
+                <SimpleListItem key={`${String(item.check ?? "check")}-${index}`}>
+                  <Space orientation="vertical" size={2}>
+                    <Space>
+                      <Tag color={statusColor(String(item.severity ?? ""))}>{String(item.severity ?? "info")}</Tag>
+                      <Text>{String(item.check ?? "check")}</Text>
+                    </Space>
+                    <Text type="secondary">{String(item.message ?? "")}</Text>
+                  </Space>
+                </SimpleListItem>
+              ))}
+            </SimpleList>
+          </Space>
+        ) : null}
+      </Drawer>
+
+      <Drawer
+        title="Artifact Cleanup Preview"
+        open={!!cleanupPreview}
+        onClose={() => setCleanupPreview(null)}
+        size={720}
+      >
+        {cleanupPreview ? (
+          <Space orientation="vertical" size={16} style={{ width: "100%" }}>
+            <Descriptions size="small" bordered column={2}>
+              <Descriptions.Item label="Candidates">{cleanupPreview.summary.candidate_count}</Descriptions.Item>
+              <Descriptions.Item label="Protected">{cleanupPreview.summary.protected_count}</Descriptions.Item>
+              <Descriptions.Item label="Candidate Bytes">{bytesText(cleanupPreview.summary.candidate_bytes)}</Descriptions.Item>
+              <Descriptions.Item label="Protected Bytes">{bytesText(cleanupPreview.summary.protected_bytes)}</Descriptions.Item>
+            </Descriptions>
+            <SimpleList title="Candidates" empty={cleanupPreview.candidates.length === 0}>
+              {cleanupPreview.candidates.map((item) => (
+                <SimpleListItem key={item.id}>
+                  <Space>
+                    <Text code>{item.id}</Text>
+                    <Text>{item.artifact_type}</Text>
+                    <Tag>{bytesText(item.byte_size)}</Tag>
+                  </Space>
+                </SimpleListItem>
+              ))}
+            </SimpleList>
+          </Space>
+        ) : null}
+      </Drawer>
+    </Spin>
+  );
+}
+
+function AssetList({ title, items }: { title: string; items: Array<[string, string, string]> }) {
+  return (
+    <SimpleList title={title} empty={items.length === 0}>
+      {items.map(([name, status, id]) => (
+        <SimpleListItem key={id}>
+          <Space orientation="vertical" size={2}>
+            <Space wrap>
+              <Tag color={statusColor(status)}>{status}</Tag>
+              <Text strong>{name}</Text>
+            </Space>
+            <Text type="secondary" code>{id}</Text>
+          </Space>
+        </SimpleListItem>
+      ))}
+    </SimpleList>
+  );
+}
+
+function SimpleList({
+  title,
+  empty,
+  children,
+}: {
+  title: string;
+  empty: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <div
+      style={{
+        border: "1px solid rgba(255,255,255,0.08)",
+        borderRadius: 6,
+        overflow: "hidden",
+        background: "rgba(255,255,255,0.02)",
+      }}
+    >
+      <div
+        style={{
+          padding: "8px 12px",
+          borderBottom: "1px solid rgba(255,255,255,0.08)",
+          fontWeight: 600,
+        }}
+      >
+        {title}
+      </div>
+      {empty ? (
+        <div style={{ padding: 16 }}>
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} />
+        </div>
+      ) : (
+        <div>{children}</div>
+      )}
+    </div>
+  );
+}
+
+function SimpleListItem({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      style={{
+        padding: "10px 12px",
+        borderBottom: "1px solid rgba(255,255,255,0.06)",
+      }}
+    >
+      {children}
+    </div>
+  );
+}

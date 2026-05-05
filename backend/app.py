@@ -22,6 +22,16 @@ from backend.api.strategies import router as strategies_router
 from backend.api.signals import router as signals_router
 from backend.api.paper_trading import router as paper_trading_router
 from backend.api.diagnostics import router as diagnostics_router
+from backend.api.research import router as research_router
+from backend.api.market_data import router as market_data_router
+from backend.api.migration import router as migration_router
+from backend.api.universe_dataset import router as universe_dataset_router
+from backend.api.factor_engine_3 import router as factor_engine_3_router
+from backend.api.model_experiment_3 import router as model_experiment_3_router
+from backend.api.portfolio_assets_3 import router as portfolio_assets_3_router
+from backend.api.strategy_graph_3 import router as strategy_graph_3_router
+from backend.api.agent_research_3 import router as agent_research_3_router
+from backend.api.production_signal_3 import router as production_signal_3_router
 from backend.config import settings
 from backend.db import close_db, init_db
 from backend.logger import get_logger, setup_logging
@@ -64,6 +74,10 @@ async def lifespan(app: FastAPI):
     from backend.services.factor_service import FactorService
     FactorService().ensure_builtin_templates()
 
+    # Register built-in agent research playbooks
+    from backend.services.agent_research_3_service import AgentResearch3Service
+    AgentResearch3Service().ensure_builtin_playbooks()
+
     yield
 
     # --- shutdown ---
@@ -103,6 +117,16 @@ app.include_router(strategies_router)
 app.include_router(signals_router)
 app.include_router(paper_trading_router)
 app.include_router(diagnostics_router)
+app.include_router(research_router)
+app.include_router(market_data_router)
+app.include_router(migration_router)
+app.include_router(universe_dataset_router)
+app.include_router(factor_engine_3_router)
+app.include_router(model_experiment_3_router)
+app.include_router(portfolio_assets_3_router)
+app.include_router(strategy_graph_3_router)
+app.include_router(agent_research_3_router)
+app.include_router(production_signal_3_router)
 
 # MCP Server -- mount at /mcp
 from backend.mcp_server import mcp as _mcp_server

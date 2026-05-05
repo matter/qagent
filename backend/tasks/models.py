@@ -28,6 +28,7 @@ class TaskSource(str, enum.Enum):
 class TaskRecord:
     id: str
     task_type: str
+    run_id: str | None = None
     status: TaskStatus = TaskStatus.QUEUED
     params: dict[str, Any] | None = None
     result_summary: dict[str, Any] | None = None

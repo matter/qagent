@@ -55,6 +55,14 @@ class UpdateRequest(BaseModel):
     mode: str = "incremental"
     market: Optional[str] = None
     history_years: Optional[int] = Field(None, ge=1, le=30)
+    start_date: Optional[date] = None
+
+
+class MultiMarketUpdateRequest(BaseModel):
+    mode: str = "incremental"
+    markets: list[str]
+    history_years: Optional[int] = Field(None, ge=1, le=30)
+    start_date: Optional[date] = None
 
 
 class RefreshStockListRequest(BaseModel):
@@ -110,7 +118,12 @@ async def trigger_update(body: UpdateRequest) -> dict:
     task_id = executor.submit(
         task_type="data_update",
         fn=svc.update_data,
-        params={"mode": body.mode, "market": market, "history_years": body.history_years},
+        params={
+            "mode": body.mode,
+            "market": market,
+            "history_years": body.history_years,
+            "start_date": body.start_date.isoformat() if body.start_date else None,
+        },
         timeout=7200,  # 2 hours max
         source=TaskSource.UI,
     )
@@ -121,6 +134,7 @@ async def trigger_update(body: UpdateRequest) -> dict:
         market=market,
         mode=body.mode,
         history_years=body.history_years,
+        start_date=str(body.start_date) if body.start_date else None,
     )
     return {
         "task_id": task_id,
@@ -128,6 +142,50 @@ async def trigger_update(body: UpdateRequest) -> dict:
         "market": market,
         "mode": body.mode,
         "history_years": body.history_years,
+        "start_date": str(body.start_date) if body.start_date else None,
+    }
+
+
+@router.post("/data/update/markets")
+async def trigger_multi_market_update(body: MultiMarketUpdateRequest) -> dict:
+    """Trigger a sequential multi-market data update as one background task."""
+    if body.mode not in ("incremental", "full"):
+        raise HTTPException(status_code=400, detail="mode must be 'incremental' or 'full'")
+    if not body.markets:
+        raise HTTPException(status_code=400, detail="markets must not be empty")
+    try:
+        markets = list(dict.fromkeys(normalize_market(market) for market in body.markets))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    executor = _get_executor()
+    svc = _get_service()
+    running_id = executor.has_running_task("data_update")
+    if running_id:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Data update already running (task_id={running_id}). Cancel it first via POST /api/tasks/{running_id}/cancel",
+        )
+
+    task_id = executor.submit(
+        task_type="data_update",
+        fn=svc.update_markets,
+        params={
+            "mode": body.mode,
+            "markets": markets,
+            "history_years": body.history_years,
+            "start_date": body.start_date.isoformat() if body.start_date else None,
+        },
+        timeout=14400,
+        source=TaskSource.UI,
+    )
+    return {
+        "task_id": task_id,
+        "status": "queued",
+        "markets": markets,
+        "mode": body.mode,
+        "history_years": body.history_years,
+        "start_date": str(body.start_date) if body.start_date else None,
     }
 
 

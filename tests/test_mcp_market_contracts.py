@@ -70,7 +70,17 @@ class MCPMarketContractsTests(unittest.TestCase):
             )
             found = mcp_server.search_stocks(query="600000", limit=3, market="CN")
             status = mcp_server.get_data_status(market="CN")
-            update = mcp_server.update_data(mode="incremental", market="CN", history_years=2)
+            update = mcp_server.update_data(
+                mode="incremental",
+                market="CN",
+                history_years=2,
+                start_date="2016-01-01",
+            )
+            multi_update = mcp_server.update_data_markets(
+                markets=["US", "CN", "US"],
+                mode="full",
+                start_date="2016-01-01",
+            )
             refresh = mcp_server.refresh_stock_list(market="CN")
 
         self.assertEqual(fake_conn.calls[0][1], ["CN", "sh.600000", "2024-01-02", "2024-01-03"])
@@ -80,11 +90,16 @@ class MCPMarketContractsTests(unittest.TestCase):
         self.assertEqual(status["market"], "CN")
         self.assertEqual(update["market"], "CN")
         self.assertEqual(update["history_years"], 2)
+        self.assertEqual(update["start_date"], "2016-01-01")
         self.assertEqual(update["asset_scope"], {"market": "CN"})
+        self.assertEqual(multi_update["markets"], ["US", "CN"])
+        self.assertEqual(multi_update["asset_scope"], {"markets": ["US", "CN"]})
         self.assertEqual(refresh["task_type"], "stock_list_refresh")
         self.assertEqual(refresh["asset_scope"], {"market": "CN"})
         self.assertEqual(fake_executor.submissions[0]["params"]["market"], "CN")
         self.assertEqual(fake_executor.submissions[0]["params"]["history_years"], 2)
+        self.assertEqual(fake_executor.submissions[0]["params"]["start_date"], "2016-01-01")
+        self.assertEqual(fake_executor.submissions[1]["params"]["markets"], ["US", "CN"])
 
     def test_models_strategies_backtests_and_signals_forward_market_to_tasks(self):
         fake_model = _FakeModelService()
@@ -227,8 +242,11 @@ class _FakeDataService:
     def get_data_status(self, market=None):
         return {"market": market}
 
-    def update_data(self, mode="incremental", market=None, history_years=None):
-        return {"mode": mode, "market": market, "history_years": history_years}
+    def update_data(self, mode="incremental", market=None, history_years=None, start_date=None):
+        return {"mode": mode, "market": market, "history_years": history_years, "start_date": start_date}
+
+    def update_markets(self, markets, mode="incremental", history_years=None, start_date=None):
+        return {"mode": mode, "markets": markets, "history_years": history_years, "start_date": start_date}
 
     def refresh_stock_list(self, market=None):
         return {"market": market}

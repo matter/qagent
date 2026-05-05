@@ -3,6 +3,16 @@
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
+
+stop_launch_agent() {
+    local label="$1"
+    local plist="$LAUNCH_AGENT_DIR/$label.plist"
+    if command -v launchctl >/dev/null 2>&1 && [ -f "$plist" ]; then
+        echo "  -> Unloading $label"
+        launchctl bootout "gui/$(id -u)" "$plist" >/dev/null 2>&1 || true
+    fi
+}
 
 stop_by_pid() {
     local name="$1"
@@ -30,6 +40,9 @@ stop_by_port() {
 }
 
 echo "==> Stopping QAgent"
+
+stop_launch_agent "com.qagent.backend"
+stop_launch_agent "com.qagent.frontend"
 
 # Try PID files first
 stop_by_pid "backend"

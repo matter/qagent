@@ -52,6 +52,7 @@ class TaskExecutor:
         fn: Callable[..., Any],
         *,
         params: dict[str, Any] | None = None,
+        run_id: str | None = None,
         timeout: int | None = None,
         source: TaskSource = TaskSource.SYSTEM,
         task_id: str | None = None,
@@ -81,6 +82,7 @@ class TaskExecutor:
 
         record = TaskRecord(
             id=tid,
+            run_id=run_id,
             task_type=task_type,
             status=TaskStatus.QUEUED,
             params=params,

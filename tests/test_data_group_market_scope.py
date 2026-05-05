@@ -100,6 +100,21 @@ class DataAndGroupMarketScopeTests(unittest.TestCase):
 
         self.assertEqual(start, date(2016, 1, 1))
 
+    def test_missing_index_history_can_use_explicit_start_date(self):
+        svc = DataService(provider=_NoopProvider())
+
+        with patch("backend.services.data_service.get_connection", return_value=self.conn):
+            start = svc._get_index_incremental_start(
+                "sh.000300",
+                date(2026, 4, 30),
+                mode="incremental",
+                market="CN",
+                history_years=10,
+                start_date=date(2016, 1, 1),
+            )
+
+        self.assertEqual(start, date(2016, 1, 1))
+
     def test_existing_index_history_incremental_start_continues_after_max_date(self):
         svc = DataService(provider=_NoopProvider())
         self.conn.execute(
@@ -388,6 +403,30 @@ class DataAndGroupMarketScopeTests(unittest.TestCase):
         self.assertEqual(summary["history_years"], 3)
         self.assertEqual(provider.stock_list_calls, 0)
         self.assertEqual(provider.daily_bar_requests[0]["start"], date(2023, 1, 1))
+
+    def test_explicit_start_date_controls_new_ticker_backfill(self):
+        provider = _OneCnProvider()
+        svc = DataService(provider=provider)
+
+        with (
+            patch("backend.services.data_service.get_connection", return_value=self.conn),
+            patch("backend.services.group_service.get_connection", return_value=self.conn),
+            patch("backend.services.data_service.get_latest_trading_day", return_value=date(2026, 4, 29)),
+            patch(
+                "backend.services.group_service._fetch_cn_index_tickers",
+                side_effect=lambda index_id: ["sh.600000"] if index_id == "cn_sz50" else [],
+            ),
+            patch("backend.services.group_service._load_cn_index_seed_tickers", return_value=[]),
+        ):
+            summary = svc.update_data(
+                "incremental",
+                market="CN",
+                history_years=3,
+                start_date=date(2016, 1, 1),
+            )
+
+        self.assertEqual(summary["start_date"], "2016-01-01")
+        self.assertEqual(provider.daily_bar_requests[0]["start"], date(2016, 1, 1))
 
     def test_us_incremental_new_tickers_keep_ten_year_history(self):
         provider = _OneUsProvider()

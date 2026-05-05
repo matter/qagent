@@ -14,6 +14,11 @@ from backend.tasks.models import TaskRecord, TaskSource, TaskStatus
 
 log = get_logger(__name__)
 
+TASK_RUN_SELECT_COLUMNS = (
+    "id, run_id, task_type, status, params, result_summary, error_message, "
+    "created_at, started_at, completed_at, timeout_seconds, source"
+)
+
 
 class TaskStore:
     """CRUD operations for the task_runs table."""
@@ -27,13 +32,14 @@ class TaskStore:
         conn.execute(
             """
             INSERT INTO task_runs
-                (id, task_type, status, params, result_summary,
+                (id, run_id, task_type, status, params, result_summary,
                  error_message, created_at, started_at, completed_at,
                  timeout_seconds, source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 task.id,
+                task.run_id,
                 task.task_type,
                 task.status.value,
                 json.dumps(task.params) if task.params else None,
@@ -112,7 +118,8 @@ class TaskStore:
     def get(self, task_id: str) -> TaskRecord | None:
         conn = get_connection()
         row = conn.execute(
-            "SELECT * FROM task_runs WHERE id = ?", [task_id]
+            f"SELECT {TASK_RUN_SELECT_COLUMNS} FROM task_runs WHERE id = ?",
+            [task_id],
         ).fetchone()
         if row is None:
             return None
@@ -141,7 +148,10 @@ class TaskStore:
             clauses.append("COALESCE(json_extract_string(params, '$.market'), 'US') = ?")
             params.append(normalize_market(market))
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        sql = f"SELECT * FROM task_runs{where} ORDER BY created_at DESC LIMIT ?"
+        sql = (
+            f"SELECT {TASK_RUN_SELECT_COLUMNS} FROM task_runs{where} "
+            "ORDER BY created_at DESC LIMIT ?"
+        )
         params.append(limit)
         rows = self._fetch_rows(sql, params)
         return [self._row_to_record(r) for r in rows]
@@ -167,7 +177,10 @@ class TaskStore:
             clauses.append("COALESCE(json_extract_string(params, '$.market'), 'US') = ?")
             params.append(normalize_market(market))
         where = " WHERE " + " AND ".join(clauses)
-        sql = f"SELECT * FROM task_runs{where} ORDER BY created_at DESC LIMIT ?"
+        sql = (
+            f"SELECT {TASK_RUN_SELECT_COLUMNS} FROM task_runs{where} "
+            "ORDER BY created_at DESC LIMIT ?"
+        )
         params.append(limit)
         rows = self._fetch_rows(sql, params)
         return [self._row_to_record(r) for r in rows]
@@ -298,7 +311,7 @@ class TaskStore:
         """Find a queued/running task matching task_type and a named param."""
         conn = get_connection()
         rows = conn.execute(
-            """SELECT * FROM task_runs
+            f"""SELECT {TASK_RUN_SELECT_COLUMNS} FROM task_runs
                WHERE task_type = ?
                  AND status IN ('queued', 'running')
                ORDER BY created_at DESC
@@ -320,16 +333,17 @@ class TaskStore:
         """Map a DuckDB row tuple to a TaskRecord."""
         return TaskRecord(
             id=row[0],
-            task_type=row[1],
-            status=TaskStatus(row[2]),
-            params=json.loads(row[3]) if row[3] else None,
-            result_summary=json.loads(row[4]) if row[4] else None,
-            error_message=row[5],
-            created_at=row[6],
-            started_at=row[7],
-            completed_at=row[8],
-            timeout_seconds=row[9],
-            source=TaskSource(row[10]),
+            run_id=row[1],
+            task_type=row[2],
+            status=TaskStatus(row[3]),
+            params=json.loads(row[4]) if row[4] else None,
+            result_summary=json.loads(row[5]) if row[5] else None,
+            error_message=row[6],
+            created_at=row[7],
+            started_at=row[8],
+            completed_at=row[9],
+            timeout_seconds=row[10],
+            source=TaskSource(row[11]),
         )
 
     @staticmethod

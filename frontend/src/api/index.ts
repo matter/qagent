@@ -168,11 +168,32 @@ export async function getDataStatus(market?: Market): Promise<DataStatus> {
   return data;
 }
 
-export async function triggerUpdate(mode: "incremental" | "full", market?: Market, historyYears?: number) {
+export async function triggerUpdate(
+  mode: "incremental" | "full",
+  market?: Market,
+  historyYears?: number,
+  startDate?: string,
+) {
   const { data } = await client.post("/data/update", {
     mode,
     market: market || undefined,
     history_years: historyYears,
+    start_date: startDate || undefined,
+  });
+  return data;
+}
+
+export async function triggerMultiMarketUpdate(
+  mode: "incremental" | "full",
+  markets: Market[],
+  historyYears?: number,
+  startDate?: string,
+) {
+  const { data } = await client.post("/data/update/markets", {
+    mode,
+    markets,
+    history_years: historyYears,
+    start_date: startDate || undefined,
   });
   return data;
 }
@@ -943,6 +964,622 @@ export interface SystemInfo {
 
 export async function getSystemInfo(): Promise<SystemInfo> {
   const { data } = await client.get<SystemInfo>("/system/info");
+  return data;
+}
+
+// ---- QAgent 3.0 Research Kernel Types ----
+
+export interface ResearchProject3 {
+  id: string;
+  name: string;
+  market_profile_id: string;
+  default_universe_id?: string | null;
+  data_policy_id?: string | null;
+  trading_rule_set_id?: string | null;
+  cost_model_id?: string | null;
+  benchmark_policy_id?: string | null;
+  artifact_policy_id?: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface ResearchRun3 {
+  id: string;
+  project_id: string;
+  market_profile_id: string;
+  run_type: string;
+  status: string;
+  lifecycle_stage: string;
+  retention_class: string;
+  params: Record<string, unknown>;
+  input_refs: Array<Record<string, unknown>>;
+  output_refs: Array<Record<string, unknown>>;
+  metrics_summary: Record<string, unknown>;
+  qa_summary: Record<string, unknown>;
+  warnings: Array<Record<string, unknown>>;
+  error_message: string | null;
+  created_by: string;
+  created_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  updated_at: string | null;
+}
+
+export interface ResearchArtifact3 {
+  id: string;
+  run_id: string;
+  project_id: string;
+  artifact_type: string;
+  uri: string;
+  format: string;
+  schema_version: string;
+  byte_size: number;
+  content_hash: string;
+  lifecycle_stage: string;
+  retention_class: string;
+  cleanup_after: string | null;
+  rebuildable: boolean;
+  metadata: Record<string, unknown>;
+  created_at: string | null;
+}
+
+export interface ResearchLineage3 {
+  run_id: string;
+  edges: LineageEdge3[];
+}
+
+export interface CleanupPreview3 {
+  mode: string;
+  filters: Record<string, unknown>;
+  summary: {
+    matched_count: number;
+    candidate_count: number;
+    protected_count: number;
+    candidate_bytes: number;
+    protected_bytes: number;
+  };
+  candidates: ResearchArtifact3[];
+  protected: Array<{ artifact: ResearchArtifact3; reasons: string[] }>;
+  warnings: string[];
+}
+
+export interface LineageEdge3 {
+  id: string;
+  from_type: string;
+  from_id: string;
+  to_type: string;
+  to_id: string;
+  relation: string;
+  metadata: Record<string, unknown>;
+  created_at: string | null;
+}
+
+export interface MarketProfile3 {
+  id: string;
+  market_code: string;
+  asset_class: string;
+  name: string;
+  currency: string;
+  timezone: string;
+  status: string;
+  data_policy?: Record<string, unknown>;
+  trading_rule_set?: Record<string, unknown>;
+  cost_model?: Record<string, unknown>;
+  benchmark_policy?: Record<string, unknown>;
+  metadata: Record<string, unknown>;
+}
+
+export interface ProjectDataStatus3 {
+  project_id: string;
+  market_profile_id: string;
+  market: Market;
+  provider: string;
+  latest_trading_day: string;
+  coverage: {
+    asset_count: number;
+    active_asset_count: number;
+    tickers_with_bars: number;
+    total_bars: number;
+    date_range: { min: string | null; max: string | null };
+    stale_assets: number;
+  };
+  last_update: {
+    completed_at: string | null;
+    status: string | null;
+    type: string | null;
+  };
+  latest_snapshot: Record<string, unknown> | null;
+  semantics: Record<string, unknown>;
+}
+
+export interface AgentPlaybook3 {
+  id: string;
+  name: string;
+  category: string;
+  description: string;
+  steps: Array<Record<string, unknown>>;
+  optimization_targets: Array<Record<string, unknown>>;
+  required_assets: Array<Record<string, unknown>>;
+  status: string;
+  metadata: Record<string, unknown>;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface AgentResearchPlan3 {
+  id: string;
+  project_id: string;
+  market_profile_id: string;
+  hypothesis: string;
+  playbook_id: string | null;
+  search_space: Record<string, unknown>;
+  budget: Record<string, unknown>;
+  stop_conditions: Record<string, unknown>;
+  status: string;
+  created_by: string;
+  metadata: Record<string, unknown>;
+  budget_state?: Record<string, unknown>;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface QaReport3 {
+  id: string;
+  project_id: string;
+  market_profile_id: string;
+  source_type: string;
+  source_id: string;
+  status: string;
+  blocking: boolean;
+  findings: Array<Record<string, unknown>>;
+  metrics: Record<string, unknown>;
+  artifact_refs: Array<Record<string, unknown>>;
+  created_at: string | null;
+}
+
+export interface PromotionRecord3 {
+  id: string;
+  project_id: string;
+  source_type: string;
+  source_id: string;
+  target_type: string;
+  target_id: string;
+  decision: string;
+  policy_snapshot: Record<string, unknown>;
+  qa_summary: Record<string, unknown>;
+  approved_by: string | null;
+  rationale: string | null;
+  created_at: string | null;
+}
+
+export interface Universe3 {
+  id: string;
+  project_id: string;
+  market_profile_id: string;
+  name: string;
+  description: string | null;
+  universe_type: string;
+  source_ref: Record<string, unknown>;
+  filter_expr: string | null;
+  lifecycle_stage: string;
+  status: string;
+  metadata: Record<string, unknown>;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface Dataset3 {
+  id: string;
+  project_id: string;
+  market_profile_id: string;
+  name: string;
+  description: string | null;
+  universe_id: string;
+  feature_pipeline_id: string;
+  label_spec_id: string;
+  legacy_label_id: string | null;
+  start_date: string;
+  end_date: string;
+  split_policy: Record<string, unknown>;
+  lifecycle_stage: string;
+  retention_class: string;
+  status: string;
+  materialized_run_id: string | null;
+  dataset_artifact_id: string | null;
+  profile_artifact_id: string | null;
+  row_count: number;
+  feature_count: number;
+  label_count: number;
+  qa_summary: Record<string, unknown>;
+  metadata: Record<string, unknown>;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface FactorSpec3 {
+  id: string;
+  project_id: string;
+  market_profile_id: string;
+  name: string;
+  description: string | null;
+  version: number;
+  source_type: string;
+  compute_mode: string;
+  lifecycle_stage: string;
+  status: string;
+  semantic_tags: string[];
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface FactorRun3 {
+  id: string;
+  run_id: string;
+  project_id: string;
+  market_profile_id: string;
+  factor_spec_id: string;
+  factor_spec_version: number;
+  universe_id: string;
+  start_date: string | null;
+  end_date: string | null;
+  mode: string;
+  status: string;
+  params: Record<string, unknown>;
+  data_snapshot_id: string | null;
+  data_policy: Record<string, unknown>;
+  output_artifact_id: string | null;
+  profile: Record<string, unknown>;
+  qa_summary: Record<string, unknown>;
+  created_at: string | null;
+  completed_at: string | null;
+}
+
+export interface PortfolioRun3 {
+  id: string;
+  run_id: string;
+  project_id: string;
+  market_profile_id: string;
+  decision_date: string | null;
+  portfolio_construction_spec_id: string;
+  risk_control_spec_id: string | null;
+  rebalance_policy_spec_id: string | null;
+  execution_policy_spec_id: string;
+  state_policy_spec_id: string;
+  input_artifact_id: string;
+  target_artifact_id: string;
+  trace_artifact_id: string;
+  order_intent_artifact_id: string;
+  profile: Record<string, unknown>;
+  status: string;
+  lifecycle_stage: string;
+  created_at: string | null;
+  completed_at: string | null;
+}
+
+export interface ModelExperiment3 {
+  id: string;
+  run_id: string;
+  project_id: string;
+  market_profile_id: string;
+  dataset_id: string;
+  name: string;
+  model_type: string;
+  objective: string;
+  metrics: Record<string, unknown>;
+  qa_summary: Record<string, unknown>;
+  status: string;
+  lifecycle_stage: string;
+  created_at: string | null;
+  completed_at: string | null;
+}
+
+export interface StrategyGraph3 {
+  id: string;
+  project_id: string;
+  market_profile_id: string;
+  name: string;
+  description: string | null;
+  graph_type: string;
+  version: number;
+  graph_config: Record<string, unknown>;
+  dependency_refs: Array<Record<string, unknown>>;
+  lifecycle_stage: string;
+  status: string;
+  metadata: Record<string, unknown>;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface ProductionSignalRun3 {
+  id: string;
+  run_id: string;
+  project_id: string;
+  market_profile_id: string;
+  strategy_graph_id: string;
+  strategy_signal_id: string;
+  decision_date: string | null;
+  portfolio_run_id: string;
+  target_artifact_id: string;
+  order_intent_artifact_id: string;
+  qa_report_id: string | null;
+  status: string;
+  lifecycle_stage: string;
+  approved_by: string;
+  profile: Record<string, unknown>;
+  created_at: string | null;
+  completed_at: string | null;
+}
+
+export interface PaperSession3 {
+  id: string;
+  project_id: string;
+  market_profile_id: string;
+  strategy_graph_id: string;
+  name: string;
+  status: string;
+  start_date: string | null;
+  current_date: string | null;
+  initial_capital: number;
+  current_nav: number;
+  current_weights: Record<string, number>;
+  config: Record<string, unknown>;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+// ---- QAgent 3.0 Research Kernel API ----
+
+export async function getBootstrapProject3(): Promise<ResearchProject3> {
+  const { data } = await client.get<ResearchProject3>("/research/projects/bootstrap");
+  return data;
+}
+
+export async function listResearchRuns3(params?: {
+  project_id?: string;
+  run_type?: string;
+  status?: string;
+  lifecycle_stage?: string;
+  created_by?: string;
+  limit?: number;
+}): Promise<ResearchRun3[]> {
+  const { data } = await client.get<ResearchRun3[]>("/research/runs", { params });
+  return data;
+}
+
+export async function listResearchArtifacts3(params?: {
+  project_id?: string;
+  run_id?: string;
+  artifact_type?: string;
+  lifecycle_stage?: string;
+  retention_class?: string;
+  limit?: number;
+}): Promise<ResearchArtifact3[]> {
+  const { data } = await client.get<ResearchArtifact3[]>("/research/artifacts", { params });
+  return data;
+}
+
+export async function getResearchLineage3(runId: string): Promise<ResearchLineage3> {
+  const { data } = await client.get<ResearchLineage3>(`/research/lineage/${runId}`);
+  return data;
+}
+
+export async function getResearchRun3(runId: string): Promise<ResearchRun3> {
+  const { data } = await client.get<ResearchRun3>(`/research/runs/${runId}`);
+  return data;
+}
+
+export async function getResearchArtifact3(artifactId: string): Promise<ResearchArtifact3> {
+  const { data } = await client.get<ResearchArtifact3>(`/research/artifacts/${artifactId}`);
+  return data;
+}
+
+export async function previewArtifactCleanup3(body: {
+  project_id?: string;
+  run_id?: string;
+  artifact_ids?: string[];
+  lifecycle_stage?: string;
+  retention_class?: string;
+  artifact_type?: string;
+  include_published?: boolean;
+  limit?: number;
+}): Promise<CleanupPreview3> {
+  const { data } = await client.post<CleanupPreview3>("/research/artifacts/cleanup-preview", body);
+  return data;
+}
+
+export async function archiveResearchArtifact3(
+  artifactId: string,
+  body?: { retention_class?: string; archive_reason?: string },
+): Promise<ResearchArtifact3> {
+  const { data } = await client.post<ResearchArtifact3>(`/research/artifacts/${artifactId}/archive`, body || {});
+  return data;
+}
+
+export async function listPromotionRecords3(params?: {
+  project_id?: string;
+  source_type?: string;
+  source_id?: string;
+  target_type?: string;
+  target_id?: string;
+  decision?: string;
+  limit?: number;
+}): Promise<PromotionRecord3[]> {
+  const { data } = await client.get<PromotionRecord3[]>("/research/promotions", { params });
+  return data;
+}
+
+export async function getPromotionRecord3(promotionId: string): Promise<PromotionRecord3> {
+  const { data } = await client.get<PromotionRecord3>(`/research/promotions/${promotionId}`);
+  return data;
+}
+
+export async function getProjectDataStatus3(projectId: string): Promise<ProjectDataStatus3> {
+  const { data } = await client.get<ProjectDataStatus3>(`/market-data/projects/${projectId}/status`);
+  return data;
+}
+
+export async function listAgentPlaybooks3(): Promise<AgentPlaybook3[]> {
+  const { data } = await client.get<AgentPlaybook3[]>("/research/agent/playbooks");
+  return data;
+}
+
+export async function listAgentResearchPlans3(params?: {
+  project_id?: string;
+  status?: string;
+  limit?: number;
+}): Promise<AgentResearchPlan3[]> {
+  const { data } = await client.get<AgentResearchPlan3[]>("/research/agent/plans", { params });
+  return data;
+}
+
+export async function listQaReports3(params?: {
+  source_type?: string;
+  source_id?: string;
+  status?: string;
+  limit?: number;
+}): Promise<QaReport3[]> {
+  const { data } = await client.get<QaReport3[]>("/research/agent/qa", { params });
+  return data;
+}
+
+export async function getQaReport3(qaReportId: string): Promise<QaReport3> {
+  const { data } = await client.get<QaReport3>(`/research/agent/qa/${qaReportId}`);
+  return data;
+}
+
+export async function evaluatePromotion3(body: {
+  source_type: string;
+  source_id: string;
+  qa_report_id: string;
+  metrics?: Record<string, unknown>;
+  policy_id?: string;
+  approved_by?: string;
+  rationale?: string;
+}): Promise<PromotionRecord3> {
+  const { data } = await client.post<PromotionRecord3>("/research/agent/promotion", body);
+  return data;
+}
+
+export async function listUniverses3(params?: {
+  project_id?: string;
+  market_profile_id?: string;
+  status?: string;
+  limit?: number;
+}): Promise<Universe3[]> {
+  const { data } = await client.get<Universe3[]>("/research-assets/universes", { params });
+  return data;
+}
+
+export async function listDatasets3(params?: {
+  project_id?: string;
+  market_profile_id?: string;
+  universe_id?: string;
+  status?: string;
+  limit?: number;
+}): Promise<Dataset3[]> {
+  const { data } = await client.get<Dataset3[]>("/research-assets/datasets", { params });
+  return data;
+}
+
+export async function listFactorSpecs3(params?: {
+  project_id?: string;
+  market_profile_id?: string;
+  status?: string;
+}): Promise<FactorSpec3[]> {
+  const { data } = await client.get<FactorSpec3[]>("/research-assets/factor-specs", { params });
+  return data;
+}
+
+export async function getFactorSpec3(factorSpecId: string): Promise<FactorSpec3> {
+  const { data } = await client.get<FactorSpec3>(`/research-assets/factor-specs/${factorSpecId}`);
+  return data;
+}
+
+export async function listFactorRuns3(params?: {
+  factor_spec_id?: string;
+  universe_id?: string;
+  mode?: string;
+}): Promise<FactorRun3[]> {
+  const { data } = await client.get<FactorRun3[]>("/research-assets/factor-runs", { params });
+  return data;
+}
+
+export async function getFactorRun3(factorRunId: string): Promise<FactorRun3> {
+  const { data } = await client.get<FactorRun3>(`/research-assets/factor-runs/${factorRunId}`);
+  return data;
+}
+
+export async function listModelExperiments3(params?: {
+  dataset_id?: string;
+}): Promise<ModelExperiment3[]> {
+  const { data } = await client.get<ModelExperiment3[]>("/research-assets/model-experiments", { params });
+  return data;
+}
+
+export async function getModelExperiment3(experimentId: string): Promise<ModelExperiment3> {
+  const { data } = await client.get<ModelExperiment3>(`/research-assets/model-experiments/${experimentId}`);
+  return data;
+}
+
+export async function listStrategyGraphs3(params?: {
+  project_id?: string;
+  status?: string;
+}): Promise<StrategyGraph3[]> {
+  const { data } = await client.get<StrategyGraph3[]>("/research-assets/strategy-graphs", { params });
+  return data;
+}
+
+export async function getStrategyGraph3(strategyGraphId: string): Promise<StrategyGraph3> {
+  const { data } = await client.get<StrategyGraph3>(`/research-assets/strategy-graphs/${strategyGraphId}`);
+  return data;
+}
+
+export async function listProductionSignalRuns3(params?: {
+  strategy_graph_id?: string;
+  limit?: number;
+}): Promise<ProductionSignalRun3[]> {
+  const { data } = await client.get<ProductionSignalRun3[]>("/research-assets/production-signals", { params });
+  return data;
+}
+
+export async function getProductionSignalRun3(signalRunId: string): Promise<ProductionSignalRun3> {
+  const { data } = await client.get<ProductionSignalRun3>(`/research-assets/production-signals/${signalRunId}`);
+  return data;
+}
+
+export async function listPaperSessions3(params?: {
+  status?: string;
+  limit?: number;
+}): Promise<PaperSession3[]> {
+  const { data } = await client.get<PaperSession3[]>("/research-assets/paper-sessions", { params });
+  return data;
+}
+
+export async function getPaperSession3(sessionId: string): Promise<PaperSession3> {
+  const { data } = await client.get<PaperSession3>(`/research-assets/paper-sessions/${sessionId}`);
+  return data;
+}
+
+export async function listPortfolioRuns3(params?: {
+  limit?: number;
+}): Promise<PortfolioRun3[]> {
+  const { data } = await client.get<PortfolioRun3[]>("/research-assets/portfolio-runs", { params });
+  return data;
+}
+
+export async function getPortfolioRun3(portfolioRunId: string): Promise<PortfolioRun3> {
+  const { data } = await client.get<PortfolioRun3>(`/research-assets/portfolio-runs/${portfolioRunId}`);
+  return data;
+}
+
+export async function getUniverse3(universeId: string): Promise<Universe3> {
+  const { data } = await client.get<Universe3>(`/research-assets/universes/${universeId}`);
+  return data;
+}
+
+export async function getDataset3(datasetId: string): Promise<Dataset3> {
+  const { data } = await client.get<Dataset3>(`/research-assets/datasets/${datasetId}`);
   return data;
 }
 

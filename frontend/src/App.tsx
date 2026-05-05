@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Routes, Route, useNavigate, useLocation } from "react-router-dom";
 import { ConfigProvider, Layout, Menu, theme, Typography } from "antd";
 import {
+  DashboardOutlined,
   LineChartOutlined,
   DatabaseOutlined,
   ExperimentOutlined,
@@ -25,6 +26,7 @@ import SignalGeneration from "./pages/SignalGeneration";
 import PaperTrading from "./pages/PaperTrading";
 import SystemSettings from "./pages/SystemSettings";
 import TaskManagement from "./pages/TaskManagement";
+import ResearchWorkbench3 from "./pages/ResearchWorkbench3";
 import MarketScopeSelector from "./components/MarketScopeSelector";
 import { getActiveMarket, subscribeActiveMarket } from "./api/client";
 import type { Market } from "./api";
@@ -33,6 +35,7 @@ const { Sider, Content, Header } = Layout;
 const { Title } = Typography;
 
 const menuItems: MenuProps["items"] = [
+  { key: "/research", icon: <DashboardOutlined />, label: "研究工作台" },
   { key: "/market", icon: <LineChartOutlined />, label: "行情浏览" },
   { key: "/data", icon: <DatabaseOutlined />, label: "数据管理" },
   { key: "/factors", icon: <ExperimentOutlined />, label: "因子研究" },
@@ -50,8 +53,10 @@ export default function App() {
   const [marketScope, setMarketScope] = useState<Market>(() => getActiveMarket());
   const navigate = useNavigate();
   const location = useLocation();
+  const isResearchWorkbench = location.pathname === "/" || location.pathname === "/research";
+  const selectedMenuKey = isResearchWorkbench ? "/research" : location.pathname;
   const currentMenuItem = menuItems?.find(
-    (i) => i && "key" in i && i.key === location.pathname,
+    (i) => i && "key" in i && i.key === selectedMenuKey,
   );
 
   const onMenuClick: MenuProps["onClick"] = ({ key }) => {
@@ -96,7 +101,7 @@ export default function App() {
           <Menu
             theme="dark"
             mode="inline"
-            selectedKeys={[location.pathname]}
+            selectedKeys={[selectedMenuKey]}
             items={menuItems}
             onClick={onMenuClick}
           />
@@ -118,14 +123,15 @@ export default function App() {
                 ? (currentMenuItem as any).label
                 : "QAgent"}
             </Title>
-            <MarketScopeSelector />
+            {isResearchWorkbench ? null : <MarketScopeSelector />}
           </Header>
           <Content
             key={marketScope}
             style={{ margin: 16, padding: 24, background: "rgba(255,255,255,0.04)", borderRadius: 8 }}
           >
             <Routes>
-              <Route path="/" element={<MarketBrowser />} />
+              <Route path="/" element={<ResearchWorkbench3 />} />
+              <Route path="/research" element={<ResearchWorkbench3 />} />
               <Route path="/market" element={<MarketBrowser />} />
               <Route path="/data" element={<DataManagement />} />
               <Route path="/factors" element={<FactorResearch />} />
