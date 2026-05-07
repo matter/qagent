@@ -438,7 +438,13 @@ class AgentResearch3Service:
         project = self.kernel.get_project(project_id)
         profile_id = market_profile_id or project["market_profile_id"]
         metric_data = metrics or {}
-        findings = self._qa_findings(metric_data, artifact_refs or [])
+        findings = self._qa_findings(
+            metric_data,
+            artifact_refs or [],
+            source_type=source_type,
+            project_id=project["id"],
+            market_profile_id=profile_id,
+        )
         blocking = any(item["blocking"] for item in findings)
         has_warning = any(item["severity"] == "warning" for item in findings)
         status = "fail" if blocking else ("warning" if has_warning else "pass")
@@ -756,6 +762,10 @@ class AgentResearch3Service:
         self,
         metrics: dict[str, Any],
         artifact_refs: list[dict[str, Any]],
+        *,
+        source_type: str,
+        project_id: str,
+        market_profile_id: str,
     ) -> list[dict[str, Any]]:
         findings: list[dict[str, Any]] = []
         coverage = metrics.get("coverage")
@@ -808,10 +818,86 @@ class AgentResearch3Service:
                     blocking=False,
                 )
             )
+        findings.extend(
+            self._artifact_findings(
+                artifact_refs,
+                source_type=source_type,
+                project_id=project_id,
+                market_profile_id=market_profile_id,
+            )
+        )
         if not findings:
             findings.append(
                 self._finding("baseline", "pass", "QA checks passed", blocking=False)
             )
+        return findings
+
+    def _artifact_findings(
+        self,
+        artifact_refs: list[dict[str, Any]],
+        *,
+        source_type: str,
+        project_id: str,
+        market_profile_id: str,
+    ) -> list[dict[str, Any]]:
+        findings: list[dict[str, Any]] = []
+        promotion_like = source_type in {
+            "strategy_graph",
+            "backtest_run",
+            "model_package",
+            "model_experiment",
+            "production_signal_run",
+        }
+        artifact_ids = []
+        for ref in artifact_refs:
+            ref_type = str(ref.get("type") or ref.get("ref_type") or "")
+            artifact_id = ref.get("artifact_id") or (ref.get("id") if ref_type == "artifact" else None)
+            if artifact_id:
+                artifact_ids.append(str(artifact_id))
+        for artifact_id in artifact_ids:
+            try:
+                artifact = self.kernel.get_artifact(artifact_id)
+            except ValueError:
+                findings.append(
+                    self._finding(
+                        "artifact_missing",
+                        "fail",
+                        f"Artifact {artifact_id} referenced by QA does not exist",
+                        blocking=promotion_like,
+                    )
+                )
+                continue
+            if artifact["project_id"] != project_id:
+                findings.append(
+                    self._finding(
+                        "artifact_project_scope",
+                        "fail",
+                        f"Artifact {artifact_id} belongs to project {artifact['project_id']}, not {project_id}",
+                        blocking=promotion_like,
+                    )
+                )
+            run = self.kernel.get_run(artifact["run_id"])
+            if run["market_profile_id"] != market_profile_id:
+                findings.append(
+                    self._finding(
+                        "artifact_market_scope",
+                        "fail",
+                        (
+                            f"Artifact {artifact_id} belongs to market_profile "
+                            f"{run['market_profile_id']}, not {market_profile_id}"
+                        ),
+                        blocking=promotion_like,
+                    )
+                )
+            if promotion_like and artifact["lifecycle_stage"] == "scratch":
+                findings.append(
+                    self._finding(
+                        "artifact_lifecycle",
+                        "fail",
+                        f"Artifact {artifact_id} is scratch and cannot support promotion QA",
+                        blocking=True,
+                    )
+                )
         return findings
 
     @staticmethod

@@ -13,6 +13,7 @@ from backend.db import get_connection
 from backend.logger import get_logger
 from backend.services.factor_engine import FactorEngine
 from backend.services.market_context import normalize_market, normalize_ticker
+from backend.services.research_cache_service import ResearchCacheService
 from backend.time_utils import utc_now_naive
 
 log = get_logger(__name__)
@@ -64,8 +65,13 @@ _PREPROCESSING_ALIASES = {
 class FeatureService:
     """CRUD and computation for feature sets (collections of factors with preprocessing)."""
 
-    def __init__(self) -> None:
-        self._factor_engine = FactorEngine()
+    def __init__(
+        self,
+        factor_engine: FactorEngine | None = None,
+        cache_service: ResearchCacheService | None = None,
+    ) -> None:
+        self._factor_engine = factor_engine or FactorEngine()
+        self._cache_service = cache_service or ResearchCacheService()
 
     # ------------------------------------------------------------------
     # CRUD
@@ -296,6 +302,23 @@ class FeatureService:
             tickers=len(tickers),
         )
 
+        hot_cache = self._cache_service.load_feature_matrix(
+            market=resolved_market,
+            feature_set_id=fs_id,
+            tickers=tickers,
+            start_date=start_date,
+            end_date=end_date,
+            factor_refs=factor_refs,
+            preprocessing=preprocessing,
+        )
+        if hot_cache is not None:
+            log.info(
+                "feature_set.compute_from_cache.hot_hit",
+                fs_id=fs_id,
+                cache_key=hot_cache["record"]["cache_key"],
+            )
+            return hot_cache["feature_data"]
+
         # Bulk load all cached factor values in one query
         cached = self._factor_engine.load_cached_factors_bulk(
             factor_ids, tickers, start_date, end_date, market=resolved_market
@@ -341,6 +364,24 @@ class FeatureService:
         result: dict[str, pd.DataFrame] = {}
         for factor_name, df in raw_data.items():
             result[factor_name] = self._apply_preprocessing(df, preprocessing)
+
+        try:
+            self._cache_service.store_feature_matrix(
+                market=resolved_market,
+                feature_set_id=fs_id,
+                tickers=tickers,
+                start_date=start_date,
+                end_date=end_date,
+                factor_refs=factor_refs,
+                preprocessing=preprocessing,
+                feature_data=result,
+            )
+        except Exception as exc:
+            log.warning(
+                "feature_set.compute_from_cache.hot_store_failed",
+                fs_id=fs_id,
+                error=str(exc),
+            )
 
         log.info(
             "feature_set.compute_from_cache.done",

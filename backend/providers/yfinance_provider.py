@@ -7,7 +7,7 @@ import random
 import time
 from datetime import date, timedelta
 from pathlib import Path
-from typing import List
+from typing import Any, List
 
 import pandas as pd
 import requests
@@ -43,6 +43,22 @@ class YFinanceProvider(DataProvider):
     # ------------------------------------------------------------------
     # DataProvider interface
     # ------------------------------------------------------------------
+
+    def capabilities(self) -> dict[str, Any]:
+        return {
+            "provider": "yfinance",
+            "market": "US",
+            "datasets": ["stock_list", "daily_bars", "index_bars"],
+            "cost": "free",
+            "quality_level": "exploratory",
+            "pit_supported": False,
+            "license_scope": "free_web_source",
+            "availability": "best_effort_web_download",
+            "notes": [
+                "No guaranteed SLA or redistribution rights.",
+                "Not a validated point-in-time equity feed.",
+            ],
+        }
 
     def get_stock_list(self) -> pd.DataFrame:
         """Download stock lists from nasdaqtrader.com, merge, and return."""

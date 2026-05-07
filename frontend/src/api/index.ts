@@ -385,6 +385,54 @@ export interface TaskStatus {
   compute_may_continue?: boolean;
 }
 
+export interface MacroSeries {
+  provider: string;
+  series_id: string;
+  title: string | null;
+  frequency: string | null;
+  units: string | null;
+  seasonal_adjustment: string | null;
+  source: string | null;
+  source_url: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface MacroObservation {
+  provider: string;
+  series_id: string;
+  title: string | null;
+  date: string;
+  realtime_start: string;
+  realtime_end: string;
+  available_at: string | null;
+  value: number | null;
+  source_metadata: Record<string, unknown>;
+}
+
+export interface MacroUpdateTask {
+  task_id: string;
+  status: string;
+  provider: string;
+  series_ids: string[];
+  poll_url: string;
+}
+
+export interface TaskResponse {
+  task_id: string;
+  status: string;
+  task_type?: string;
+  poll_url?: string;
+  [key: string]: unknown;
+}
+
+export interface MacroObservationsResponse {
+  provider: string;
+  series_ids: string[];
+  observations: MacroObservation[];
+}
+
 // ---- Factor API ----
 
 export async function listFactors(category?: string, status?: string, market?: string): Promise<Factor[]> {
@@ -574,6 +622,43 @@ export async function createTaskPauseRule(params: {
 
 export async function deleteTaskPauseRule(ruleId: string): Promise<{ id: string; status: string }> {
   const { data } = await client.delete<{ id: string; status: string }>(`/tasks/pause-rules/${ruleId}`);
+  return data;
+}
+
+// ---- Macro Data API ----
+
+export async function updateFredSeries(params: {
+  series_ids: string[];
+  start_date?: string;
+  end_date?: string;
+}): Promise<MacroUpdateTask> {
+  const { data } = await client.post<MacroUpdateTask>("/macro-data/fred/update", params);
+  return data;
+}
+
+export async function listMacroSeries(provider = "fred", limit = 1000): Promise<MacroSeries[]> {
+  const { data } = await client.get<{ provider: string; series: MacroSeries[] }>("/macro-data/series", {
+    params: { provider, limit },
+  });
+  return data.series;
+}
+
+export async function queryMacroObservations(params: {
+  series_ids: string[];
+  start_date?: string;
+  end_date?: string;
+  as_of?: string;
+  limit?: number;
+}): Promise<MacroObservationsResponse> {
+  const { data } = await client.get<MacroObservationsResponse>("/macro-data/observations", {
+    params: {
+      series_ids: params.series_ids.join(","),
+      start_date: params.start_date,
+      end_date: params.end_date,
+      as_of: params.as_of,
+      limit: params.limit,
+    },
+  });
   return data;
 }
 
@@ -1291,6 +1376,45 @@ export interface StrategyGraph3 {
   updated_at: string | null;
 }
 
+export interface ProviderCapability3 {
+  provider: string;
+  dataset: string;
+  market_profile_id: string;
+  capability: string;
+  quality_level: string;
+  pit_supported: boolean;
+  license_scope: string;
+  availability: string;
+  as_of_date: string | null;
+  available_at: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface DataQualityContract3 {
+  market_profile_id: string | null;
+  capabilities: ProviderCapability3[];
+  summary: Record<string, unknown>;
+  policy: Record<string, unknown>;
+}
+
+export interface BacktestRun3 {
+  id: string;
+  run_id: string;
+  project_id: string;
+  market_profile_id: string;
+  strategy_graph_id: string;
+  start_date: string | null;
+  end_date: string | null;
+  config: Record<string, unknown>;
+  summary: Record<string, unknown>;
+  status: string;
+  lifecycle_stage: string;
+  created_at: string | null;
+  completed_at: string | null;
+}
+
 export interface ProductionSignalRun3 {
   id: string;
   run_id: string;
@@ -1419,6 +1543,22 @@ export async function getProjectDataStatus3(projectId: string): Promise<ProjectD
   return data;
 }
 
+export async function listProviderCapabilities3(params?: {
+  provider?: string;
+  market_profile_id?: string;
+  dataset?: string;
+}): Promise<ProviderCapability3[]> {
+  const { data } = await client.get<ProviderCapability3[]>("/market-data/provider-capabilities", { params });
+  return data;
+}
+
+export async function getDataQualityContract3(params?: {
+  market_profile_id?: string;
+}): Promise<DataQualityContract3> {
+  const { data } = await client.get<DataQualityContract3>("/market-data/quality-contract", { params });
+  return data;
+}
+
 export async function listAgentPlaybooks3(): Promise<AgentPlaybook3[]> {
   const { data } = await client.get<AgentPlaybook3[]>("/research/agent/playbooks");
   return data;
@@ -1532,6 +1672,38 @@ export async function listStrategyGraphs3(params?: {
 
 export async function getStrategyGraph3(strategyGraphId: string): Promise<StrategyGraph3> {
   const { data } = await client.get<StrategyGraph3>(`/research-assets/strategy-graphs/${strategyGraphId}`);
+  return data;
+}
+
+export async function backtestStrategyGraph3(
+  strategyGraphId: string,
+  body: {
+    start_date: string;
+    end_date: string;
+    alpha_frames_by_date?: Record<string, Array<Record<string, unknown>>>;
+    legacy_signal_frames_by_date?: Record<string, Array<Record<string, unknown>>>;
+    initial_capital?: number;
+    lifecycle_stage?: string;
+    price_field?: string;
+  },
+): Promise<TaskResponse> {
+  const { data } = await client.post<TaskResponse>(`/research-assets/strategy-graphs/${strategyGraphId}/backtest`, body);
+  return data;
+}
+
+export async function listStrategyGraphBacktests3(
+  strategyGraphId: string,
+  params?: { limit?: number },
+): Promise<BacktestRun3[]> {
+  const { data } = await client.get<BacktestRun3[]>(
+    `/research-assets/strategy-graphs/${strategyGraphId}/backtests`,
+    { params },
+  );
+  return data;
+}
+
+export async function getStrategyGraphBacktest3(backtestRunId: string): Promise<BacktestRun3> {
+  const { data } = await client.get<BacktestRun3>(`/research-assets/backtests/${backtestRunId}`);
   return data;
 }
 

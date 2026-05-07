@@ -13,7 +13,9 @@ import uuid
 from typing import Any
 
 from backend.db import get_connection
+from backend.services.calendar_service import get_trading_days
 from backend.services.portfolio_assets_3_service import PortfolioAssets3Service
+from backend.services.portfolio_valuation_service import PortfolioValuationService
 from backend.services.research_kernel_service import ResearchKernelService
 from backend.time_utils import utc_now_naive
 
@@ -26,11 +28,13 @@ class StrategyGraph3Service:
         *,
         kernel_service: ResearchKernelService | None = None,
         portfolio_service: PortfolioAssets3Service | None = None,
+        valuation_service: PortfolioValuationService | None = None,
     ) -> None:
         self.kernel = kernel_service or ResearchKernelService()
         self.portfolio_service = portfolio_service or PortfolioAssets3Service(
             kernel_service=self.kernel
         )
+        self.valuation_service = valuation_service or PortfolioValuationService()
 
     # ------------------------------------------------------------------
     # Graph creation
@@ -286,6 +290,188 @@ class StrategyGraph3Service:
             "artifact_refs": payload["artifact_refs"],
         }
 
+    def backtest_graph(
+        self,
+        strategy_graph_id: str,
+        *,
+        start_date: str,
+        end_date: str,
+        alpha_frames_by_date: dict[str, list[dict[str, Any]]] | None = None,
+        legacy_signal_frames_by_date: dict[str, list[dict[str, Any]]] | None = None,
+        initial_capital: float = 1_000_000,
+        lifecycle_stage: str = "experiment",
+        price_field: str = "close",
+    ) -> dict:
+        graph = self.get_graph(strategy_graph_id)
+        market = "CN" if graph["market_profile_id"] == "CN_A" else "US"
+        dates = [str(day) for day in get_trading_days(start_date, end_date, market=market)]
+        run = self.kernel.create_run(
+            run_type="strategy_graph_backtest",
+            project_id=graph["project_id"],
+            market_profile_id=graph["market_profile_id"],
+            lifecycle_stage=lifecycle_stage,
+            retention_class="standard",
+            created_by="strategy_graph_3",
+            params={
+                "strategy_graph_id": strategy_graph_id,
+                "start_date": start_date,
+                "end_date": end_date,
+                "initial_capital": initial_capital,
+                "price_field": price_field,
+            },
+            input_refs=[{"type": "strategy_graph", "id": strategy_graph_id}],
+        )
+        backtest_run_id = uuid.uuid4().hex[:12]
+        now = utc_now_naive()
+        get_connection().execute(
+            """INSERT INTO backtest_runs
+               (id, run_id, project_id, market_profile_id, strategy_graph_id,
+                start_date, end_date, config, summary, status,
+                lifecycle_stage, created_at, completed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, NULL)""",
+            [
+                backtest_run_id,
+                run["id"],
+                graph["project_id"],
+                graph["market_profile_id"],
+                graph["id"],
+                start_date,
+                end_date,
+                json.dumps(
+                    {
+                        "price_field": price_field,
+                        "alpha_dates": sorted((alpha_frames_by_date or {}).keys()),
+                        "legacy_signal_dates": sorted((legacy_signal_frames_by_date or {}).keys()),
+                    },
+                    default=str,
+                ),
+                json.dumps({}, default=str),
+                lifecycle_stage,
+                now,
+            ],
+        )
+
+        nav = float(initial_capital)
+        current_weights: dict[str, float] = {}
+        previous_date: str | None = None
+        daily: list[dict[str, Any]] = []
+        total_turnover = 0.0
+        warnings: list[dict[str, Any]] = []
+
+        for decision_date in dates:
+            valuation = self.valuation_service.revalue_weights(
+                market_profile_id=graph["market_profile_id"],
+                from_date=previous_date,
+                to_date=decision_date,
+                nav=nav,
+                weights=current_weights,
+                price_field=price_field,
+            )
+            nav = float(valuation["nav"])
+            drifted_weights = {
+                asset_id: float(weight)
+                for asset_id, weight in (valuation.get("weights") or {}).items()
+            }
+            alpha_frame = (alpha_frames_by_date or {}).get(decision_date)
+            legacy_signal_frame = (legacy_signal_frames_by_date or {}).get(decision_date)
+            runtime = self.simulate_day(
+                strategy_graph_id,
+                decision_date=decision_date,
+                alpha_frame=alpha_frame,
+                legacy_signal_frame=legacy_signal_frame,
+                current_weights=drifted_weights,
+                portfolio_value=nav,
+                lifecycle_stage=lifecycle_stage,
+            )
+            target_weights = {
+                row["asset_id"]: float(row["target_weight"])
+                for row in runtime["targets"]
+                if float(row["target_weight"]) > 1e-10
+            }
+            turnover = sum(abs(float(order["delta_weight"])) for order in runtime["order_intents"])
+            total_turnover += turnover
+            self._insert_backtest_trades(
+                backtest_run_id=backtest_run_id,
+                order_intents=runtime["order_intents"],
+            )
+            diagnostics = {
+                "strategy_signal_id": runtime["strategy_signal"]["id"],
+                "portfolio_run_id": runtime["portfolio_run"]["id"],
+                "valuation": valuation["diagnostics"],
+                "turnover_estimate": round(turnover, 12),
+                "target_count": len(runtime["targets"]),
+            }
+            gross = sum(abs(weight) for weight in target_weights.values())
+            net = sum(target_weights.values())
+            get_connection().execute(
+                """INSERT OR REPLACE INTO backtest_daily
+                   (backtest_run_id, date, nav, cash, gross_exposure,
+                    net_exposure, diagnostics)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    backtest_run_id,
+                    decision_date,
+                    nav,
+                    0.0,
+                    gross,
+                    net,
+                    json.dumps(diagnostics, default=str),
+                ],
+            )
+            daily.append(
+                {
+                    "backtest_run_id": backtest_run_id,
+                    "date": decision_date,
+                    "nav": nav,
+                    "cash": 0.0,
+                    "gross_exposure": gross,
+                    "net_exposure": net,
+                    "diagnostics": diagnostics,
+                }
+            )
+            if valuation["diagnostics"]["status"] != "valued":
+                warnings.append({"date": decision_date, "valuation": valuation["diagnostics"]})
+            current_weights = target_weights
+            previous_date = decision_date
+
+        summary = {
+            "initial_capital": float(initial_capital),
+            "final_nav": nav,
+            "total_return": (nav / float(initial_capital) - 1.0) if initial_capital else 0.0,
+            "days_processed": len(daily),
+            "total_turnover_estimate": round(total_turnover, 12),
+            "valuation_warnings": warnings,
+        }
+        get_connection().execute(
+            """UPDATE backtest_runs
+                  SET summary = ?,
+                      status = 'completed',
+                      completed_at = ?
+                WHERE id = ?""",
+            [json.dumps(summary, default=str), utc_now_naive(), backtest_run_id],
+        )
+        self.kernel.add_lineage(
+            from_type="strategy_graph",
+            from_id=strategy_graph_id,
+            to_type="backtest_run",
+            to_id=backtest_run_id,
+            relation="backtested",
+            metadata={"start_date": start_date, "end_date": end_date},
+        )
+        self.kernel.update_run_status(
+            run["id"],
+            status="completed",
+            metrics_summary=summary,
+            qa_summary={"blocking": False, "valuation_warning_count": len(warnings)},
+            warnings=warnings,
+        )
+        return {
+            "run": self.kernel.get_run(run["id"]),
+            "backtest_run": self.get_backtest_run(backtest_run_id),
+            "daily": daily,
+            "summary": summary,
+        }
+
     # ------------------------------------------------------------------
     # Read APIs
     # ------------------------------------------------------------------
@@ -356,6 +542,41 @@ class StrategyGraph3Service:
         if row is None:
             raise ValueError(f"Strategy signal {strategy_signal_id} not found")
         return self._signal_row(row)
+
+    def get_backtest_run(self, backtest_run_id: str) -> dict:
+        row = get_connection().execute(
+            """SELECT id, run_id, project_id, market_profile_id,
+                      strategy_graph_id, start_date, end_date, config,
+                      summary, status, lifecycle_stage, created_at,
+                      completed_at
+               FROM backtest_runs
+               WHERE id = ?""",
+            [backtest_run_id],
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Backtest run {backtest_run_id} not found")
+        return self._backtest_run_row(row)
+
+    def list_backtest_runs(
+        self,
+        *,
+        strategy_graph_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        query = """SELECT id, run_id, project_id, market_profile_id,
+                          strategy_graph_id, start_date, end_date, config,
+                          summary, status, lifecycle_stage, created_at,
+                          completed_at
+                   FROM backtest_runs
+                   WHERE 1 = 1"""
+        params: list[Any] = []
+        if strategy_graph_id:
+            query += " AND strategy_graph_id = ?"
+            params.append(strategy_graph_id)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(int(limit))
+        rows = get_connection().execute(query, params).fetchall()
+        return [self._backtest_run_row(row) for row in rows]
 
     # ------------------------------------------------------------------
     # Internals
@@ -602,6 +823,41 @@ class StrategyGraph3Service:
         )
         return self.get_strategy_signal(signal_id)
 
+    def _insert_backtest_trades(
+        self,
+        *,
+        backtest_run_id: str,
+        order_intents: list[dict[str, Any]],
+    ) -> None:
+        now = utc_now_naive()
+        rows = []
+        for order in order_intents:
+            rows.append(
+                [
+                    uuid.uuid4().hex[:12],
+                    backtest_run_id,
+                    order.get("decision_date"),
+                    order.get("execution_date"),
+                    order["asset_id"],
+                    order["side"],
+                    None,
+                    None,
+                    abs(float(order.get("estimated_value") or 0.0)),
+                    None,
+                    json.dumps(order, default=str),
+                    now,
+                ]
+            )
+        if not rows:
+            return
+        get_connection().executemany(
+            """INSERT INTO backtest_trades
+               (id, backtest_run_id, decision_date, execution_date, asset_id,
+                side, quantity, price, value, cost, metadata, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+
     @staticmethod
     def _dependency_refs(config: dict[str, Any]) -> list[dict[str, Any]]:
         refs = []
@@ -668,6 +924,24 @@ class StrategyGraph3Service:
             "status": row[8],
             "lifecycle_stage": row[9],
             "profile": _json(row[10], {}),
+            "created_at": str(row[11]) if row[11] is not None else None,
+            "completed_at": str(row[12]) if row[12] is not None else None,
+        }
+
+    @staticmethod
+    def _backtest_run_row(row) -> dict:
+        return {
+            "id": row[0],
+            "run_id": row[1],
+            "project_id": row[2],
+            "market_profile_id": row[3],
+            "strategy_graph_id": row[4],
+            "start_date": str(row[5]) if row[5] is not None else None,
+            "end_date": str(row[6]) if row[6] is not None else None,
+            "config": _json(row[7], {}),
+            "summary": _json(row[8], {}),
+            "status": row[9],
+            "lifecycle_stage": row[10],
             "created_at": str(row[11]) if row[11] is not None else None,
             "completed_at": str(row[12]) if row[12] is not None else None,
         }

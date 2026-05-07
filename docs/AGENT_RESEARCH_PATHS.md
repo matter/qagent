@@ -288,7 +288,7 @@ Data Start                                                       Latest Complete
 │  └─ 长度 = max(label_horizon, holding_period, rebalance_period, execution_lag)
 │
 ├─ W2 模型验证窗口
-│  ├─ 默认不少于 18-24 个月
+│  ├─ 默认不少于 3-6 个月
 │  ├─ 只用于选择模型、特征集合、标签定义和训练协议
 │  └─ 不允许根据策略回测收益反向修改因子或标签
 │
@@ -296,7 +296,7 @@ Data Start                                                       Latest Complete
 │  └─ 防止 W2 末端标签、持仓或执行收益跨入 W3
 │
 ├─ W3 策略回测窗口
-│  ├─ 默认不少于 12-24 个月
+│  ├─ 默认不少于 4-6 个月
 │  ├─ 模型和特征已冻结，只允许研究分数到仓位、组合约束、再平衡和执行
 │  └─ 每个交易日按 walk-forward 方式生成信号，不能使用未来窗口重新训练或归一化
 │

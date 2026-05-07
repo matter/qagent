@@ -88,6 +88,24 @@ class ProviderContractTests(unittest.TestCase):
         self.assertIsInstance(provider, _FakeProvider)
         self.assertIn("fake_provider", available_providers("US"))
 
+    def test_provider_capability_contract_marks_free_sources_as_research_grade(self):
+        yfinance = YFinanceProvider()
+        baostock = BaoStockProvider(client=_FakeBaoClient())
+
+        yf_caps = yfinance.capabilities()
+        bao_caps = baostock.capabilities()
+
+        self.assertEqual(yf_caps["provider"], "yfinance")
+        self.assertEqual(yf_caps["market"], "US")
+        self.assertEqual(yf_caps["cost"], "free")
+        self.assertEqual(yf_caps["quality_level"], "exploratory")
+        self.assertFalse(yf_caps["pit_supported"])
+        self.assertIn("daily_bars", yf_caps["datasets"])
+        self.assertEqual(bao_caps["provider"], "baostock")
+        self.assertEqual(bao_caps["market"], "CN")
+        self.assertFalse(bao_caps["pit_supported"])
+        self.assertIn("trade_status", bao_caps["datasets"])
+
     def test_baostock_stock_list_is_market_scoped_and_filters_indices(self):
         provider = BaoStockProvider(client=_FakeBaoClient())
 

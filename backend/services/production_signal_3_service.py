@@ -7,6 +7,7 @@ import uuid
 from typing import Any
 
 from backend.db import get_connection
+from backend.services.portfolio_valuation_service import PortfolioValuationService
 from backend.services.research_kernel_service import ResearchKernelService
 from backend.services.strategy_graph_3_service import StrategyGraph3Service
 from backend.time_utils import utc_now_naive
@@ -23,11 +24,13 @@ class ProductionSignal3Service:
         *,
         kernel_service: ResearchKernelService | None = None,
         graph_service: StrategyGraph3Service | None = None,
+        valuation_service: PortfolioValuationService | None = None,
     ) -> None:
         self.kernel = kernel_service or ResearchKernelService()
         self.graph_service = graph_service or StrategyGraph3Service(
             kernel_service=self.kernel
         )
+        self.valuation_service = valuation_service or PortfolioValuationService()
 
     # ------------------------------------------------------------------
     # Production signal
@@ -242,13 +245,26 @@ class ProductionSignal3Service:
         session = self.get_paper_session(session_id)
         if session["status"] != "active":
             raise ValueError(f"Paper session is {session['status']}, not active")
+        valuation = self.valuation_service.revalue_weights(
+            market_profile_id=session["market_profile_id"],
+            from_date=session.get("current_date"),
+            to_date=decision_date,
+            nav=session["current_nav"],
+            weights=session.get("current_weights") or {},
+            price_field=str((session.get("config") or {}).get("valuation_price_field") or "close"),
+        )
+        nav = float(valuation["nav"])
+        drifted_weights = {
+            asset_id: float(weight)
+            for asset_id, weight in (valuation.get("weights") or {}).items()
+        }
         result = self.generate_production_signal(
             strategy_graph_id=session["strategy_graph_id"],
             decision_date=decision_date,
             alpha_frame=alpha_frame,
             legacy_signal_frame=legacy_signal_frame,
-            current_weights=session.get("current_weights") or {},
-            portfolio_value=session["current_nav"],
+            current_weights=drifted_weights,
+            portfolio_value=nav,
             approved_by="paper_session",
         )
         target_weights = {
@@ -257,9 +273,9 @@ class ProductionSignal3Service:
             if float(row["target_weight"]) > 1e-10
         }
         turnover = sum(abs(float(order["delta_weight"])) for order in result["order_intents"])
-        nav = float(session["current_nav"])
         diagnostics = {
             "execution_model": "target weights applied at next-open intent level",
+            "valuation": valuation["diagnostics"],
             "turnover_estimate": round(turnover, 12),
             "order_intent_count": len(result["order_intents"]),
             "strategy_signal_id": result["strategy_signal"]["id"],

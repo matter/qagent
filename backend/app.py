@@ -24,7 +24,9 @@ from backend.api.paper_trading import router as paper_trading_router
 from backend.api.diagnostics import router as diagnostics_router
 from backend.api.research import router as research_router
 from backend.api.market_data import router as market_data_router
+from backend.api.macro_data import router as macro_data_router
 from backend.api.migration import router as migration_router
+from backend.api.research_cache import router as research_cache_router
 from backend.api.universe_dataset import router as universe_dataset_router
 from backend.api.factor_engine_3 import router as factor_engine_3_router
 from backend.api.model_experiment_3 import router as model_experiment_3_router
@@ -119,7 +121,9 @@ app.include_router(paper_trading_router)
 app.include_router(diagnostics_router)
 app.include_router(research_router)
 app.include_router(market_data_router)
+app.include_router(macro_data_router)
 app.include_router(migration_router)
+app.include_router(research_cache_router)
 app.include_router(universe_dataset_router)
 app.include_router(factor_engine_3_router)
 app.include_router(model_experiment_3_router)

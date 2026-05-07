@@ -136,6 +136,49 @@ class ProductionSignal3ServiceContractTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(counts, (1, 1, 1))
 
+    def test_paper_session_revalues_existing_weights_before_next_signal(self):
+        conn = get_connection()
+        conn.executemany(
+            """INSERT INTO stocks
+               (market, ticker, name, exchange, sector, status, updated_at)
+               VALUES ('US', ?, ?, 'NYSE', 'Test', 'active', current_timestamp)""",
+            [("AAA", "AAA Inc"), ("BBB", "BBB Inc")],
+        )
+        conn.executemany(
+            """INSERT INTO daily_bars
+               (market, ticker, date, open, high, low, close, volume, adj_factor)
+               VALUES ('US', ?, ?, ?, ?, ?, ?, 1000, 1.0)""",
+            [
+                ("AAA", "2024-01-02", 100.0, 101.0, 99.0, 100.0),
+                ("AAA", "2024-01-03", 110.0, 111.0, 109.0, 110.0),
+                ("BBB", "2024-01-02", 50.0, 51.0, 49.0, 50.0),
+                ("BBB", "2024-01-03", 50.0, 51.0, 49.0, 50.0),
+            ],
+        )
+        service = ProductionSignal3Service()
+        session = service.create_paper_session(
+            strategy_graph_id=self.graph["id"],
+            name="M10 revalue paper",
+            start_date="2024-01-02",
+            initial_capital=1_000_000,
+        )
+        first = service.advance_paper_session(
+            session["id"],
+            decision_date="2024-01-02",
+            alpha_frame=[{"asset_id": "US_EQ:AAA", "score": 1.0}],
+        )
+        second = service.advance_paper_session(
+            session["id"],
+            decision_date="2024-01-03",
+            alpha_frame=[{"asset_id": "US_EQ:AAA", "score": 1.0}],
+        )
+
+        self.assertAlmostEqual(first["paper_daily"]["nav"], 1_000_000.0, places=2)
+        self.assertAlmostEqual(second["paper_daily"]["nav"], 1_100_000.0, places=2)
+        self.assertEqual(second["paper_daily"]["diagnostics"]["valuation"]["status"], "valued")
+        self.assertEqual(second["paper_daily"]["diagnostics"]["valuation"]["from_date"], "2024-01-02")
+        self.assertEqual(second["paper_daily"]["diagnostics"]["valuation"]["to_date"], "2024-01-03")
+
 
 if __name__ == "__main__":
     unittest.main()

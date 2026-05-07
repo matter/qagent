@@ -4,13 +4,30 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import date
-from typing import List
+from typing import Any, List
 
 import pandas as pd
 
 
 class DataProvider(ABC):
     """Interface that every concrete data provider must implement."""
+
+    def capabilities(self) -> dict[str, Any]:
+        """Return provider capability metadata.
+
+        Concrete providers should override this with data quality semantics.
+        The base fallback is intentionally conservative.
+        """
+        return {
+            "provider": self.__class__.__name__,
+            "market": None,
+            "datasets": [],
+            "cost": "unknown",
+            "quality_level": "exploratory",
+            "pit_supported": False,
+            "license_scope": "unknown",
+            "notes": ["Provider has not declared data quality capabilities."],
+        }
 
     @abstractmethod
     def get_stock_list(self) -> pd.DataFrame:

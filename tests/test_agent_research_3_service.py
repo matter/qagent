@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from backend.db import close_db, get_connection, init_db
 from backend.services.agent_research_3_service import AgentResearch3Service
+from backend.services.research_kernel_service import ResearchKernelService
 
 
 class AgentResearch3ServiceContractTests(unittest.TestCase):
@@ -162,6 +163,43 @@ class AgentResearch3ServiceContractTests(unittest.TestCase):
         self.assertEqual(performance["best_trial"]["metrics"]["sharpe"], 1.3)
         self.assertEqual(len(performance["top_trials"]), 2)
         self.assertEqual(performance["metric_ranges"]["sharpe"]["count"], 3)
+
+    def test_qa_gate_blocks_missing_artifacts_and_scratch_artifacts_for_promotion_sources(self):
+        service = AgentResearch3Service()
+        missing = service.evaluate_qa(
+            source_type="strategy_graph",
+            source_id="graph-missing-artifact",
+            metrics={"coverage": 1.0, "sharpe": 1.1, "max_drawdown": -0.05},
+            artifact_refs=[{"type": "artifact", "id": "does-not-exist"}],
+        )
+
+        kernel = ResearchKernelService()
+        run = kernel.create_run(
+            run_type="qa_artifact_fixture",
+            lifecycle_stage="scratch",
+            retention_class="rebuildable",
+            created_by="unit-test",
+        )
+        artifact = kernel.create_json_artifact(
+            run_id=run["id"],
+            artifact_type="scratch_candidate",
+            payload={"value": 1},
+            lifecycle_stage="scratch",
+            retention_class="rebuildable",
+        )
+        scratch = service.evaluate_qa(
+            source_type="strategy_graph",
+            source_id="graph-scratch-artifact",
+            metrics={"coverage": 1.0, "sharpe": 1.1, "max_drawdown": -0.05},
+            artifact_refs=[{"type": "artifact", "id": artifact["id"]}],
+        )
+
+        self.assertEqual(missing["status"], "fail")
+        self.assertTrue(missing["blocking"])
+        self.assertTrue(any(item["check"] == "artifact_missing" for item in missing["findings"]))
+        self.assertEqual(scratch["status"], "fail")
+        self.assertTrue(scratch["blocking"])
+        self.assertTrue(any(item["check"] == "artifact_lifecycle" for item in scratch["findings"]))
 
 
 if __name__ == "__main__":

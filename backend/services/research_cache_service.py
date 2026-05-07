@@ -1,0 +1,583 @@
+"""Research cache service for daily hot paths and storage governance."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import timedelta
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+from backend.config import settings
+from backend.db import get_connection
+from backend.logger import get_logger
+from backend.services.market_context import normalize_market, normalize_ticker
+from backend.time_utils import utc_now_naive
+
+log = get_logger(__name__)
+
+_FEATURE_MATRIX_SCHEMA_VERSION = "1"
+_DEFAULT_DAILY_HOT_DAYS = 20
+
+
+class ResearchCacheService:
+    """Manage reusable research caches and cache cleanup decisions.
+
+    The first production slice focuses on preprocessed feature matrices, which
+    are the most repeated daily research object after raw factor values.
+    """
+
+    def __init__(self, cache_root: Path | None = None) -> None:
+        self._cache_root = cache_root or (settings.project_root / "data" / "research_cache")
+
+    # ------------------------------------------------------------------
+    # Feature matrix hot cache
+    # ------------------------------------------------------------------
+
+    def build_feature_matrix_key(
+        self,
+        *,
+        market: str | None,
+        feature_set_id: str,
+        tickers: list[str],
+        start_date: str,
+        end_date: str,
+        factor_refs: list[dict],
+        preprocessing: dict | None,
+        data_version: str | None = None,
+    ) -> str:
+        resolved_market = normalize_market(market)
+        normalized_tickers = sorted({normalize_ticker(t, resolved_market) for t in tickers})
+        payload = {
+            "schema_version": _FEATURE_MATRIX_SCHEMA_VERSION,
+            "object_type": "feature_matrix",
+            "market": resolved_market,
+            "feature_set_id": feature_set_id,
+            "tickers": normalized_tickers,
+            "start_date": str(start_date),
+            "end_date": str(end_date),
+            "factor_refs": _canonical_jsonable(factor_refs),
+            "preprocessing": _canonical_jsonable(preprocessing or {}),
+            "data_version": data_version or self.default_data_version(resolved_market, end_date),
+        }
+        digest = hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+        return f"feature_matrix:{digest}"
+
+    def load_feature_matrix(
+        self,
+        *,
+        market: str | None,
+        feature_set_id: str,
+        tickers: list[str],
+        start_date: str,
+        end_date: str,
+        factor_refs: list[dict],
+        preprocessing: dict | None,
+        data_version: str | None = None,
+    ) -> dict[str, Any] | None:
+        cache_key = self.build_feature_matrix_key(
+            market=market,
+            feature_set_id=feature_set_id,
+            tickers=tickers,
+            start_date=start_date,
+            end_date=end_date,
+            factor_refs=factor_refs,
+            preprocessing=preprocessing,
+            data_version=data_version,
+        )
+        record = self.get_cache_stats(cache_key)
+        if record is None or record.get("status") != "active" or not record.get("uri"):
+            return None
+
+        path = Path(record["uri"])
+        if not path.exists():
+            self._record_miss(cache_key)
+            return None
+
+        try:
+            frame = pd.read_parquet(path)
+        except Exception as exc:
+            log.warning("research_cache.feature_matrix.load_failed", cache_key=cache_key, error=str(exc))
+            self._record_miss(cache_key)
+            return None
+        self._record_hit(cache_key)
+        return {
+            "record": self.get_cache_stats(cache_key),
+            "feature_data": self._wide_frame_to_feature_data(frame),
+        }
+
+    def store_feature_matrix(
+        self,
+        *,
+        market: str | None,
+        feature_set_id: str,
+        tickers: list[str],
+        start_date: str,
+        end_date: str,
+        factor_refs: list[dict],
+        preprocessing: dict | None,
+        feature_data: dict[str, pd.DataFrame],
+        data_version: str | None = None,
+        retention_class: str = "daily_hot",
+        ttl_days: int = _DEFAULT_DAILY_HOT_DAYS,
+    ) -> dict[str, Any]:
+        resolved_market = normalize_market(market)
+        normalized_tickers = sorted({normalize_ticker(t, resolved_market) for t in tickers})
+        resolved_data_version = data_version or self.default_data_version(resolved_market, end_date)
+        cache_key = self.build_feature_matrix_key(
+            market=resolved_market,
+            feature_set_id=feature_set_id,
+            tickers=normalized_tickers,
+            start_date=start_date,
+            end_date=end_date,
+            factor_refs=factor_refs,
+            preprocessing=preprocessing,
+            data_version=resolved_data_version,
+        )
+        frame = self._feature_data_to_wide_frame(feature_data)
+        if frame.empty:
+            raise ValueError("feature_data must not be empty")
+
+        path = self._feature_matrix_path(resolved_market, feature_set_id, cache_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_parquet(path, index=True)
+        byte_size = path.stat().st_size
+        content_hash = _file_hash(path)
+        metadata = {
+            "tickers": normalized_tickers,
+            "factor_refs": _canonical_jsonable(factor_refs),
+            "preprocessing": _canonical_jsonable(preprocessing or {}),
+            "data_version": resolved_data_version,
+            "features": sorted(feature_data.keys()),
+        }
+        now = utc_now_naive()
+        expires_at = now + timedelta(days=ttl_days) if ttl_days > 0 else None
+
+        conn = get_connection()
+        conn.execute(
+            """INSERT OR REPLACE INTO research_cache_entries
+               (cache_key, object_type, market, object_id, uri, format,
+                schema_version, byte_size, content_hash, row_count,
+                feature_count, ticker_count, start_date, end_date, data_version,
+                retention_class, rebuildable, status, metadata, created_at,
+                updated_at, expires_at, last_accessed_at, hit_count, miss_count)
+               VALUES (?, 'feature_matrix', ?, ?, ?, 'parquet', ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?, TRUE, 'active', ?, COALESCE(
+                           (SELECT created_at FROM research_cache_entries WHERE cache_key = ?),
+                           ?
+                       ), ?, ?, NULL,
+                       COALESCE((SELECT hit_count FROM research_cache_entries WHERE cache_key = ?), 0),
+                       COALESCE((SELECT miss_count FROM research_cache_entries WHERE cache_key = ?), 0))""",
+            [
+                cache_key,
+                resolved_market,
+                feature_set_id,
+                str(path),
+                _FEATURE_MATRIX_SCHEMA_VERSION,
+                byte_size,
+                content_hash,
+                int(len(frame)),
+                int(len(feature_data)),
+                int(len(normalized_tickers)),
+                start_date,
+                end_date,
+                resolved_data_version,
+                retention_class,
+                json.dumps(metadata, default=str),
+                cache_key,
+                now,
+                now,
+                expires_at,
+                cache_key,
+                cache_key,
+            ],
+        )
+        log.info(
+            "research_cache.feature_matrix.stored",
+            cache_key=cache_key,
+            market=resolved_market,
+            feature_set_id=feature_set_id,
+            rows=len(frame),
+            bytes=byte_size,
+        )
+        return self.get_cache_stats(cache_key)
+
+    def default_data_version(self, market: str | None, as_of_date: str | None) -> str:
+        resolved_market = normalize_market(market)
+        return f"{resolved_market}:{as_of_date or 'latest'}"
+
+    # ------------------------------------------------------------------
+    # Inventory
+    # ------------------------------------------------------------------
+
+    def get_cache_stats(self, cache_key: str) -> dict[str, Any] | None:
+        row = get_connection().execute(
+            """SELECT cache_key, object_type, market, object_id, uri, format,
+                      schema_version, byte_size, content_hash, row_count,
+                      feature_count, ticker_count, start_date, end_date,
+                      data_version, retention_class, rebuildable, status,
+                      metadata, created_at, updated_at, expires_at,
+                      last_accessed_at, hit_count, miss_count
+               FROM research_cache_entries
+               WHERE cache_key = ?""",
+            [cache_key],
+        ).fetchone()
+        if row is None:
+            return None
+        return _cache_row(row)
+
+    def list_cache_entries(
+        self,
+        *,
+        market: str | None = None,
+        object_type: str | None = None,
+        status: str = "active",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if market:
+            clauses.append("market = ?")
+            params.append(normalize_market(market))
+        if object_type:
+            clauses.append("object_type = ?")
+            params.append(object_type)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(int(limit))
+        rows = get_connection().execute(
+            f"""SELECT cache_key, object_type, market, object_id, uri, format,
+                       schema_version, byte_size, content_hash, row_count,
+                       feature_count, ticker_count, start_date, end_date,
+                       data_version, retention_class, rebuildable, status,
+                       metadata, created_at, updated_at, expires_at,
+                       last_accessed_at, hit_count, miss_count
+                FROM research_cache_entries
+                {where}
+                ORDER BY COALESCE(last_accessed_at, updated_at) DESC
+                LIMIT ?""",
+            params,
+        ).fetchall()
+        return [_cache_row(row) for row in rows]
+
+    def inventory_summary(self, *, market: str | None = None) -> dict[str, Any]:
+        resolved_market = normalize_market(market) if market else None
+        params: list[Any] = []
+        where = ""
+        if resolved_market:
+            where = "WHERE market = ?"
+            params.append(resolved_market)
+        rows = get_connection().execute(
+            f"""SELECT object_type, retention_class, COUNT(*) AS entry_count,
+                       COALESCE(SUM(byte_size), 0) AS byte_size,
+                       COALESCE(SUM(row_count), 0) AS row_count
+                FROM research_cache_entries
+                {where}
+                GROUP BY object_type, retention_class
+                ORDER BY byte_size DESC""",
+            params,
+        ).fetchall()
+        return {
+            "market": resolved_market,
+            "items": [
+                {
+                    "object_type": row[0],
+                    "retention_class": row[1],
+                    "entry_count": int(row[2] or 0),
+                    "byte_size": int(row[3] or 0),
+                    "row_count": int(row[4] or 0),
+                }
+                for row in rows
+            ],
+        }
+
+    def apply_expired_cache_cleanup(
+        self,
+        *,
+        market: str | None = None,
+        object_type: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        clauses = ["status = 'active'", "expires_at IS NOT NULL", "expires_at <= ?"]
+        params: list[Any] = [utc_now_naive()]
+        resolved_market = normalize_market(market) if market else None
+        if resolved_market:
+            clauses.append("market = ?")
+            params.append(resolved_market)
+        if object_type:
+            clauses.append("object_type = ?")
+            params.append(object_type)
+        params.append(int(limit))
+        rows = get_connection().execute(
+            f"""SELECT cache_key, uri, byte_size
+                FROM research_cache_entries
+                WHERE {' AND '.join(clauses)}
+                ORDER BY expires_at
+                LIMIT ?""",
+            params,
+        ).fetchall()
+        deleted_keys: list[str] = []
+        deleted_bytes = 0
+        for cache_key, uri, byte_size in rows:
+            path = Path(uri) if uri else None
+            if path is not None and path.exists():
+                try:
+                    path.unlink()
+                    deleted_bytes += int(byte_size or 0)
+                except OSError as exc:
+                    log.warning("research_cache.expired_delete_failed", cache_key=cache_key, error=str(exc))
+                    continue
+            get_connection().execute(
+                """UPDATE research_cache_entries
+                      SET status = 'deleted',
+                          uri = NULL,
+                          byte_size = 0,
+                          updated_at = ?
+                    WHERE cache_key = ?""",
+                [utc_now_naive(), cache_key],
+            )
+            deleted_keys.append(cache_key)
+        return {
+            "market": resolved_market,
+            "object_type": object_type,
+            "deleted_entries": len(deleted_keys),
+            "deleted_bytes": deleted_bytes,
+            "deleted_cache_keys": deleted_keys,
+        }
+
+    # ------------------------------------------------------------------
+    # Factor cache cleanup
+    # ------------------------------------------------------------------
+
+    def preview_factor_cache_cleanup(
+        self,
+        *,
+        market: str | None = None,
+        include_recent_days: int = 0,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        resolved_market = normalize_market(market)
+        recent_filter = ""
+        recent_params: list[Any] = []
+        if include_recent_days > 0:
+            recent_filter = "AND f.updated_at < ?"
+            recent_params.append(utc_now_naive() - timedelta(days=include_recent_days))
+        rows = get_connection().execute(
+            f"""WITH referenced AS (
+                    SELECT DISTINCT json_extract_string(ref.value, '$.factor_id') AS factor_id
+                    FROM feature_sets fs, json_each(fs.factor_refs) AS ref
+                    WHERE fs.market = ?
+                    UNION
+                    SELECT DISTINCT json_extract_string(ref.value, '$.factor_id') AS factor_id
+                    FROM models m
+                    JOIN feature_sets fs
+                      ON fs.market = m.market AND fs.id = m.feature_set_id,
+                         json_each(fs.factor_refs) AS ref
+                    WHERE m.market = ?
+                      AND m.status IN ('trained', 'active', 'published')
+                    UNION
+                    SELECT DISTINCT f.id AS factor_id
+                    FROM strategies s,
+                         json_each(s.required_factors) AS req
+                    JOIN factors f
+                      ON f.market = s.market
+                     AND f.name = json_extract_string(req.value, '$')
+                    WHERE s.market = ?
+                      AND s.status IN ('active', 'published', 'validated', 'draft')
+                ),
+                candidates AS (
+                    SELECT c.factor_id,
+                           COUNT(*) AS row_count,
+                           MIN(c.date) AS min_date,
+                           MAX(c.date) AS max_date,
+                           f.status AS factor_status
+                    FROM factor_values_cache c
+                    JOIN factors f
+                      ON f.market = c.market AND f.id = c.factor_id
+                    LEFT JOIN referenced r
+                      ON r.factor_id = c.factor_id
+                    WHERE c.market = ?
+                      AND COALESCE(f.status, 'draft') = 'draft'
+                      AND r.factor_id IS NULL
+                      {recent_filter}
+                    GROUP BY c.factor_id, f.status
+                )
+                SELECT factor_id, row_count, min_date, max_date, factor_status
+                FROM candidates
+                ORDER BY row_count DESC
+                LIMIT ?""",
+            [resolved_market, resolved_market, resolved_market, resolved_market, *recent_params, int(limit)],
+        ).fetchall()
+        candidates = [
+            {
+                "market": resolved_market,
+                "factor_id": row[0],
+                "row_count": int(row[1] or 0),
+                "min_date": str(row[2]) if row[2] else None,
+                "max_date": str(row[3]) if row[3] else None,
+                "factor_status": row[4],
+                "reason": "unreferenced_draft_factor_cache",
+            }
+            for row in rows
+        ]
+        return {
+            "market": resolved_market,
+            "summary": {
+                "candidate_count": len(candidates),
+                "candidate_rows": sum(item["row_count"] for item in candidates),
+                "policy": "delete unreferenced draft factor_values_cache rows",
+            },
+            "candidates": candidates,
+        }
+
+    def apply_factor_cache_cleanup(
+        self,
+        *,
+        market: str | None = None,
+        include_recent_days: int = 0,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        preview = self.preview_factor_cache_cleanup(
+            market=market,
+            include_recent_days=include_recent_days,
+            limit=limit,
+        )
+        factor_ids = [item["factor_id"] for item in preview["candidates"]]
+        if not factor_ids:
+            return {
+                "market": preview["market"],
+                "deleted_rows": 0,
+                "deleted_factors": [],
+                "preview": preview,
+            }
+        conn = get_connection()
+        before = conn.execute(
+            "SELECT COUNT(*) FROM factor_values_cache WHERE market = ? AND factor_id = ANY(?)",
+            [preview["market"], factor_ids],
+        ).fetchone()[0]
+        conn.execute(
+            "DELETE FROM factor_values_cache WHERE market = ? AND factor_id = ANY(?)",
+            [preview["market"], factor_ids],
+        )
+        return {
+            "market": preview["market"],
+            "deleted_rows": int(before or 0),
+            "deleted_factors": factor_ids,
+            "preview": preview,
+        }
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _feature_matrix_path(self, market: str, feature_set_id: str, cache_key: str) -> Path:
+        digest = cache_key.split(":", 1)[1]
+        return self._cache_root / "feature_matrix" / market / feature_set_id / f"{digest}.parquet"
+
+    @staticmethod
+    def _feature_data_to_wide_frame(feature_data: dict[str, pd.DataFrame]) -> pd.DataFrame:
+        pieces: list[pd.DataFrame] = []
+        for feature_name in sorted(feature_data):
+            df = feature_data[feature_name].copy()
+            df.index = pd.to_datetime(df.index)
+            df.columns = pd.MultiIndex.from_product([[feature_name], [str(c) for c in df.columns]])
+            pieces.append(df)
+        if not pieces:
+            return pd.DataFrame()
+        wide = pd.concat(pieces, axis=1).sort_index()
+        wide.index.name = "date"
+        return wide
+
+    @staticmethod
+    def _wide_frame_to_feature_data(frame: pd.DataFrame) -> dict[str, pd.DataFrame]:
+        if not isinstance(frame.columns, pd.MultiIndex):
+            raise ValueError("feature matrix cache has invalid column index")
+        result: dict[str, pd.DataFrame] = {}
+        for feature_name in frame.columns.get_level_values(0).unique():
+            feature_frame = frame.xs(feature_name, axis=1, level=0).copy()
+            feature_frame.index = pd.to_datetime(feature_frame.index)
+            feature_frame.index.name = None
+            result[str(feature_name)] = feature_frame
+        return result
+
+    @staticmethod
+    def _record_hit(cache_key: str) -> None:
+        get_connection().execute(
+            """UPDATE research_cache_entries
+                  SET hit_count = hit_count + 1,
+                      last_accessed_at = ?,
+                      updated_at = ?
+                WHERE cache_key = ?""",
+            [utc_now_naive(), utc_now_naive(), cache_key],
+        )
+
+    @staticmethod
+    def _record_miss(cache_key: str) -> None:
+        get_connection().execute(
+            """UPDATE research_cache_entries
+                  SET miss_count = miss_count + 1,
+                      last_accessed_at = ?,
+                      updated_at = ?
+                WHERE cache_key = ?""",
+            [utc_now_naive(), utc_now_naive(), cache_key],
+        )
+
+
+def _canonical_jsonable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _canonical_jsonable(value[k]) for k in sorted(value)}
+    if isinstance(value, list):
+        return [_canonical_jsonable(item) for item in value]
+    return value
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(_canonical_jsonable(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _file_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _cache_row(row: tuple) -> dict[str, Any]:
+    metadata = row[18]
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except json.JSONDecodeError:
+            metadata = {}
+    return {
+        "cache_key": row[0],
+        "object_type": row[1],
+        "market": row[2],
+        "object_id": row[3],
+        "uri": row[4],
+        "format": row[5],
+        "schema_version": row[6],
+        "byte_size": int(row[7] or 0),
+        "content_hash": row[8],
+        "row_count": int(row[9] or 0),
+        "feature_count": int(row[10] or 0),
+        "ticker_count": int(row[11] or 0),
+        "start_date": str(row[12]) if row[12] else None,
+        "end_date": str(row[13]) if row[13] else None,
+        "data_version": row[14],
+        "retention_class": row[15],
+        "rebuildable": bool(row[16]),
+        "status": row[17],
+        "metadata": metadata or {},
+        "created_at": str(row[19]) if row[19] else None,
+        "updated_at": str(row[20]) if row[20] else None,
+        "expires_at": str(row[21]) if row[21] else None,
+        "last_accessed_at": str(row[22]) if row[22] else None,
+        "hit_count": int(row[23] or 0),
+        "miss_count": int(row[24] or 0),
+    }

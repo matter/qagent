@@ -6,6 +6,8 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from backend.services.strategy_graph_3_service import StrategyGraph3Service
+from backend.tasks.executor import get_task_executor
+from backend.tasks.models import TaskSource
 
 router = APIRouter(prefix="/api/research-assets", tags=["research-assets"])
 
@@ -51,8 +53,22 @@ class SimulateDayRequest(BaseModel):
     lifecycle_stage: str = "experiment"
 
 
+class BacktestGraphRequest(BaseModel):
+    start_date: str
+    end_date: str
+    alpha_frames_by_date: dict[str, list[dict]] | None = None
+    legacy_signal_frames_by_date: dict[str, list[dict]] | None = None
+    initial_capital: float = 1_000_000
+    lifecycle_stage: str = "experiment"
+    price_field: str = "close"
+
+
 def _svc() -> StrategyGraph3Service:
     return StrategyGraph3Service()
+
+
+def _executor():
+    return get_task_executor()
 
 
 @router.post("/strategy-graphs/builtin-alpha")
@@ -93,6 +109,43 @@ async def simulate_strategy_graph_day(strategy_graph_id: str, body: SimulateDayR
         return _svc().simulate_day(strategy_graph_id, **body.model_dump())
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/strategy-graphs/{strategy_graph_id}/backtest")
+async def backtest_strategy_graph(strategy_graph_id: str, body: BacktestGraphRequest) -> dict:
+    try:
+        task_id = _executor().submit(
+            task_type="strategy_graph_backtest",
+            fn=_svc().backtest_graph,
+            params={"strategy_graph_id": strategy_graph_id, **body.model_dump()},
+            timeout=3600,
+            source=TaskSource.UI,
+        )
+        return {
+            "task_id": task_id,
+            "status": "queued",
+            "task_type": "strategy_graph_backtest",
+            "strategy_graph_id": strategy_graph_id,
+            "poll_url": f"/api/tasks/{task_id}",
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/strategy-graphs/{strategy_graph_id}/backtests")
+async def list_strategy_graph_backtests(
+    strategy_graph_id: str,
+    limit: int = Query(50, ge=1, le=500),
+) -> list[dict]:
+    return _svc().list_backtest_runs(strategy_graph_id=strategy_graph_id, limit=limit)
+
+
+@router.get("/backtests/{backtest_run_id}")
+async def get_strategy_graph_backtest(backtest_run_id: str) -> dict:
+    try:
+        return _svc().get_backtest_run(backtest_run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get("/strategy-signals/{strategy_signal_id}/explain")

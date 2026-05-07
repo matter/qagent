@@ -50,12 +50,25 @@ class MarketEntryConfig:
 
 
 @dataclass
+class FredConfig:
+    api_key: str | None = None
+    base_url: str = "https://api.stlouisfed.org/fred"
+    request_timeout_seconds: int = 30
+
+
+@dataclass
+class ExternalDataConfig:
+    fred: FredConfig = field(default_factory=FredConfig)
+
+
+@dataclass
 class Settings:
     data: DataConfig = field(default_factory=DataConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
     market: MarketConfig = field(default_factory=MarketConfig)
     markets: dict[str, MarketEntryConfig] = field(default_factory=dict)
+    external_data: ExternalDataConfig = field(default_factory=ExternalDataConfig)
 
     # Resolved absolute paths (set after loading)
     project_root: Path = field(default=_PROJECT_ROOT)
@@ -87,6 +100,7 @@ def _build_settings(raw: dict[str, Any]) -> Settings:
     backtest = BacktestConfig(**raw.get("backtest", {}))
     market = MarketConfig(**raw.get("market", {}))
     markets = _build_market_configs(raw.get("markets", {}), data, backtest, market)
+    external_data = _build_external_data_config(raw.get("external_data", {}))
 
     return Settings(
         data=data,
@@ -94,7 +108,19 @@ def _build_settings(raw: dict[str, Any]) -> Settings:
         backtest=backtest,
         market=market,
         markets=markets,
+        external_data=external_data,
     )
+
+
+def _build_external_data_config(raw_external_data: dict[str, Any]) -> ExternalDataConfig:
+    raw_fred = {}
+    if isinstance(raw_external_data, dict):
+        raw_fred = raw_external_data.get("fred", {}) or {}
+    fred = FredConfig(**raw_fred)
+    env_api_key = os.getenv("FRED_API_KEY")
+    if env_api_key:
+        fred.api_key = env_api_key
+    return ExternalDataConfig(fred=fred)
 
 
 def _build_market_configs(

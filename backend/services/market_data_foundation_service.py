@@ -14,6 +14,7 @@ from typing import Any
 
 from backend.db import get_connection
 from backend.services.calendar_service import get_latest_trading_day
+from backend.services.data_quality_service import DataQualityService
 from backend.services.market_context import normalize_market
 
 
@@ -109,6 +110,9 @@ class MarketDataFoundationService:
             "market_profile_id": profile["id"],
             "market": market,
             "provider": profile["data_policy"]["provider"],
+            "provider_capabilities": DataQualityService().list_provider_capabilities(
+                market_profile_id=profile["id"],
+            ),
             "latest_trading_day": str(latest_trading_day),
             "coverage": {
                 "asset_count": asset_count,

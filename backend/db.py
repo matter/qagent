@@ -143,6 +143,25 @@ CREATE TABLE IF NOT EXISTS data_policies (
 );
 """
 
+_PROVIDER_CAPABILITIES_DDL = """\
+CREATE TABLE IF NOT EXISTS provider_capabilities (
+    provider             VARCHAR NOT NULL,
+    dataset              VARCHAR NOT NULL,
+    market_profile_id    VARCHAR NOT NULL DEFAULT 'GLOBAL',
+    capability           VARCHAR NOT NULL,
+    quality_level        VARCHAR NOT NULL DEFAULT 'exploratory',
+    pit_supported        BOOLEAN NOT NULL DEFAULT FALSE,
+    license_scope        VARCHAR NOT NULL DEFAULT 'unknown',
+    availability         VARCHAR NOT NULL DEFAULT 'best_effort',
+    as_of_date           DATE,
+    available_at         TIMESTAMP,
+    metadata             JSON,
+    created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (provider, dataset, market_profile_id, capability)
+);
+"""
+
 _TRADING_RULE_SETS_DDL = """\
 CREATE TABLE IF NOT EXISTS trading_rule_sets (
     id                         VARCHAR PRIMARY KEY,
@@ -1004,6 +1023,11 @@ _PERFORMANCE_INDEX_DDLS = [
     "CREATE INDEX IF NOT EXISTS idx_agent_trials_plan_index ON agent_research_trials(plan_id, trial_index)",
     "CREATE INDEX IF NOT EXISTS idx_qa_source_status ON qa_gate_results(source_type, source_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_promotion_source_decision ON promotion_records(source_type, source_id, decision)",
+    "CREATE INDEX IF NOT EXISTS idx_research_cache_market_type ON research_cache_entries(market, object_type, status)",
+    "CREATE INDEX IF NOT EXISTS idx_research_cache_accessed ON research_cache_entries(last_accessed_at, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_macro_obs_provider_series_date ON macro_observations(provider, series_id, date)",
+    "CREATE INDEX IF NOT EXISTS idx_macro_obs_available_at ON macro_observations(provider, series_id, available_at)",
+    "CREATE INDEX IF NOT EXISTS idx_provider_capabilities_provider ON provider_capabilities(provider, market_profile_id)",
 ]
 
 _STOCKS_DDL = """\
@@ -1287,6 +1311,68 @@ CREATE TABLE IF NOT EXISTS paper_trading_signal_cache (
 );
 """
 
+_MACRO_SERIES_DDL = """\
+CREATE TABLE IF NOT EXISTS macro_series (
+    provider        VARCHAR NOT NULL,
+    series_id       VARCHAR NOT NULL,
+    title           TEXT,
+    frequency       VARCHAR,
+    units           VARCHAR,
+    seasonal_adjustment VARCHAR,
+    source          TEXT,
+    source_url      TEXT,
+    metadata        JSON,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (provider, series_id)
+);
+"""
+
+_MACRO_OBSERVATIONS_DDL = """\
+CREATE TABLE IF NOT EXISTS macro_observations (
+    provider        VARCHAR NOT NULL,
+    series_id       VARCHAR NOT NULL,
+    date            DATE NOT NULL,
+    realtime_start  DATE NOT NULL,
+    realtime_end    DATE NOT NULL,
+    available_at    TIMESTAMP NOT NULL,
+    value           DOUBLE,
+    source_metadata JSON,
+    ingested_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (provider, series_id, date, realtime_start, realtime_end)
+);
+"""
+
+_RESEARCH_CACHE_ENTRIES_DDL = """\
+CREATE TABLE IF NOT EXISTS research_cache_entries (
+    cache_key        VARCHAR PRIMARY KEY,
+    object_type      VARCHAR NOT NULL,
+    market           VARCHAR NOT NULL DEFAULT 'US',
+    object_id        VARCHAR,
+    uri              TEXT,
+    format           VARCHAR NOT NULL DEFAULT 'parquet',
+    schema_version   VARCHAR NOT NULL DEFAULT '1',
+    byte_size        BIGINT NOT NULL DEFAULT 0,
+    content_hash     VARCHAR,
+    row_count        BIGINT NOT NULL DEFAULT 0,
+    feature_count    INTEGER NOT NULL DEFAULT 0,
+    ticker_count     INTEGER NOT NULL DEFAULT 0,
+    start_date       DATE,
+    end_date         DATE,
+    data_version     VARCHAR,
+    retention_class  VARCHAR NOT NULL DEFAULT 'standard',
+    rebuildable      BOOLEAN NOT NULL DEFAULT TRUE,
+    status           VARCHAR NOT NULL DEFAULT 'active',
+    metadata         JSON,
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_at       TIMESTAMP,
+    last_accessed_at TIMESTAMP,
+    hit_count        BIGINT NOT NULL DEFAULT 0,
+    miss_count       BIGINT NOT NULL DEFAULT 0
+);
+"""
+
 
 def get_connection() -> duckdb.DuckDBPyConnection:
     """Return a thread-local cursor from the singleton DuckDB connection.
@@ -1316,6 +1402,7 @@ def init_db() -> None:
         ("lineage_edges", _LINEAGE_EDGES_DDL),
         ("market_profiles", _MARKET_PROFILES_DDL),
         ("data_policies", _DATA_POLICIES_DDL),
+        ("provider_capabilities", _PROVIDER_CAPABILITIES_DDL),
         ("trading_rule_sets", _TRADING_RULE_SETS_DDL),
         ("cost_models", _COST_MODELS_DDL),
         ("benchmark_policies", _BENCHMARK_POLICIES_DDL),
@@ -1385,6 +1472,9 @@ def init_db() -> None:
         ("paper_trading_sessions", _PAPER_SESSIONS_DDL),
         ("paper_trading_daily", _PAPER_DAILY_DDL),
         ("paper_trading_signal_cache", _PAPER_SIGNAL_CACHE_DDL),
+        ("macro_series", _MACRO_SERIES_DDL),
+        ("macro_observations", _MACRO_OBSERVATIONS_DDL),
+        ("research_cache_entries", _RESEARCH_CACHE_ENTRIES_DDL),
     ):
         conn.execute(ddl)
         log.info("db.init", table=name)
@@ -1392,6 +1482,7 @@ def init_db() -> None:
     # ---- Lightweight migrations for existing databases ----
     _run_migrations(conn)
     _ensure_market_data_foundation(conn)
+    _ensure_provider_capabilities(conn)
     _ensure_bootstrap_research_project(conn)
     _ensure_performance_indexes(conn)
 
@@ -1705,6 +1796,118 @@ def _ensure_market_data_foundation(conn) -> None:
         )
 
     log.info("db.market_data_foundation.seeded", profiles=["US_EQ", "CN_A"])
+
+
+def _ensure_provider_capabilities(conn) -> None:
+    """Seed explicit capability and quality semantics for free data sources."""
+    import json
+
+    rows = [
+        (
+            "yfinance",
+            "stock_list",
+            "US_EQ",
+            "reference_universe",
+            "exploratory",
+            False,
+            "free_web_source",
+            "best_effort_web_download",
+            {"source": "seed", "restriction": "no_sla"},
+        ),
+        (
+            "yfinance",
+            "daily_bars",
+            "US_EQ",
+            "ohlcv_daily",
+            "exploratory",
+            False,
+            "free_web_source",
+            "best_effort_web_download",
+            {"source": "seed", "adjustment": "adj_factor_column", "restriction": "no_pit"},
+        ),
+        (
+            "yfinance",
+            "index_bars",
+            "US_EQ",
+            "benchmark_daily",
+            "exploratory",
+            False,
+            "free_web_source",
+            "best_effort_web_download",
+            {"source": "seed", "restriction": "no_sla"},
+        ),
+        (
+            "baostock",
+            "stock_list",
+            "CN_A",
+            "reference_universe",
+            "exploratory",
+            False,
+            "free_web_source",
+            "best_effort_web_download",
+            {"source": "seed", "restriction": "no_sla"},
+        ),
+        (
+            "baostock",
+            "daily_bars",
+            "CN_A",
+            "ohlcv_daily",
+            "exploratory",
+            False,
+            "free_web_source",
+            "best_effort_web_download",
+            {"source": "seed", "adjustment": "qfq_default", "restriction": "no_pit"},
+        ),
+        (
+            "baostock",
+            "trade_status",
+            "CN_A",
+            "tradability_daily",
+            "exploratory",
+            False,
+            "free_web_source",
+            "best_effort_web_download",
+            {"source": "seed", "fields": ["tradestatus", "isST"]},
+        ),
+        (
+            "fred",
+            "macro_observations",
+            "GLOBAL",
+            "macro_time_series",
+            "research_grade",
+            False,
+            "free_api_key_required",
+            "api_key_quota_limited",
+            {
+                "source": "seed",
+                "restriction": "current realtime window unless explicitly replayed",
+                "configured_by": "external_data.fred",
+            },
+        ),
+    ]
+    conn.executemany(
+        """INSERT OR REPLACE INTO provider_capabilities
+           (provider, dataset, market_profile_id, capability, quality_level,
+            pit_supported, license_scope, availability, as_of_date,
+            available_at, metadata, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, current_date, current_timestamp,
+                   ?, current_timestamp, current_timestamp)""",
+        [
+            [provider, dataset, profile, capability, quality, pit, license_scope, availability, json.dumps(metadata)]
+            for (
+                provider,
+                dataset,
+                profile,
+                capability,
+                quality,
+                pit,
+                license_scope,
+                availability,
+                metadata,
+            ) in rows
+        ],
+    )
+    log.info("db.provider_capabilities.seeded", count=len(rows))
 
 
 def close_db() -> None:

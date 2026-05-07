@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import date
-from typing import Iterable, List
+from typing import Any, Iterable, List
 
 import pandas as pd
 
@@ -40,6 +40,22 @@ class BaoStockProvider(DataProvider):
 
     def __init__(self, client=None) -> None:
         self._client = client
+
+    def capabilities(self) -> dict[str, Any]:
+        return {
+            "provider": "baostock",
+            "market": "CN",
+            "datasets": ["stock_list", "daily_bars", "index_bars", "trade_status"],
+            "cost": "free",
+            "quality_level": "exploratory",
+            "pit_supported": False,
+            "license_scope": "free_web_source",
+            "availability": "best_effort_web_download",
+            "notes": [
+                "CN A-share tradability fields need explicit execution checks.",
+                "Not a validated point-in-time institutional feed.",
+            ],
+        }
 
     def get_stock_list(self) -> pd.DataFrame:
         with self._session() as bs:
@@ -158,4 +174,3 @@ def _exchange_from_code(code: str) -> str:
 def _is_a_share_code(code: str) -> bool:
     code = str(code).lower()
     return code.startswith(("sh.60", "sh.68", "sz.00", "sz.30", "bj."))
-

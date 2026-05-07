@@ -7,6 +7,7 @@ from datetime import date
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from backend.services.data_quality_service import DataQualityService
 from backend.services.market_data_foundation_service import MarketDataFoundationService
 
 router = APIRouter(prefix="/api/market-data", tags=["market-data"])
@@ -25,9 +26,33 @@ def _svc() -> MarketDataFoundationService:
     return MarketDataFoundationService()
 
 
+def _quality_svc() -> DataQualityService:
+    return DataQualityService()
+
+
 @router.get("/profiles")
 async def list_market_profiles() -> list[dict]:
     return _svc().list_market_profiles()
+
+
+@router.get("/provider-capabilities")
+async def list_provider_capabilities(
+    provider: str | None = Query(None),
+    market_profile_id: str | None = Query(None),
+    dataset: str | None = Query(None),
+) -> list[dict]:
+    return _quality_svc().list_provider_capabilities(
+        provider=provider,
+        market_profile_id=market_profile_id,
+        dataset=dataset,
+    )
+
+
+@router.get("/quality-contract")
+async def get_data_quality_contract(
+    market_profile_id: str | None = Query(None),
+) -> dict:
+    return _quality_svc().get_data_quality_contract(market_profile_id=market_profile_id)
 
 
 @router.get("/profiles/{profile_id}")

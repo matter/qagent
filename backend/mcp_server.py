@@ -76,6 +76,16 @@ def _market_data_foundation_service():
     return MarketDataFoundationService()
 
 
+def _data_quality_service():
+    from backend.services.data_quality_service import DataQualityService
+    return DataQualityService()
+
+
+def _macro_data_service():
+    from backend.services.macro_data_service import MacroDataService
+    return MacroDataService()
+
+
 def _migration_service():
     from backend.services.migration_service import MigrationService
     return MigrationService()
@@ -418,6 +428,28 @@ def get_project_data_status(project_id: str = "bootstrap_us") -> dict:
 
 
 @mcp.tool()
+def list_provider_capabilities_3_0(
+    provider: str | None = None,
+    market_profile_id: str | None = None,
+    dataset: str | None = None,
+) -> list[dict]:
+    """List declared provider/data quality capabilities for free data sources."""
+    return _data_quality_service().list_provider_capabilities(
+        provider=provider,
+        market_profile_id=market_profile_id,
+        dataset=dataset,
+    )
+
+
+@mcp.tool()
+def get_data_quality_contract_3_0(market_profile_id: str | None = None) -> dict:
+    """Return data source quality policy and capability summary."""
+    return _data_quality_service().get_data_quality_contract(
+        market_profile_id=market_profile_id,
+    )
+
+
+@mcp.tool()
 def search_assets_3_0(
     query: str,
     project_id: str = "bootstrap_us",
@@ -447,6 +479,61 @@ def query_bars_3_0(
         end=end_date,
         limit=limit,
     )
+
+
+@mcp.tool()
+def update_fred_series(
+    series_ids: list[str],
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict:
+    """Trigger a FRED macro series update task."""
+    from backend.tasks.models import TaskSource
+
+    svc = _macro_data_service()
+    executor = _task_executor()
+    task_id = executor.submit(
+        task_type="macro_data_update",
+        fn=svc.update_fred_series,
+        params={
+            "series_ids": series_ids,
+            "start_date": start_date,
+            "end_date": end_date,
+        },
+        timeout=1800,
+        source=TaskSource.AGENT,
+    )
+    return {
+        "task_id": task_id,
+        "status": "queued",
+        "task_type": "macro_data_update",
+        "provider": "fred",
+        "series_ids": series_ids,
+        "poll_url": f"/api/tasks/{task_id}",
+    }
+
+
+@mcp.tool()
+def query_macro_series(
+    series_ids: list[str],
+    start_date: str | None = None,
+    end_date: str | None = None,
+    as_of: str | None = None,
+    limit: int = 10000,
+) -> dict:
+    """Query persisted macro observations from FRED."""
+    rows = _macro_data_service().query_series(
+        series_ids=series_ids,
+        start_date=start_date,
+        end_date=end_date,
+        as_of=as_of,
+        limit=limit,
+    )
+    return {
+        "provider": "fred",
+        "series_ids": series_ids,
+        "observations": rows,
+    }
 
 
 @mcp.tool()
@@ -976,6 +1063,62 @@ def simulate_strategy_graph_day_3_0(
         legacy_signal_frame=legacy_signal_frame,
         current_weights=current_weights,
     )
+
+
+@mcp.tool()
+def backtest_strategy_graph_3_0(
+    strategy_graph_id: str,
+    start_date: str,
+    end_date: str,
+    alpha_frames_by_date: dict[str, list[dict]] | None = None,
+    legacy_signal_frames_by_date: dict[str, list[dict]] | None = None,
+    initial_capital: float = 1_000_000,
+    price_field: str = "close",
+) -> dict:
+    """Trigger a StrategyGraph historical backtest task."""
+    from backend.tasks.models import TaskSource
+
+    params = {
+        "strategy_graph_id": strategy_graph_id,
+        "start_date": start_date,
+        "end_date": end_date,
+        "alpha_frames_by_date": alpha_frames_by_date,
+        "legacy_signal_frames_by_date": legacy_signal_frames_by_date,
+        "initial_capital": initial_capital,
+        "price_field": price_field,
+    }
+    task_id = _task_executor().submit(
+        task_type="strategy_graph_backtest",
+        fn=_strategy_graph_3_service().backtest_graph,
+        params=params,
+        timeout=3600,
+        source=TaskSource.AGENT,
+    )
+    return {
+        "task_id": task_id,
+        "status": "queued",
+        "task_type": "strategy_graph_backtest",
+        "strategy_graph_id": strategy_graph_id,
+        "poll_url": f"/api/tasks/{task_id}",
+    }
+
+
+@mcp.tool()
+def list_strategy_graph_backtests_3_0(
+    strategy_graph_id: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """List persisted StrategyGraph backtest runs."""
+    return _strategy_graph_3_service().list_backtest_runs(
+        strategy_graph_id=strategy_graph_id,
+        limit=limit,
+    )
+
+
+@mcp.tool()
+def get_strategy_graph_backtest_3_0(backtest_run_id: str) -> dict:
+    """Get one persisted StrategyGraph backtest run."""
+    return _strategy_graph_3_service().get_backtest_run(backtest_run_id)
 
 
 @mcp.tool()

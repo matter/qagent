@@ -108,6 +108,60 @@ class StrategyGraph3ServiceContractTests(unittest.TestCase):
         self.assertEqual(result["strategy_signal"]["status"], "completed")
         self.assertTrue(result["order_intents"])
 
+    def test_backtest_graph_revalues_nav_and_persists_daily_records(self):
+        conn = get_connection()
+        conn.executemany(
+            """INSERT INTO stocks
+               (market, ticker, name, exchange, sector, status, updated_at)
+               VALUES ('US', ?, ?, 'NYSE', 'Test', 'active', current_timestamp)""",
+            [("AAA", "AAA Inc"), ("BBB", "BBB Inc")],
+        )
+        conn.executemany(
+            """INSERT INTO daily_bars
+               (market, ticker, date, open, high, low, close, volume, adj_factor)
+               VALUES ('US', ?, ?, ?, ?, ?, ?, 1000, 1.0)""",
+            [
+                ("AAA", "2024-01-02", 100.0, 101.0, 99.0, 100.0),
+                ("AAA", "2024-01-03", 110.0, 111.0, 109.0, 110.0),
+                ("BBB", "2024-01-02", 50.0, 51.0, 49.0, 50.0),
+                ("BBB", "2024-01-03", 50.0, 51.0, 49.0, 50.0),
+            ],
+        )
+        service = StrategyGraph3Service()
+        graph = service.create_builtin_alpha_graph(
+            name="M8 backtest graph",
+            selection_policy={"top_n": 1, "score_column": "score"},
+            portfolio_construction_spec_id=self.portfolio["id"],
+            risk_control_spec_id=self.risk["id"],
+            execution_policy_spec_id=self.execution["id"],
+        )
+
+        result = service.backtest_graph(
+            graph["id"],
+            start_date="2024-01-02",
+            end_date="2024-01-03",
+            alpha_frames_by_date={
+                "2024-01-02": [{"asset_id": "US_EQ:AAA", "score": 1.0}],
+                "2024-01-03": [{"asset_id": "US_EQ:AAA", "score": 1.0}],
+            },
+            initial_capital=1_000_000,
+        )
+
+        self.assertEqual(result["backtest_run"]["status"], "completed")
+        self.assertEqual(result["summary"]["days_processed"], 2)
+        self.assertAlmostEqual(result["summary"]["final_nav"], 1_100_000.0, places=2)
+        self.assertEqual(result["daily"][1]["diagnostics"]["valuation"]["status"], "valued")
+        counts = conn.execute(
+            """SELECT
+                    (SELECT COUNT(*) FROM backtest_runs),
+                    (SELECT COUNT(*) FROM backtest_daily),
+                    (SELECT COUNT(*) FROM backtest_trades)
+            """
+        ).fetchone()
+        self.assertEqual(counts[0], 1)
+        self.assertEqual(counts[1], 2)
+        self.assertGreaterEqual(counts[2], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
