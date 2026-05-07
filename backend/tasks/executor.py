@@ -169,6 +169,8 @@ class TaskExecutor:
         cancel_summary = {
             "cancel_requested": True,
             "compute_may_continue": compute_may_continue,
+            "authoritative_terminal": True,
+            "late_results_are_quarantined": True,
             "reason": (
                 "cancelled_running_thread"
                 if compute_may_continue
@@ -279,7 +281,7 @@ class TaskExecutor:
                 and record.error_message.startswith("Cancelled by user")
             )
 
-    def _mark_late_result(
+    def _quarantine_late_result(
         self,
         task_id: str,
         result: Any,
@@ -292,7 +294,10 @@ class TaskExecutor:
         late_summary: dict[str, Any] = {}
         if existing and isinstance(existing.result_summary, dict):
             late_summary.update(existing.result_summary)
-        late_summary["late_result"] = summary
+        late_summary.pop("late_result", None)
+        late_summary["late_result_diagnostics"] = summary
+        late_summary["late_result_quarantined"] = True
+        late_summary["authoritative_terminal"] = True
         completed = utc_now_naive()
         self._update_memory_status(
             task_id,
@@ -350,13 +355,13 @@ class TaskExecutor:
         try:
             result = inner_future.result(timeout=timeout)
             if self._is_cancelled(task_id):
-                self._mark_late_result(
+                self._quarantine_late_result(
                     task_id,
                     result,
                     status=TaskStatus.FAILED,
-                    error_message="Cancelled by user; late result saved",
+                    error_message="Cancelled by user; late result quarantined",
                 )
-                log.info("task.cancelled_late_result_saved", task_id=task_id)
+                log.info("task.cancelled_late_result_quarantined", task_id=task_id)
                 return
             completed = utc_now_naive()
             summary = result if isinstance(result, dict) else {"result": result}
@@ -380,13 +385,25 @@ class TaskExecutor:
                 task_id,
                 TaskStatus.TIMEOUT,
                 completed_at=completed,
-                error_message=f"Task timed out after {timeout}s (still running in background)",
+                result_summary={
+                    "compute_may_continue": True,
+                    "authoritative_terminal": True,
+                    "late_results_are_quarantined": True,
+                    "message": "Task timed out; worker may finish later but outputs will be quarantined.",
+                },
+                error_message=f"Task timed out after {timeout}s; late result quarantined",
             )
             self._store.update_status(
                 task_id,
                 TaskStatus.TIMEOUT,
                 completed_at=completed,
-                error_message=f"Task timed out after {timeout}s (still running in background)",
+                result_summary={
+                    "compute_may_continue": True,
+                    "authoritative_terminal": True,
+                    "late_results_are_quarantined": True,
+                    "message": "Task timed out; worker may finish later but outputs will be quarantined.",
+                },
+                error_message=f"Task timed out after {timeout}s; late result quarantined",
             )
             log.warning("task.timeout", task_id=task_id, timeout=timeout)
 
@@ -401,30 +418,21 @@ class TaskExecutor:
                 try:
                     result = fut.result()  # blocks until inner completes
                     if self._is_cancelled(tid):
-                        self._mark_late_result(
+                        self._quarantine_late_result(
                             tid,
                             result,
                             status=TaskStatus.FAILED,
-                            error_message="Cancelled by user; late result saved",
+                            error_message="Cancelled by user; late result quarantined",
                         )
-                        log.info("task.cancelled_late_result_saved", task_id=tid)
+                        log.info("task.cancelled_late_result_quarantined", task_id=tid)
                         return
-                    summary = result if isinstance(result, dict) else {"result": result}
-                    self._update_memory_status(
+                    self._quarantine_late_result(
                         tid,
-                        TaskStatus.TIMEOUT,
-                        completed_at=utc_now_naive(),
-                        result_summary={"late_result": summary},
-                        error_message=f"Task timed out after {timeout}s; late result saved",
+                        result,
+                        status=TaskStatus.TIMEOUT,
+                        error_message=f"Task timed out after {timeout}s; late result quarantined",
                     )
-                    store.update_status(
-                        tid,
-                        TaskStatus.TIMEOUT,
-                        completed_at=utc_now_naive(),
-                        result_summary={"late_result": summary},
-                        error_message=f"Task timed out after {timeout}s; late result saved",
-                    )
-                    log.info("task.late_completed", task_id=tid)
+                    log.info("task.late_result_quarantined", task_id=tid)
                 except Exception:
                     if self._is_cancelled(tid):
                         log.info("task.cancelled_late_error_ignored", task_id=tid)

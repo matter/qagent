@@ -43,6 +43,17 @@ class DiagnosticsApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(conn.params[0], "CN")
         self.assertNotIn("unnest", conn.sql)
 
+    async def test_db_preflight_endpoint_returns_service_payload(self):
+        with patch("backend.api.diagnostics.DbPreflightService") as service_cls:
+            service_cls.return_value.check_database.return_value = {
+                "ok": False,
+                "status": "locked",
+            }
+
+            payload = await diagnostics.diagnostic_db_preflight()
+
+        self.assertEqual(payload["status"], "locked")
+
 
 class _DiagnosticConnection:
     def __init__(self, rows):

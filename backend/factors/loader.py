@@ -7,6 +7,7 @@ from typing import Any
 
 from backend.factors.base import FactorBase
 from backend.logger import get_logger
+from backend.services.custom_code_safety import validate_user_code_safety
 
 log = get_logger(__name__)
 
@@ -49,6 +50,7 @@ def load_factor_from_code(source_code: str) -> FactorBase:
     """
     if not source_code or not source_code.strip():
         raise ValueError("source_code is empty")
+    validate_user_code_safety(source_code, code_kind="factor")
 
     # Build a namespace with limited builtins plus common libraries.
     import builtins as _builtins

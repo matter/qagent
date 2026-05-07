@@ -7,6 +7,7 @@ from typing import Any
 
 from backend.strategies.base import StrategyBase, StrategyContext
 from backend.logger import get_logger
+from backend.services.custom_code_safety import validate_user_code_safety
 
 log = get_logger(__name__)
 
@@ -48,6 +49,7 @@ def load_strategy_from_code(source_code: str) -> StrategyBase:
     """
     if not source_code or not source_code.strip():
         raise ValueError("source_code is empty")
+    validate_user_code_safety(source_code, code_kind="strategy")
 
     import builtins as _builtins
     import math

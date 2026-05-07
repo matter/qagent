@@ -54,16 +54,13 @@ def _record_to_dict(record) -> dict:
             result["cancel_requested"] = True
         if record.result_summary.get("compute_may_continue"):
             result["compute_may_continue"] = True
-        late_result = record.result_summary.get("late_result")
-        if isinstance(late_result, dict):
-            for key in ("backtest_id", "model_id", "run_id", "signal_run_id", "id"):
-                if key in late_result:
-                    payload_key = "late_result_id" if key == "id" else f"late_{key}"
-                    if payload_key == "late_backtest_id":
-                        payload_key = "late_result_id"
-                    result[payload_key] = late_result[key]
-                    break
-            result["late_result"] = late_result
+        if record.result_summary.get("authoritative_terminal"):
+            result["authoritative_terminal"] = True
+        if record.result_summary.get("late_result_quarantined"):
+            result["late_result_quarantined"] = True
+        late_diagnostics = record.result_summary.get("late_result_diagnostics")
+        if isinstance(late_diagnostics, dict):
+            result["late_result_diagnostics"] = late_diagnostics
     return result
 
 

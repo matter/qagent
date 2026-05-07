@@ -81,7 +81,7 @@ class TaskExecutorContractTests(unittest.TestCase):
         self.assertEqual(record.status.value, "failed")
         self.assertTrue(record.error_message.startswith("Cancelled by user"))
 
-    def test_cancelled_running_task_exposes_late_result(self):
+    def test_cancelled_running_task_quarantines_late_result(self):
         store = MemoryOnlyStore()
         executor = TaskExecutor(store=store, max_workers=1)
         started = threading.Event()
@@ -100,7 +100,7 @@ class TaskExecutorContractTests(unittest.TestCase):
             deadline = time.time() + 2
             while time.time() < deadline:
                 record = executor.get_task(task_id)
-                if record.result_summary:
+                if record.result_summary and record.result_summary.get("late_result_quarantined"):
                     break
                 time.sleep(0.01)
             executor.shutdown(wait=True)
@@ -109,10 +109,13 @@ class TaskExecutorContractTests(unittest.TestCase):
             gate.set()
 
         self.assertEqual(record.status.value, "failed")
-        self.assertEqual(record.error_message, "Cancelled by user; late result saved")
-        self.assertEqual(record.result_summary["late_result"]["backtest_id"], "bt_late")
+        self.assertEqual(record.error_message, "Cancelled by user; late result quarantined")
+        self.assertTrue(record.result_summary["authoritative_terminal"])
+        self.assertTrue(record.result_summary["late_result_quarantined"])
+        self.assertNotIn("late_result", record.result_summary)
+        self.assertEqual(record.result_summary["late_result_diagnostics"]["backtest_id"], "bt_late")
 
-    def test_cancelled_running_task_warns_compute_may_continue(self):
+    def test_cancelled_running_task_warns_compute_may_continue_and_terminal_is_authoritative(self):
         store = MemoryOnlyStore()
         executor = TaskExecutor(store=store, max_workers=1)
         started = threading.Event()
@@ -135,6 +138,7 @@ class TaskExecutorContractTests(unittest.TestCase):
         self.assertEqual(record.status.value, "failed")
         self.assertTrue(record.result_summary["cancel_requested"])
         self.assertTrue(record.result_summary["compute_may_continue"])
+        self.assertTrue(record.result_summary["authoritative_terminal"])
         self.assertEqual(record.result_summary["reason"], "cancelled_running_thread")
 
     def test_cancelled_queued_task_does_not_warn_compute_may_continue(self):
@@ -164,7 +168,7 @@ class TaskExecutorContractTests(unittest.TestCase):
         self.assertFalse(second_started.is_set())
         self.assertNotEqual(first_id, second_id)
 
-    def test_timed_out_task_exposes_late_result(self):
+    def test_timed_out_task_quarantines_late_result(self):
         store = MemoryOnlyStore()
         executor = TaskExecutor(store=store, max_workers=1)
         gate = threading.Event()
@@ -194,8 +198,11 @@ class TaskExecutorContractTests(unittest.TestCase):
             gate.set()
 
         self.assertEqual(record.status.value, "timeout")
-        self.assertIn("late result saved", record.error_message)
-        self.assertEqual(record.result_summary["late_result"]["model_id"], "model_late")
+        self.assertIn("late result quarantined", record.error_message)
+        self.assertTrue(record.result_summary["authoritative_terminal"])
+        self.assertTrue(record.result_summary["late_result_quarantined"])
+        self.assertNotIn("late_result", record.result_summary)
+        self.assertEqual(record.result_summary["late_result_diagnostics"]["model_id"], "model_late")
 
     def test_task_store_filters_by_source_and_market_param(self):
         store = QueryRecordingStore()

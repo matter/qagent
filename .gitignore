@@ -27,6 +27,7 @@ Thumbs.db
 # Env
 .env
 .env.*
+config.local.yaml
 
 # Runtime
 logs/

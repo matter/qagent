@@ -35,6 +35,54 @@ class MacroDataConfigTests(unittest.TestCase):
 
             self.assertEqual(env_settings.external_data.fred.api_key, "env_key")
 
+    def test_checked_in_config_does_not_store_fred_api_key(self):
+        config_path = Path(__file__).resolve().parent.parent / "config.yaml"
+
+        settings = load_settings(config_path)
+
+        self.assertIsNone(settings.external_data.fred.api_key)
+
+    def test_ignored_local_config_can_supply_fred_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_path = Path(tmp) / "config.yaml"
+            local_path = Path(tmp) / "config.local.yaml"
+            base_path.write_text(
+                "\n".join(
+                    [
+                        "external_data:",
+                        "  fred:",
+                        "    api_key:",
+                        "    request_timeout_seconds: 12",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            local_path.write_text(
+                "\n".join(
+                    [
+                        "external_data:",
+                        "  fred:",
+                        "    api_key: local_key",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "QAGENT_CONFIG": str(base_path),
+                    "QAGENT_LOCAL_CONFIG": str(local_path),
+                },
+            ):
+                settings = load_settings()
+
+            self.assertEqual(settings.external_data.fred.api_key, "local_key")
+            self.assertEqual(
+                settings.external_data.fred.request_timeout_seconds,
+                12,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

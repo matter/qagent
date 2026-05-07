@@ -19,6 +19,24 @@ _DEFAULT_THRESHOLDS = {
     "max_annual_turnover": 15.0,
 }
 
+_PROMOTION_LIKE_SOURCE_TYPES = {
+    "strategy_graph",
+    "backtest_run",
+    "model_package",
+    "model_experiment",
+    "production_signal_run",
+}
+
+_REQUIRED_EVIDENCE_KEYS = {
+    "data_quality_contract",
+    "pit_status",
+    "split_policy",
+    "dependency_snapshot",
+    "valuation_diagnostics",
+    "artifact_hashes",
+    "reviewer_decision",
+}
+
 
 class AgentResearch3Service:
     """Own agent research plans, QA gate checks, promotion policy, playbooks."""
@@ -810,14 +828,16 @@ class AgentResearch3Service:
                 )
             )
         if not artifact_refs:
+            severity = "fail" if self._is_promotion_like(source_type) else "warning"
             findings.append(
                 self._finding(
                     "lineage",
-                    "warning",
+                    severity,
                     "No artifact refs supplied for QA evaluation",
-                    blocking=False,
+                    blocking=self._is_promotion_like(source_type),
                 )
             )
+        findings.extend(self._evidence_findings(metrics, source_type=source_type))
         findings.extend(
             self._artifact_findings(
                 artifact_refs,
@@ -841,13 +861,7 @@ class AgentResearch3Service:
         market_profile_id: str,
     ) -> list[dict[str, Any]]:
         findings: list[dict[str, Any]] = []
-        promotion_like = source_type in {
-            "strategy_graph",
-            "backtest_run",
-            "model_package",
-            "model_experiment",
-            "production_signal_run",
-        }
+        promotion_like = self._is_promotion_like(source_type)
         artifact_ids = []
         for ref in artifact_refs:
             ref_type = str(ref.get("type") or ref.get("ref_type") or "")
@@ -899,6 +913,59 @@ class AgentResearch3Service:
                     )
                 )
         return findings
+
+    @staticmethod
+    def _is_promotion_like(source_type: str) -> bool:
+        return source_type in _PROMOTION_LIKE_SOURCE_TYPES
+
+    def _evidence_findings(
+        self,
+        metrics: dict[str, Any],
+        *,
+        source_type: str,
+    ) -> list[dict[str, Any]]:
+        if not self._is_promotion_like(source_type):
+            return []
+        evidence = metrics.get("evidence")
+        if not isinstance(evidence, dict):
+            return [
+                self._finding(
+                    "evidence_package",
+                    "fail",
+                    "Promotion-like QA requires a complete evidence package",
+                    blocking=True,
+                )
+            ]
+        missing = sorted(key for key in _REQUIRED_EVIDENCE_KEYS if not evidence.get(key))
+        findings: list[dict[str, Any]] = []
+        if missing:
+            findings.append(
+                self._finding(
+                    "evidence_package",
+                    "fail",
+                    f"Evidence package missing required keys: {', '.join(missing)}",
+                    blocking=True,
+                )
+            )
+        reviewer_decision = evidence.get("reviewer_decision")
+        if not self._reviewer_decision_accepted(reviewer_decision):
+            findings.append(
+                self._finding(
+                    "reviewer_decision",
+                    "fail",
+                    "Evidence package requires an approved reviewer decision",
+                    blocking=True,
+                )
+            )
+        return findings
+
+    @staticmethod
+    def _reviewer_decision_accepted(value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        decision = str(value.get("decision") or "").strip().lower()
+        reviewer = str(value.get("reviewer") or value.get("approved_by") or "").strip()
+        return bool(reviewer) and decision in {"approved", "accepted"}
 
     @staticmethod
     def _promotion_failures(metrics: dict[str, Any], thresholds: dict[str, Any]) -> list[dict[str, Any]]:

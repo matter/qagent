@@ -11,6 +11,7 @@ import yaml
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CONFIG_PATH = _PROJECT_ROOT / "config.yaml"
+_LOCAL_CONFIG_PATH = _PROJECT_ROOT / "config.local.yaml"
 
 
 @dataclass
@@ -163,14 +164,32 @@ def _build_market_configs(
     return markets
 
 
+def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _load_yaml(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with open(path, "r") as f:
+        raw = yaml.safe_load(f) or {}
+    return raw if isinstance(raw, dict) else {}
+
+
 def load_settings(config_path: Path | None = None) -> Settings:
-    """Load settings from a YAML file. Falls back to defaults if missing."""
+    """Load settings from YAML. Env vars override YAML values."""
     path = config_path or Path(os.getenv("QAGENT_CONFIG", str(_CONFIG_PATH)))
-    if path.exists():
-        with open(path, "r") as f:
-            raw = yaml.safe_load(f) or {}
-    else:
-        raw = {}
+    raw = _load_yaml(path)
+    local_path = os.getenv("QAGENT_LOCAL_CONFIG")
+    if config_path is None:
+        local_overlay_path = Path(local_path) if local_path else _LOCAL_CONFIG_PATH
+        raw = _deep_merge(raw, _load_yaml(local_overlay_path))
     return _build_settings(raw)
 
 

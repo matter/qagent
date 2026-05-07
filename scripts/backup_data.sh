@@ -17,13 +17,21 @@ if [ ! -f "$DB_PATH" ]; then
     exit 1
 fi
 
-# Check if backend is running (DB would be locked)
-if lsof "$DB_PATH" >/dev/null 2>&1; then
-    echo "Warning: Database is in use. Stop the backend first:"
-    echo "  bash scripts/stop.sh"
-    echo ""
-    echo "Attempting backup anyway (read-only)..."
-fi
+cd "$PROJECT_ROOT"
+
+echo "==> Checking database maintenance preflight"
+uv run python - << PYEOF
+from pathlib import Path
+from backend.services.db_preflight_service import DbPreflightService
+
+result = DbPreflightService().check_database(Path("$DB_PATH"))
+if not result["ok"]:
+    print(f"Error: {result['message']}")
+    print(f"Status: {result['status']}")
+    print(f"Action: {result['action']}")
+    raise SystemExit(1)
+print(f"Database preflight: {result['status']}")
+PYEOF
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 DEST="$BACKUP_DIR/$TIMESTAMP"
@@ -31,7 +39,6 @@ mkdir -p "$DEST"
 
 echo "==> Backing up all QAgent data to $DEST"
 
-cd "$PROJECT_ROOT"
 uv run python << PYEOF
 import duckdb
 import os

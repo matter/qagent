@@ -32,6 +32,6 @@ markets:
 
 external_data:
   fred:
-    api_key: 4ed1751195b7e31d03b1d94260c2f242
+    api_key:
     base_url: https://api.stlouisfed.org/fred
     request_timeout_seconds: 30

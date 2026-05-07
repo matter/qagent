@@ -222,6 +222,16 @@ export default function TaskManagement() {
       ellipsis: true,
       render: (_: unknown, record: TaskStatusType) => {
         if (record.error) {
+          if (record.late_result_quarantined) {
+            const diagnosticKeys = record.late_result_diagnostics
+              ? Object.keys(record.late_result_diagnostics).slice(0, 3).join(", ")
+              : "diagnostics";
+            return (
+              <Text type="warning" ellipsis style={{ maxWidth: 200 }}>
+                晚到结果已隔离: {diagnosticKeys}
+              </Text>
+            );
+          }
           if (record.cancel_requested && record.compute_may_continue) {
             return (
               <Text type="warning" ellipsis style={{ maxWidth: 200 }}>
@@ -246,13 +256,6 @@ export default function TaskManagement() {
                 {record.error.split("\n").pop() || record.error}
               </Text>
             </a>
-          );
-        }
-        if (record.late_result_id || record.late_model_id || record.late_run_id || record.late_signal_run_id) {
-          return (
-            <Text type="warning" ellipsis style={{ maxWidth: 200 }}>
-              late result: {record.late_result_id ?? record.late_model_id ?? record.late_run_id ?? record.late_signal_run_id}
-            </Text>
           );
         }
         if (record.date_adjustment) {

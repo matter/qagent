@@ -30,14 +30,17 @@ import {
   archiveResearchArtifact3,
   evaluatePromotion3,
   getBootstrapProject3,
+  getDataQualityContract3,
   getProjectDataStatus3,
   getResearchLineage3,
   listAgentPlaybooks3,
   listAgentResearchPlans3,
   listDatasets3,
+  listMacroSeries,
   listPaperSessions3,
   listProductionSignalRuns3,
   listPromotionRecords3,
+  listProviderCapabilities3,
   listQaReports3,
   listResearchArtifacts3,
   listResearchRuns3,
@@ -49,11 +52,14 @@ import type {
   AgentPlaybook3,
   AgentResearchPlan3,
   CleanupPreview3,
+  DataQualityContract3,
   Dataset3,
+  MacroSeries,
   PaperSession3,
   ProductionSignalRun3,
   ProjectDataStatus3,
   PromotionRecord3,
+  ProviderCapability3,
   QaReport3,
   ResearchArtifact3,
   ResearchLineage3,
@@ -79,6 +85,9 @@ interface WorkbenchState {
   strategyGraphs: StrategyGraph3[];
   productionSignals: ProductionSignalRun3[];
   paperSessions: PaperSession3[];
+  providerCapabilities: ProviderCapability3[];
+  qualityContract: DataQualityContract3 | null;
+  macroSeries: MacroSeries[];
 }
 
 const emptyState: WorkbenchState = {
@@ -95,6 +104,9 @@ const emptyState: WorkbenchState = {
   strategyGraphs: [],
   productionSignals: [],
   paperSessions: [],
+  providerCapabilities: [],
+  qualityContract: null,
+  macroSeries: [],
 };
 
 function statusColor(status: string) {
@@ -149,6 +161,9 @@ export default function ResearchWorkbench3() {
         strategyGraphs,
         productionSignals,
         paperSessions,
+        providerCapabilities,
+        qualityContract,
+        macroSeries,
       ] = await Promise.all([
         getProjectDataStatus3(project.id).catch(() => null),
         listResearchRuns3({ project_id: project.id, limit: 50 }),
@@ -162,6 +177,9 @@ export default function ResearchWorkbench3() {
         listStrategyGraphs3({ project_id: project.id }),
         listProductionSignalRuns3({ limit: 20 }),
         listPaperSessions3({ limit: 20 }),
+        listProviderCapabilities3(),
+        getDataQualityContract3({ market_profile_id: project.market_profile_id }).catch(() => null),
+        listMacroSeries("fred", 100).catch(() => []),
       ]);
       setState({
         project,
@@ -177,6 +195,9 @@ export default function ResearchWorkbench3() {
         strategyGraphs,
         productionSignals,
         paperSessions,
+        providerCapabilities,
+        qualityContract,
+        macroSeries,
       });
     } catch {
       messageApi.error("加载研究工作台失败");
@@ -267,6 +288,10 @@ export default function ResearchWorkbench3() {
       qaBlocking: state.qaReports.filter((item) => item.blocking).length,
       strategyCount: state.strategyGraphs.length,
       signalCount: state.productionSignals.length,
+      nonPitSources: state.providerCapabilities.filter((item) => !item.pit_supported).length,
+      evidenceBlocking: state.qaReports.filter((item) =>
+        item.findings.some((finding) => finding.check === "evidence_package" && Boolean(finding.blocking)),
+      ).length,
     };
   }, [state]);
 
@@ -337,6 +362,35 @@ export default function ResearchWorkbench3() {
     { title: "创建时间", dataIndex: "created_at", width: 170, render: timeText },
   ];
 
+  const providerColumns: ColumnsType<ProviderCapability3> = [
+    { title: "Provider", dataIndex: "provider", width: 110 },
+    { title: "Dataset", dataIndex: "dataset", width: 170 },
+    { title: "Market", dataIndex: "market_profile_id", width: 120 },
+    { title: "Capability", dataIndex: "capability", width: 170 },
+    {
+      title: "Quality",
+      dataIndex: "quality_level",
+      width: 130,
+      render: (value: string) => <Tag color={statusColor(value)}>{value}</Tag>,
+    },
+    {
+      title: "PIT",
+      dataIndex: "pit_supported",
+      width: 80,
+      render: (value: boolean) => <Tag color={value ? "success" : "warning"}>{value ? "yes" : "no"}</Tag>,
+    },
+    { title: "License", dataIndex: "license_scope", width: 170 },
+    { title: "Availability", dataIndex: "availability", width: 190 },
+  ];
+
+  const macroColumns: ColumnsType<MacroSeries> = [
+    { title: "Series", dataIndex: "series_id", width: 120 },
+    { title: "Title", dataIndex: "title", width: 260, ellipsis: true },
+    { title: "Frequency", dataIndex: "frequency", width: 120 },
+    { title: "Units", dataIndex: "units", width: 160, ellipsis: true },
+    { title: "Updated", dataIndex: "updated_at", width: 170, render: timeText },
+  ];
+
   return (
     <Spin spinning={loading}>
       {contextHolder}
@@ -371,6 +425,8 @@ export default function ResearchWorkbench3() {
           <Statistic title="QA Blocking" value={summary.qaBlocking} prefix={<AuditOutlined />} />
           <Statistic title="Strategy Graphs" value={summary.strategyCount} prefix={<BranchesOutlined />} />
           <Statistic title="Signals" value={summary.signalCount} prefix={<DatabaseOutlined />} />
+          <Statistic title="Non-PIT Sources" value={summary.nonPitSources} prefix={<DatabaseOutlined />} />
+          <Statistic title="Evidence Blocks" value={summary.evidenceBlocking} prefix={<AuditOutlined />} />
         </div>
 
         {state.dataStatus ? (
@@ -417,6 +473,12 @@ export default function ResearchWorkbench3() {
               label: "QA / Promotion",
               children: (
                 <Space orientation="vertical" size={12} style={{ width: "100%" }}>
+                  <Alert
+                    type={summary.evidenceBlocking > 0 ? "warning" : "info"}
+                    showIcon
+                    message={`Promotion evidence blocks: ${summary.evidenceBlocking}`}
+                    description="Promotion-like QA now requires lineage, data-quality contract, PIT status, split policy, dependency snapshot, valuation diagnostics, artifact hashes, and reviewer decision."
+                  />
                   <Table
                     rowKey="id"
                     size="small"
@@ -437,6 +499,37 @@ export default function ResearchWorkbench3() {
                       </SimpleListItem>
                     ))}
                   </SimpleList>
+                </Space>
+              ),
+            },
+            {
+              key: "review",
+              label: "Human Review",
+              children: (
+                <Space orientation="vertical" size={12} style={{ width: "100%" }}>
+                  <Alert
+                    type={summary.nonPitSources > 0 ? "warning" : "info"}
+                    showIcon
+                    message={`Data quality contract: ${String(state.qualityContract?.summary?.highest_quality_level ?? "unknown")}`}
+                    description={`PIT-supported capabilities: ${state.providerCapabilities.filter((item) => item.pit_supported).length} / ${state.providerCapabilities.length}. Free/web sources are reviewable but not publication-grade unless the evidence package proves availability timing.`}
+                  />
+                  <Table
+                    rowKey={(row) => `${row.provider}:${row.dataset}:${row.market_profile_id}:${row.capability}`}
+                    size="small"
+                    columns={providerColumns}
+                    dataSource={state.providerCapabilities}
+                    pagination={{ pageSize: 8 }}
+                    scroll={{ x: 1130 }}
+                  />
+                  <Table
+                    rowKey={(row) => `${row.provider}:${row.series_id}`}
+                    size="small"
+                    title={() => "FRED Macro Series"}
+                    columns={macroColumns}
+                    dataSource={state.macroSeries}
+                    pagination={{ pageSize: 6 }}
+                    scroll={{ x: 830 }}
+                  />
                 </Space>
               ),
             },

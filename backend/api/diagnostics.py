@@ -8,10 +8,17 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 
 from backend.db import get_connection
+from backend.services.db_preflight_service import DbPreflightService
 from backend.services.market_context import normalize_market, normalize_ticker
 from backend.services.sql_filters import registered_values_table
 
 router = APIRouter(prefix="/api/diagnostics", tags=["diagnostics"])
+
+
+@router.get("/db-preflight")
+async def diagnostic_db_preflight() -> dict:
+    """Check whether direct DB maintenance can safely open DuckDB read-only."""
+    return DbPreflightService().check_database()
 
 
 @router.get("/daily-bars")

@@ -22,6 +22,20 @@ class AgentResearch3ServiceContractTests(unittest.TestCase):
 
     def test_plan_budget_trial_and_qa_gate(self):
         service = AgentResearch3Service()
+        kernel = ResearchKernelService()
+        run = kernel.create_run(
+            run_type="qa_artifact_fixture",
+            lifecycle_stage="validated",
+            retention_class="standard",
+            created_by="unit-test",
+        )
+        artifact = kernel.create_json_artifact(
+            run_id=run["id"],
+            artifact_type="validated_backtest_candidate",
+            payload={"backtest_id": "bt-1"},
+            lifecycle_stage="validated",
+            retention_class="standard",
+        )
         playbooks = service.ensure_builtin_playbooks()
         plan = service.create_research_plan(
             hypothesis="Momentum quality blend improves risk-adjusted return",
@@ -47,8 +61,13 @@ class AgentResearch3ServiceContractTests(unittest.TestCase):
                 "annual_turnover": 3.0,
                 "purge_gap": 5,
                 "label_horizon": 5,
+                "evidence": self._complete_evidence(
+                    artifact,
+                    source_id="bt-1",
+                    purge_gap=5,
+                ),
             },
-            artifact_refs=[{"type": "backtest_run", "id": "bt-1"}],
+            artifact_refs=[{"type": "artifact", "id": artifact["id"]}],
         )
         promoted = service.evaluate_promotion(
             source_type="strategy_graph",
@@ -200,6 +219,74 @@ class AgentResearch3ServiceContractTests(unittest.TestCase):
         self.assertEqual(scratch["status"], "fail")
         self.assertTrue(scratch["blocking"])
         self.assertTrue(any(item["check"] == "artifact_lifecycle" for item in scratch["findings"]))
+
+    def test_promotion_like_qa_requires_evidence_package(self):
+        service = AgentResearch3Service()
+
+        qa = service.evaluate_qa(
+            source_type="strategy_graph",
+            source_id="graph-with-headline-metrics-only",
+            metrics={"coverage": 1.0, "sharpe": 1.2, "max_drawdown": -0.08},
+            artifact_refs=[],
+        )
+
+        self.assertEqual(qa["status"], "fail")
+        self.assertTrue(qa["blocking"])
+        self.assertTrue(any(item["check"] == "evidence_package" for item in qa["findings"]))
+        self.assertTrue(any(item["check"] == "lineage" for item in qa["findings"]))
+
+    def test_promotion_like_qa_accepts_complete_evidence_package(self):
+        service = AgentResearch3Service()
+        kernel = ResearchKernelService()
+        run = kernel.create_run(
+            run_type="qa_artifact_fixture",
+            lifecycle_stage="validated",
+            retention_class="standard",
+            created_by="unit-test",
+        )
+        artifact = kernel.create_json_artifact(
+            run_id=run["id"],
+            artifact_type="validated_candidate",
+            payload={"value": 1},
+            lifecycle_stage="validated",
+            retention_class="standard",
+        )
+
+        qa = service.evaluate_qa(
+            source_type="strategy_graph",
+            source_id="graph-with-evidence",
+            metrics={
+                "coverage": 1.0,
+                "sharpe": 1.2,
+                "max_drawdown": -0.08,
+                "purge_gap": 5,
+                "label_horizon": 5,
+                "evidence": self._complete_evidence(
+                    artifact,
+                    source_id="graph-with-evidence",
+                    purge_gap=5,
+                ),
+            },
+            artifact_refs=[{"type": "artifact", "id": artifact["id"]}],
+        )
+
+        self.assertEqual(qa["status"], "pass")
+        self.assertFalse(qa["blocking"])
+
+    @staticmethod
+    def _complete_evidence(artifact, *, source_id: str, purge_gap: int) -> dict:
+        return {
+            "data_quality_contract": {"highest_quality_level": "research_grade"},
+            "pit_status": {"equity_prices": "not_pit_free_source"},
+            "split_policy": {"method": "time_series", "purge_gap": purge_gap},
+            "dependency_snapshot": {"source_id": source_id},
+            "valuation_diagnostics": {"status": "valued"},
+            "artifact_hashes": {artifact["id"]: artifact["content_hash"]},
+            "reviewer_decision": {
+                "reviewer": "unit-test",
+                "decision": "approved",
+            },
+        }
 
 
 if __name__ == "__main__":
