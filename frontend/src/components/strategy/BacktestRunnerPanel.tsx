@@ -29,6 +29,7 @@ import type {
   Strategy,
   StockGroup,
   BacktestResultDetail,
+  ExecutionModel,
 } from "../../api";
 import {
   BacktestSummaryCards,
@@ -70,6 +71,8 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
   const [warmupStartDate, setWarmupStartDate] = useState<Dayjs | null>(null);
   const [evaluationStartDate, setEvaluationStartDate] = useState<Dayjs | null>(null);
   const [initialEntryPolicy, setInitialEntryPolicy] = useState("wait_for_anchor");
+  const [executionModel, setExecutionModel] = useState<ExecutionModel>("next_open");
+  const [plannedPriceBufferBps, setPlannedPriceBufferBps] = useState<number>(50);
   const [maxSingleNameWeight, setMaxSingleNameWeight] = useState<number | null>(null);
   const [weeklyTurnoverFloor, setWeeklyTurnoverFloor] = useState<number | null>(null);
   const [constraintDriftBuffer, setConstraintDriftBuffer] = useState<number | null>(null);
@@ -103,6 +106,10 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
     if (restoreConfig.rebalanceBuffer != null) setRebalanceBuffer(restoreConfig.rebalanceBuffer);
     if (restoreConfig.minHoldingDays != null) setMinHoldingDays(restoreConfig.minHoldingDays);
     if (restoreConfig.reentryCooldownDays != null) setReentryCooldownDays(restoreConfig.reentryCooldownDays);
+    if (restoreConfig.executionModel) setExecutionModel(restoreConfig.executionModel);
+    if (restoreConfig.plannedPriceBufferBps != null) {
+      setPlannedPriceBufferBps(restoreConfig.plannedPriceBufferBps);
+    }
   }, [restoreConfig]);
 
   useEffect(() => {
@@ -143,6 +150,8 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
           min_holding_days: minHoldingDays,
           reentry_cooldown_days: reentryCooldownDays,
           normalize_target_weights: normalizeTargetWeights,
+          execution_model: executionModel,
+          planned_price_buffer_bps: executionModel === "planned_price" ? plannedPriceBufferBps : undefined,
           constraint_config: {
             ...(maxSingleNameWeight != null ? { max_single_name_weight: maxSingleNameWeight } : {}),
             ...(weeklyTurnoverFloor != null ? { weekly_turnover_floor: weeklyTurnoverFloor } : {}),
@@ -412,6 +421,33 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
                   />
                 </div>
               </Col>
+              <Col span={8}>
+                <Text type="secondary" style={{ fontSize: 12 }}>成交模式</Text>
+                <Radio.Group
+                  value={executionModel}
+                  onChange={(e) => setExecutionModel(e.target.value)}
+                  optionType="button"
+                  buttonStyle="solid"
+                  size="small"
+                  style={{ marginTop: 4 }}
+                >
+                  <Radio.Button value="next_open">次日开盘</Radio.Button>
+                  <Radio.Button value="planned_price">计划价</Radio.Button>
+                </Radio.Group>
+              </Col>
+              {executionModel === "planned_price" && (
+                <Col span={8}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>计划价缓冲 bps</Text>
+                  <InputNumber
+                    style={{ width: "100%" }}
+                    value={plannedPriceBufferBps}
+                    onChange={(v) => setPlannedPriceBufferBps(v ?? 50)}
+                    min={0}
+                    max={4999}
+                    step={10}
+                  />
+                </Col>
+              )}
             </Row>
 
             <Row gutter={12}>

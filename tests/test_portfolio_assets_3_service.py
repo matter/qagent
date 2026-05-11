@@ -92,6 +92,18 @@ class PortfolioAssets3ServiceContractTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(counts, (1, 1, 1, 1, 1, 1))
 
+    def test_can_create_planned_price_execution_policy(self):
+        service = PortfolioAssets3Service()
+
+        execution = service.create_execution_policy_spec(
+            name="M7 planned price",
+            policy_type="planned_price",
+            params={"planned_price_buffer_bps": 50, "fallback": "decision_close"},
+        )
+
+        self.assertEqual(execution["policy_type"], "planned_price")
+        self.assertEqual(execution["params"]["planned_price_buffer_bps"], 50)
+
     def test_score_proportional_and_inverse_vol_are_independent_builders(self):
         service = PortfolioAssets3Service()
         score_spec = service.create_portfolio_construction_spec(

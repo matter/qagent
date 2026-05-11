@@ -7,6 +7,86 @@ from backend.services.backtest_engine import BacktestConfig, BacktestEngine
 
 
 class BacktestEngineContractTests(unittest.TestCase):
+    def test_planned_price_execution_fills_at_planned_price_inside_buffer(self):
+        engine = BacktestEngine()
+        dates = pd.to_datetime(["2026-04-06", "2026-04-07"])
+        prices_close = pd.DataFrame({"AAA": [10.0, 12.0]}, index=dates)
+        prices_open = pd.DataFrame({"AAA": [10.0, 11.0]}, index=dates)
+        prices_high = pd.DataFrame({"AAA": [10.2, 12.2]}, index=dates)
+        prices_low = pd.DataFrame({"AAA": [9.8, 10.8]}, index=dates)
+        prices_empty = pd.DataFrame({"AAA": [0.0, 0.0]}, index=dates)
+        signals = pd.DataFrame({"AAA": [1.0, 1.0]}, index=dates)
+        planned_prices = pd.DataFrame({"AAA": [11.5, 11.5]}, index=dates)
+        config = BacktestConfig(
+            initial_capital=1150.0,
+            start_date="2026-04-06",
+            end_date="2026-04-07",
+            commission_rate=0.0,
+            slippage_rate=0.0,
+            rebalance_freq="daily",
+            execution_model="planned_price",
+            planned_price_buffer_bps=50,
+        )
+
+        with (
+            patch.object(
+                engine,
+                "_load_prices",
+                return_value=(prices_close, prices_open, prices_high, prices_low, prices_empty),
+            ),
+            patch.object(engine, "_load_benchmark", return_value=prices_close["AAA"]),
+        ):
+            result = engine.run(signals, config, planned_prices=planned_prices)
+
+        self.assertEqual(len(result.trades), 1)
+        self.assertEqual(result.trades[0]["price"], 11.5)
+        self.assertEqual(result.trades[0]["shares"], 100.0)
+        planned_diag = result.trade_diagnostics["planned_price_execution"]
+        self.assertEqual(planned_diag["filled_order_count"], 1)
+        self.assertEqual(planned_diag["blocked_order_count"], 0)
+        self.assertEqual(planned_diag["execution_model"], "planned_price")
+
+    def test_planned_price_execution_rejects_outside_buffer_without_mutating_holdings(self):
+        engine = BacktestEngine()
+        dates = pd.to_datetime(["2026-04-06", "2026-04-07"])
+        prices_close = pd.DataFrame({"AAA": [10.0, 12.0]}, index=dates)
+        prices_open = pd.DataFrame({"AAA": [10.0, 11.0]}, index=dates)
+        prices_high = pd.DataFrame({"AAA": [10.2, 12.0]}, index=dates)
+        prices_low = pd.DataFrame({"AAA": [9.8, 10.8]}, index=dates)
+        prices_empty = pd.DataFrame({"AAA": [0.0, 0.0]}, index=dates)
+        signals = pd.DataFrame({"AAA": [1.0, 1.0]}, index=dates)
+        planned_prices = pd.DataFrame({"AAA": [10.81, 10.81]}, index=dates)
+        config = BacktestConfig(
+            initial_capital=1000.0,
+            start_date="2026-04-06",
+            end_date="2026-04-07",
+            commission_rate=0.0,
+            slippage_rate=0.0,
+            rebalance_freq="daily",
+            execution_model="planned_price",
+            planned_price_buffer_bps=50,
+        )
+
+        with (
+            patch.object(
+                engine,
+                "_load_prices",
+                return_value=(prices_close, prices_open, prices_high, prices_low, prices_empty),
+            ),
+            patch.object(engine, "_load_benchmark", return_value=prices_close["AAA"]),
+        ):
+            result = engine.run(signals, config, planned_prices=planned_prices)
+
+        self.assertEqual(result.trades, [])
+        self.assertEqual(result.nav, [1000.0, 1000.0])
+        planned_diag = result.trade_diagnostics["planned_price_execution"]
+        self.assertEqual(planned_diag["filled_order_count"], 0)
+        self.assertEqual(planned_diag["blocked_order_count"], 1)
+        self.assertEqual(
+            planned_diag["blocked"][0]["reason"],
+            "planned_price_outside_buffered_range",
+        )
+
     def test_nav_includes_cash_after_trade_costs(self):
         engine = BacktestEngine()
         dates = pd.to_datetime(["2026-04-06", "2026-04-07"])
@@ -175,6 +255,13 @@ class BacktestEngineContractTests(unittest.TestCase):
         self.assertEqual([t["trade_reason"] for t in result.trades], ["new_entry", "new_entry"])
         self.assertNotIn("add", [t["trade_reason"] for t in result.trades])
         self.assertNotIn("reduce", [t["trade_reason"] for t in result.trades])
+        diagnostics = result.trade_diagnostics["rebalance_execution_diagnostics"]
+        self.assertEqual(diagnostics[1]["date"], "2026-04-08")
+        self.assertEqual(diagnostics[1]["target_positions_after"], {"AAA": 0.54, "BBB": 0.46})
+        self.assertEqual(diagnostics[1]["executed_positions_after"], {"AAA": 0.5, "BBB": 0.5})
+        self.assertAlmostEqual(diagnostics[1]["target_turnover"], 0.08)
+        self.assertAlmostEqual(diagnostics[1]["turnover"], 0.0)
+        self.assertEqual(diagnostics[1]["diagnostic_layers"]["executed_positions_after"], "post_buffer")
 
     def test_hold_overlap_buffer_can_compare_against_actual_open_weights(self):
         engine = BacktestEngine()

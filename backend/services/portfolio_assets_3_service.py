@@ -16,6 +16,7 @@ import pandas as pd
 
 from backend.db import get_connection
 from backend.services.calendar_service import offset_trading_days
+from backend.services.execution_model_service import normalize_planned_price_buffer_bps
 from backend.services.market_context import normalize_market
 from backend.services.research_kernel_service import ResearchKernelService
 from backend.time_utils import utc_now_naive
@@ -25,7 +26,7 @@ _PROFILE_BY_MARKET = {"US": "US_EQ", "CN": "CN_A"}
 _MARKET_BY_PROFILE = {"US_EQ": "US", "CN_A": "CN"}
 _SUPPORTED_BUILDERS = {"equal_weight", "score_proportional", "inverse_vol"}
 _SUPPORTED_REBALANCE = {"none", "band"}
-_SUPPORTED_EXECUTION = {"next_open"}
+_SUPPORTED_EXECUTION = {"next_open", "planned_price"}
 _SUPPORTED_STATE = {"stateless"}
 
 
@@ -134,6 +135,7 @@ class PortfolioAssets3Service:
     ) -> dict:
         if policy_type not in _SUPPORTED_EXECUTION:
             raise ValueError(f"Unsupported execution policy {policy_type!r}")
+        params = self._normalize_execution_params(policy_type, params or {})
         return self._insert_spec(
             table="execution_policy_specs",
             name=name,
@@ -143,7 +145,7 @@ class PortfolioAssets3Service:
             lifecycle_stage=lifecycle_stage,
             status=status,
             metadata=metadata,
-            extra_columns={"policy_type": policy_type, "params": params or {}},
+            extra_columns={"policy_type": policy_type, "params": params},
         )
 
     def create_state_policy_spec(
@@ -203,6 +205,23 @@ class PortfolioAssets3Service:
             status="active",
             metadata={"built_in": True},
         )
+
+    @staticmethod
+    def _normalize_execution_params(policy_type: str, params: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(params or {})
+        if policy_type == "planned_price":
+            normalized["planned_price_buffer_bps"] = normalize_planned_price_buffer_bps(
+                normalized.get("planned_price_buffer_bps")
+            )
+            fallback = normalized.get("fallback", "decision_close")
+            if fallback != "decision_close":
+                raise ValueError("planned_price fallback must be 'decision_close'")
+            normalized["fallback"] = fallback
+            order_ttl = normalized.get("order_ttl", "same_day")
+            if order_ttl != "same_day":
+                raise ValueError("planned_price order_ttl must be 'same_day'")
+            normalized["order_ttl"] = order_ttl
+        return normalized
 
     # ------------------------------------------------------------------
     # Runtime
@@ -740,24 +759,39 @@ class PortfolioAssets3Service:
     ) -> list[dict]:
         score_by_asset = dict(zip(frame["asset_id"], frame["score"], strict=False))
         confidence_by_asset = dict(zip(frame["asset_id"], frame["confidence"], strict=False))
+        planned_price_by_asset = (
+            dict(zip(frame["asset_id"], frame["planned_price"], strict=False))
+            if "planned_price" in frame.columns
+            else {}
+        )
         rows = []
         for rank, (asset_id, weight) in enumerate(
             sorted(weights.items(), key=lambda item: item[1], reverse=True),
             start=1,
         ):
+            row = {
+                "date": decision_date,
+                "asset_id": asset_id,
+                "target_weight": round(float(weight), 12),
+                "cash_weight": 0.0,
+                "score": float(score_by_asset.get(asset_id, 0.0)),
+                "rank": rank,
+                "confidence": float(confidence_by_asset.get(asset_id, 1.0)),
+                "construction_reason": (
+                    f"{portfolio_spec['method']} from {portfolio_spec['name']}"
+                ),
+            }
+            planned_price = planned_price_by_asset.get(asset_id)
+            if planned_price is not None:
+                try:
+                    planned_price_float = float(planned_price)
+                except (TypeError, ValueError):
+                    planned_price_float = 0.0
+                if math.isfinite(planned_price_float) and planned_price_float > 0:
+                    row["planned_price"] = planned_price_float
+                    row["planned_price_source"] = "strategy_output"
             rows.append(
-                {
-                    "date": decision_date,
-                    "asset_id": asset_id,
-                    "target_weight": round(float(weight), 12),
-                    "cash_weight": 0.0,
-                    "score": float(score_by_asset.get(asset_id, 0.0)),
-                    "rank": rank,
-                    "confidence": float(confidence_by_asset.get(asset_id, 1.0)),
-                    "construction_reason": (
-                        f"{portfolio_spec['method']} from {portfolio_spec['name']}"
-                    ),
-                }
+                row
             )
         return rows
 
@@ -771,11 +805,13 @@ class PortfolioAssets3Service:
         market_profile_id: str,
         portfolio_value: float,
     ) -> list[dict]:
-        if execution_spec["policy_type"] != "next_open":
+        policy_type = execution_spec["policy_type"]
+        if policy_type not in _SUPPORTED_EXECUTION:
             raise ValueError(f"Unsupported execution policy {execution_spec['policy_type']!r}")
         market = _MARKET_BY_PROFILE.get(market_profile_id, normalize_market(None))
         execution_date = offset_trading_days(decision_date, 1, market=market)
         target_by_asset = {row["asset_id"]: float(row["target_weight"]) for row in targets}
+        target_rows_by_asset = {row["asset_id"]: row for row in targets}
         assets = sorted(set(current_weights) | set(target_by_asset))
         orders = []
         for asset_id in assets:
@@ -784,20 +820,40 @@ class PortfolioAssets3Service:
             delta = after - before
             if abs(delta) <= 1e-8:
                 continue
+            target_row = target_rows_by_asset.get(asset_id, {})
+            params = execution_spec.get("params") or {}
+            order = {
+                "decision_date": decision_date,
+                "execution_date": str(execution_date),
+                "asset_id": asset_id,
+                "side": "buy" if delta > 0 else "sell",
+                "current_weight": round(before, 12),
+                "target_weight": round(after, 12),
+                "delta_weight": round(delta, 12),
+                "estimated_value": round(float(portfolio_value) * abs(delta), 2),
+                "execution_policy_id": execution_spec["id"],
+                "execution_model": policy_type,
+            }
+            if policy_type == "planned_price":
+                if target_row.get("planned_price") is not None:
+                    order["planned_price"] = float(target_row["planned_price"])
+                    order["planned_price_source"] = target_row.get(
+                        "planned_price_source",
+                        "strategy_output",
+                    )
+                else:
+                    order["planned_price_source"] = "decision_close"
+                order["planned_price_buffer_bps"] = float(
+                    params.get("planned_price_buffer_bps", 50)
+                )
+                order["fallback"] = params.get("fallback", "decision_close")
+                order["order_ttl"] = params.get("order_ttl", "same_day")
+                order["reason"] = "move current portfolio toward target at planned price"
+            else:
+                order["price_field"] = params.get("price_field", "open")
+                order["reason"] = "move current portfolio toward target at next session open"
             orders.append(
-                {
-                    "decision_date": decision_date,
-                    "execution_date": str(execution_date),
-                    "asset_id": asset_id,
-                    "side": "buy" if delta > 0 else "sell",
-                    "current_weight": round(before, 12),
-                    "target_weight": round(after, 12),
-                    "delta_weight": round(delta, 12),
-                    "estimated_value": round(float(portfolio_value) * abs(delta), 2),
-                    "execution_policy_id": execution_spec["id"],
-                    "price_field": (execution_spec.get("params") or {}).get("price_field", "open"),
-                    "reason": "move current portfolio toward target at next session open",
-                }
+                order
             )
         return orders
 

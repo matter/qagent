@@ -658,6 +658,51 @@ class PaperTradingServiceContractTests(unittest.TestCase):
         self.assertEqual(result["positions_after"], positions)
         self.assertEqual(result["cash_after"], 100.0)
 
+    def test_execute_trades_planned_price_fills_inside_buffered_range(self):
+        result = PaperTradingService._execute_trades_cached(
+            positions={},
+            cash=1150.0,
+            target_weights={"AAA": 1.0},
+            trade_date=date(2026, 4, 10),
+            cost_rate=0.0,
+            price_cache={
+                date(2026, 4, 10): {
+                    "AAA": {"open": 11.0, "high": 12.2, "low": 10.8, "close": 12.0}
+                }
+            },
+            execution_model="planned_price",
+            planned_prices={"AAA": 11.5},
+            planned_price_buffer_bps=50,
+        )
+
+        self.assertEqual(len(result["trades"]), 1)
+        self.assertEqual(result["trades"][0]["price"], 11.5)
+        self.assertEqual(result["positions_after"]["AAA"]["shares"], 100.0)
+        self.assertEqual(result["diagnostics"]["planned_price_execution"]["filled_order_count"], 1)
+
+    def test_execute_trades_planned_price_rejects_outside_buffered_range(self):
+        result = PaperTradingService._execute_trades_cached(
+            positions={},
+            cash=1000.0,
+            target_weights={"AAA": 1.0},
+            trade_date=date(2026, 4, 10),
+            cost_rate=0.0,
+            price_cache={
+                date(2026, 4, 10): {
+                    "AAA": {"open": 11.0, "high": 12.0, "low": 10.8, "close": 12.0}
+                }
+            },
+            execution_model="planned_price",
+            planned_prices={"AAA": 10.81},
+            planned_price_buffer_bps=50,
+        )
+
+        self.assertEqual(result["trades"], [])
+        self.assertEqual(result["positions_after"], {})
+        self.assertEqual(result["cash_after"], 1000.0)
+        blocked = result["diagnostics"]["planned_price_execution"]["blocked"]
+        self.assertEqual(blocked[0]["reason"], "planned_price_outside_buffered_range")
+
 
 if __name__ == "__main__":
     unittest.main()

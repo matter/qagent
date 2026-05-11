@@ -11,6 +11,7 @@ export {
 // ---- Types ----
 
 export type Market = "US" | "CN";
+export type ExecutionModel = "next_open" | "planned_price";
 
 export interface StockSearchResult {
   market: Market;
@@ -801,8 +802,8 @@ export interface BacktestResultSummary {
   id: string;
   market: Market;
   strategy_id: string;
-  config: Record<string, unknown> | null;
-  summary: Record<string, unknown> | null;
+  config: BacktestRunConfig | null;
+  summary: BacktestSummary | null;
   result_level: string | null;
   trade_count: number | null;
   created_at: string;
@@ -825,6 +826,43 @@ export interface RebalanceDiagnostic {
   lane_counts?: Record<string, number>;
   blocked_buy_limit_up?: number | string[] | null;
   kept_due_limit_down?: number | string[] | null;
+  [key: string]: unknown;
+}
+
+export interface BacktestRunConfig {
+  start_date?: string;
+  end_date?: string;
+  warmup_start_date?: string | null;
+  evaluation_start_date?: string | null;
+  initial_entry_policy?: string;
+  initial_capital?: number;
+  commission_rate?: number;
+  slippage_rate?: number;
+  max_positions?: number;
+  benchmark?: string;
+  rebalance_freq?: string;
+  rebalance_frequency?: string;
+  rebalance_buffer?: number;
+  min_holding_days?: number;
+  reentry_cooldown_days?: number;
+  normalize_target_weights?: boolean;
+  execution_model?: ExecutionModel;
+  planned_price_buffer_bps?: number;
+  universe_group_id?: string;
+  constraint_config?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export interface BacktestSummary {
+  annual_return?: number;
+  sharpe?: number;
+  sharpe_ratio?: number;
+  max_drawdown?: number;
+  constraint_pass?: boolean;
+  portfolio_compliance?: Record<string, unknown>;
+  planned_price_execution?: Record<string, unknown>;
+  planned_price_inputs?: Record<string, unknown>;
+  fill_diagnostics?: Record<string, unknown>;
   [key: string]: unknown;
 }
 
@@ -918,7 +956,7 @@ export async function getStrategyTemplate(name: string): Promise<StrategyTemplat
 
 export async function runBacktest(
   strategyId: string,
-  body: { market?: string; config: Record<string, unknown>; universe_group_id: string },
+  body: { market?: string; config: BacktestRunConfig; universe_group_id: string },
 ): Promise<{ task_id: string; market?: string }> {
   const { data } = await client.post<{ task_id: string; market?: string }>(`/strategies/${strategyId}/backtest`, body);
   return data;

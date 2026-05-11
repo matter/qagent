@@ -150,7 +150,10 @@ class SignalPaperMarketScopeTests(unittest.TestCase):
             market="CN",
         )
 
-        self.assertEqual(cache[next(iter(cache))]["sh.600000"], (10.0, 10.5))
+        self.assertEqual(
+            cache[next(iter(cache))]["sh.600000"],
+            {"open": 10.0, "high": 11.0, "low": 9.5, "close": 10.5},
+        )
 
     def test_paper_api_forwards_market_to_create_and_advance(self):
         executor = _FakeExecutor()

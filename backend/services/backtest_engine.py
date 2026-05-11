@@ -19,6 +19,12 @@ import pandas as pd
 from backend.db import get_connection
 from backend.logger import get_logger
 from backend.services.calendar_service import snap_to_trading_day
+from backend.services.execution_model_service import (
+    DEFAULT_PLANNED_PRICE_BUFFER_BPS,
+    evaluate_planned_price_fill,
+    normalize_execution_model,
+    normalize_planned_price_buffer_bps,
+)
 from backend.services.market_context import normalize_market, normalize_ticker
 from backend.services.sql_filters import registered_values_table
 
@@ -53,9 +59,15 @@ class BacktestConfig:
     normalize_target_weights: bool = True  # legacy default: invest non-empty targets fully
     max_single_name_weight: float | None = None  # absolute per-name target/order cap
     max_holding_days: int | None = None           # force exit after N holding days
+    execution_model: str = "next_open"
+    planned_price_buffer_bps: float = DEFAULT_PLANNED_PRICE_BUFFER_BPS
 
     def __post_init__(self) -> None:
         self.market = normalize_market(self.market)
+        self.execution_model = normalize_execution_model(self.execution_model)
+        self.planned_price_buffer_bps = normalize_planned_price_buffer_bps(
+            self.planned_price_buffer_bps
+        )
         if isinstance(self.start_date, str):
             self.start_date = date.fromisoformat(self.start_date)
         if isinstance(self.end_date, str):
@@ -89,6 +101,8 @@ class BacktestConfig:
             "normalize_target_weights": self.normalize_target_weights,
             "max_single_name_weight": self.max_single_name_weight,
             "max_holding_days": self.max_holding_days,
+            "execution_model": self.execution_model,
+            "planned_price_buffer_bps": self.planned_price_buffer_bps,
         }
 
 
@@ -164,7 +178,10 @@ class BacktestEngine:
     """
 
     def run(
-        self, signals: pd.DataFrame, config: BacktestConfig
+        self,
+        signals: pd.DataFrame,
+        config: BacktestConfig,
+        planned_prices: pd.DataFrame | None = None,
     ) -> BacktestResult:
         """Run a backtest.
 
@@ -173,6 +190,8 @@ class BacktestEngine:
                      values=target_weight (0~1). Only tickers with
                      weight > 0 are held.
             config: Backtest configuration.
+            planned_prices: Optional DataFrame with columns=[ticker],
+                            index=[decision_date], values=planned execution price.
 
         Returns:
             BacktestResult with all metrics and data.
@@ -187,7 +206,7 @@ class BacktestEngine:
 
         # 1. Load price data
         tickers = list(signals.columns)
-        prices_close, prices_open, _high, _low, _vol = self._load_prices(
+        prices_close, prices_open, prices_high, prices_low, _vol = self._load_prices(
             tickers, str(config.start_date), str(config.end_date), market=config.market
         )
         benchmark_close = self._load_benchmark(
@@ -200,6 +219,9 @@ class BacktestEngine:
         # 2. Align signals and prices to common trading days
         all_trading_days = sorted(prices_close.index)
         signals.index = pd.to_datetime(signals.index)
+        if planned_prices is not None:
+            planned_prices = planned_prices.copy()
+            planned_prices.index = pd.to_datetime(planned_prices.index)
 
         # 3. Determine rebalance dates
         rebalance_dates = self._get_rebalance_dates(all_trading_days, config.rebalance_freq)
@@ -225,6 +247,15 @@ class BacktestEngine:
         last_close_by_ticker: dict[str, float] = {}
         missing_price_valuations: list[dict[str, Any]] = []
         last_cash_weight: float | None = None
+        rebalance_execution_diagnostics: list[dict[str, Any]] = []
+        planned_execution_diagnostics: dict[str, Any] = {
+            "execution_model": config.execution_model,
+            "planned_price_buffer_bps": config.planned_price_buffer_bps,
+            "filled_order_count": 0,
+            "blocked_order_count": 0,
+            "filled": [],
+            "blocked": [],
+        }
 
         for day_idx, trade_date in enumerate(all_trading_days):
             trade_date_ts = pd.Timestamp(trade_date)
@@ -293,6 +324,7 @@ class BacktestEngine:
                     # Compute trades: current weights vs target weights
                     # Apply low-turnover constraints before executing trades
                     effective_targets = dict(target_weights)
+                    positions_before = dict(current_weights)
 
                     if config.rebalance_buffer > 0 or config.min_holding_days > 0 or config.reentry_cooldown_days > 0:
                         all_involved_tickers = set(current_weights.keys()) | set(
@@ -378,6 +410,7 @@ class BacktestEngine:
                     )
 
                     day_turnover = 0.0
+                    executed_targets = dict(current_weights)
                     for ticker in all_involved_tickers:
                         old_w = current_weights.get(ticker, 0.0)
                         new_w = effective_targets.get(ticker, 0.0)
@@ -386,15 +419,43 @@ class BacktestEngine:
                         if weight_change < 1e-8:
                             continue
 
-                        # Get execution price (T+1 open)
-                        if (
-                            trade_date_ts not in prices_open.index
-                            or ticker not in prices_open.columns
-                        ):
-                            continue
-                        exec_price = prices_open.loc[trade_date_ts, ticker]
-                        if pd.isna(exec_price) or exec_price <= 0:
-                            continue
+                        # Get execution price.
+                        exec_price: float | None = None
+                        if config.execution_model == "planned_price":
+                            planned_price = _lookup_planned_price(
+                                planned_prices=planned_prices,
+                                decision_date=prev_date_ts,
+                                ticker=ticker,
+                            )
+                            high_price = _lookup_price(prices_high, trade_date_ts, ticker)
+                            low_price = _lookup_price(prices_low, trade_date_ts, ticker)
+                            fill_decision = evaluate_planned_price_fill(
+                                planned_price=planned_price,
+                                high=high_price,
+                                low=low_price,
+                                buffer_bps=config.planned_price_buffer_bps,
+                            )
+                            if not fill_decision.filled:
+                                planned_execution_diagnostics["blocked_order_count"] += 1
+                                planned_execution_diagnostics["blocked"].append(
+                                    {
+                                        "date": str(trade_date_ts.date()),
+                                        "decision_date": str(prev_date_ts.date()),
+                                        "ticker": ticker,
+                                        "reason": fill_decision.reason,
+                                        "planned_price": planned_price,
+                                        "high": high_price,
+                                        "low": low_price,
+                                        "lower_bound": fill_decision.lower_bound,
+                                        "upper_bound": fill_decision.upper_bound,
+                                    }
+                                )
+                                continue
+                            exec_price = fill_decision.fill_price
+                        else:
+                            exec_price = _lookup_price(prices_open, trade_date_ts, ticker)
+                            if exec_price is None:
+                                continue
 
                         # Calculate target dollar amount and shares
                         target_dollar = new_w * portfolio_value
@@ -439,12 +500,14 @@ class BacktestEngine:
                         # Update holdings and track exits
                         if target_shares > 1e-8:
                             holdings[ticker] = target_shares
+                            executed_targets[ticker] = new_w
                             # Track new entry for holding days
                             if ticker not in ticker_holding_days:
                                 ticker_holding_days[ticker] = 0
                         else:
                             if ticker in holdings:
                                 del holdings[ticker]
+                            executed_targets.pop(ticker, None)
                             # Record exit day for cooldown
                             ticker_exit_day[ticker] = day_idx
                             ticker_holding_days.pop(ticker, None)
@@ -464,10 +527,31 @@ class BacktestEngine:
                                 "holding_days": days_held,
                             }
                         )
+                        if config.execution_model == "planned_price":
+                            planned_execution_diagnostics["filled_order_count"] += 1
+                            planned_execution_diagnostics["filled"].append(
+                                {
+                                    "date": str(trade_date_ts.date()),
+                                    "decision_date": str(prev_date_ts.date()),
+                                    "ticker": ticker,
+                                    "planned_price": round(float(exec_price), 6),
+                                    "shares": round(abs(share_change), 4),
+                                    "action": action,
+                                }
+                            )
 
                     total_weight_turnover += day_turnover
                     num_rebalance_periods += 1
-                    current_weights = dict(effective_targets)
+                    rebalance_execution_diagnostics.append(
+                        _build_execution_rebalance_diagnostic(
+                            date_key=str(trade_date_ts.date()),
+                            positions_before=positions_before,
+                            target_positions_after=target_weights,
+                            executed_positions_after=executed_targets,
+                            executed_turnover=day_turnover,
+                        )
+                    )
+                    current_weights = dict(executed_targets)
 
             # --- Value portfolio at today's close ---
             portfolio_value = cash
@@ -546,6 +630,15 @@ class BacktestEngine:
             "normalized": bool(config.normalize_target_weights),
             "last_cash_weight": round(float(last_cash_weight or 0.0), 6),
         }
+        trade_diagnostics["rebalance_execution_diagnostics"] = rebalance_execution_diagnostics
+        if config.execution_model == "planned_price":
+            filled = int(planned_execution_diagnostics["filled_order_count"])
+            blocked = int(planned_execution_diagnostics["blocked_order_count"])
+            total = filled + blocked
+            planned_execution_diagnostics["fill_rate"] = (
+                round(filled / total, 6) if total else None
+            )
+            trade_diagnostics["planned_price_execution"] = planned_execution_diagnostics
 
         result = BacktestResult(
             config=config.to_dict(),
@@ -975,6 +1068,74 @@ def _calc_trade_diagnostics(trade_log: list[dict]) -> dict:
         "core_net_pnl": round(core_pnl - core_cost, 2),
         "core_trips": core_trips,
     }
+
+
+def _build_execution_rebalance_diagnostic(
+    *,
+    date_key: str,
+    positions_before: dict[str, float],
+    target_positions_after: dict[str, float],
+    executed_positions_after: dict[str, float],
+    executed_turnover: float,
+) -> dict[str, Any]:
+    before = _nonzero_weight_map(positions_before)
+    target = _nonzero_weight_map(target_positions_after)
+    executed = _nonzero_weight_map(executed_positions_after)
+    target_turnover = sum(
+        abs(target.get(ticker, 0.0) - before.get(ticker, 0.0))
+        for ticker in set(before) | set(target)
+    )
+    return {
+        "date": date_key,
+        "positions_before": before,
+        "positions_after": executed,
+        "executed_positions_after": executed,
+        "target_positions_after": target,
+        "turnover": round(float(executed_turnover), 6),
+        "target_turnover": round(float(target_turnover), 6),
+        "diagnostic_layers": {
+            "positions_after": "post_buffer",
+            "executed_positions_after": "post_buffer",
+            "target_positions_after": "pre_buffer",
+        },
+    }
+
+
+def _nonzero_weight_map(weights: dict[str, float]) -> dict[str, float]:
+    return {
+        str(ticker): round(float(weight), 6)
+        for ticker, weight in weights.items()
+        if abs(float(weight)) > 1e-8
+    }
+
+
+def _lookup_price(
+    prices: pd.DataFrame,
+    trade_date: pd.Timestamp,
+    ticker: str,
+) -> float | None:
+    if trade_date not in prices.index or ticker not in prices.columns:
+        return None
+    value = prices.loc[trade_date, ticker]
+    if pd.isna(value) or value <= 0:
+        return None
+    return float(value)
+
+
+def _lookup_planned_price(
+    *,
+    planned_prices: pd.DataFrame | None,
+    decision_date: pd.Timestamp,
+    ticker: str,
+) -> float | None:
+    if planned_prices is None:
+        return None
+    if decision_date not in planned_prices.index or ticker not in planned_prices.columns:
+        return None
+    value = planned_prices.loc[decision_date, ticker]
+    if pd.isna(value) or value <= 0:
+        return None
+    return float(value)
 
 
 def _calc_monthly_returns(

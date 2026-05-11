@@ -149,7 +149,8 @@ class StrategyGraph3ServiceContractTests(unittest.TestCase):
 
         self.assertEqual(result["backtest_run"]["status"], "completed")
         self.assertEqual(result["summary"]["days_processed"], 2)
-        self.assertAlmostEqual(result["summary"]["final_nav"], 1_100_000.0, places=2)
+        self.assertAlmostEqual(result["summary"]["final_nav"], 1_097_800.0, places=2)
+        self.assertAlmostEqual(result["summary"]["total_cost"], 2_000.0, places=2)
         self.assertEqual(result["daily"][1]["diagnostics"]["valuation"]["status"], "valued")
         counts = conn.execute(
             """SELECT
@@ -161,6 +162,218 @@ class StrategyGraph3ServiceContractTests(unittest.TestCase):
         self.assertEqual(counts[0], 1)
         self.assertEqual(counts[1], 2)
         self.assertGreaterEqual(counts[2], 1)
+
+    def test_backtest_graph_persists_fills_costs_and_unfilled_diagnostics(self):
+        conn = get_connection()
+        conn.executemany(
+            """INSERT INTO stocks
+               (market, ticker, name, exchange, sector, status, updated_at)
+               VALUES ('CN', ?, ?, 'SSE', 'Test', 'active', current_timestamp)""",
+            [("sh.600000", "浦发银行"), ("sh.600001", "Blocked")],
+        )
+        conn.executemany(
+            """INSERT INTO daily_bars
+               (market, ticker, date, open, high, low, close, volume, adj_factor)
+               VALUES ('CN', ?, ?, ?, ?, ?, ?, ?, 1.0)""",
+            [
+                ("sh.600000", "2024-01-02", 10.0, 10.2, 9.8, 10.0, 100000),
+                ("sh.600000", "2024-01-03", 10.0, 10.2, 9.8, 10.0, 100000),
+                ("sh.600001", "2024-01-02", 20.0, 20.2, 19.8, 20.0, 100000),
+                ("sh.600001", "2024-01-03", 20.0, 20.2, 19.8, 20.0, 100000),
+            ],
+        )
+        service = StrategyGraph3Service()
+        graph = service.create_builtin_alpha_graph(
+            name="M8 CN fill graph",
+            market_profile_id="CN_A",
+            selection_policy={"top_n": 2, "score_column": "score"},
+            portfolio_construction_spec_id=self.portfolio["id"],
+            risk_control_spec_id=None,
+            execution_policy_spec_id=self.execution["id"],
+        )
+        conn.execute(
+            """INSERT INTO trade_status
+               (market_profile_id, asset_id, date, is_trading, is_suspended, is_st, limit_up, limit_down, metadata)
+               VALUES ('CN_A', 'CN_A:sh.600001', DATE '2024-01-03', false, true, false, NULL, NULL, '{}')"""
+        )
+
+        result = service.backtest_graph(
+            graph["id"],
+            start_date="2024-01-02",
+            end_date="2024-01-03",
+            alpha_frames_by_date={
+                "2024-01-02": [
+                    {"asset_id": "CN_A:sh.600000", "score": 1.0},
+                    {"asset_id": "CN_A:sh.600001", "score": 0.9},
+                ],
+                "2024-01-03": [
+                    {"asset_id": "CN_A:sh.600000", "score": 1.0},
+                    {"asset_id": "CN_A:sh.600001", "score": 0.9},
+                ],
+            },
+            initial_capital=1_000_000,
+        )
+
+        rows = conn.execute(
+            """SELECT asset_id, side, quantity, price, value, cost, metadata
+               FROM backtest_trades
+               WHERE backtest_run_id = ?
+               ORDER BY asset_id""",
+            [result["backtest_run"]["id"]],
+        ).fetchall()
+        filled = [row for row in rows if row[2] is not None]
+        blocked = [row for row in rows if row[2] is None]
+        self.assertEqual(len(filled), 1)
+        self.assertEqual(filled[0][0], "CN_A:sh.600000")
+        self.assertGreaterEqual(filled[0][2] % 100, 0)
+        self.assertEqual(filled[0][3], 10.0)
+        self.assertGreater(filled[0][5], 0)
+        self.assertEqual(len(blocked), 1)
+        self.assertIn("suspended", blocked[0][6])
+        self.assertEqual(result["summary"]["fill_diagnostics"]["blocked_order_count"], 1)
+
+    def test_backtest_graph_planned_price_fills_and_blocks_by_buffered_range(self):
+        conn = get_connection()
+        conn.executemany(
+            """INSERT INTO stocks
+               (market, ticker, name, exchange, sector, status, updated_at)
+               VALUES ('US', ?, ?, 'NYSE', 'Test', 'active', current_timestamp)""",
+            [("AAA", "AAA Inc"), ("BBB", "BBB Inc")],
+        )
+        conn.executemany(
+            """INSERT INTO daily_bars
+               (market, ticker, date, open, high, low, close, volume, adj_factor)
+               VALUES ('US', ?, ?, ?, ?, ?, ?, 1000, 1.0)""",
+            [
+                ("AAA", "2024-01-02", 10.0, 10.2, 9.8, 10.0),
+                ("AAA", "2024-01-03", 11.0, 12.2, 10.8, 12.0),
+                ("BBB", "2024-01-02", 20.0, 20.2, 19.8, 20.0),
+                ("BBB", "2024-01-03", 21.0, 22.0, 20.8, 22.0),
+            ],
+        )
+        planned_execution = self.portfolio_service.create_execution_policy_spec(
+            name="M8 planned price",
+            policy_type="planned_price",
+            params={"planned_price_buffer_bps": 50},
+        )
+        service = StrategyGraph3Service()
+        graph = service.create_builtin_alpha_graph(
+            name="M8 planned graph",
+            selection_policy={"top_n": 2, "score_column": "score"},
+            portfolio_construction_spec_id=self.portfolio["id"],
+            risk_control_spec_id=None,
+            execution_policy_spec_id=planned_execution["id"],
+        )
+
+        result = service.backtest_graph(
+            graph["id"],
+            start_date="2024-01-02",
+            end_date="2024-01-03",
+            alpha_frames_by_date={
+                "2024-01-02": [
+                    {"asset_id": "US_EQ:AAA", "score": 1.0, "planned_price": 11.5},
+                    {"asset_id": "US_EQ:BBB", "score": 0.9, "planned_price": 20.81},
+                ],
+                "2024-01-03": [
+                    {"asset_id": "US_EQ:AAA", "score": 1.0, "planned_price": 11.5},
+                    {"asset_id": "US_EQ:BBB", "score": 0.9, "planned_price": 20.81},
+                ],
+            },
+            initial_capital=1_000_000,
+        )
+
+        rows = conn.execute(
+            """SELECT asset_id, quantity, price, metadata
+               FROM backtest_trades
+               WHERE backtest_run_id = ?
+               ORDER BY asset_id""",
+            [result["backtest_run"]["id"]],
+        ).fetchall()
+        filled = [row for row in rows if row[1] is not None]
+        blocked = [row for row in rows if row[1] is None]
+        self.assertEqual(len(filled), 1)
+        self.assertEqual(filled[0][0], "US_EQ:AAA")
+        self.assertEqual(filled[0][2], 11.5)
+        self.assertGreaterEqual(len(blocked), 1)
+        self.assertTrue(
+            any("planned_price_outside_buffered_range" in row[3] for row in blocked)
+        )
+        self.assertEqual(result["summary"]["fill_diagnostics"]["execution_model"], "planned_price")
+
+    def test_backtest_graph_blocks_cn_st_limit_and_missing_price_orders(self):
+        conn = get_connection()
+        conn.executemany(
+            """INSERT INTO stocks
+               (market, ticker, name, exchange, sector, status, updated_at)
+               VALUES ('CN', ?, ?, 'SSE', 'Test', 'active', current_timestamp)""",
+            [
+                ("sh.600010", "Limit Up"),
+                ("sh.600011", "ST Blocked"),
+                ("sh.600012", "Missing Price"),
+            ],
+        )
+        conn.executemany(
+            """INSERT INTO daily_bars
+               (market, ticker, date, open, high, low, close, volume, adj_factor)
+               VALUES ('CN', ?, ?, ?, ?, ?, ?, ?, 1.0)""",
+            [
+                ("sh.600010", "2024-01-02", 10.0, 10.0, 9.8, 10.0, 100000),
+                ("sh.600010", "2024-01-03", 11.0, 11.0, 10.8, 11.0, 100000),
+                ("sh.600011", "2024-01-02", 20.0, 20.0, 19.8, 20.0, 100000),
+                ("sh.600011", "2024-01-03", 20.0, 20.0, 19.8, 20.0, 100000),
+            ],
+        )
+        conn.executemany(
+            """INSERT INTO trade_status
+               (market_profile_id, asset_id, date, is_trading, is_suspended, is_st, limit_up, limit_down, metadata)
+               VALUES ('CN_A', ?, DATE '2024-01-03', true, false, ?, ?, NULL, '{}')""",
+            [
+                ("CN_A:sh.600010", False, 11.0),
+                ("CN_A:sh.600011", True, None),
+                ("CN_A:sh.600012", False, None),
+            ],
+        )
+        service = StrategyGraph3Service()
+        graph = service.create_builtin_alpha_graph(
+            name="M8 CN blocked fills graph",
+            market_profile_id="CN_A",
+            selection_policy={"top_n": 3, "score_column": "score"},
+            portfolio_construction_spec_id=self.portfolio["id"],
+            risk_control_spec_id=None,
+            execution_policy_spec_id=self.execution["id"],
+        )
+
+        result = service.backtest_graph(
+            graph["id"],
+            start_date="2024-01-02",
+            end_date="2024-01-03",
+            alpha_frames_by_date={
+                "2024-01-02": [
+                    {"asset_id": "CN_A:sh.600010", "score": 1.0},
+                    {"asset_id": "CN_A:sh.600011", "score": 0.9},
+                    {"asset_id": "CN_A:sh.600012", "score": 0.8},
+                ],
+                "2024-01-03": [
+                    {"asset_id": "CN_A:sh.600010", "score": 1.0},
+                    {"asset_id": "CN_A:sh.600011", "score": 0.9},
+                    {"asset_id": "CN_A:sh.600012", "score": 0.8},
+                ],
+            },
+            initial_capital=1_000_000,
+        )
+
+        rows = conn.execute(
+            """SELECT metadata
+               FROM backtest_trades
+               WHERE backtest_run_id = ?
+               ORDER BY asset_id""",
+            [result["backtest_run"]["id"]],
+        ).fetchall()
+        metadata_text = "\n".join(row[0] for row in rows)
+        self.assertIn("limit_up_buy_blocked", metadata_text)
+        self.assertIn("st_buy_blocked", metadata_text)
+        self.assertIn("missing_execution_price", metadata_text)
+        self.assertEqual(result["summary"]["fill_diagnostics"]["blocked_order_count"], 3)
 
 
 if __name__ == "__main__":

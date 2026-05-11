@@ -9,15 +9,34 @@ without copying portfolio or execution logic.
 from __future__ import annotations
 
 import json
+import math
 import uuid
 from typing import Any
 
 from backend.db import get_connection
 from backend.services.calendar_service import get_trading_days
+from backend.services.execution_model_service import (
+    evaluate_planned_price_fill,
+    normalize_planned_price_buffer_bps,
+)
+from backend.services.market_context import normalize_market
+from backend.services.market_data_foundation_service import MarketDataFoundationService
 from backend.services.portfolio_assets_3_service import PortfolioAssets3Service
 from backend.services.portfolio_valuation_service import PortfolioValuationService
 from backend.services.research_kernel_service import ResearchKernelService
 from backend.time_utils import utc_now_naive
+
+
+def _positive_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric) or numeric <= 0:
+        return None
+    return numeric
 
 
 class StrategyGraph3Service:
@@ -29,12 +48,14 @@ class StrategyGraph3Service:
         kernel_service: ResearchKernelService | None = None,
         portfolio_service: PortfolioAssets3Service | None = None,
         valuation_service: PortfolioValuationService | None = None,
+        market_data_service: MarketDataFoundationService | None = None,
     ) -> None:
         self.kernel = kernel_service or ResearchKernelService()
         self.portfolio_service = portfolio_service or PortfolioAssets3Service(
             kernel_service=self.kernel
         )
         self.valuation_service = valuation_service or PortfolioValuationService()
+        self.market_data = market_data_service or MarketDataFoundationService()
 
     # ------------------------------------------------------------------
     # Graph creation
@@ -356,7 +377,11 @@ class StrategyGraph3Service:
         previous_date: str | None = None
         daily: list[dict[str, Any]] = []
         total_turnover = 0.0
+        total_cost = 0.0
+        total_filled_orders = 0
+        total_blocked_orders = 0
         warnings: list[dict[str, Any]] = []
+        execution_models_seen: set[str] = set()
 
         for decision_date in dates:
             valuation = self.valuation_service.revalue_weights(
@@ -390,19 +415,35 @@ class StrategyGraph3Service:
             }
             turnover = sum(abs(float(order["delta_weight"])) for order in runtime["order_intents"])
             total_turnover += turnover
-            self._insert_backtest_trades(
+            fills = self._execute_backtest_orders(
                 backtest_run_id=backtest_run_id,
                 order_intents=runtime["order_intents"],
+                market_profile_id=graph["market_profile_id"],
+                nav=nav,
             )
+            if fills["diagnostics"].get("execution_model") == "planned_price":
+                executed_weights = self._executed_weights_after_orders(
+                    starting_weights=drifted_weights,
+                    order_intents=runtime["order_intents"],
+                    fill_diagnostics=fills["diagnostics"],
+                )
+            else:
+                executed_weights = target_weights
+            nav -= fills["total_cost"]
+            total_cost += fills["total_cost"]
+            total_filled_orders += fills["filled_order_count"]
+            total_blocked_orders += fills["blocked_order_count"]
+            execution_models_seen.add(str(fills["diagnostics"].get("execution_model") or "next_open"))
             diagnostics = {
                 "strategy_signal_id": runtime["strategy_signal"]["id"],
                 "portfolio_run_id": runtime["portfolio_run"]["id"],
                 "valuation": valuation["diagnostics"],
                 "turnover_estimate": round(turnover, 12),
+                "execution": fills["diagnostics"],
                 "target_count": len(runtime["targets"]),
             }
-            gross = sum(abs(weight) for weight in target_weights.values())
-            net = sum(target_weights.values())
+            gross = sum(abs(weight) for weight in executed_weights.values())
+            net = sum(executed_weights.values())
             get_connection().execute(
                 """INSERT OR REPLACE INTO backtest_daily
                    (backtest_run_id, date, nav, cash, gross_exposure,
@@ -431,7 +472,9 @@ class StrategyGraph3Service:
             )
             if valuation["diagnostics"]["status"] != "valued":
                 warnings.append({"date": decision_date, "valuation": valuation["diagnostics"]})
-            current_weights = target_weights
+            if fills["blocked_order_count"]:
+                warnings.append({"date": decision_date, "execution": fills["diagnostics"]})
+            current_weights = executed_weights
             previous_date = decision_date
 
         summary = {
@@ -440,6 +483,16 @@ class StrategyGraph3Service:
             "total_return": (nav / float(initial_capital) - 1.0) if initial_capital else 0.0,
             "days_processed": len(daily),
             "total_turnover_estimate": round(total_turnover, 12),
+            "total_cost": round(total_cost, 6),
+            "fill_diagnostics": {
+                "filled_order_count": total_filled_orders,
+                "blocked_order_count": total_blocked_orders,
+                "execution_model": (
+                    "mixed"
+                    if len(execution_models_seen) > 1
+                    else next(iter(execution_models_seen), "next_open")
+                ),
+            },
             "valuation_warnings": warnings,
         }
         get_connection().execute(
@@ -714,16 +767,18 @@ class StrategyGraph3Service:
         for index, row in enumerate(alpha_frame):
             asset_id = str(row["asset_id"])
             score = float(row["score"])
-            rows.append(
-                {
-                    "date": decision_date,
-                    "asset_id": asset_id,
-                    "score": score,
-                    "rank": index + 1,
-                    "confidence": float(row.get("confidence", 1.0)),
-                    "reason": row.get("reason") or "provided alpha score",
-                }
-            )
+            alpha_row = {
+                "date": decision_date,
+                "asset_id": asset_id,
+                "score": score,
+                "rank": index + 1,
+                "confidence": float(row.get("confidence", 1.0)),
+                "reason": row.get("reason") or "provided alpha score",
+            }
+            planned_price = _positive_float(row.get("planned_price"))
+            if planned_price is not None:
+                alpha_row["planned_price"] = planned_price
+            rows.append(alpha_row)
         return sorted(rows, key=lambda item: item["score"], reverse=True)
 
     def _legacy_signal_to_alpha(
@@ -823,33 +878,235 @@ class StrategyGraph3Service:
         )
         return self.get_strategy_signal(signal_id)
 
-    def _insert_backtest_trades(
+    def _execute_backtest_orders(
         self,
         *,
         backtest_run_id: str,
         order_intents: list[dict[str, Any]],
-    ) -> None:
+        market_profile_id: str,
+        nav: float,
+    ) -> dict[str, Any]:
         now = utc_now_naive()
         rows = []
+        diagnostics = {
+            "status": "no_orders" if not order_intents else "evaluated",
+            "filled": [],
+            "blocked": [],
+            "missing_price": [],
+            "cost_model": {},
+            "trading_rules": {},
+        }
+        if not order_intents:
+            return {
+                "filled_order_count": 0,
+                "blocked_order_count": 0,
+                "total_cost": 0.0,
+                "diagnostics": diagnostics,
+            }
+
+        profile = self.market_data.get_market_profile(market_profile_id)
+        market = normalize_market(profile["market_code"])
+        cost_model = profile.get("cost_model") or {}
+        trading_rules = profile.get("trading_rule_set") or {}
+        diagnostics["cost_model"] = {
+            "commission_rate": float(cost_model.get("commission_rate") or 0.0),
+            "slippage_rate": float(cost_model.get("slippage_rate") or 0.0),
+            "stamp_tax_rate": float(cost_model.get("stamp_tax_rate") or 0.0),
+            "min_commission": float(cost_model.get("min_commission") or 0.0),
+        }
+        diagnostics["trading_rules"] = {
+            "lot_size": int(trading_rules.get("lot_size") or 1),
+            "limit_up_down": bool(trading_rules.get("limit_up_down")),
+        }
+
+        asset_ids = sorted({str(order["asset_id"]) for order in order_intents})
+        execution_dates = sorted(
+            {
+                str(order.get("execution_date"))
+                for order in order_intents
+                if order.get("execution_date")
+            }
+            | {
+                str(order.get("decision_date"))
+                for order in order_intents
+                if str(order.get("execution_model") or "next_open") == "planned_price"
+                and order.get("decision_date")
+            }
+        )
+        price_field_by_order = {
+            (str(order["asset_id"]), str(order.get("execution_date"))): str(order.get("price_field") or "open")
+            for order in order_intents
+        }
+        requested_price_fields = set(price_field_by_order.values())
+        if any(str(order.get("execution_model") or "next_open") == "planned_price" for order in order_intents):
+            requested_price_fields.update({"high", "low", "close"})
+        prices = self._load_execution_prices(
+            market_profile_id=market_profile_id,
+            asset_ids=asset_ids,
+            execution_dates=execution_dates,
+            price_fields=sorted(requested_price_fields),
+        )
+        statuses = self._load_trade_status(
+            market_profile_id=market_profile_id,
+            asset_ids=asset_ids,
+            execution_dates=execution_dates,
+        )
+
+        filled_count = 0
+        blocked_count = 0
+        total_cost = 0.0
         for order in order_intents:
+            execution_date = str(order.get("execution_date"))
+            asset_id = str(order["asset_id"])
+            side = str(order["side"])
+            execution_model = str(order.get("execution_model") or "next_open")
+            price_field = str(order.get("price_field") or "open")
+            estimated_value = abs(float(order.get("estimated_value") or 0.0))
+            if execution_model == "planned_price":
+                planned_price = _positive_float(order.get("planned_price"))
+                planned_price_source = str(order.get("planned_price_source") or "strategy_output")
+                if planned_price is None and planned_price_source == "decision_close":
+                    planned_price = prices.get((asset_id, str(order.get("decision_date")), "close"))
+                high_price = prices.get((asset_id, execution_date, "high"))
+                low_price = prices.get((asset_id, execution_date, "low"))
+                fill_decision = evaluate_planned_price_fill(
+                    planned_price=planned_price,
+                    high=high_price,
+                    low=low_price,
+                    buffer_bps=order.get("planned_price_buffer_bps"),
+                )
+                price = fill_decision.fill_price
+                planned_block_reason = fill_decision.reason
+            else:
+                planned_price = None
+                planned_price_source = None
+                high_price = None
+                low_price = None
+                fill_decision = None
+                planned_block_reason = None
+                price = prices.get((asset_id, execution_date, price_field))
+            block_reason = self._execution_block_reason(
+                order=order,
+                status=statuses.get((asset_id, execution_date)),
+                price=price,
+                market=market,
+                trading_rules=trading_rules,
+            )
+            quantity = None
+            value = estimated_value
+            cost = None
+            metadata = dict(order)
+            metadata["execution_model"] = execution_model
+            metadata["price_field"] = price_field
+            if execution_model == "planned_price":
+                metadata["planned_price"] = planned_price
+                metadata["planned_price_source"] = planned_price_source
+                metadata["planned_price_buffer_bps"] = normalize_planned_price_buffer_bps(
+                    order.get("planned_price_buffer_bps")
+                )
+                metadata["execution_high"] = high_price
+                metadata["execution_low"] = low_price
+            if fill_decision is not None:
+                metadata["planned_price_bounds"] = {
+                    "lower": fill_decision.lower_bound,
+                    "upper": fill_decision.upper_bound,
+                }
+            if block_reason is None and planned_block_reason is not None:
+                if planned_block_reason == "missing_high_low":
+                    block_reason = "missing_execution_price"
+                else:
+                    block_reason = planned_block_reason
+            if block_reason:
+                blocked_count += 1
+                metadata["fill_status"] = "blocked"
+                metadata["block_reason"] = block_reason
+                diagnostics["blocked"].append(
+                    {
+                        "asset_id": asset_id,
+                        "execution_date": execution_date,
+                        "side": side,
+                        "reason": block_reason,
+                        **(
+                            {
+                                "planned_price": planned_price,
+                                "planned_price_source": planned_price_source,
+                                "high": high_price,
+                                "low": low_price,
+                            }
+                            if execution_model == "planned_price"
+                            else {}
+                        ),
+                    }
+                )
+                if block_reason == "missing_execution_price":
+                    diagnostics["missing_price"].append(
+                        {"asset_id": asset_id, "execution_date": execution_date, "price_field": price_field}
+                    )
+            else:
+                quantity = self._order_quantity(
+                    side=side,
+                    estimated_value=estimated_value,
+                    price=float(price),
+                    trading_rules=trading_rules,
+                )
+                if quantity <= 0:
+                    blocked_count += 1
+                    metadata["fill_status"] = "blocked"
+                    metadata["block_reason"] = "quantity_rounds_to_zero"
+                    diagnostics["blocked"].append(
+                        {
+                            "asset_id": asset_id,
+                            "execution_date": execution_date,
+                            "side": side,
+                            "reason": "quantity_rounds_to_zero",
+                        }
+                    )
+                    quantity = None
+                else:
+                    value = abs(float(quantity) * float(price))
+                    cost = self._execution_cost(side=side, trade_value=value, cost_model=cost_model)
+                    total_cost += cost
+                    filled_count += 1
+                    metadata["fill_status"] = "filled"
+                    metadata["execution_price"] = float(price)
+                    metadata["quantity"] = quantity
+                    metadata["cost"] = cost
+                    diagnostics["filled"].append(
+                        {
+                            "asset_id": asset_id,
+                            "execution_date": execution_date,
+                            "side": side,
+                            "target_weight": float(order.get("target_weight") or 0.0),
+                            "quantity": quantity,
+                            "price": float(price),
+                            "value": round(value, 6),
+                            "cost": round(cost, 6),
+                            **(
+                                {
+                                    "planned_price": planned_price,
+                                    "planned_price_source": planned_price_source,
+                                }
+                                if execution_model == "planned_price"
+                                else {}
+                            ),
+                        }
+                    )
             rows.append(
                 [
                     uuid.uuid4().hex[:12],
                     backtest_run_id,
                     order.get("decision_date"),
-                    order.get("execution_date"),
-                    order["asset_id"],
-                    order["side"],
-                    None,
-                    None,
-                    abs(float(order.get("estimated_value") or 0.0)),
-                    None,
-                    json.dumps(order, default=str),
+                    execution_date,
+                    asset_id,
+                    side,
+                    quantity,
+                    price if quantity is not None else None,
+                    value,
+                    cost,
+                    json.dumps(metadata, default=str),
                     now,
                 ]
             )
-        if not rows:
-            return
         get_connection().executemany(
             """INSERT INTO backtest_trades
                (id, backtest_run_id, decision_date, execution_date, asset_id,
@@ -857,6 +1114,176 @@ class StrategyGraph3Service:
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             rows,
         )
+        diagnostics["status"] = "filled" if blocked_count == 0 else ("partial" if filled_count else "blocked")
+        diagnostics["filled_order_count"] = filled_count
+        diagnostics["blocked_order_count"] = blocked_count
+        diagnostics["total_cost"] = round(total_cost, 6)
+        diagnostics["nav_after_cost"] = round(float(nav) - total_cost, 6)
+        diagnostics["execution_model"] = (
+            "planned_price"
+            if any(str(order.get("execution_model") or "next_open") == "planned_price" for order in order_intents)
+            else "next_open"
+        )
+        return {
+            "filled_order_count": filled_count,
+            "blocked_order_count": blocked_count,
+            "total_cost": total_cost,
+            "diagnostics": diagnostics,
+        }
+
+    def _load_execution_prices(
+        self,
+        *,
+        market_profile_id: str,
+        asset_ids: list[str],
+        execution_dates: list[str],
+        price_fields: list[str],
+    ) -> dict[tuple[str, str, str], float]:
+        if not asset_ids or not execution_dates:
+            return {}
+        allowed_fields = {"open", "high", "low", "close"}
+        fields = [field for field in price_fields if field in allowed_fields] or ["open"]
+        bars = self.market_data.query_bars(
+            market_profile_id=market_profile_id,
+            asset_ids=asset_ids,
+            start=min(execution_dates),
+            end=max(execution_dates),
+            limit=max(len(asset_ids) * len(execution_dates) * 2, 100),
+        )["bars"]
+        result: dict[tuple[str, str, str], float] = {}
+        execution_date_set = set(execution_dates)
+        for row in bars:
+            row_date = str(row["date"])
+            if row_date not in execution_date_set:
+                continue
+            for field in fields:
+                value = row.get(field)
+                if value is None:
+                    continue
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if numeric > 0:
+                    result[(str(row["asset_id"]), row_date, field)] = numeric
+        return result
+
+    @staticmethod
+    def _executed_weights_after_orders(
+        *,
+        starting_weights: dict[str, float],
+        order_intents: list[dict[str, Any]],
+        fill_diagnostics: dict[str, Any],
+    ) -> dict[str, float]:
+        weights = {
+            str(asset_id): float(weight)
+            for asset_id, weight in starting_weights.items()
+            if abs(float(weight)) > 1e-10
+        }
+        filled = {
+            (str(item.get("asset_id")), str(item.get("execution_date")))
+            for item in fill_diagnostics.get("filled", [])
+            if item.get("asset_id") and item.get("execution_date")
+        }
+        for order in order_intents:
+            key = (str(order.get("asset_id")), str(order.get("execution_date")))
+            if key not in filled:
+                continue
+            target_weight = float(order.get("target_weight") or 0.0)
+            asset_id = str(order["asset_id"])
+            if abs(target_weight) <= 1e-10:
+                weights.pop(asset_id, None)
+            else:
+                weights[asset_id] = target_weight
+        return weights
+
+    @staticmethod
+    def _load_trade_status(
+        *,
+        market_profile_id: str,
+        asset_ids: list[str],
+        execution_dates: list[str],
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        if not asset_ids or not execution_dates:
+            return {}
+        asset_placeholders = ",".join("?" for _ in asset_ids)
+        date_placeholders = ",".join("?" for _ in execution_dates)
+        rows = get_connection().execute(
+            f"""SELECT asset_id, date, is_trading, is_suspended, is_st,
+                       limit_up, limit_down, metadata
+                FROM trade_status
+                WHERE market_profile_id = ?
+                  AND asset_id IN ({asset_placeholders})
+                  AND date IN ({date_placeholders})""",
+            [market_profile_id, *asset_ids, *execution_dates],
+        ).fetchall()
+        return {
+            (str(row[0]), str(row[1])): {
+                "is_trading": bool(row[2]),
+                "is_suspended": bool(row[3]),
+                "is_st": bool(row[4]),
+                "limit_up": row[5],
+                "limit_down": row[6],
+                "metadata": _json(row[7], {}),
+            }
+            for row in rows
+        }
+
+    @staticmethod
+    def _execution_block_reason(
+        *,
+        order: dict[str, Any],
+        status: dict[str, Any] | None,
+        price: float | None,
+        market: str,
+        trading_rules: dict[str, Any],
+    ) -> str | None:
+        if str(order.get("execution_model") or "next_open") != "planned_price" and (
+            price is None or float(price) <= 0
+        ):
+            return "missing_execution_price"
+        if not status:
+            return None
+        if status.get("is_suspended") or status.get("is_trading") is False:
+            return "suspended"
+        if market == "CN" and status.get("is_st") and order.get("side") == "buy":
+            return "st_buy_blocked"
+        if bool(trading_rules.get("limit_up_down")):
+            side = str(order.get("side"))
+            limit_up = status.get("limit_up")
+            limit_down = status.get("limit_down")
+            if side == "buy" and limit_up is not None and math.isclose(float(price), float(limit_up), rel_tol=0, abs_tol=1e-9):
+                return "limit_up_buy_blocked"
+            if side == "sell" and limit_down is not None and math.isclose(float(price), float(limit_down), rel_tol=0, abs_tol=1e-9):
+                return "limit_down_sell_blocked"
+        return None
+
+    @staticmethod
+    def _order_quantity(
+        *,
+        side: str,
+        estimated_value: float,
+        price: float,
+        trading_rules: dict[str, Any],
+    ) -> float:
+        if price <= 0:
+            return 0.0
+        raw = estimated_value / price
+        lot_size = int(trading_rules.get("lot_size") or 1)
+        if side == "buy" and lot_size > 1:
+            return float(math.floor(raw / lot_size) * lot_size)
+        return float(raw)
+
+    @staticmethod
+    def _execution_cost(*, side: str, trade_value: float, cost_model: dict[str, Any]) -> float:
+        commission_rate = float(cost_model.get("commission_rate") or 0.0)
+        slippage_rate = float(cost_model.get("slippage_rate") or 0.0)
+        stamp_tax_rate = float(cost_model.get("stamp_tax_rate") or 0.0)
+        min_commission = float(cost_model.get("min_commission") or 0.0)
+        commission = max(trade_value * commission_rate, min_commission) if trade_value > 0 else 0.0
+        slippage = trade_value * slippage_rate
+        stamp_tax = trade_value * stamp_tax_rate if side == "sell" else 0.0
+        return round(commission + slippage + stamp_tax, 6)
 
     @staticmethod
     def _dependency_refs(config: dict[str, Any]) -> list[dict[str, Any]]:

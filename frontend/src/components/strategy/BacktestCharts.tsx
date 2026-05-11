@@ -63,6 +63,9 @@ interface BacktestSummaryCardsProps {
 export function BacktestSummaryCards({ summary }: BacktestSummaryCardsProps) {
   const compliance = summary.portfolio_compliance as Record<string, unknown> | undefined;
   const constraintReport = summary.constraint_report as Record<string, unknown> | undefined;
+  const tradeDiagnostics = summary.trade_diagnostics as Record<string, unknown> | undefined;
+  const plannedExecution = tradeDiagnostics?.planned_price_execution as Record<string, unknown> | undefined;
+  const plannedInputs = tradeDiagnostics?.planned_price_inputs as Record<string, unknown> | undefined;
   const startupState = (
     summary.startup_state_report
     || constraintReport?.startup_state_report
@@ -72,6 +75,10 @@ export function BacktestSummaryCards({ summary }: BacktestSummaryCardsProps) {
   const minPositionCount = asNumber(compliance?.min_position_count);
   const maxTargetWeight = asNumber(compliance?.max_target_weight);
   const maxHoldingDays = asNumber(compliance?.max_trade_holding_days);
+  const plannedFillRate = asNumber(plannedExecution?.fill_rate);
+  const plannedFilled = asNumber(plannedExecution?.filled_order_count);
+  const plannedBlocked = asNumber(plannedExecution?.blocked_order_count);
+  const plannedFallbacks = asNumber(plannedInputs?.fallback_count);
   const items: Array<{
     key: string;
     title: string;
@@ -175,6 +182,25 @@ export function BacktestSummaryCards({ summary }: BacktestSummaryCardsProps) {
             />
             <Text type="secondary" style={{ fontSize: 11 }}>
               {`首评估持仓 ${startupState.first_evaluation_positions_before_count ?? "-"}`}
+            </Text>
+          </Card>
+        </Col>
+      )}
+      {plannedExecution && (
+        <Col xs={12} sm={8} md={6} lg={3}>
+          <Card size="small">
+            <Statistic
+              title="计划价成交"
+              value={plannedFillRate != null ? plannedFillRate * 100 : "-"}
+              precision={plannedFillRate != null ? 1 : undefined}
+              suffix={plannedFillRate != null ? "%" : undefined}
+              valueStyle={{
+                fontSize: 18,
+                color: plannedBlocked && plannedBlocked > 0 ? "#faad14" : "#52c41a",
+              }}
+            />
+            <Text type="secondary" style={{ fontSize: 11 }}>
+              {`成交 ${plannedFilled ?? 0} / 失败 ${plannedBlocked ?? 0} / fallback ${plannedFallbacks ?? 0}`}
             </Text>
           </Card>
         </Col>

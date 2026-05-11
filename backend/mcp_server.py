@@ -959,7 +959,12 @@ def create_execution_policy_spec_3_0(
     project_id: str | None = None,
     market_profile_id: str | None = None,
 ) -> dict:
-    """Create a reusable 3.0 execution policy."""
+    """Create a reusable 3.0 execution policy.
+
+    policy_type may be "next_open" or "planned_price". For planned-price
+    execution, params supports planned_price_buffer_bps (default 50),
+    fallback="decision_close", and order_ttl="same_day".
+    """
     return _portfolio_assets_3_service().create_execution_policy_spec(
         name=name,
         policy_type=policy_type,
@@ -980,7 +985,12 @@ def construct_portfolio_3_0(
     current_weights: dict[str, float] | None = None,
     portfolio_value: float = 1_000_000,
 ) -> dict:
-    """Construct portfolio targets, constraint trace, and order intents from alpha."""
+    """Construct portfolio targets, constraint trace, and order intents from alpha.
+
+    When the execution policy is planned_price, alpha_frame rows may include
+    planned_price. Missing planned_price falls back to decision-date close at
+    execution time.
+    """
     return _portfolio_assets_3_service().construct_portfolio(
         decision_date=decision_date,
         alpha_frame=alpha_frame,
@@ -1075,7 +1085,12 @@ def backtest_strategy_graph_3_0(
     initial_capital: float = 1_000_000,
     price_field: str = "close",
 ) -> dict:
-    """Trigger a StrategyGraph historical backtest task."""
+    """Trigger a StrategyGraph historical backtest task.
+
+    Planned-price StrategyGraphs use their execution policy and optional
+    planned_price values in alpha_frames_by_date rows; fills are evaluated
+    against execution-day high/low and written to fill diagnostics.
+    """
     from backend.tasks.models import TaskSource
 
     params = {
@@ -1757,7 +1772,9 @@ def run_backtest(
         config_json: JSON string with backtest configuration. Keys:
             initial_capital, start_date, end_date, benchmark,
             commission_rate, slippage_rate, max_positions, rebalance_freq,
-            rebalance_buffer, min_holding_days, reentry_cooldown_days.
+            rebalance_buffer, min_holding_days, reentry_cooldown_days,
+            execution_model ("next_open" or "planned_price"), and
+            planned_price_buffer_bps (default 50 for planned_price).
         universe_group_id: ID of the stock group for the backtest universe.
         market: Market scope. Defaults to "US" for compatibility.
 
@@ -2142,7 +2159,12 @@ def create_paper_session(
     config: dict | None = None,
     market: str | None = None,
 ) -> dict:
-    """Create a market-scoped paper-trading session."""
+    """Create a market-scoped paper-trading session.
+
+    config may include execution_model="planned_price" and
+    planned_price_buffer_bps. Missing strategy planned_price values fall back
+    to decision-date close; failed planned orders are canceled for that day.
+    """
     resolved_market = _resolve_market(market)
     svc = _paper_service()
     return svc.create_session(

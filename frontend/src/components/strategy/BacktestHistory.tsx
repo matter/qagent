@@ -17,7 +17,13 @@ import {
   getBacktest,
   listStrategies,
 } from "../../api";
-import type { BacktestResultSummary, BacktestResultDetail, Market, Strategy } from "../../api";
+import type {
+  BacktestResultSummary,
+  BacktestResultDetail,
+  ExecutionModel,
+  Market,
+  Strategy,
+} from "../../api";
 import {
   BacktestSummaryCards,
   NavCurveChart,
@@ -66,6 +72,8 @@ export interface BacktestRestoreConfig {
   rebalanceBuffer?: number;
   minHoldingDays?: number;
   reentryCooldownDays?: number;
+  executionModel?: ExecutionModel;
+  plannedPriceBufferBps?: number;
 }
 
 interface BacktestHistoryProps {
@@ -128,7 +136,7 @@ export default function BacktestHistory({ refreshKey, onRestoreConfig }: Backtes
   const handleRestore = (record: BacktestRow, e: React.MouseEvent) => {
     e.stopPropagation();
     if (!onRestoreConfig) return;
-    const cfg = record.config as Record<string, unknown> | null;
+    const cfg = record.config;
     onRestoreConfig({
       strategyId: record.strategy_id,
       groupId: (cfg?.universe_group_id as string) ?? "",
@@ -143,6 +151,8 @@ export default function BacktestHistory({ refreshKey, onRestoreConfig }: Backtes
       rebalanceBuffer: (cfg?.rebalance_buffer as number) ?? 0,
       minHoldingDays: (cfg?.min_holding_days as number) ?? 0,
       reentryCooldownDays: (cfg?.reentry_cooldown_days as number) ?? 0,
+      executionModel: cfg?.execution_model,
+      plannedPriceBufferBps: (cfg?.planned_price_buffer_bps as number) ?? 50,
     });
     messageApi.success("已还原回测配置");
   };

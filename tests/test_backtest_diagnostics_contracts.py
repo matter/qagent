@@ -1,4 +1,6 @@
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event, Lock
 from unittest.mock import patch
 
 import pandas as pd
@@ -26,7 +28,105 @@ class BacktestDiagnosticsContractTests(unittest.TestCase):
         self.assertAlmostEqual(diag["turnover"], 1.2)
         self.assertEqual(diag["candidate_pool"], ["MSFT", "NVDA"])
 
-    def test_portfolio_compliance_metrics_flag_concentration_and_holding_violations(self):
+    def test_rebalance_diagnostics_distinguish_target_and_executed_weights(self):
+        diag = BacktestService._build_rebalance_diagnostics(
+            date_key="2026-04-10",
+            positions_before={"AAPL": 0.5, "MSFT": 0.5},
+            positions_after={"AAPL": 0.5, "MSFT": 0.5},
+            target_positions_after={"MSFT": 0.4, "NVDA": 0.6},
+            target_layer="strategy_sized",
+            executed_layer="post_buffer",
+        )
+
+        self.assertEqual(diag["positions_after"], {"AAPL": 0.5, "MSFT": 0.5})
+        self.assertEqual(diag["executed_positions_after"], {"AAPL": 0.5, "MSFT": 0.5})
+        self.assertEqual(diag["target_positions_after"], {"MSFT": 0.4, "NVDA": 0.6})
+        self.assertEqual(diag["diagnostic_layers"]["positions_after"], "post_buffer")
+        self.assertEqual(diag["diagnostic_layers"]["target_positions_after"], "strategy_sized")
+        self.assertEqual(diag["turnover"], 0.0)
+        self.assertAlmostEqual(diag["target_turnover"], 1.2)
+
+    def test_rebalance_diagnostics_merge_engine_post_buffer_execution_layer(self):
+        diagnostics = [
+            {
+                "date": "2026-04-07",
+                "positions_before": {},
+                "positions_after": {"AAA": 0.5, "BBB": 0.5},
+                "turnover": 1.0,
+            },
+            {
+                "date": "2026-04-08",
+                "positions_before": {"AAA": 0.5, "BBB": 0.5},
+                "positions_after": {"AAA": 0.54, "BBB": 0.46},
+                "turnover": 0.08,
+            },
+        ]
+        engine_diagnostics = [
+            {
+                "date": "2026-04-08",
+                "positions_before": {"AAA": 0.5, "BBB": 0.5},
+                "positions_after": {"AAA": 0.5, "BBB": 0.5},
+                "executed_positions_after": {"AAA": 0.5, "BBB": 0.5},
+                "target_positions_after": {"AAA": 0.54, "BBB": 0.46},
+                "turnover": 0.0,
+                "target_turnover": 0.08,
+                "diagnostic_layers": {
+                    "positions_after": "post_buffer",
+                    "executed_positions_after": "post_buffer",
+                    "target_positions_after": "pre_buffer",
+                },
+            }
+        ]
+
+        merged = BacktestService._merge_engine_rebalance_diagnostics(
+            diagnostics,
+            engine_diagnostics,
+        )
+
+        self.assertEqual(merged[0]["positions_after"], {"AAA": 0.5, "BBB": 0.5})
+        self.assertEqual(merged[1]["positions_after"], {"AAA": 0.5, "BBB": 0.5})
+        self.assertEqual(merged[1]["target_positions_after"], {"AAA": 0.54, "BBB": 0.46})
+        self.assertEqual(merged[1]["turnover"], 0.0)
+        self.assertEqual(merged[1]["target_turnover"], 0.08)
+        self.assertEqual(merged[1]["diagnostic_layers"]["positions_after"], "post_buffer")
+
+    def test_planned_price_matrix_uses_strategy_output_and_close_fallback(self):
+        dates = pd.to_datetime(["2026-04-06"])
+        prices_close = pd.DataFrame(
+            {"AAA": [10.0], "BBB": [20.0], "CCC": [30.0]},
+            index=dates,
+        )
+        raw_signals = pd.DataFrame(
+            {
+                "signal": [1, 1, 1],
+                "weight": [0.4, 0.3, 0.3],
+                "strength": [3.0, 2.0, 1.0],
+                "planned_price": [10.5, None, 0.0],
+            },
+            index=["AAA", "BBB", "CCC"],
+        )
+        planned_prices = pd.DataFrame(index=dates, columns=["AAA", "BBB", "CCC"], dtype=float)
+        diagnostics = {"fallback_count": 0, "invalid_count": 0, "samples": []}
+
+        BacktestService._write_planned_prices_for_date(
+            planned_prices=planned_prices,
+            raw_signals=raw_signals,
+            selected_weights={"AAA": 0.4, "BBB": 0.3, "CCC": 0.3},
+            prices_close=prices_close,
+            trade_ts=dates[0],
+            diagnostics=diagnostics,
+        )
+
+        self.assertEqual(float(planned_prices.loc[dates[0], "AAA"]), 10.5)
+        self.assertEqual(float(planned_prices.loc[dates[0], "BBB"]), 20.0)
+        self.assertEqual(float(planned_prices.loc[dates[0], "CCC"]), 30.0)
+        self.assertEqual(diagnostics["fallback_count"], 2)
+        self.assertEqual(diagnostics["invalid_count"], 1)
+        self.assertTrue(
+            any(sample["planned_price_source"] == "decision_close" for sample in diagnostics["samples"])
+        )
+
+    def test_portfolio_compliance_metrics_flag_concentration_without_default_holding_violation(self):
         metrics = BacktestService._build_portfolio_compliance_metrics(
             rebalance_diagnostics=[
                 {"date": "2026-01-05", "positions_after": {"AAPL": 1.0}},
@@ -43,6 +143,32 @@ class BacktestDiagnosticsContractTests(unittest.TestCase):
         self.assertEqual(metrics["max_target_weight"], 1.0)
         self.assertFalse(metrics["compliance_pass"])
         self.assertIn("min_position_count", metrics["violations"])
+        self.assertNotIn("max_trade_holding_days", metrics["violations"])
+        self.assertIn("max_trade_holding_days", metrics["heuristic_violations"])
+
+    def test_portfolio_compliance_metrics_enforces_configured_holding_limit(self):
+        metrics = BacktestService._build_portfolio_compliance_metrics(
+            rebalance_diagnostics=[
+                {
+                    "date": "2026-01-05",
+                    "positions_after": {
+                        "A": 0.15,
+                        "B": 0.15,
+                        "C": 0.15,
+                        "D": 0.15,
+                        "E": 0.15,
+                        "F": 0.15,
+                        "G": 0.10,
+                    },
+                }
+            ],
+            trades=[
+                {"date": "2026-02-20", "ticker": "A", "action": "sell", "holding_days": 41},
+            ],
+            config={"compliance_max_holding_days": 21},
+        )
+
+        self.assertFalse(metrics["compliance_pass"])
         self.assertIn("max_trade_holding_days", metrics["violations"])
 
     def test_portfolio_compliance_metrics_pass_for_diversified_short_hold_portfolio(self):
@@ -72,6 +198,32 @@ class BacktestDiagnosticsContractTests(unittest.TestCase):
         self.assertLessEqual(metrics["max_target_weight"], 0.15)
         self.assertTrue(metrics["compliance_pass"])
 
+    def test_portfolio_compliance_metrics_does_not_fail_long_holds_without_hard_constraint(self):
+        metrics = BacktestService._build_portfolio_compliance_metrics(
+            rebalance_diagnostics=[
+                {
+                    "date": "2026-01-05",
+                    "positions_after": {
+                        "A": 0.15,
+                        "B": 0.15,
+                        "C": 0.15,
+                        "D": 0.15,
+                        "E": 0.15,
+                        "F": 0.15,
+                        "G": 0.10,
+                    },
+                }
+            ],
+            trades=[
+                {"date": "2026-03-01", "ticker": "A", "action": "sell", "holding_days": 41},
+            ],
+            config={"constraint_config": {"max_single_name_weight": 0.20}},
+        )
+
+        self.assertTrue(metrics["compliance_pass"])
+        self.assertEqual(metrics["max_trade_holding_days"], 41)
+        self.assertIn("max_trade_holding_days", metrics["heuristic_violations"])
+
     def test_constraint_config_caps_weights_and_reports_weekly_failures(self):
         constraints = BacktestService._merge_constraint_config(
             {"max_single_name_weight": 0.20, "weekly_turnover_floor": 0.30},
@@ -98,6 +250,38 @@ class BacktestDiagnosticsContractTests(unittest.TestCase):
         self.assertFalse(report["constraint_pass"])
         self.assertIn("weekly_turnover_floor", report["failed_constraints"])
         self.assertEqual(report["weekly_turnover"]["weeks"][1]["pass"], False)
+
+    def test_constraint_report_fails_raw_target_budget_before_single_name_cap(self):
+        weights, actions = BacktestService._apply_weight_constraints(
+            {
+                "A": 1.0,
+                "B": 1.0,
+                "C": 1.0,
+                "D": 1.0,
+                "E": 1.0,
+                "F": 1.0,
+                "G": 1.0,
+            },
+            {"max_single_name_weight": 0.20},
+        )
+        report = BacktestService._build_constraint_report(
+            constraint_config={"max_single_name_weight": 0.20},
+            rebalance_diagnostics=[
+                {
+                    "date": "2026-01-09",
+                    "positions_after": weights,
+                    "turnover": 1.0,
+                    "constraint_actions": actions,
+                },
+            ],
+            trades=[],
+            startup_state_report=None,
+        )
+
+        self.assertFalse(report["constraint_pass"])
+        self.assertIn("target_weight_budget", report["failed_constraints"])
+        self.assertEqual(report["target_weight_budget"]["max_raw_target_sum"], 7.0)
+        self.assertEqual(report["target_weight_budget"]["max_constrained_target_sum"], 1.4)
 
     def test_evaluation_slice_rebases_nav_and_excludes_warmup_trades(self):
         full = BacktestResult(
@@ -234,6 +418,46 @@ class BacktestDiagnosticsContractTests(unittest.TestCase):
         self.assertEqual(svc._model_service.load_model_calls, ["model_a", "model_b"])
         self.assertIn("model_a", result["2024-01-03"])
         self.assertIn("model_b", result["2024-01-03"])
+
+    def test_batch_predict_serializes_shared_feature_matrix_cache_builds(self):
+        fake_model_service = _ConcurrentFeatureModelService()
+        svc_a = BacktestService()
+        svc_b = BacktestService()
+        svc_a._model_service = fake_model_service
+        svc_b._model_service = fake_model_service
+
+        first = ThreadPoolExecutor(max_workers=1)
+        second = ThreadPoolExecutor(max_workers=1)
+        self.addCleanup(first.shutdown, wait=True)
+        self.addCleanup(second.shutdown, wait=True)
+
+        future_a = first.submit(
+            svc_a._batch_predict_all_dates,
+            ["model_a"],
+            ["sh.600000", "sh.600001"],
+            "2024-01-02",
+            "2024-01-03",
+            ["2024-01-03"],
+            "CN",
+        )
+        self.assertTrue(fake_model_service.first_compute_inside.wait(timeout=1))
+        future_b = second.submit(
+            svc_b._batch_predict_all_dates,
+            ["model_a"],
+            ["sh.600000", "sh.600001"],
+            "2024-01-02",
+            "2024-01-03",
+            ["2024-01-03"],
+            "CN",
+        )
+        fake_model_service.release_first_compute.set()
+
+        result_a = future_a.result(timeout=2)
+        result_b = future_b.result(timeout=2)
+
+        self.assertIn("model_a", result_a["2024-01-03"])
+        self.assertIn("model_a", result_b["2024-01-03"])
+        self.assertEqual(fake_model_service.max_active_compute_calls, 1)
 
     def test_save_result_persists_reproducibility_fingerprint(self):
         svc = BacktestService()
@@ -438,6 +662,39 @@ class _SharedFeatureModelService:
 
     def _break_prediction_ties(self, preds):
         return preds
+
+
+class _ConcurrentFeatureModelService(_SharedFeatureModelService):
+    def __init__(self):
+        super().__init__()
+        self.first_compute_inside = Event()
+        self.release_first_compute = Event()
+        self._active_lock = Lock()
+        self._active_compute_calls = 0
+        self.max_active_compute_calls = 0
+
+    def compute_features_from_cache(self, fs_id, tickers, start_date, end_date, market=None):
+        with self._active_lock:
+            self._active_compute_calls += 1
+            self.max_active_compute_calls = max(
+                self.max_active_compute_calls,
+                self._active_compute_calls,
+            )
+            active_now = self._active_compute_calls
+        try:
+            if active_now == 1:
+                self.first_compute_inside.set()
+                self.release_first_compute.wait(timeout=1)
+            return super().compute_features_from_cache(
+                fs_id,
+                tickers,
+                start_date,
+                end_date,
+                market=market,
+            )
+        finally:
+            with self._active_lock:
+                self._active_compute_calls -= 1
 
 
 class _LinearPredictModel:

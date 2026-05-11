@@ -9,8 +9,10 @@ from __future__ import annotations
 import json
 import hashlib
 import subprocess
+import threading
 import uuid
 from datetime import date, datetime
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -20,6 +22,7 @@ from backend.db import get_connection
 from backend.logger import get_logger
 from backend.services.backtest_engine import BacktestConfig, BacktestEngine, BacktestResult
 from backend.services import backtest_engine as backtest_engine_module
+from backend.services.execution_model_service import _positive_float
 from backend.services.factor_engine import FactorEngine
 from backend.services.group_service import GroupService
 from backend.services.market_context import (
@@ -43,6 +46,8 @@ _INITIAL_ENTRY_POLICIES = {
     "bootstrap_from_history",
     "require_warmup_state",
 }
+_PREDICTION_CACHE_LOCKS_GUARD = threading.Lock()
+_PREDICTION_CACHE_LOCKS: dict[tuple, threading.Lock] = {}
 
 
 class BacktestService:
@@ -153,6 +158,8 @@ class BacktestService:
             normalize_target_weights=normalize_target_weights,
             max_single_name_weight=constraint_config.get("max_single_name_weight"),
             max_holding_days=self._resolve_max_holding_days(constraint_config),
+            execution_model=config_dict.get("execution_model", "next_open"),
+            planned_price_buffer_bps=config_dict.get("planned_price_buffer_bps", 50),
         )
 
         max_position_pct = config_dict.get("max_position_pct", 0.10)
@@ -222,6 +229,15 @@ class BacktestService:
 
         # Create weight signals: DataFrame(index=dates, columns=tickers)
         all_weights = pd.DataFrame(0.0, index=prices_close.index, columns=tickers)
+        planned_prices = None
+        planned_price_diagnostics: dict[str, Any] | None = None
+        if bt_config.execution_model == "planned_price":
+            planned_prices = pd.DataFrame(np.nan, index=prices_close.index, columns=tickers)
+            planned_price_diagnostics = {
+                "fallback_count": 0,
+                "invalid_count": 0,
+                "samples": [],
+            }
 
         # ---- 6a. Pre-compute model predictions for ALL rebalance dates at once ----
         # This avoids per-date DB lookups, model loading, feature computation
@@ -343,6 +359,9 @@ class BacktestService:
                     date_key=date_key,
                     positions_before=positions_before,
                     positions_after={},
+                    target_positions_after={},
+                    target_layer="strategy_sized",
+                    executed_layer="post_constraints",
                     strategy_diagnostics=context.diagnostics,
                 )
                 diag_entry["phase"] = self._diagnostic_phase(
@@ -362,10 +381,20 @@ class BacktestService:
                 bt_config.max_positions,
                 max_position_pct,
             )
+            target_weights = dict(weights)
             weights, constraint_actions = self._apply_weight_constraints(
                 weights,
                 constraint_config,
             )
+            if planned_prices is not None and planned_price_diagnostics is not None:
+                self._write_planned_prices_for_date(
+                    planned_prices=planned_prices,
+                    raw_signals=raw_signals,
+                    selected_weights=weights,
+                    prices_close=prices_close,
+                    trade_ts=trade_ts,
+                    diagnostics=planned_price_diagnostics,
+                )
 
             # Write weights for this date
             for ticker, w in weights.items():
@@ -402,6 +431,9 @@ class BacktestService:
                 date_key=date_key,
                 positions_before=positions_before,
                 positions_after=port_weights,
+                target_positions_after=target_weights,
+                target_layer="strategy_sized",
+                executed_layer="post_constraints",
                 strategy_diagnostics=context.diagnostics,
             )
             diag_entry["phase"] = self._diagnostic_phase(
@@ -424,7 +456,18 @@ class BacktestService:
                 )
 
         # ---- 8. Run BacktestEngine ----
-        overlay_result = self._backtest_engine.run(all_weights, bt_config)
+        if planned_prices is not None:
+            overlay_result = self._backtest_engine.run(
+                all_weights,
+                bt_config,
+                planned_prices=planned_prices,
+            )
+        else:
+            overlay_result = self._backtest_engine.run(all_weights, bt_config)
+        if planned_price_diagnostics is not None:
+            overlay_result.trade_diagnostics.setdefault("planned_price_inputs", {}).update(
+                planned_price_diagnostics
+            )
         portfolio_config = config_dict.get("portfolio_overlay")
         if portfolio_config:
             base_result = self._run_base_portfolio_leg(
@@ -442,6 +485,10 @@ class BacktestService:
             )
         else:
             result = overlay_result
+        rebalance_diagnostics = self._merge_engine_rebalance_diagnostics(
+            rebalance_diagnostics,
+            (result.trade_diagnostics or {}).get("rebalance_execution_diagnostics"),
+        )
         startup_state_report = self._build_startup_state_report(
             rebalance_diagnostics=rebalance_diagnostics,
             warmup_start_date=str(warmup_start_date) if warmup_start_date else None,
@@ -1055,6 +1102,9 @@ class BacktestService:
         date_key: str,
         positions_before: dict[str, float],
         positions_after: dict[str, float],
+        target_positions_after: dict[str, float] | None = None,
+        target_layer: str = "strategy_target",
+        executed_layer: str = "executed",
         strategy_diagnostics: dict | None = None,
     ) -> dict:
         """Build a structured per-rebalance position delta snapshot."""
@@ -1068,9 +1118,15 @@ class BacktestService:
             for t, w in positions_after.items()
             if abs(float(w)) > 1e-8
         }
+        target_after = {
+            str(t): float(w)
+            for t, w in (target_positions_after or positions_after).items()
+            if abs(float(w)) > 1e-8
+        }
 
         before_tickers = set(before)
         after_tickers = set(after)
+        target_tickers = set(target_after)
         shared = before_tickers & after_tickers
 
         added = sorted(after_tickers - before_tickers)
@@ -1087,16 +1143,28 @@ class BacktestService:
             abs(after.get(ticker, 0.0) - before.get(ticker, 0.0))
             for ticker in before_tickers | after_tickers
         )
+        target_turnover = sum(
+            abs(target_after.get(ticker, 0.0) - before.get(ticker, 0.0))
+            for ticker in before_tickers | target_tickers
+        )
 
         diag = {
             "date": date_key,
             "positions_before": cls._round_weight_map(before),
             "positions_after": cls._round_weight_map(after),
+            "executed_positions_after": cls._round_weight_map(after),
+            "target_positions_after": cls._round_weight_map(target_after),
             "added": added,
             "removed": removed,
             "increased": increased,
             "decreased": decreased,
             "turnover": round(float(turnover), 6),
+            "target_turnover": round(float(target_turnover), 6),
+            "diagnostic_layers": {
+                "positions_after": executed_layer,
+                "executed_positions_after": executed_layer,
+                "target_positions_after": target_layer,
+            },
         }
         if strategy_diagnostics:
             diag.update(strategy_diagnostics)
@@ -1142,6 +1210,14 @@ class BacktestService:
                 continue
 
         config = config or {}
+        constraint_config = config.get("constraint_config")
+        if not isinstance(constraint_config, dict):
+            constraint_config = {}
+        holding_constraint_active = (
+            "compliance_max_holding_days" in config
+            or isinstance(constraint_config.get("holding_period"), dict)
+            and constraint_config["holding_period"].get("max_days") is not None
+        )
         thresholds = {
             "min_position_count": int(config.get("compliance_min_positions", 5)),
             "max_target_weight": float(config.get("compliance_max_target_weight", 0.20)),
@@ -1157,6 +1233,7 @@ class BacktestService:
         avg_target_sum = sum(target_sums) / len(target_sums) if target_sums else 0.0
 
         violations: dict[str, dict[str, float | int]] = {}
+        heuristic_violations: dict[str, dict[str, float | int]] = {}
         if position_counts and min_position_count < thresholds["min_position_count"]:
             violations["min_position_count"] = {
                 "actual": min_position_count,
@@ -1168,10 +1245,14 @@ class BacktestService:
                 "limit": thresholds["max_target_weight"],
             }
         if max_trade_holding_days > thresholds["max_trade_holding_days"]:
-            violations["max_trade_holding_days"] = {
+            holding_violation = {
                 "actual": max_trade_holding_days,
                 "limit": thresholds["max_trade_holding_days"],
             }
+            if holding_constraint_active:
+                violations["max_trade_holding_days"] = holding_violation
+            else:
+                heuristic_violations["max_trade_holding_days"] = holding_violation
         if max_target_sum > thresholds["max_target_sum"] + 1e-8:
             violations["max_target_sum"] = {
                 "actual": round(max_target_sum, 6),
@@ -1187,8 +1268,92 @@ class BacktestService:
             "avg_target_sum": round(float(avg_target_sum), 6),
             "thresholds": thresholds,
             "violations": violations,
+            "heuristic_violations": heuristic_violations,
             "compliance_pass": not violations,
         }
+
+    @staticmethod
+    def _merge_engine_rebalance_diagnostics(
+        service_diagnostics: list[dict],
+        engine_diagnostics: Any,
+    ) -> list[dict]:
+        if not isinstance(engine_diagnostics, list) or not engine_diagnostics:
+            return service_diagnostics
+        by_date = {
+            str(item.get("date"))[:10]: item
+            for item in engine_diagnostics
+            if isinstance(item, dict) and item.get("date")
+        }
+        if not by_date:
+            return service_diagnostics
+
+        merged: list[dict] = []
+        seen_dates: set[str] = set()
+        for diag in service_diagnostics or []:
+            date_key = str(diag.get("date"))[:10]
+            engine_diag = by_date.get(date_key)
+            if not engine_diag:
+                merged.append(diag)
+                continue
+            updated = dict(diag)
+            updated.update(engine_diag)
+            if "phase" in diag and "phase" not in engine_diag:
+                updated["phase"] = diag["phase"]
+            if "constraint_actions" in diag and "constraint_actions" not in engine_diag:
+                updated["constraint_actions"] = diag["constraint_actions"]
+            merged.append(updated)
+            seen_dates.add(date_key)
+
+        for date_key, engine_diag in by_date.items():
+            if date_key not in seen_dates:
+                merged.append(engine_diag)
+        return merged
+
+    @staticmethod
+    def _write_planned_prices_for_date(
+        *,
+        planned_prices: pd.DataFrame,
+        raw_signals: pd.DataFrame,
+        selected_weights: dict[str, float],
+        prices_close: pd.DataFrame,
+        trade_ts: pd.Timestamp,
+        diagnostics: dict[str, Any],
+    ) -> None:
+        for ticker in selected_weights:
+            if ticker not in planned_prices.columns:
+                continue
+            source = "strategy_output"
+            planned_price = None
+            if "planned_price" in raw_signals.columns and ticker in raw_signals.index:
+                planned_price = _positive_float(raw_signals.loc[ticker, "planned_price"])
+            if planned_price is None:
+                close_price = None
+                if trade_ts in prices_close.index and ticker in prices_close.columns:
+                    close_price = _positive_float(prices_close.loc[trade_ts, ticker])
+                if close_price is None:
+                    diagnostics["invalid_count"] = int(diagnostics.get("invalid_count") or 0) + 1
+                    continue
+                source = "decision_close"
+                planned_price = close_price
+                diagnostics["fallback_count"] = int(diagnostics.get("fallback_count") or 0) + 1
+                raw_value = (
+                    raw_signals.loc[ticker, "planned_price"]
+                    if "planned_price" in raw_signals.columns and ticker in raw_signals.index
+                    else None
+                )
+                if raw_value is not None and pd.notna(raw_value):
+                    diagnostics["invalid_count"] = int(diagnostics.get("invalid_count") or 0) + 1
+            planned_prices.loc[trade_ts, ticker] = planned_price
+            samples = diagnostics.setdefault("samples", [])
+            if len(samples) < 20:
+                samples.append(
+                    {
+                        "date": str(trade_ts.date()),
+                        "ticker": str(ticker),
+                        "planned_price": round(float(planned_price), 6),
+                        "planned_price_source": source,
+                    }
+                )
 
     @staticmethod
     def _apply_position_sizing(
@@ -1352,8 +1517,14 @@ class BacktestService:
             return {}, {}
         config = constraint_config if isinstance(constraint_config, dict) else {}
         max_weight = config.get("max_single_name_weight")
+        raw_target_sum = sum(max(0.0, float(weight)) for weight in weights.values())
         if max_weight is None:
-            return dict(weights), {}
+            actions = {}
+            if raw_target_sum > 1.000001:
+                actions["raw_target_sum"] = round(float(raw_target_sum), 6)
+                actions["constrained_target_sum"] = round(float(raw_target_sum), 6)
+                actions["target_sum_limit"] = 1.0
+            return dict(weights), actions
 
         limit = float(max_weight)
         clipped: dict[str, dict[str, float]] = {}
@@ -1369,10 +1540,17 @@ class BacktestService:
             if capped > 1e-8:
                 constrained[str(ticker)] = capped
 
-        actions = {
-            "max_single_name_weight": limit,
-            "clipped": clipped,
-        } if clipped else {}
+        constrained_target_sum = sum(constrained.values())
+        actions = {}
+        if clipped:
+            actions.update({
+                "max_single_name_weight": limit,
+                "clipped": clipped,
+            })
+        if raw_target_sum > 1.000001 or constrained_target_sum > 1.000001:
+            actions["raw_target_sum"] = round(float(raw_target_sum), 6)
+            actions["constrained_target_sum"] = round(float(constrained_target_sum), 6)
+            actions["target_sum_limit"] = 1.0
         return constrained, actions
 
     @staticmethod
@@ -1398,6 +1576,9 @@ class BacktestService:
 
         max_observed_weight = 0.0
         clipped_events = 0
+        max_raw_target_sum = 0.0
+        max_constrained_target_sum = 0.0
+        target_sum_dates: list[dict[str, Any]] = []
         for diag in rebalance_diagnostics or []:
             positions = diag.get("positions_after") or {}
             if isinstance(positions, dict):
@@ -1411,6 +1592,20 @@ class BacktestService:
                 clipped = actions.get("clipped") or {}
                 if isinstance(clipped, dict):
                     clipped_events += len(clipped)
+                try:
+                    raw_sum = float(actions.get("raw_target_sum") or 0.0)
+                    constrained_sum = float(actions.get("constrained_target_sum") or 0.0)
+                except (TypeError, ValueError):
+                    raw_sum = 0.0
+                    constrained_sum = 0.0
+                max_raw_target_sum = max(max_raw_target_sum, raw_sum)
+                max_constrained_target_sum = max(max_constrained_target_sum, constrained_sum)
+                if raw_sum > 1.000001 or constrained_sum > 1.000001:
+                    target_sum_dates.append({
+                        "date": str(diag.get("date"))[:10],
+                        "raw_target_sum": round(float(raw_sum), 6),
+                        "constrained_target_sum": round(float(constrained_sum), 6),
+                    })
 
         max_single_report = None
         if config.get("max_single_name_weight") is not None:
@@ -1502,12 +1697,25 @@ class BacktestService:
         if startup_report and startup_report.get("startup_silence_violation"):
             failed.append("startup_silence")
 
+        budget_report = None
+        if max_raw_target_sum > 0.0 or max_constrained_target_sum > 0.0:
+            budget_report = {
+                "limit": 1.0,
+                "max_raw_target_sum": round(float(max_raw_target_sum), 6),
+                "max_constrained_target_sum": round(float(max_constrained_target_sum), 6),
+                "violation_dates": target_sum_dates[:20],
+                "pass": max_raw_target_sum <= 1.000001 and max_constrained_target_sum <= 1.000001,
+            }
+            if not budget_report["pass"]:
+                failed.append("target_weight_budget")
+
         return {
             "constraint_pass": not failed,
             "failed_constraints": failed,
             "max_single_name_weight": max_single_report,
             "weekly_turnover": weekly_report,
             "holding_period": holding_report,
+            "target_weight_budget": budget_report,
             "rebalance_drift_buffer": config.get("rebalance_drift_buffer"),
             "startup_state_report": startup_report,
         }
@@ -1749,23 +1957,31 @@ class BacktestService:
                 if fs_id in feature_matrix_cache:
                     X = feature_matrix_cache[fs_id]
                 else:
-                    # Compute features for full date range (use bulk cache path)
-                    feature_data = self._model_service._feature_service.compute_features_from_cache(
-                        fs_id, tickers, start_date, end_date, market=resolved_market
+                    lock_key = self._prediction_feature_lock_key(
+                        market=resolved_market,
+                        feature_set_id=fs_id,
+                        tickers=tickers,
+                        start_date=start_date,
+                        end_date=end_date,
                     )
+                    with _prediction_cache_lock(lock_key):
+                        # Compute features for full date range (use bulk cache path)
+                        feature_data = self._model_service._feature_service.compute_features_from_cache(
+                            fs_id, tickers, start_date, end_date, market=resolved_market
+                        )
 
-                    # Build full X matrix: (date, ticker) x factors
-                    X, _ = ModelService._build_Xy(
-                        feature_data,
-                        # Dummy label_df: we only need X, not y
-                        pd.DataFrame(columns=["ticker", "date", "label_value"]),
-                    )
+                        # Build full X matrix: (date, ticker) x factors
+                        X, _ = ModelService._build_Xy(
+                            feature_data,
+                            # Dummy label_df: we only need X, not y
+                            pd.DataFrame(columns=["ticker", "date", "label_value"]),
+                        )
 
-                    # _build_Xy returns empty if no labels overlap.
-                    # Instead, build X directly from feature_data.
-                    if X.empty:
-                        X = self._build_full_X(feature_data)
-                    feature_matrix_cache[fs_id] = X
+                        # _build_Xy returns empty if no labels overlap.
+                        # Instead, build X directly from feature_data.
+                        if X.empty:
+                            X = self._build_full_X(feature_data)
+                        feature_matrix_cache[fs_id] = X
 
                 if X.empty:
                     log.warning("backtest_service.batch_predict.empty_X", model_id=model_id)
@@ -1820,6 +2036,23 @@ class BacktestService:
             )
 
         return result
+
+    @staticmethod
+    def _prediction_feature_lock_key(
+        *,
+        market: str,
+        feature_set_id: str,
+        tickers: list[str],
+        start_date: str,
+        end_date: str,
+    ) -> tuple:
+        return (
+            market,
+            feature_set_id,
+            tuple(sorted(str(ticker) for ticker in tickers)),
+            str(start_date),
+            str(end_date),
+        )
 
     @staticmethod
     def _build_full_X(feature_data: dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -2452,6 +2685,15 @@ def _compute_stock_pnl(trades: list[dict]) -> list[dict]:
     # Sort by realized_pnl descending
     results.sort(key=lambda x: x["realized_pnl"], reverse=True)
     return results
+
+
+def _prediction_cache_lock(key: tuple) -> threading.Lock:
+    with _PREDICTION_CACHE_LOCKS_GUARD:
+        lock = _PREDICTION_CACHE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _PREDICTION_CACHE_LOCKS[key] = lock
+        return lock
 
 
 def _cap_weights(

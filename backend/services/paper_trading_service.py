@@ -16,6 +16,12 @@ import pandas as pd
 from backend.db import get_connection
 from backend.logger import get_logger
 from backend.services.calendar_service import get_latest_trading_day, get_trading_days, offset_trading_days
+from backend.services.execution_model_service import (
+    evaluate_planned_price_fill,
+    normalize_execution_model,
+    normalize_planned_price_buffer_bps,
+    _positive_float,
+)
 from backend.services.group_service import GroupService
 from backend.services.market_context import normalize_market, normalize_ticker
 from backend.services.signal_service import SignalService
@@ -393,6 +399,15 @@ class PaperTradingService:
         slippage_rate = config.get("slippage_rate", 0.001)
         max_positions = config.get("max_positions", 50)
         cost_rate = commission_rate + slippage_rate
+        execution_model = normalize_execution_model(config.get("execution_model"))
+        planned_price_buffer_bps = normalize_planned_price_buffer_bps(
+            config.get("planned_price_buffer_bps")
+        )
+        planned_price_input_diagnostics = {
+            "fallback_count": 0,
+            "invalid_count": 0,
+            "samples": [],
+        }
 
         # Execution constraints (aligned with backtest engine)
         rebalance_buffer = config.get("rebalance_buffer", 0.0)
@@ -637,13 +652,34 @@ class PaperTradingService:
                 for ticker in set(current_execution_weights) | set(target_weights)
                 if abs(target_weights.get(ticker, 0.0) - current_execution_weights.get(ticker, 0.0)) < 1e-8
             }
+            planned_prices = None
+            if execution_model == "planned_price":
+                planned_prices = self._planned_prices_from_signals(
+                    signals=signals,
+                    target_weights=target_weights,
+                    signal_date=signal_date,
+                    price_cache=price_cache,
+                    diagnostics=planned_price_input_diagnostics,
+                )
 
             day_trades = self._execute_trades_cached(
                 positions, cash, target_weights,
                 trade_date, cost_rate, price_cache,
                 no_trade_tickers=no_trade_tickers,
+                execution_model=execution_model,
+                planned_prices=planned_prices,
+                planned_price_buffer_bps=planned_price_buffer_bps,
             )
-            execution_weights = dict(target_weights)
+            if execution_model == "planned_price":
+                execution_weights = self._execution_weights_after_trades(
+                    positions_before=positions,
+                    positions_after=day_trades["positions_after"],
+                    cash_after=float(day_trades["cash_after"]),
+                    trade_date=trade_date,
+                    price_cache=price_cache,
+                )
+            else:
+                execution_weights = dict(target_weights)
 
             # Track exits and holding days for execution constraints
             old_positions = set(positions.keys())
@@ -666,10 +702,23 @@ class PaperTradingService:
             total_new_trades += len(day_trades["trades"])
             nav = self._value_portfolio_cached(positions, cash, trade_date, price_cache)
 
+            trades_to_record = list(day_trades["trades"])
+            if execution_model == "planned_price" and day_trades.get("diagnostics"):
+                trades_to_record.append(
+                    {
+                        "type": "execution_diagnostics",
+                        "execution_model": "planned_price",
+                        "diagnostics": {
+                            **day_trades["diagnostics"],
+                            "planned_price_inputs": planned_price_input_diagnostics,
+                        },
+                    }
+                )
+
             daily_snapshots.append((
                 session_id, resolved_market, trade_date, nav, cash,
                 json.dumps(positions, default=str),
-                json.dumps(day_trades["trades"], default=str),
+                json.dumps(trades_to_record, default=str),
             ))
             days_processed += 1
 
@@ -709,12 +758,15 @@ class PaperTradingService:
             "baseline_days": baseline_days,
             "rebalance_freq": rebalance_freq,
             "rebalance_executions": len(rebalance_execution_days),
+            "execution_model": execution_model,
             "execution_rule": (
-                f"T+1 open, {rebalance_freq} rebalance; a fresh session records "
+                f"T+1 {execution_model}, {rebalance_freq} rebalance; a fresh session records "
                 "its first trading day as a no-trade baseline and starts "
                 "executing on the next eligible trading day"
             ),
         }
+        if execution_model == "planned_price":
+            result["planned_price_inputs"] = planned_price_input_diagnostics
         if days_without:
             result["message"] = (
                 f"已推进 {days_processed} 天。"
@@ -1676,12 +1728,17 @@ class PaperTradingService:
             signal_list = []
             for ticker in raw_signals.index:
                 row = raw_signals.loc[ticker]
-                signal_list.append({
+                signal = {
                     "ticker": str(ticker),
                     "signal": int(row.get("signal", 0)),
                     "target_weight": float(row.get("weight", 0.0)),
                     "strength": float(row.get("strength", 0.0)),
-                })
+                }
+                if "planned_price" in raw_signals.columns:
+                    planned_price = _positive_float(row.get("planned_price"))
+                    if planned_price is not None:
+                        signal["planned_price"] = planned_price
+                signal_list.append(signal)
             return signal_list
         except Exception as exc:
             log.warning("paper_trading.signal_single_day_failed", date=str(signal_date), error=str(exc))
@@ -1720,9 +1777,9 @@ class PaperTradingService:
         portfolio_value = cash
         current_prices: dict[str, float] = {}
         for ticker, pos in positions.items():
-            prices = best_prices.get(ticker)
-            if prices:
-                current_prices[ticker] = prices[1]  # close price
+            bar = _cached_bar(best_prices.get(ticker))
+            if bar:
+                current_prices[ticker] = bar["close"]
             else:
                 current_prices[ticker] = pos.get("avg_price", 0)
             portfolio_value += pos["shares"] * current_prices[ticker]
@@ -1767,9 +1824,9 @@ class PaperTradingService:
         unrealized_pnl: dict[str, float] = {}
         for ticker, entry_price in avg_entry_price.items():
             close_price = entry_price
-            prices = day_prices.get(ticker)
-            if prices and prices[1] > 0:
-                close_price = prices[1]
+            bar = _cached_bar(day_prices.get(ticker))
+            if bar and bar["close"] > 0:
+                close_price = bar["close"]
             unrealized_pnl[ticker] = (
                 close_price / entry_price - 1.0
                 if entry_price and entry_price > 0
@@ -1807,12 +1864,79 @@ class PaperTradingService:
 
         day_prices = price_cache.get(signal_date, {})
         for ticker in new_held - old_held:
-            prices = day_prices.get(ticker)
-            avg_entry_price[ticker] = float(prices[1]) if prices and prices[1] > 0 else 0.0
+            bar = _cached_bar(day_prices.get(ticker))
+            avg_entry_price[ticker] = float(bar["close"]) if bar and bar["close"] > 0 else 0.0
             holding_days[ticker] = 0
 
         current_weights.clear()
         current_weights.update(filtered_targets)
+
+    @staticmethod
+    def _planned_prices_from_signals(
+        *,
+        signals: list[dict],
+        target_weights: dict[str, float],
+        signal_date: date,
+        price_cache: dict[date, dict[str, tuple[float, float] | dict[str, float]]],
+        diagnostics: dict[str, Any],
+    ) -> dict[str, float]:
+        by_ticker = {str(sig.get("ticker")): sig for sig in signals}
+        day_prices = price_cache.get(signal_date, {})
+        planned_prices: dict[str, float] = {}
+        for ticker in target_weights:
+            signal = by_ticker.get(ticker, {})
+            planned_price = _positive_float(signal.get("planned_price"))
+            source = "strategy_output"
+            if planned_price is None:
+                bar = _cached_bar(day_prices.get(ticker))
+                if not bar or bar.get("close", 0.0) <= 0:
+                    diagnostics["invalid_count"] = int(diagnostics.get("invalid_count") or 0) + 1
+                    continue
+                planned_price = float(bar["close"])
+                source = "decision_close"
+                diagnostics["fallback_count"] = int(diagnostics.get("fallback_count") or 0) + 1
+                raw_value = signal.get("planned_price")
+                if raw_value is not None:
+                    diagnostics["invalid_count"] = int(diagnostics.get("invalid_count") or 0) + 1
+            planned_prices[ticker] = planned_price
+            samples = diagnostics.setdefault("samples", [])
+            if len(samples) < 20:
+                samples.append(
+                    {
+                        "date": str(signal_date),
+                        "ticker": ticker,
+                        "planned_price": round(float(planned_price), 6),
+                        "planned_price_source": source,
+                    }
+                )
+        return planned_prices
+
+    @staticmethod
+    def _execution_weights_after_trades(
+        *,
+        positions_before: dict[str, dict],
+        positions_after: dict[str, dict],
+        cash_after: float,
+        trade_date: date,
+        price_cache: dict[date, dict[str, tuple[float, float] | dict[str, float]]],
+    ) -> dict[str, float]:
+        del positions_before
+        day_prices = price_cache.get(trade_date, {})
+        portfolio_value = cash_after
+        values: dict[str, float] = {}
+        for ticker, pos in positions_after.items():
+            bar = _cached_bar(day_prices.get(ticker))
+            price = bar["open"] if bar else pos.get("avg_price", 0.0)
+            value = float(pos.get("shares", 0.0)) * float(price)
+            values[ticker] = value
+            portfolio_value += value
+        if portfolio_value <= 0:
+            return {}
+        return {
+            ticker: value / portfolio_value
+            for ticker, value in values.items()
+            if abs(value) > 1e-8
+        }
 
     @staticmethod
     def _apply_position_sizing_from_signals(
@@ -2268,20 +2392,27 @@ class PaperTradingService:
             return {}
         with registered_values_table(conn, "ticker", normalized_tickers, table_prefix="_qagent_tickers") as ticker_table:
             rows = conn.execute(
-                f"""SELECT b.date, b.ticker, b.open, b.close FROM daily_bars b
+                f"""SELECT b.date, b.ticker, b.open, b.high, b.low, b.close FROM daily_bars b
                     JOIN {ticker_table} t ON b.ticker = t.ticker
                     WHERE b.market = ?
                       AND b.date >= ? AND b.date <= ?""",
                 [resolved_market, start, end],
             ).fetchall()
 
-        cache: dict[date, dict[str, tuple[float, float]]] = {}
+        cache: dict[date, dict[str, dict[str, float]]] = {}
         for r in rows:
             d = r[0] if isinstance(r[0], date) else date.fromisoformat(str(r[0]))
             if d not in cache:
                 cache[d] = {}
-            if r[2] and r[3]:
-                cache[d][r[1]] = (float(r[2]), float(r[3]))
+            if r[2] and r[5]:
+                open_price = float(r[2])
+                close_price = float(r[5])
+                cache[d][r[1]] = {
+                    "open": open_price,
+                    "high": float(r[3]) if r[3] else max(open_price, close_price),
+                    "low": float(r[4]) if r[4] else min(open_price, close_price),
+                    "close": close_price,
+                }
         return cache
 
     def _load_latest_state(
@@ -2313,23 +2444,41 @@ class PaperTradingService:
         target_weights: dict[str, float],
         trade_date: date,
         cost_rate: float,
-        price_cache: dict[date, dict[str, tuple[float, float]]],
+        price_cache: dict[date, dict[str, tuple[float, float] | dict[str, float]]],
         no_trade_tickers: set[str] | None = None,
+        execution_model: str = "next_open",
+        planned_prices: dict[str, float] | None = None,
+        planned_price_buffer_bps: float = 50,
     ) -> dict:
         """Simulate trade execution using cached prices."""
+        execution_model = normalize_execution_model(execution_model)
+        planned_price_buffer_bps = normalize_planned_price_buffer_bps(planned_price_buffer_bps)
         day_prices = price_cache.get(trade_date, {})
         all_tickers = set(positions.keys()) | set(target_weights.keys())
         no_trade_tickers = no_trade_tickers or set()
+        planned_diagnostics = {
+            "execution_model": execution_model,
+            "planned_price_buffer_bps": planned_price_buffer_bps,
+            "filled_order_count": 0,
+            "blocked_order_count": 0,
+            "filled": [],
+            "blocked": [],
+        }
 
         # Calculate current portfolio value at open
         portfolio_value = cash
         for ticker, pos in positions.items():
-            prices = day_prices.get(ticker)
-            if prices:
-                portfolio_value += pos["shares"] * prices[0]  # open price
+            bar = _cached_bar(day_prices.get(ticker))
+            if bar:
+                portfolio_value += pos["shares"] * bar["open"]
 
         if portfolio_value <= 0:
-            return {"trades": [], "positions_after": positions, "cash_after": cash}
+            return {
+                "trades": [],
+                "positions_after": positions,
+                "cash_after": cash,
+                "diagnostics": {"planned_price_execution": planned_diagnostics},
+            }
 
         trades: list[dict] = []
         new_positions = dict(positions)
@@ -2340,11 +2489,36 @@ class PaperTradingService:
             old_shares = positions.get(ticker, {}).get("shares", 0.0)
             target_w = target_weights.get(ticker, 0.0)
 
-            prices = day_prices.get(ticker)
-            if not prices:
+            bar = _cached_bar(day_prices.get(ticker))
+            if not bar:
                 continue
-            price = prices[0]  # open price
-            if not price or price <= 0:
+            if execution_model == "planned_price":
+                planned_price = (planned_prices or {}).get(ticker)
+                fill_decision = evaluate_planned_price_fill(
+                    planned_price=planned_price,
+                    high=bar.get("high"),
+                    low=bar.get("low"),
+                    buffer_bps=planned_price_buffer_bps,
+                )
+                if not fill_decision.filled:
+                    planned_diagnostics["blocked_order_count"] += 1
+                    planned_diagnostics["blocked"].append(
+                        {
+                            "ticker": ticker,
+                            "date": str(trade_date),
+                            "reason": fill_decision.reason,
+                            "planned_price": planned_price,
+                            "high": bar.get("high"),
+                            "low": bar.get("low"),
+                            "lower_bound": fill_decision.lower_bound,
+                            "upper_bound": fill_decision.upper_bound,
+                        }
+                    )
+                    continue
+                price = fill_decision.fill_price
+            else:
+                price = bar["open"]
+            if price is None or price <= 0:
                 continue
 
             target_value = target_w * portfolio_value
@@ -2389,19 +2563,41 @@ class PaperTradingService:
                     "price": round(price, 4),
                     "cost": round(trade_cost, 4),
                 })
+            if execution_model == "planned_price":
+                planned_diagnostics["filled_order_count"] += 1
+                planned_diagnostics["filled"].append(
+                    {
+                        "ticker": ticker,
+                        "date": str(trade_date),
+                        "price": round(float(price), 4),
+                        "shares": round(abs(share_change), 4),
+                        "action": "buy" if share_change > 0 else "sell",
+                    }
+                )
 
-        return {
+        result = {
             "trades": trades,
             "positions_after": new_positions,
             "cash_after": round(cash, 2),
         }
+        if execution_model == "planned_price":
+            total = (
+                planned_diagnostics["filled_order_count"]
+                + planned_diagnostics["blocked_order_count"]
+            )
+            planned_diagnostics["fill_rate"] = (
+                round(planned_diagnostics["filled_order_count"] / total, 6)
+                if total else None
+            )
+        result["diagnostics"] = {"planned_price_execution": planned_diagnostics}
+        return result
 
     @staticmethod
     def _value_portfolio_cached(
         positions: dict[str, dict],
         cash: float,
         trade_date: date,
-        price_cache: dict[date, dict[str, tuple[float, float]]],
+        price_cache: dict[date, dict[str, tuple[float, float] | dict[str, float]]],
     ) -> float:
         """Value portfolio at close prices using cached data."""
         if not positions:
@@ -2410,9 +2606,9 @@ class PaperTradingService:
         day_prices = price_cache.get(trade_date, {})
         total = cash
         for ticker, pos in positions.items():
-            prices = day_prices.get(ticker)
-            if prices:
-                total += pos["shares"] * prices[1]  # close price
+            bar = _cached_bar(day_prices.get(ticker))
+            if bar:
+                total += pos["shares"] * bar["close"]
             else:
                 total += pos["shares"] * pos.get("avg_price", 0)
         return round(total, 2)
@@ -2548,3 +2744,32 @@ class PaperTradingService:
                 holding_days[ticker] = max(1, days_held)
 
         return holding_days
+
+
+def _cached_bar(value: tuple[float, float] | dict[str, float] | None) -> dict[str, float] | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        try:
+            open_price = float(value["open"])
+            close_price = float(value["close"])
+            high_price = float(value.get("high", max(open_price, close_price)))
+            low_price = float(value.get("low", min(open_price, close_price)))
+        except (KeyError, TypeError, ValueError):
+            return None
+        return {
+            "open": open_price,
+            "high": high_price,
+            "low": low_price,
+            "close": close_price,
+        }
+    if len(value) < 2:
+        return None
+    open_price = float(value[0])
+    close_price = float(value[1])
+    return {
+        "open": open_price,
+        "high": max(open_price, close_price),
+        "low": min(open_price, close_price),
+        "close": close_price,
+    }
