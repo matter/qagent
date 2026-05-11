@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -20,6 +24,13 @@ log = get_logger(__name__)
 
 _FEATURE_MATRIX_SCHEMA_VERSION = "1"
 _DEFAULT_DAILY_HOT_DAYS = 20
+_CACHE_WRITE_LOCKS_GUARD = threading.Lock()
+_CACHE_WRITE_LOCKS: dict[str, threading.Lock] = {}
+_TRANSIENT_DUCKDB_MARKERS = (
+    "TransactionContext Error",
+    "Conflict on tuple deletion",
+    "PRIMARY KEY or UNIQUE constraint violation",
+)
 
 
 class ResearchCacheService:
@@ -141,10 +152,8 @@ class ResearchCacheService:
             raise ValueError("feature_data must not be empty")
 
         path = self._feature_matrix_path(resolved_market, feature_set_id, cache_key)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        frame.to_parquet(path, index=True)
-        byte_size = path.stat().st_size
-        content_hash = _file_hash(path)
+        byte_size = 0
+        content_hash = ""
         metadata = {
             "tickers": normalized_tickers,
             "factor_refs": _canonical_jsonable(factor_refs),
@@ -155,45 +164,39 @@ class ResearchCacheService:
         now = utc_now_naive()
         expires_at = now + timedelta(days=ttl_days) if ttl_days > 0 else None
 
-        conn = get_connection()
-        conn.execute(
-            """INSERT OR REPLACE INTO research_cache_entries
-               (cache_key, object_type, market, object_id, uri, format,
-                schema_version, byte_size, content_hash, row_count,
-                feature_count, ticker_count, start_date, end_date, data_version,
-                retention_class, rebuildable, status, metadata, created_at,
-                updated_at, expires_at, last_accessed_at, hit_count, miss_count)
-               VALUES (?, 'feature_matrix', ?, ?, ?, 'parquet', ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?, TRUE, 'active', ?, COALESCE(
-                           (SELECT created_at FROM research_cache_entries WHERE cache_key = ?),
-                           ?
-                       ), ?, ?, NULL,
-                       COALESCE((SELECT hit_count FROM research_cache_entries WHERE cache_key = ?), 0),
-                       COALESCE((SELECT miss_count FROM research_cache_entries WHERE cache_key = ?), 0))""",
-            [
-                cache_key,
-                resolved_market,
-                feature_set_id,
-                str(path),
-                _FEATURE_MATRIX_SCHEMA_VERSION,
-                byte_size,
-                content_hash,
-                int(len(frame)),
-                int(len(feature_data)),
-                int(len(normalized_tickers)),
-                start_date,
-                end_date,
-                resolved_data_version,
-                retention_class,
-                json.dumps(metadata, default=str),
-                cache_key,
-                now,
-                now,
-                expires_at,
-                cache_key,
-                cache_key,
-            ],
-        )
+        insert_params = [
+            cache_key,
+            resolved_market,
+            feature_set_id,
+            str(path),
+            _FEATURE_MATRIX_SCHEMA_VERSION,
+            byte_size,
+            content_hash,
+            int(len(frame)),
+            int(len(feature_data)),
+            int(len(normalized_tickers)),
+            start_date,
+            end_date,
+            resolved_data_version,
+            retention_class,
+            json.dumps(metadata, default=str),
+            cache_key,
+            now,
+            now,
+            expires_at,
+            cache_key,
+            cache_key,
+        ]
+        with _cache_write_lock(cache_key):
+            path = self._feature_matrix_path(resolved_market, feature_set_id, cache_key)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            frame.to_parquet(path, index=True)
+            byte_size = path.stat().st_size
+            content_hash = _file_hash(path)
+            insert_params[3] = str(path)
+            insert_params[5] = byte_size
+            insert_params[6] = content_hash
+            self._execute_cache_metadata_write(insert_params, cache_key)
         log.info(
             "research_cache.feature_matrix.stored",
             cache_key=cache_key,
@@ -206,7 +209,12 @@ class ResearchCacheService:
 
     def default_data_version(self, market: str | None, as_of_date: str | None) -> str:
         resolved_market = normalize_market(market)
-        return f"{resolved_market}:{as_of_date or 'latest'}"
+        if not as_of_date:
+            raise ValueError(
+                "Research cache keys require a stable as_of_date or explicit data_version; "
+                "unversioned latest caches are not reproducible."
+            )
+        return f"{resolved_market}:asof:{as_of_date}"
 
     # ------------------------------------------------------------------
     # Inventory
@@ -526,6 +534,40 @@ class ResearchCacheService:
             [utc_now_naive(), utc_now_naive(), cache_key],
         )
 
+    @staticmethod
+    def _execute_cache_metadata_write(params: list[Any], cache_key: str) -> None:
+        query = """INSERT OR REPLACE INTO research_cache_entries
+           (cache_key, object_type, market, object_id, uri, format,
+            schema_version, byte_size, content_hash, row_count,
+            feature_count, ticker_count, start_date, end_date, data_version,
+            retention_class, rebuildable, status, metadata, created_at,
+            updated_at, expires_at, last_accessed_at, hit_count, miss_count)
+           VALUES (?, 'feature_matrix', ?, ?, ?, 'parquet', ?, ?, ?, ?,
+                   ?, ?, ?, ?, ?, ?, TRUE, 'active', ?, COALESCE(
+                       (SELECT created_at FROM research_cache_entries WHERE cache_key = ?),
+                       ?
+                   ), ?, ?, NULL,
+                   COALESCE((SELECT hit_count FROM research_cache_entries WHERE cache_key = ?), 0),
+                   COALESCE((SELECT miss_count FROM research_cache_entries WHERE cache_key = ?), 0))"""
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                get_connection().execute(query, params)
+                return
+            except Exception as exc:
+                if not _is_transient_duckdb_conflict(exc) or attempt == 2:
+                    raise
+                last_exc = exc
+                log.warning(
+                    "research_cache.feature_matrix.metadata_write_retry",
+                    cache_key=cache_key,
+                    attempt=attempt + 1,
+                    error=str(exc),
+                )
+                time.sleep(0.05 * (2 ** attempt))
+        if last_exc is not None:
+            raise last_exc
+
 
 def _canonical_jsonable(value: Any) -> Any:
     if isinstance(value, dict):
@@ -537,6 +579,22 @@ def _canonical_jsonable(value: Any) -> Any:
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(_canonical_jsonable(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+@contextmanager
+def _cache_write_lock(cache_key: str) -> Iterator[None]:
+    with _CACHE_WRITE_LOCKS_GUARD:
+        lock = _CACHE_WRITE_LOCKS.get(cache_key)
+        if lock is None:
+            lock = threading.Lock()
+            _CACHE_WRITE_LOCKS[cache_key] = lock
+    with lock:
+        yield
+
+
+def _is_transient_duckdb_conflict(exc: Exception) -> bool:
+    message = str(exc)
+    return any(marker in message for marker in _TRANSIENT_DUCKDB_MARKERS)
 
 
 def _file_hash(path: Path) -> str:

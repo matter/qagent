@@ -1704,6 +1704,93 @@ def train_model(
     )
 
 
+@mcp.tool()
+def train_model_distillation(
+    name: str,
+    teacher_model_id: str,
+    student_feature_set_id: str,
+    universe_group_id: str,
+    start_date: str,
+    end_date: str,
+    market: str | None = None,
+    model_type: str = "lightgbm",
+    model_params: dict | None = None,
+    train_config: dict | None = None,
+    objective_type: str | None = "regression",
+    ranking_config: dict | None = None,
+    prediction_feature_set_id: str | None = None,
+    label_name: str | None = None,
+) -> dict:
+    """Train a student model from frozen teacher prediction labels."""
+    from backend.tasks.models import TaskSource
+    resolved_market = _resolve_market(market)
+    svc = _model_service()
+    executor = _task_executor()
+
+    def _do_train_distillation(
+        name: str,
+        teacher_model_id: str,
+        student_feature_set_id: str,
+        universe_group_id: str,
+        start_date: str,
+        end_date: str,
+        market: str,
+        model_type: str,
+        model_params: dict | None,
+        train_config: dict | None,
+        objective_type: str | None,
+        ranking_config: dict | None,
+        prediction_feature_set_id: str | None,
+        label_name: str | None,
+    ) -> dict:
+        return svc.train_distilled_model(
+            name=name,
+            teacher_model_id=teacher_model_id,
+            student_feature_set_id=student_feature_set_id,
+            universe_group_id=universe_group_id,
+            start_date=start_date,
+            end_date=end_date,
+            market=market,
+            objective_type=objective_type,
+            model_type=model_type,
+            model_params=model_params,
+            train_config=train_config,
+            ranking_config=ranking_config,
+            prediction_feature_set_id=prediction_feature_set_id,
+            label_name=label_name,
+        )
+
+    task_id = executor.submit(
+        task_type="model_distillation_train",
+        fn=_do_train_distillation,
+        params={
+            "name": name,
+            "teacher_model_id": teacher_model_id,
+            "student_feature_set_id": student_feature_set_id,
+            "universe_group_id": universe_group_id,
+            "start_date": start_date,
+            "end_date": end_date,
+            "market": resolved_market,
+            "model_type": model_type,
+            "model_params": model_params,
+            "train_config": train_config,
+            "objective_type": objective_type,
+            "ranking_config": ranking_config,
+            "prediction_feature_set_id": prediction_feature_set_id,
+            "label_name": label_name,
+        },
+        timeout=7200,
+        source=TaskSource.AGENT,
+    )
+
+    return _task_response(
+        task_id=task_id,
+        task_type="model_distillation_train",
+        market=resolved_market,
+        name=name,
+    )
+
+
 # ======================================================================
 # Strategy tools
 # ======================================================================
@@ -1825,6 +1912,29 @@ def run_backtest(
         market=resolved_market,
         strategy_id=strategy_id,
     )
+
+
+@mcp.tool()
+def get_backtest_debug_replay(
+    backtest_id: str,
+    market: str | None = None,
+    date: str | None = None,
+    ticker: str | None = None,
+) -> dict:
+    """Load a temporary debug replay bundle produced by debug_mode backtest."""
+    resolved_market = _resolve_market(market)
+    return _backtest_service().get_debug_replay(
+        backtest_id,
+        market=resolved_market,
+        date=date,
+        ticker=ticker,
+    )
+
+
+@mcp.tool()
+def cleanup_backtest_debug_replay(ttl_hours: int = 24) -> dict:
+    """Delete expired temporary backtest debug replay bundles."""
+    return _backtest_service().cleanup_debug_replay(ttl_hours=ttl_hours)
 
 
 @mcp.tool()

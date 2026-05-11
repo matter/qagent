@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime
 from typing import Any
 
 from backend.db import get_connection
 from backend.logger import get_logger
 from backend.services.market_context import normalize_market
+from backend.tasks.json_safety import json_safe_string, json_safe_value
 from backend.time_utils import utc_now_naive
 from backend.tasks.models import TaskRecord, TaskSource, TaskStatus
 
@@ -42,9 +44,9 @@ class TaskStore:
                 task.run_id,
                 task.task_type,
                 task.status.value,
-                json.dumps(task.params) if task.params else None,
-                json.dumps(task.result_summary) if task.result_summary else None,
-                task.error_message,
+                json.dumps(json_safe_value(task.params)) if task.params else None,
+                json.dumps(json_safe_value(task.result_summary)) if task.result_summary else None,
+                json_safe_string(task.error_message) if task.error_message else None,
                 task.created_at,
                 task.started_at,
                 task.completed_at,
@@ -79,8 +81,8 @@ class TaskStore:
                 status.value,
                 started_at,
                 completed_at,
-                json.dumps(result_summary) if result_summary else None,
-                error_message,
+                json.dumps(json_safe_value(result_summary)) if result_summary else None,
+                json_safe_string(error_message) if error_message else None,
                 task_id,
             ],
         )
@@ -336,9 +338,9 @@ class TaskStore:
             run_id=row[1],
             task_type=row[2],
             status=TaskStatus(row[3]),
-            params=json.loads(row[4]) if row[4] else None,
-            result_summary=json.loads(row[5]) if row[5] else None,
-            error_message=row[6],
+            params=json_safe_value(json.loads(row[4])) if row[4] else None,
+            result_summary=json_safe_value(json.loads(row[5])) if row[5] else None,
+            error_message=json_safe_string(row[6]) if row[6] else None,
             created_at=row[7],
             started_at=row[8],
             completed_at=row[9],

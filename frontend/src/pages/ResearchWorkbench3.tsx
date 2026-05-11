@@ -5,8 +5,12 @@ import {
   Descriptions,
   Drawer,
   Empty,
+  Form,
+  Input,
+  InputNumber,
   message,
   Popconfirm,
+  Select,
   Space,
   Spin,
   Statistic,
@@ -17,6 +21,7 @@ import {
 } from "antd";
 import {
   AuditOutlined,
+  BarChartOutlined,
   BranchesOutlined,
   CheckCircleOutlined,
   ClearOutlined,
@@ -28,10 +33,12 @@ import {
 import type { ColumnsType } from "antd/es/table";
 import {
   archiveResearchArtifact3,
+  backtestStrategyGraph3,
   evaluatePromotion3,
   getBootstrapProject3,
   getDataQualityContract3,
   getProjectDataStatus3,
+  getStrategyGraphBacktest3,
   getResearchLineage3,
   listAgentPlaybooks3,
   listAgentResearchPlans3,
@@ -44,6 +51,7 @@ import {
   listQaReports3,
   listResearchArtifacts3,
   listResearchRuns3,
+  listStrategyGraphBacktests3,
   listStrategyGraphs3,
   listUniverses3,
   previewArtifactCleanup3,
@@ -51,6 +59,7 @@ import {
 import type {
   AgentPlaybook3,
   AgentResearchPlan3,
+  BacktestRun3,
   CleanupPreview3,
   DataQualityContract3,
   Dataset3,
@@ -70,6 +79,18 @@ import type {
 } from "../api";
 
 const { Text, Paragraph } = Typography;
+
+const dateRule = {
+  pattern: /^\d{4}-\d{2}-\d{2}$/,
+  message: "YYYY-MM-DD",
+};
+
+interface BacktestFormValues {
+  start_date: string;
+  end_date: string;
+  initial_capital: number;
+  price_field: string;
+}
 
 interface WorkbenchState {
   project: ResearchProject3 | null;
@@ -141,8 +162,14 @@ export default function ResearchWorkbench3() {
   const [selectedQa, setSelectedQa] = useState<QaReport3 | null>(null);
   const [lineage, setLineage] = useState<ResearchLineage3 | null>(null);
   const [cleanupPreview, setCleanupPreview] = useState<CleanupPreview3 | null>(null);
+  const [selectedGraph, setSelectedGraph] = useState<StrategyGraph3 | null>(null);
+  const [graphBacktests, setGraphBacktests] = useState<BacktestRun3[]>([]);
+  const [selectedBacktest, setSelectedBacktest] = useState<BacktestRun3 | null>(null);
+  const [backtestTaskId, setBacktestTaskId] = useState<string | null>(null);
+  const [backtestLoading, setBacktestLoading] = useState(false);
   const [actionLoading, setActionLoading] = useState(false);
   const [messageApi, contextHolder] = message.useMessage();
+  const [backtestForm] = Form.useForm<BacktestFormValues>();
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -277,6 +304,58 @@ export default function ResearchWorkbench3() {
     }
   };
 
+  const openStrategyGraph = async (graph: StrategyGraph3) => {
+    setSelectedGraph(graph);
+    setSelectedBacktest(null);
+    setBacktestTaskId(null);
+    backtestForm.setFieldsValue(defaultBacktestFormValues(state.dataStatus));
+    await loadGraphBacktests(graph.id);
+  };
+
+  const loadGraphBacktests = async (strategyGraphId: string) => {
+    setBacktestLoading(true);
+    try {
+      setGraphBacktests(await listStrategyGraphBacktests3(strategyGraphId, { limit: 20 }));
+    } catch {
+      messageApi.error("回测记录加载失败");
+    } finally {
+      setBacktestLoading(false);
+    }
+  };
+
+  const submitGraphBacktest = async (values: BacktestFormValues) => {
+    if (!selectedGraph) return;
+    setBacktestLoading(true);
+    try {
+      const response = await backtestStrategyGraph3(selectedGraph.id, {
+        start_date: values.start_date,
+        end_date: values.end_date,
+        initial_capital: Number(values.initial_capital),
+        price_field: values.price_field,
+        lifecycle_stage: selectedGraph.lifecycle_stage || "experiment",
+      });
+      setBacktestTaskId(response.task_id);
+      messageApi.success(`回测任务已提交：${response.task_id}`);
+      await loadGraphBacktests(selectedGraph.id);
+    } catch {
+      messageApi.error("回测任务提交失败");
+    } finally {
+      setBacktestLoading(false);
+    }
+  };
+
+  const openBacktestRun = async (backtest: BacktestRun3) => {
+    setBacktestLoading(true);
+    try {
+      setSelectedBacktest(await getStrategyGraphBacktest3(backtest.id));
+    } catch {
+      setSelectedBacktest(backtest);
+      messageApi.warning("回测详情加载失败，显示列表缓存");
+    } finally {
+      setBacktestLoading(false);
+    }
+  };
+
   const summary = useMemo(() => {
     const protectedArtifacts = state.artifacts.filter((item) =>
       ["validated", "published"].includes(item.lifecycle_stage),
@@ -381,6 +460,80 @@ export default function ResearchWorkbench3() {
     },
     { title: "License", dataIndex: "license_scope", width: 170 },
     { title: "Availability", dataIndex: "availability", width: 190 },
+  ];
+
+  const graphColumns: ColumnsType<StrategyGraph3> = [
+    {
+      title: "StrategyGraph",
+      dataIndex: "id",
+      width: 150,
+      render: (value: string, row) => <Button type="link" size="small" onClick={() => openStrategyGraph(row)}>{value}</Button>,
+    },
+    { title: "Name", dataIndex: "name", width: 220, ellipsis: true },
+    { title: "Type", dataIndex: "graph_type", width: 150 },
+    {
+      title: "Status",
+      dataIndex: "status",
+      width: 100,
+      render: (value: string) => <Tag color={statusColor(value)}>{value}</Tag>,
+    },
+    {
+      title: "Lifecycle",
+      dataIndex: "lifecycle_stage",
+      width: 120,
+      render: (value: string) => <Tag>{value}</Tag>,
+    },
+    {
+      title: "Action",
+      key: "action",
+      width: 110,
+      render: (_, row) => (
+        <Button size="small" icon={<BarChartOutlined />} onClick={() => openStrategyGraph(row)}>
+          回测
+        </Button>
+      ),
+    },
+  ];
+
+  const backtestColumns: ColumnsType<BacktestRun3> = [
+    {
+      title: "Backtest",
+      dataIndex: "id",
+      width: 130,
+      render: (value: string, row) => <Button type="link" size="small" onClick={() => openBacktestRun(row)}>{value}</Button>,
+    },
+    { title: "Start", dataIndex: "start_date", width: 110 },
+    { title: "End", dataIndex: "end_date", width: 110 },
+    {
+      title: "Status",
+      dataIndex: "status",
+      width: 100,
+      render: (value: string) => <Tag color={statusColor(value)}>{value}</Tag>,
+    },
+    {
+      title: "Return",
+      key: "return",
+      width: 100,
+      render: (_, row) => percentText(numberField(row.summary, "total_return")),
+    },
+    {
+      title: "Final NAV",
+      key: "final_nav",
+      width: 120,
+      render: (_, row) => currencyText(numberField(row.summary, "final_nav")),
+    },
+    {
+      title: "Costs",
+      key: "total_cost",
+      width: 100,
+      render: (_, row) => currencyText(numberField(row.summary, "total_cost")),
+    },
+    {
+      title: "Created",
+      dataIndex: "created_at",
+      width: 170,
+      render: timeText,
+    },
   ];
 
   const macroColumns: ColumnsType<MacroSeries> = [
@@ -504,15 +657,28 @@ export default function ResearchWorkbench3() {
             },
             {
               key: "review",
-              label: "Human Review",
+              label: "Data Quality",
               children: (
                 <Space orientation="vertical" size={12} style={{ width: "100%" }}>
                   <Alert
-                    type={summary.nonPitSources > 0 ? "warning" : "info"}
+                    type={hasBlockedPublicationGate(state.qualityContract) ? "warning" : "info"}
                     showIcon
                     message={`Data quality contract: ${String(state.qualityContract?.summary?.highest_quality_level ?? "unknown")}`}
-                    description={`PIT-supported capabilities: ${state.providerCapabilities.filter((item) => item.pit_supported).length} / ${state.providerCapabilities.length}. Free/web sources are reviewable but not publication-grade unless the evidence package proves availability timing.`}
+                    description={`Publication grade: ${String(state.qualityContract?.summary?.publication_grade ?? false)}; PIT-supported capabilities: ${state.providerCapabilities.filter((item) => item.pit_supported).length} / ${state.providerCapabilities.length}.`}
                   />
+                  <SimpleList title="Publication Gates" empty={(state.qualityContract?.publication_gates ?? []).length === 0}>
+                    {(state.qualityContract?.publication_gates ?? []).map((item, index) => (
+                      <SimpleListItem key={`${String(item.gate ?? "gate")}-${index}`}>
+                        <Space orientation="vertical" size={2}>
+                          <Space wrap>
+                            <Tag color={statusColor(String(item.status ?? ""))}>{String(item.status ?? "unknown")}</Tag>
+                            <Text strong>{String(item.gate ?? "gate")}</Text>
+                          </Space>
+                          <Text type="secondary">{String(item.reason ?? "")}</Text>
+                        </Space>
+                      </SimpleListItem>
+                    ))}
+                  </SimpleList>
                   <Table
                     rowKey={(row) => `${row.provider}:${row.dataset}:${row.market_profile_id}:${row.capability}`}
                     size="small"
@@ -537,13 +703,23 @@ export default function ResearchWorkbench3() {
               key: "assets",
               label: "Assets",
               children: (
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 12 }}>
-                  <AssetList title="Universes" items={state.universes.map((item) => [item.name, item.status, item.id])} />
-                  <AssetList title="Datasets" items={state.datasets.map((item) => [item.name, item.status, item.id])} />
-                  <AssetList title="Strategy Graphs" items={state.strategyGraphs.map((item) => [item.name, item.status, item.id])} />
-                  <AssetList title="Production Signals" items={state.productionSignals.map((item) => [item.strategy_graph_id, item.status, item.id])} />
-                  <AssetList title="Paper Sessions" items={state.paperSessions.map((item) => [item.name, item.status, item.id])} />
-                </div>
+                <Space orientation="vertical" size={12} style={{ width: "100%" }}>
+                  <Table
+                    rowKey="id"
+                    size="small"
+                    title={() => "Strategy Graphs"}
+                    columns={graphColumns}
+                    dataSource={state.strategyGraphs}
+                    pagination={{ pageSize: 8 }}
+                    scroll={{ x: 850 }}
+                  />
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 12 }}>
+                    <AssetList title="Universes" items={state.universes.map((item) => [item.name, item.status, item.id])} />
+                    <AssetList title="Datasets" items={state.datasets.map((item) => [item.name, item.status, item.id])} />
+                    <AssetList title="Production Signals" items={state.productionSignals.map((item) => [item.strategy_graph_id, item.status, item.id])} />
+                    <AssetList title="Paper Sessions" items={state.paperSessions.map((item) => [item.name, item.status, item.id])} />
+                  </div>
+                </Space>
               ),
             },
             {
@@ -709,7 +885,120 @@ export default function ResearchWorkbench3() {
           </Space>
         ) : null}
       </Drawer>
+
+      <Drawer
+        title={selectedGraph ? `StrategyGraph ${selectedGraph.id}` : "StrategyGraph"}
+        open={!!selectedGraph}
+        onClose={() => {
+          setSelectedGraph(null);
+          setGraphBacktests([]);
+          setSelectedBacktest(null);
+          setBacktestTaskId(null);
+        }}
+        size={860}
+      >
+        {selectedGraph ? (
+          <Spin spinning={backtestLoading}>
+            <Space orientation="vertical" size={16} style={{ width: "100%" }}>
+              <Descriptions size="small" bordered column={1}>
+                <Descriptions.Item label="Name">{selectedGraph.name}</Descriptions.Item>
+                <Descriptions.Item label="Market">{selectedGraph.market_profile_id}</Descriptions.Item>
+                <Descriptions.Item label="Type">{selectedGraph.graph_type}</Descriptions.Item>
+                <Descriptions.Item label="Status"><Tag color={statusColor(selectedGraph.status)}>{selectedGraph.status}</Tag></Descriptions.Item>
+                <Descriptions.Item label="Dependencies">{shortJson(selectedGraph.dependency_refs)}</Descriptions.Item>
+              </Descriptions>
+              <Form
+                form={backtestForm}
+                layout="inline"
+                initialValues={defaultBacktestFormValues(state.dataStatus)}
+                onFinish={submitGraphBacktest}
+                style={{ rowGap: 8 }}
+              >
+                <Form.Item
+                  name="start_date"
+                  rules={[{ required: true, message: "start date required" }, dateRule]}
+                >
+                  <Input style={{ width: 130 }} placeholder="YYYY-MM-DD" />
+                </Form.Item>
+                <Form.Item
+                  name="end_date"
+                  rules={[{ required: true, message: "end date required" }, dateRule]}
+                >
+                  <Input style={{ width: 130 }} placeholder="YYYY-MM-DD" />
+                </Form.Item>
+                <Form.Item
+                  name="initial_capital"
+                  rules={[{ required: true, message: "capital required" }]}
+                >
+                  <InputNumber min={1000} step={10000} style={{ width: 150 }} />
+                </Form.Item>
+                <Form.Item name="price_field" rules={[{ required: true }]}>
+                  <Select
+                    style={{ width: 110 }}
+                    options={[
+                      { value: "open", label: "open" },
+                      { value: "close", label: "close" },
+                    ]}
+                  />
+                </Form.Item>
+                <Button type="primary" htmlType="submit" icon={<BarChartOutlined />} loading={backtestLoading}>
+                  运行回测
+                </Button>
+              </Form>
+              {backtestTaskId ? (
+                <Alert type="success" showIcon message="Backtest task queued" description={backtestTaskId} />
+              ) : null}
+              <Table
+                rowKey="id"
+                size="small"
+                columns={backtestColumns}
+                dataSource={graphBacktests}
+                pagination={{ pageSize: 8 }}
+                scroll={{ x: 940 }}
+              />
+              <BacktestSummaryPanel backtest={selectedBacktest ?? graphBacktests[0] ?? null} />
+            </Space>
+          </Spin>
+        ) : null}
+      </Drawer>
     </Spin>
+  );
+}
+
+function BacktestSummaryPanel({ backtest }: { backtest: BacktestRun3 | null }) {
+  if (!backtest) {
+    return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} />;
+  }
+  const diagnostics = objectField(backtest.summary, "fill_diagnostics");
+  const warnings = arrayField(backtest.summary, "valuation_warnings");
+  return (
+    <Space orientation="vertical" size={12} style={{ width: "100%" }}>
+      <Descriptions size="small" bordered column={2}>
+        <Descriptions.Item label="Selected">{backtest.id}</Descriptions.Item>
+        <Descriptions.Item label="Status"><Tag color={statusColor(backtest.status)}>{backtest.status}</Tag></Descriptions.Item>
+        <Descriptions.Item label="Return">{percentText(numberField(backtest.summary, "total_return"))}</Descriptions.Item>
+        <Descriptions.Item label="Final NAV">{currencyText(numberField(backtest.summary, "final_nav"))}</Descriptions.Item>
+        <Descriptions.Item label="Total Cost">{currencyText(numberField(backtest.summary, "total_cost"))}</Descriptions.Item>
+        <Descriptions.Item label="Days">{String(numberField(backtest.summary, "days_processed") ?? "-")}</Descriptions.Item>
+      </Descriptions>
+      <SimpleList title="Fill Diagnostics" empty={Object.keys(diagnostics).length === 0}>
+        {Object.entries(diagnostics).map(([key, value]) => (
+          <SimpleListItem key={key}>
+            <Space>
+              <Text strong>{key}</Text>
+              <Text type="secondary">{String(value)}</Text>
+            </Space>
+          </SimpleListItem>
+        ))}
+      </SimpleList>
+      <SimpleList title="Valuation Warnings" empty={warnings.length === 0}>
+        {warnings.map((item, index) => (
+          <SimpleListItem key={index}>
+            <Text>{shortJson(item)}</Text>
+          </SimpleListItem>
+        ))}
+      </SimpleList>
+    </Space>
   );
 }
 
@@ -780,4 +1069,47 @@ function SimpleListItem({ children }: { children: React.ReactNode }) {
       {children}
     </div>
   );
+}
+
+function defaultBacktestFormValues(dataStatus: ProjectDataStatus3 | null): BacktestFormValues {
+  const end = dataStatus?.latest_trading_day ?? todayText();
+  const start = dataStatus?.coverage.date_range.min ?? end;
+  return {
+    start_date: start,
+    end_date: end,
+    initial_capital: 1_000_000,
+    price_field: "open",
+  };
+}
+
+function todayText() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function numberField(source: Record<string, unknown>, key: string): number | null {
+  const value = source[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function objectField(source: Record<string, unknown>, key: string): Record<string, unknown> {
+  const value = source[key];
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function arrayField(source: Record<string, unknown>, key: string): unknown[] {
+  const value = source[key];
+  return Array.isArray(value) ? value : [];
+}
+
+function percentText(value: number | null) {
+  return value == null ? "-" : `${(value * 100).toFixed(2)}%`;
+}
+
+function currencyText(value: number | null) {
+  return value == null ? "-" : value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+
+function hasBlockedPublicationGate(contract: DataQualityContract3 | null) {
+  const gates = contract?.publication_gates;
+  return Array.isArray(gates) && gates.some((item) => String(item.status ?? "") === "blocked");
 }

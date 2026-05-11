@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import threading
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from backend.logger import get_logger
 from backend.services.market_context import normalize_market
@@ -18,6 +20,8 @@ log = get_logger(__name__)
 router = APIRouter(prefix="/api", tags=["models"])
 
 _service: ModelService | None = None
+_PREDICT_API_CONCURRENCY_LIMIT = 2
+_PREDICT_API_SEMAPHORE = threading.BoundedSemaphore(_PREDICT_API_CONCURRENCY_LIMIT)
 
 
 def _get_service() -> ModelService:
@@ -48,6 +52,24 @@ class TrainModelRequest(BaseModel):
     sample_weight_config: Optional[dict[str, Any]] = None
     objective_type: Optional[str] = None
     ranking_config: Optional[dict[str, Any]] = None
+
+
+class TrainDistillationRequest(BaseModel):
+    market: Optional[str] = None
+    name: str
+    teacher_model_id: str
+    student_feature_set_id: str
+    universe_group_id: str
+    start_date: str
+    end_date: str
+    model_type: str = "lightgbm"
+    model_params: Optional[dict[str, Any]] = None
+    train_config: Optional[dict[str, Any]] = None
+    sample_weight_config: Optional[dict[str, Any]] = None
+    objective_type: Optional[str] = "regression"
+    ranking_config: Optional[dict[str, Any]] = None
+    prediction_feature_set_id: Optional[str] = None
+    label_name: Optional[str] = None
 
 
 class PredictRequest(BaseModel):
@@ -148,6 +170,91 @@ async def train_model(body: TrainModelRequest) -> dict:
     return {"task_id": task_id, "status": "queued", "name": body.name, "market": resolved_market}
 
 
+@router.post("/models/train-distillation")
+async def train_model_distillation(body: TrainDistillationRequest) -> dict:
+    """Trigger teacher-prediction label generation and student model training."""
+    svc = _get_service()
+    executor = _get_executor()
+    try:
+        resolved_market = normalize_market(body.market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    def _do_train_distillation(
+        name: str,
+        teacher_model_id: str,
+        student_feature_set_id: str,
+        universe_group_id: str,
+        start_date: str,
+        end_date: str,
+        market: str,
+        model_type: str,
+        model_params: dict | None,
+        train_config: dict | None,
+        sample_weight_config: dict | None,
+        objective_type: str | None,
+        ranking_config: dict | None,
+        prediction_feature_set_id: str | None,
+        label_name: str | None,
+    ) -> dict:
+        return svc.train_distilled_model(
+            name=name,
+            teacher_model_id=teacher_model_id,
+            student_feature_set_id=student_feature_set_id,
+            universe_group_id=universe_group_id,
+            start_date=start_date,
+            end_date=end_date,
+            market=market,
+            model_type=model_type,
+            model_params=model_params,
+            train_config=train_config,
+            sample_weight_config=sample_weight_config,
+            objective_type=objective_type,
+            ranking_config=ranking_config,
+            prediction_feature_set_id=prediction_feature_set_id,
+            label_name=label_name,
+        )
+
+    task_id = executor.submit(
+        task_type="model_distillation_train",
+        fn=_do_train_distillation,
+        params={
+            "name": body.name,
+            "teacher_model_id": body.teacher_model_id,
+            "student_feature_set_id": body.student_feature_set_id,
+            "universe_group_id": body.universe_group_id,
+            "start_date": body.start_date,
+            "end_date": body.end_date,
+            "market": resolved_market,
+            "model_type": body.model_type,
+            "model_params": body.model_params,
+            "train_config": body.train_config,
+            "sample_weight_config": body.sample_weight_config,
+            "objective_type": body.objective_type,
+            "ranking_config": body.ranking_config,
+            "prediction_feature_set_id": body.prediction_feature_set_id,
+            "label_name": body.label_name,
+        },
+        timeout=7200,
+        source=TaskSource.UI,
+    )
+
+    log.info(
+        "api.model.distillation_train_triggered",
+        task_id=task_id,
+        name=body.name,
+        teacher_model_id=body.teacher_model_id,
+        market=resolved_market,
+    )
+    return {
+        "task_id": task_id,
+        "status": "queued",
+        "task_type": "model_distillation_train",
+        "name": body.name,
+        "market": resolved_market,
+    }
+
+
 @router.get("/models")
 async def list_models(market: Optional[str] = Query(None)) -> list[dict]:
     """List all trained models."""
@@ -187,9 +294,19 @@ async def predict(model_id: str, body: PredictRequest) -> dict:
     For regression models, returns prediction per ticker.
     """
     svc = _get_service()
+    acquired = _PREDICT_API_SEMAPHORE.acquire(blocking=False)
+    if not acquired:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Too many concurrent prediction requests; retry after the "
+                "current diagnostics finish"
+            ),
+        )
     try:
         resolved_market = normalize_market(body.market)
-        df = svc.predict_detailed(
+        df = await run_in_threadpool(
+            svc.predict_detailed,
             model_id=model_id,
             tickers=body.tickers,
             date=body.date,
@@ -231,6 +348,8 @@ async def predict(model_id: str, body: PredictRequest) -> dict:
     except Exception as e:
         log.error("api.model.predict_error", model_id=model_id, error=str(e))
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
+    finally:
+        _PREDICT_API_SEMAPHORE.release()
 
 
 @router.post("/models/{model_id}/predict-batch")
@@ -241,9 +360,19 @@ async def predict_batch(model_id: str, body: PredictBatchRequest) -> dict:
     predicts per date.  Much faster than calling predict() per date.
     """
     svc = _get_service()
+    acquired = _PREDICT_API_SEMAPHORE.acquire(blocking=False)
+    if not acquired:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Too many concurrent prediction requests; retry after the "
+                "current diagnostics finish"
+            ),
+        )
     try:
         resolved_market = normalize_market(body.market)
-        results = svc.predict_batch(
+        results = await run_in_threadpool(
+            svc.predict_batch,
             model_id=model_id,
             tickers=body.tickers,
             dates=body.dates,
@@ -263,3 +392,5 @@ async def predict_batch(model_id: str, body: PredictBatchRequest) -> dict:
     except Exception as e:
         log.error("api.model.predict_batch_error", model_id=model_id, error=str(e))
         raise HTTPException(status_code=500, detail=f"Batch prediction failed: {e}")
+    finally:
+        _PREDICT_API_SEMAPHORE.release()

@@ -52,6 +52,18 @@ class DataQualityServiceContractTests(unittest.TestCase):
         self.assertEqual(contract["market_profile_id"], "US_EQ")
         self.assertEqual(fake_service.calls[1], ("contract", "US_EQ"))
 
+    def test_equity_quality_contract_blocks_publication_without_pit_and_survivorship(self):
+        service = DataQualityService()
+
+        contract = service.get_data_quality_contract(market_profile_id="CN_A")
+
+        self.assertFalse(contract["summary"]["publication_grade"])
+        gates = {item["gate"]: item for item in contract["publication_gates"]}
+        self.assertEqual(gates["pit_data"]["status"], "blocked")
+        self.assertEqual(gates["survivorship_safe_universe"]["status"], "blocked")
+        self.assertEqual(gates["corporate_actions"]["status"], "blocked")
+        self.assertIn("publication-grade", contract["policy"]["research_grade_warning"])
+
 
 class _FakeDataQualityService:
     def __init__(self):

@@ -46,12 +46,18 @@ class FredClient:
         *,
         start_date: str | date | None = None,
         end_date: str | date | None = None,
+        realtime_start: str | date | None = None,
+        realtime_end: str | date | None = None,
     ) -> list[dict[str, Any]]:
         params: dict[str, Any] = {"series_id": series_id}
         if start_date:
             params["observation_start"] = _date_str(start_date)
         if end_date:
             params["observation_end"] = _date_str(end_date)
+        if realtime_start:
+            params["realtime_start"] = _date_str(realtime_start)
+        if realtime_end:
+            params["realtime_end"] = _date_str(realtime_end)
         payload = self._get("series/observations", params)
         return [dict(row) for row in payload.get("observations", [])]
 
@@ -84,6 +90,8 @@ class MacroDataService:
         series_ids: list[str],
         start_date: str | date | None = None,
         end_date: str | date | None = None,
+        realtime_start: str | date | None = None,
+        realtime_end: str | date | None = None,
     ) -> dict[str, Any]:
         normalized_series = _normalize_series_ids(series_ids)
         if not normalized_series:
@@ -101,6 +109,8 @@ class MacroDataService:
                     series_id,
                     start_date=start_date,
                     end_date=end_date,
+                    realtime_start=realtime_start,
+                    realtime_end=realtime_end,
                 )
                 self._upsert_series_metadata(conn, series_id, metadata)
                 inserted = self._upsert_observations(conn, series_id, observations)
@@ -125,6 +135,8 @@ class MacroDataService:
             "failures": failures,
             "start_date": _date_str(start_date) if start_date else None,
             "end_date": _date_str(end_date) if end_date else None,
+            "realtime_start": _date_str(realtime_start) if realtime_start else None,
+            "realtime_end": _date_str(realtime_end) if realtime_end else None,
         }
 
     def query_series(
@@ -177,6 +189,84 @@ class MacroDataService:
                 "available_at": _format_datetime(row[6]),
                 "value": row[7],
                 "source_metadata": _parse_json(row[8]),
+            }
+            for row in rows
+        ]
+
+    def query_series_as_of(
+        self,
+        *,
+        series_ids: list[str] | None = None,
+        start_date: str | date | None = None,
+        end_date: str | date | None = None,
+        decision_time: str | date | datetime,
+        provider: str = "fred",
+        limit: int = 10000,
+    ) -> list[dict[str, Any]]:
+        """Return the latest stored realtime version visible at decision_time.
+
+        This is a strict point-in-time query over locally materialized
+        observations. It does not fetch missing historical realtime windows; if
+        the store only contains the provider's current window, callers should
+        still treat the source as non-publication-grade.
+        """
+        normalized_provider = provider.lower()
+        normalized_series = _normalize_series_ids(series_ids or [])
+        decision_ts = _timestamp_str(decision_time)
+        query = [
+            """WITH visible AS (
+                   SELECT o.provider, o.series_id, s.title, o.date,
+                          o.realtime_start, o.realtime_end, o.available_at,
+                          o.value, o.source_metadata,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY o.provider, o.series_id, o.date
+                              ORDER BY o.available_at DESC, o.realtime_start DESC
+                          ) AS rn
+                     FROM macro_observations o
+                     LEFT JOIN macro_series s
+                       ON s.provider = o.provider AND s.series_id = o.series_id
+                    WHERE o.provider = ?
+                      AND o.available_at <= ?"""
+        ]
+        params: list[Any] = [normalized_provider, decision_ts]
+        if normalized_series:
+            placeholders = ", ".join("?" for _ in normalized_series)
+            query.append(f"AND o.series_id IN ({placeholders})")
+            params.extend(normalized_series)
+        if start_date:
+            query.append("AND o.date >= ?")
+            params.append(_date_str(start_date))
+        if end_date:
+            query.append("AND o.date <= ?")
+            params.append(_date_str(end_date))
+        query.append(
+            """)
+               SELECT provider, series_id, title, date, realtime_start,
+                      realtime_end, available_at, value, source_metadata
+                 FROM visible
+                WHERE rn = 1
+                ORDER BY series_id, date
+                LIMIT ?"""
+        )
+        params.append(limit)
+
+        rows = get_connection().execute("\n".join(query), params).fetchall()
+        return [
+            {
+                "provider": row[0],
+                "series_id": row[1],
+                "title": row[2],
+                "date": str(row[3]),
+                "realtime_start": str(row[4]),
+                "realtime_end": str(row[5]),
+                "available_at": _format_datetime(row[6]),
+                "value": row[7],
+                "source_metadata": _parse_json(row[8]),
+                "pit_query": {
+                    "decision_time": decision_ts,
+                    "mode": "latest_visible_observation_version",
+                    "strict_historical_replay": True,
+                },
             }
             for row in rows
         ]

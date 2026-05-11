@@ -820,6 +820,13 @@ export interface BacktestResultDetail extends BacktestResultSummary {
   rebalance_diagnostics_count?: number;
 }
 
+export interface BacktestDebugReplay {
+  backtest_id: string;
+  market: Market;
+  manifest: Record<string, unknown>;
+  items: Array<Record<string, unknown>>;
+}
+
 export interface RebalanceDiagnostic {
   date?: string;
   market_state?: string;
@@ -972,6 +979,28 @@ export async function listBacktests(strategyId?: string, market?: string): Promi
 export async function getBacktest(backtestId: string, market?: string): Promise<BacktestResultDetail> {
   const { data } = await client.get<BacktestResultDetail>(`/strategies/backtests/${backtestId}`, {
     params: { market: market || undefined },
+  });
+  return data;
+}
+
+export async function getBacktestDebugReplay(
+  backtestId: string,
+  market?: string,
+  params?: { date?: string; ticker?: string },
+): Promise<BacktestDebugReplay> {
+  const { data } = await client.get<BacktestDebugReplay>(`/strategies/backtests/${backtestId}/debug-replay`, {
+    params: {
+      market: market || undefined,
+      date: params?.date || undefined,
+      ticker: params?.ticker || undefined,
+    },
+  });
+  return data;
+}
+
+export async function cleanupBacktestDebugReplay(ttlHours = 24) {
+  const { data } = await client.delete("/strategies/backtests/debug-replay/expired", {
+    params: { ttl_hours: ttlHours },
   });
   return data;
 }
@@ -1428,11 +1457,18 @@ export interface ProviderCapability3 {
   updated_at: string | null;
 }
 
+export interface PublicationGate3 {
+  gate: string;
+  status: string;
+  reason: string;
+}
+
 export interface DataQualityContract3 {
   market_profile_id: string | null;
   capabilities: ProviderCapability3[];
   summary: Record<string, unknown>;
   policy: Record<string, unknown>;
+  publication_gates: PublicationGate3[];
 }
 
 export interface BacktestRun3 {

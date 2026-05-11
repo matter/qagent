@@ -40,6 +40,7 @@ class DataQualityService:
 
     def get_data_quality_contract(self, *, market_profile_id: str | None = None) -> dict:
         rows = self.list_provider_capabilities(market_profile_id=market_profile_id)
+        publication_gates = self._publication_gates(rows, market_profile_id=market_profile_id)
         return {
             "market_profile_id": market_profile_id,
             "capabilities": rows,
@@ -48,11 +49,17 @@ class DataQualityService:
                 "dataset_count": len({(row["provider"], row["dataset"]) for row in rows}),
                 "pit_supported_count": sum(1 for row in rows if row["pit_supported"]),
                 "highest_quality_level": self._highest_quality_level(rows),
+                "publication_grade": all(item["status"] == "pass" for item in publication_gates),
             },
             "policy": {
                 "free_sources_are_not_assumed_pit": True,
                 "missing_capability_blocks_validated_or_published_research": True,
+                "research_grade_warning": (
+                    "Exploratory/free sources may support local research, but they are not "
+                    "publication-grade until PIT, survivorship, and corporate-action gates pass."
+                ),
             },
+            "publication_gates": publication_gates,
         }
 
     @staticmethod
@@ -82,6 +89,69 @@ class DataQualityService:
             (str(row.get("quality_level") or "unknown") for row in rows),
             key=lambda item: order.get(item, -1),
         )
+
+    @staticmethod
+    def _publication_gates(
+        rows: list[dict[str, Any]],
+        *,
+        market_profile_id: str | None,
+    ) -> list[dict[str, Any]]:
+        if not rows:
+            return [
+                {
+                    "gate": "provider_capability",
+                    "status": "blocked",
+                    "reason": "No provider capability metadata is registered for this scope.",
+                }
+            ]
+
+        pit_supported = any(row["pit_supported"] for row in rows)
+        gates = [
+            {
+                "gate": "pit_data",
+                "status": "pass" if pit_supported else "blocked",
+                "reason": (
+                    "At least one provider capability is PIT-supported."
+                    if pit_supported
+                    else "Registered free providers are explicitly non-PIT; promotion evidence must not treat them as strict historical replay."
+                ),
+            }
+        ]
+
+        is_equity_profile = market_profile_id in {"US_EQ", "CN_A"} or any(
+            row["market_profile_id"] in {"US_EQ", "CN_A"} for row in rows
+        )
+        if is_equity_profile:
+            gates.extend(
+                [
+                    {
+                        "gate": "survivorship_safe_universe",
+                        "status": "blocked",
+                        "reason": "Current free stock lists do not include dated delistings and historical index/universe membership.",
+                    },
+                    {
+                        "gate": "corporate_actions",
+                        "status": "blocked",
+                        "reason": "Corporate-action table exists, but free providers have not populated split/dividend/symbol-change history as dated facts.",
+                    },
+                ]
+            )
+        else:
+            gates.extend(
+                [
+                    {
+                        "gate": "survivorship_safe_universe",
+                        "status": "not_applicable",
+                        "reason": "Not an equity universe scope.",
+                    },
+                    {
+                        "gate": "corporate_actions",
+                        "status": "not_applicable",
+                        "reason": "Not an equity price-adjustment scope.",
+                    },
+                ]
+            )
+        return gates
 
 
 def _json(value: Any, default: Any) -> Any:

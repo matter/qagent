@@ -77,6 +77,71 @@ class MacroDataServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "series_ids"):
             service.update_fred_series(series_ids=[], start_date="2024-01-01")
 
+    def test_query_series_as_of_returns_latest_observation_version_per_date(self):
+        conn = get_connection()
+        conn.execute(
+            """INSERT INTO macro_series
+               (provider, series_id, title, frequency, units, metadata)
+               VALUES ('fred', 'CPIAUCSL', 'CPI', 'M', 'Index', '{}')"""
+        )
+        conn.executemany(
+            """INSERT INTO macro_observations
+               (provider, series_id, date, realtime_start, realtime_end, available_at, value, source_metadata)
+               VALUES ('fred', 'CPIAUCSL', DATE '2024-01-01', ?, ?, ?, ?, '{}')""",
+            [
+                ("2024-02-01", "2024-02-29", "2024-02-01 00:00:00", 100.0),
+                ("2024-03-01", "9999-12-31", "2024-03-01 00:00:00", 101.0),
+            ],
+        )
+        service = MacroDataService(client=_FakeFredClient())
+
+        early = service.query_series_as_of(
+            series_ids=["CPIAUCSL"],
+            start_date="2024-01-01",
+            end_date="2024-01-01",
+            decision_time="2024-02-15 00:00:00",
+        )
+        revised = service.query_series_as_of(
+            series_ids=["CPIAUCSL"],
+            start_date="2024-01-01",
+            end_date="2024-01-01",
+            decision_time="2024-03-15 00:00:00",
+        )
+
+        self.assertEqual(len(early), 1)
+        self.assertEqual(early[0]["value"], 100.0)
+        self.assertEqual(early[0]["pit_query"]["decision_time"], "2024-02-15 00:00:00")
+        self.assertEqual(revised[0]["value"], 101.0)
+
+    def test_update_fred_series_can_request_historical_realtime_window(self):
+        client = _FakeFredClient(
+            observations=[
+                {
+                    "realtime_start": "2014-01-01",
+                    "realtime_end": "2014-01-31",
+                    "date": "2014-01-15",
+                    "value": "1.5",
+                }
+            ],
+            metadata={"id": "DGS10", "title": "10Y"},
+        )
+        service = MacroDataService(client=client)
+
+        result = service.update_fred_series(
+            series_ids=["DGS10"],
+            start_date="2014-01-01",
+            end_date="2014-01-31",
+            realtime_start="2014-01-01",
+            realtime_end="2014-01-31",
+        )
+
+        self.assertEqual(result["realtime_start"], "2014-01-01")
+        self.assertEqual(result["realtime_end"], "2014-01-31")
+        self.assertEqual(
+            client.observation_calls,
+            [("DGS10", "2014-01-01", "2014-01-31", "2014-01-01", "2014-01-31")],
+        )
+
 
 class _FakeFredClient:
     def __init__(self, observations=None, metadata=None):
@@ -89,8 +154,15 @@ class _FakeFredClient:
         self.metadata_calls.append(series_id)
         return dict(self.metadata)
 
-    def get_series_observations(self, series_id, start_date=None, end_date=None):
-        self.observation_calls.append((series_id, start_date, end_date))
+    def get_series_observations(
+        self,
+        series_id,
+        start_date=None,
+        end_date=None,
+        realtime_start=None,
+        realtime_end=None,
+    ):
+        self.observation_calls.append((series_id, start_date, end_date, realtime_start, realtime_end))
         return [dict(row) for row in self.observations]
 
 

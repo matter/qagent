@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from datetime import date, datetime
 from typing import Any
 
 from backend.db import get_connection
@@ -741,10 +742,16 @@ class AgentResearch3Service:
     @staticmethod
     def _next_trial_index(plan_id: str) -> int:
         row = get_connection().execute(
-            "SELECT COALESCE(MAX(trial_index), 0) + 1 FROM agent_research_trials WHERE plan_id = ?",
+            """SELECT trial_index
+               FROM agent_research_trials
+               WHERE plan_id = ?
+               ORDER BY trial_index DESC
+               LIMIT 1""",
             [plan_id],
         ).fetchone()
-        return int(row[0])
+        if row is None or row[0] is None:
+            return 1
+        return int(row[0]) + 1
 
     @staticmethod
     def _metric_number(metrics: dict[str, Any], key: str) -> float | None:
@@ -957,6 +964,7 @@ class AgentResearch3Service:
                     blocking=True,
                 )
             )
+        findings.extend(self._cutoff_validation_findings(evidence))
         return findings
 
     @staticmethod
@@ -966,6 +974,105 @@ class AgentResearch3Service:
         decision = str(value.get("decision") or "").strip().lower()
         reviewer = str(value.get("reviewer") or value.get("approved_by") or "").strip()
         return bool(reviewer) and decision in {"approved", "accepted"}
+
+    def _cutoff_validation_findings(self, evidence: dict[str, Any]) -> list[dict[str, Any]]:
+        cfg = evidence.get("cutoff_validation")
+        dependency_snapshot = evidence.get("dependency_snapshot")
+        if not isinstance(cfg, dict):
+            cfg = dependency_snapshot if isinstance(dependency_snapshot, dict) else {}
+
+        mode = str(cfg.get("mode") or cfg.get("cutoff_mode") or "").strip().lower()
+        cutoff_value = cfg.get("cutoff_date") or cfg.get("cutoff_at") or cfg.get("as_of_date")
+        if not cutoff_value and not mode:
+            return []
+        if mode not in {"strict", "locked", "cutoff_locked"} and not cutoff_value:
+            return []
+
+        cutoff_date = _parse_cutoff_date(cutoff_value)
+        override = _cutoff_override_recorded(evidence, cfg)
+        blocking = not override
+        severity = "fail" if blocking else "warning"
+        override_note = " with reviewer override" if override else ""
+
+        if cutoff_date is None:
+            return [
+                self._finding(
+                    "cutoff_locked_dependency",
+                    severity,
+                    f"Strict cutoff validation{override_note} requires a valid cutoff_date",
+                    blocking=blocking,
+                )
+            ]
+
+        dependencies = _cutoff_dependencies(cfg, dependency_snapshot)
+        if not dependencies:
+            return [
+                self._finding(
+                    "cutoff_locked_dependency",
+                    severity,
+                    f"Strict cutoff validation{override_note} requires dependency asset timestamps",
+                    blocking=blocking,
+                )
+            ]
+
+        missing_timestamps: list[str] = []
+        post_cutoff_assets: list[str] = []
+        for dependency in dependencies:
+            label = _dependency_label(dependency)
+            frozen_at = _parse_cutoff_date(
+                dependency.get("frozen_at")
+                or dependency.get("freeze_at")
+                or dependency.get("snapshot_at")
+            )
+            if frozen_at is not None and frozen_at <= cutoff_date:
+                continue
+
+            timestamp_values = [
+                ("created_at", dependency.get("created_at")),
+                ("updated_at", dependency.get("updated_at")),
+            ]
+            parsed_timestamps = [
+                (field, parsed)
+                for field, value in timestamp_values
+                if (parsed := _parse_cutoff_date(value)) is not None
+            ]
+            if not parsed_timestamps:
+                missing_timestamps.append(label)
+                continue
+            offending = [
+                f"{field}={parsed.isoformat()}"
+                for field, parsed in parsed_timestamps
+                if parsed > cutoff_date
+            ]
+            if frozen_at is not None and frozen_at > cutoff_date:
+                offending.append(f"frozen_at={frozen_at.isoformat()}")
+            if offending:
+                post_cutoff_assets.append(f"{label} ({', '.join(offending)})")
+
+        if not missing_timestamps and not post_cutoff_assets:
+            return []
+
+        messages: list[str] = []
+        if post_cutoff_assets:
+            messages.append(
+                "post-cutoff dependencies: " + "; ".join(post_cutoff_assets)
+            )
+        if missing_timestamps:
+            messages.append(
+                "dependencies missing created_at/updated_at/frozen_at: "
+                + ", ".join(missing_timestamps)
+            )
+        return [
+            self._finding(
+                "cutoff_locked_dependency",
+                severity,
+                (
+                    f"Strict cutoff validation{override_note} cutoff={cutoff_date.isoformat()} "
+                    + " | ".join(messages)
+                ),
+                blocking=blocking,
+            )
+        ]
 
     @staticmethod
     def _promotion_failures(metrics: dict[str, Any], thresholds: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1080,6 +1187,84 @@ def _json(value: Any, default: Any) -> Any:
         return json.loads(value)
     except Exception:
         return default
+
+
+def _parse_cutoff_date(value: Any) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    normalized = text.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized).date()
+    except ValueError:
+        try:
+            return date.fromisoformat(text[:10])
+        except ValueError:
+            return None
+
+
+def _cutoff_dependencies(
+    cfg: dict[str, Any],
+    dependency_snapshot: Any,
+) -> list[dict[str, Any]]:
+    raw = (
+        cfg.get("dependencies")
+        or cfg.get("assets")
+        or cfg.get("dependency_assets")
+    )
+    if raw is None and isinstance(dependency_snapshot, dict):
+        raw = (
+            dependency_snapshot.get("dependencies")
+            or dependency_snapshot.get("assets")
+            or dependency_snapshot.get("dependency_assets")
+        )
+    if isinstance(raw, dict):
+        items: list[dict[str, Any]] = []
+        for asset_type, values in raw.items():
+            values_list = values if isinstance(values, list) else [values]
+            for value in values_list:
+                if isinstance(value, dict):
+                    item = dict(value)
+                    item.setdefault("asset_type", asset_type)
+                    items.append(item)
+        return items
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, dict)]
+    return []
+
+
+def _cutoff_override_recorded(
+    evidence: dict[str, Any],
+    cfg: dict[str, Any],
+) -> bool:
+    override = cfg.get("override") or evidence.get("cutoff_override")
+    if not isinstance(override, dict):
+        return False
+    reviewer = str(override.get("reviewer") or override.get("approved_by") or "").strip()
+    reason = str(override.get("reason") or override.get("classification") or "").strip()
+    return bool(reviewer and reason)
+
+
+def _dependency_label(dependency: dict[str, Any]) -> str:
+    asset_type = str(
+        dependency.get("asset_type")
+        or dependency.get("type")
+        or dependency.get("kind")
+        or "asset"
+    )
+    asset_id = str(
+        dependency.get("asset_id")
+        or dependency.get("id")
+        or dependency.get("name")
+        or "unknown"
+    )
+    return f"{asset_type}:{asset_id}"
 
 
 _BUILTIN_PLAYBOOKS = [

@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from backend.logger import get_logger
 from backend.services.market_context import normalize_market
+from backend.tasks.json_safety import json_safe_string, json_safe_value
 from backend.tasks.executor import TaskExecutor, get_task_executor
 from backend.tasks.models import TaskSource, TaskStatus
 from backend.tasks.store import TaskStore
@@ -33,13 +34,13 @@ def _get_store() -> TaskStore:
 
 def _record_to_dict(record) -> dict:
     result = {
-        "task_id": record.id,
-        "run_id": record.run_id,
-        "task_type": record.task_type,
+        "task_id": json_safe_string(record.id),
+        "run_id": json_safe_value(record.run_id),
+        "task_type": json_safe_string(record.task_type),
         "status": record.status.value,
-        "params": record.params,
-        "result": record.result_summary,
-        "error": record.error_message,
+        "params": json_safe_value(record.params),
+        "result": json_safe_value(record.result_summary),
+        "error": json_safe_string(record.error_message) if record.error_message else None,
         "created_at": str(record.created_at) if record.created_at else None,
         "started_at": str(record.started_at) if record.started_at else None,
         "completed_at": str(record.completed_at) if record.completed_at else None,
@@ -60,7 +61,7 @@ def _record_to_dict(record) -> dict:
             result["late_result_quarantined"] = True
         late_diagnostics = record.result_summary.get("late_result_diagnostics")
         if isinstance(late_diagnostics, dict):
-            result["late_result_diagnostics"] = late_diagnostics
+            result["late_result_diagnostics"] = json_safe_value(late_diagnostics)
     return result
 
 

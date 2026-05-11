@@ -2,6 +2,7 @@ import threading
 import time
 import unittest
 import asyncio
+import json
 
 from backend.tasks.executor import TaskExecutor, TaskSubmissionPaused
 from backend.tasks.models import TaskRecord, TaskSource, TaskStatus
@@ -189,7 +190,7 @@ class TaskExecutorContractTests(unittest.TestCase):
             deadline = time.time() + 2
             while time.time() < deadline:
                 record = executor.get_task(task_id)
-                if record.result_summary:
+                if record.result_summary and record.result_summary.get("late_result_quarantined"):
                     break
                 time.sleep(0.01)
             executor.shutdown(wait=True)
@@ -346,6 +347,83 @@ class TaskExecutorContractTests(unittest.TestCase):
             "CN:heavy-research",
         )
         self.assertIsNone(TaskExecutor._serial_key("strategy_backtest", {"market": "US"}))
+
+    def test_commit_callback_runs_only_for_accepted_completed_task(self):
+        store = MemoryOnlyStore()
+        executor = TaskExecutor(store=store, max_workers=1)
+        committed = []
+
+        task_id = executor.submit(
+            "staged_write",
+            fn=lambda **_: {"staging_id": "stage_ok"},
+            params={},
+            on_accept=lambda result, task: committed.append((task.id, result["staging_id"])),
+        )
+
+        executor.shutdown(wait=True)
+        record = executor.get_task(task_id)
+        self.assertEqual(record.status, TaskStatus.COMPLETED)
+        self.assertEqual(committed, [(task_id, "stage_ok")])
+        self.assertEqual(record.result_summary["acceptance"]["status"], "accepted")
+
+    def test_commit_callback_is_not_run_for_late_timed_out_result(self):
+        store = MemoryOnlyStore()
+        executor = TaskExecutor(store=store, max_workers=1)
+        committed = []
+        gate = threading.Event()
+
+        def work():
+            gate.wait(timeout=1)
+            return {"staging_id": "stage_late"}
+
+        task_id = executor.submit(
+            "staged_write",
+            fn=work,
+            params={},
+            timeout=0.01,
+            on_accept=lambda result, task: committed.append(result["staging_id"]),
+        )
+        try:
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                if executor.get_task(task_id).status == TaskStatus.TIMEOUT:
+                    break
+                time.sleep(0.01)
+            gate.set()
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                record = executor.get_task(task_id)
+                if record.result_summary and record.result_summary.get("late_result_quarantined"):
+                    break
+                time.sleep(0.01)
+            executor.shutdown(wait=True)
+        finally:
+            gate.set()
+
+        record = executor.get_task(task_id)
+        self.assertEqual(record.status, TaskStatus.TIMEOUT)
+        self.assertEqual(committed, [])
+        self.assertTrue(record.result_summary["late_result_quarantined"])
+
+    def test_failed_task_error_message_is_strict_json_safe(self):
+        from backend.api.tasks import _record_to_dict
+
+        store = MemoryOnlyStore()
+        executor = TaskExecutor(store=store, max_workers=1)
+
+        def fail_with_control_character():
+            raise ValueError("bad payload \x00 inside")
+
+        task_id = executor.submit("json_failure", fn=fail_with_control_character, params={})
+        executor.shutdown(wait=True)
+        record = executor.get_task(task_id)
+
+        self.assertEqual(record.status, TaskStatus.FAILED)
+        self.assertNotIn("\x00", record.error_message)
+        encoded = json.dumps(_record_to_dict(record), ensure_ascii=False)
+        self.assertNotIn("\x00", encoded)
+        decoded = json.loads(encoded)
+        self.assertEqual(decoded["status"], "failed")
 
 class QueryRecordingStore(TaskStore):
     def __init__(self, active_records=None):

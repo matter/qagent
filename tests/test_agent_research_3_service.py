@@ -183,6 +183,16 @@ class AgentResearch3ServiceContractTests(unittest.TestCase):
         self.assertEqual(len(performance["top_trials"]), 2)
         self.assertEqual(performance["metric_ranges"]["sharpe"]["count"], 3)
 
+    def test_next_trial_index_avoids_empty_plan_aggregate_path(self):
+        conn = _TrialIndexConnection(rows=[])
+
+        with patch("backend.services.agent_research_3_service.get_connection", return_value=conn):
+            next_index = AgentResearch3Service._next_trial_index("empty_plan")
+
+        self.assertEqual(next_index, 1)
+        self.assertIn("ORDER BY trial_index DESC", conn.sql)
+        self.assertNotIn("MAX(", conn.sql.upper())
+
     def test_qa_gate_blocks_missing_artifacts_and_scratch_artifacts_for_promotion_sources(self):
         service = AgentResearch3Service()
         missing = service.evaluate_qa(
@@ -273,6 +283,122 @@ class AgentResearch3ServiceContractTests(unittest.TestCase):
         self.assertEqual(qa["status"], "pass")
         self.assertFalse(qa["blocking"])
 
+    def test_cutoff_locked_qa_rejects_post_cutoff_dependencies_without_override(self):
+        service = AgentResearch3Service()
+        kernel = ResearchKernelService()
+        run = kernel.create_run(
+            run_type="qa_artifact_fixture",
+            lifecycle_stage="validated",
+            retention_class="standard",
+            created_by="unit-test",
+        )
+        artifact = kernel.create_json_artifact(
+            run_id=run["id"],
+            artifact_type="validated_candidate",
+            payload={"value": 1},
+            lifecycle_stage="validated",
+            retention_class="standard",
+        )
+        evidence = self._complete_evidence(
+            artifact,
+            source_id="cutoff-locked-graph",
+            purge_gap=5,
+        )
+        evidence["cutoff_validation"] = {
+            "mode": "strict",
+            "cutoff_date": "2026-04-03",
+            "dependencies": [
+                {
+                    "asset_type": "strategy",
+                    "asset_id": "8991d710c162",
+                    "created_at": "2026-05-07T10:30:00",
+                },
+                {
+                    "asset_type": "factor",
+                    "asset_id": "exp0413_near_52w_high_252",
+                    "updated_at": "2026-04-13",
+                },
+            ],
+        }
+
+        qa = service.evaluate_qa(
+            source_type="strategy_graph",
+            source_id="cutoff-locked-graph",
+            metrics={
+                "coverage": 1.0,
+                "sharpe": 1.2,
+                "max_drawdown": -0.08,
+                "purge_gap": 5,
+                "label_horizon": 5,
+                "evidence": evidence,
+            },
+            artifact_refs=[{"type": "artifact", "id": artifact["id"]}],
+        )
+
+        self.assertEqual(qa["status"], "fail")
+        self.assertTrue(qa["blocking"])
+        finding = next(item for item in qa["findings"] if item["check"] == "cutoff_locked_dependency")
+        self.assertTrue(finding["blocking"])
+        self.assertIn("8991d710c162", finding["message"])
+        self.assertIn("exp0413_near_52w_high_252", finding["message"])
+
+    def test_cutoff_locked_qa_warns_when_post_cutoff_dependencies_have_override(self):
+        service = AgentResearch3Service()
+        kernel = ResearchKernelService()
+        run = kernel.create_run(
+            run_type="qa_artifact_fixture",
+            lifecycle_stage="validated",
+            retention_class="standard",
+            created_by="unit-test",
+        )
+        artifact = kernel.create_json_artifact(
+            run_id=run["id"],
+            artifact_type="validated_candidate",
+            payload={"value": 1},
+            lifecycle_stage="validated",
+            retention_class="standard",
+        )
+        evidence = self._complete_evidence(
+            artifact,
+            source_id="retrospective-graph",
+            purge_gap=5,
+        )
+        evidence["cutoff_validation"] = {
+            "mode": "strict",
+            "cutoff_date": "2026-04-03",
+            "dependencies": [
+                {
+                    "asset_type": "model",
+                    "asset_id": "model-post-cutoff",
+                    "updated_at": "2026-04-10T09:00:00",
+                }
+            ],
+            "override": {
+                "reviewer": "unit-test",
+                "reason": "Retrospective replay; not pre-simulation eligible",
+            },
+        }
+
+        qa = service.evaluate_qa(
+            source_type="strategy_graph",
+            source_id="retrospective-graph",
+            metrics={
+                "coverage": 1.0,
+                "sharpe": 1.2,
+                "max_drawdown": -0.08,
+                "purge_gap": 5,
+                "label_horizon": 5,
+                "evidence": evidence,
+            },
+            artifact_refs=[{"type": "artifact", "id": artifact["id"]}],
+        )
+
+        self.assertEqual(qa["status"], "warning")
+        self.assertFalse(qa["blocking"])
+        finding = next(item for item in qa["findings"] if item["check"] == "cutoff_locked_dependency")
+        self.assertFalse(finding["blocking"])
+        self.assertIn("override", finding["message"].lower())
+
     @staticmethod
     def _complete_evidence(artifact, *, source_id: str, purge_gap: int) -> dict:
         return {
@@ -287,6 +413,21 @@ class AgentResearch3ServiceContractTests(unittest.TestCase):
                 "decision": "approved",
             },
         }
+
+
+class _TrialIndexConnection:
+    def __init__(self, rows):
+        self.rows = rows
+        self.sql = ""
+
+    def execute(self, sql, params=None):
+        self.sql = str(sql)
+        if "MAX(" in self.sql.upper() or "COALESCE" in self.sql.upper():
+            raise RuntimeError("DuckDB InternalException: Attempted to access index 0 within vector of size 0")
+        return self
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
 
 
 if __name__ == "__main__":

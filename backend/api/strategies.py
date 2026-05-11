@@ -192,6 +192,35 @@ async def get_backtest_rebalance_diagnostics(
         raise HTTPException(status_code=404, detail=str(e))
 
 
+@router.get("/strategies/backtests/{backtest_id}/debug-replay")
+async def get_backtest_debug_replay(
+    backtest_id: str,
+    market: Optional[str] = Query(None),
+    date: Optional[str] = Query(None),
+    ticker: Optional[str] = Query(None),
+) -> dict:
+    """Get an optional temporary debug replay bundle for a backtest."""
+    svc = _get_backtest_service()
+    try:
+        return svc.get_debug_replay(
+            backtest_id,
+            market=market,
+            date=date,
+            ticker=ticker,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.delete("/strategies/backtests/debug-replay/expired")
+async def cleanup_backtest_debug_replay(
+    ttl_hours: int = Query(24, ge=0, le=168),
+) -> dict:
+    """Delete expired temporary debug replay bundles."""
+    svc = _get_backtest_service()
+    return svc.cleanup_debug_replay(ttl_hours=ttl_hours)
+
+
 @router.delete("/strategies/backtests/{backtest_id}")
 async def delete_backtest(
     backtest_id: str,
@@ -339,6 +368,7 @@ async def run_backtest(strategy_id: str, body: RunBacktestRequest) -> dict:
             "effective_start_date", "effective_end_date", "date_adjustment",
             "constraint_pass", "failed_constraints", "constraint_report",
             "startup_state_report", "evaluation_start_date", "warmup_start_date",
+            "debug_artifact_id",
         ):
             if key in full:
                 summary[key] = full[key]

@@ -8,7 +8,7 @@ import duckdb
 import pandas as pd
 
 from backend.api import strategies as strategy_api
-from backend.services.backtest_engine import BacktestEngine, BacktestResult
+from backend.services.backtest_engine import BacktestConfig, BacktestEngine, BacktestResult
 from backend.services.backtest_service import BacktestService
 from backend.services.strategy_service import StrategyService
 
@@ -160,6 +160,95 @@ class StrategyBacktestMarketScopeTests(unittest.TestCase):
 
         self.assertEqual(weights, {"AAA": 0.45, "BBB": 0.20})
         self.assertLess(sum(weights.values()), 1.0)
+
+    def test_signal_weight_position_sizing_accepts_dict_strategy_output(self):
+        raw_signals = {
+            "AAA": {"signal": 1, "weight": 0.60, "strength": 3.0},
+            "BBB": {"signal": 1, "weight": 0.40, "strength": 1.0},
+        }
+
+        normalized = BacktestService._normalize_strategy_signals(raw_signals)
+        weights = BacktestService._apply_position_sizing(
+            normalized,
+            "signal_weight",
+            max_positions=5,
+        )
+
+        self.assertEqual(weights, {"AAA": 0.75, "BBB": 0.25})
+
+    def test_normalize_strategy_signals_preserves_planned_price_column(self):
+        raw_signals = {
+            "AAA": {"signal": 1, "weight": 0.60, "strength": 3.0, "planned_price": 10.5},
+        }
+
+        normalized = BacktestService._normalize_strategy_signals(raw_signals)
+
+        self.assertIn("planned_price", normalized.columns)
+        self.assertEqual(float(normalized.loc["AAA", "planned_price"]), 10.5)
+
+    def test_leakage_audit_uses_forward_label_horizon_effective_data_end(self):
+        svc = BacktestService.__new__(BacktestService)
+        svc._model_service = unittest.mock.Mock()
+        svc._group_service = unittest.mock.Mock()
+        svc._model_service.get_model.return_value = {
+            "id": "model_forward_20d",
+            "name": "Forward 20d",
+            "market": "US",
+            "train_config": {
+                "train_start": "2025-01-02",
+                "train_end": "2025-10-31",
+                "valid_end": "2025-11-28",
+                "test_end": "2025-12-31",
+            },
+            "eval_metrics": {
+                "label_summary": {"horizon": 20},
+            },
+        }
+        svc._group_service.get_group_tickers.return_value = ["AAPL"]
+
+        warnings = svc._check_data_leakage(
+            ["model_forward_20d"],
+            BacktestConfig(start_date="2026-01-02", end_date="2026-02-27", market="US"),
+            ["AAPL"],
+            "sp500",
+            market="US",
+        )
+
+        self.assertEqual(len(warnings), 1)
+        self.assertTrue(warnings[0]["time_overlap"])
+        self.assertEqual(warnings[0]["model_data_end"], "2026-01-30")
+        self.assertEqual(warnings[0]["model_window_end"], "2025-12-31")
+        self.assertEqual(warnings[0]["label_horizon"], 20)
+
+    def test_leakage_audit_allows_safe_forward_label_horizon_cutoff(self):
+        svc = BacktestService.__new__(BacktestService)
+        svc._model_service = unittest.mock.Mock()
+        svc._group_service = unittest.mock.Mock()
+        svc._model_service.get_model.return_value = {
+            "id": "model_forward_20d_safe",
+            "name": "Forward 20d safe",
+            "market": "US",
+            "train_config": {
+                "train_start": "2025-01-02",
+                "train_end": "2025-10-31",
+                "valid_end": "2025-11-14",
+                "test_end": "2025-12-01",
+            },
+            "eval_metrics": {
+                "label_summary": {"horizon": 20},
+            },
+        }
+        svc._group_service.get_group_tickers.return_value = ["AAPL"]
+
+        warnings = svc._check_data_leakage(
+            ["model_forward_20d_safe"],
+            BacktestConfig(start_date="2026-01-02", end_date="2026-02-27", market="US"),
+            ["AAPL"],
+            "sp500",
+            market="US",
+        )
+
+        self.assertEqual(warnings, [])
 
     def test_raw_weight_backtest_config_disables_target_normalization_by_default(self):
         captured = {}
@@ -351,6 +440,133 @@ class StrategyBacktestMarketScopeTests(unittest.TestCase):
         self.assertEqual(summary["date_adjustment"]["effective_start_date"], "2026-04-07")
         self.assertEqual(summary["requested_start_date"], "2026-04-06")
         self.assertEqual(summary["effective_start_date"], "2026-04-07")
+
+    def test_strategy_api_backtest_task_summary_includes_debug_artifact_id(self):
+        executor = _FakeExecutor()
+        strategy_service = _FakeStrategyService()
+        backtest_service = _FakeBacktestService(
+            result={
+                "backtest_id": "bt_debug",
+                "market": "US",
+                "strategy_id": "strategy_us",
+                "debug_artifact_id": "bt_debug",
+            },
+        )
+
+        with (
+            patch.object(strategy_api, "_get_strategy_service", return_value=strategy_service),
+            patch.object(strategy_api, "_get_backtest_service", return_value=backtest_service),
+            patch.object(strategy_api, "_get_executor", return_value=executor),
+        ):
+            asyncio.run(
+                strategy_api.run_backtest(
+                    "strategy_us",
+                    strategy_api.RunBacktestRequest(
+                        market="US",
+                        config={"debug_mode": True},
+                        universe_group_id="sp500",
+                    ),
+                )
+            )
+
+        summary = executor.fn(**executor.params)
+        self.assertEqual(summary["debug_artifact_id"], "bt_debug")
+
+    def test_strategy_api_debug_replay_routes_to_backtest_service(self):
+        svc = _FakeBacktestService(
+            result={"backtest_id": "bt_debug", "market": "US"},
+        )
+
+        with patch.object(strategy_api, "_get_backtest_service", return_value=svc):
+            result = asyncio.run(
+                strategy_api.get_backtest_debug_replay(
+                    "bt_debug",
+                    market="US",
+                    date="2026-04-06",
+                    ticker="AAA",
+                )
+            )
+
+        self.assertEqual(result["backtest_id"], "bt_debug")
+        self.assertEqual(svc.debug_replay_call["date"], "2026-04-06")
+        self.assertEqual(svc.debug_replay_call["ticker"], "AAA")
+
+    def test_debug_backtest_writes_readable_replay_bundle_and_cleanup(self):
+        tmp_data = Path(self._tmp.name) / "runtime"
+        settings = _FakeBacktestSettings(tmp_data)
+        svc = BacktestService.__new__(BacktestService)
+        debug_state = {
+            "debug_mode": True,
+            "debug_level": "signals",
+            "debug_tickers": ["AAA"],
+            "debug_dates": ["2026-04-06"],
+        }
+        result = BacktestResult(
+            config={"start_date": "2026-04-06", "end_date": "2026-04-07"},
+            dates=["2026-04-06", "2026-04-07"],
+            nav=[1000.0, 1010.0],
+            benchmark_nav=[1000.0, 1000.0],
+            drawdown=[0.0, 0.0],
+            total_return=0.01,
+            annual_return=1.0,
+            annual_volatility=0.1,
+            max_drawdown=0.0,
+            sharpe_ratio=1.0,
+            calmar_ratio=0.0,
+            sortino_ratio=0.0,
+            win_rate=1.0,
+            profit_loss_ratio=0.0,
+            total_trades=1,
+            annual_turnover=0.5,
+            total_cost=1.0,
+            monthly_returns=[],
+            trades=[{"date": "2026-04-06", "ticker": "AAA", "action": "buy"}],
+            trade_diagnostics={"rebalance_execution_diagnostics": []},
+        )
+        model_predictions = {"model_1": pd.Series({"AAA": 0.9, "BBB": 0.1})}
+        raw_signals = pd.DataFrame(
+            {"signal": [1, 1], "weight": [0.6, 0.4], "strength": [2.0, 1.0]},
+            index=["AAA", "BBB"],
+        )
+        target_weights = {"AAA": 0.6, "BBB": 0.4}
+        adjusted_weights = {"AAA": 0.5, "BBB": 0.5}
+
+        with patch("backend.services.backtest_service.settings", settings):
+            svc._record_debug_rebalance(
+                debug_state,
+                date_key="2026-04-06",
+                model_predictions=model_predictions,
+                factor_data={},
+                raw_signals=raw_signals,
+                target_weights=target_weights,
+                adjusted_weights=adjusted_weights,
+                context_diagnostics={"gate": "passed"},
+                positions_before={},
+                positions_after={"AAA": 0.5},
+            )
+            artifact = svc._write_debug_replay_bundle(
+                backtest_id="bt_debug",
+                market="US",
+                strategy_id="strategy_us",
+                config={"debug_mode": True},
+                result=result,
+                rebalance_diagnostics=[],
+                debug_state=debug_state,
+            )
+            loaded = svc.get_debug_replay(
+                "bt_debug",
+                market="US",
+                date="2026-04-06",
+                ticker="AAA",
+            )
+            deleted = svc.cleanup_debug_replay(ttl_hours=0)
+
+        self.assertEqual(artifact["id"], "bt_debug")
+        self.assertEqual(loaded["manifest"]["market"], "US")
+        self.assertEqual(loaded["items"][0]["raw_signals"], {"AAA": {"signal": 1.0, "weight": 0.6, "strength": 2.0}})
+        self.assertEqual(loaded["items"][0]["model_predictions"]["model_1"], {"AAA": 0.9})
+        self.assertEqual(deleted["deleted"], 1)
+        self.assertFalse(Path(artifact["path"]).exists())
 
     def test_strategy_api_rejects_flattened_backtest_config_fields(self):
         from pydantic import ValidationError
@@ -593,6 +809,7 @@ class _FailingCreateStrategyService:
 class _FakeBacktestService:
     def __init__(self, result=None):
         self._result = result
+        self.debug_replay_call = None
 
     def run_backtest(self, strategy_id, config_dict, universe_group_id, market=None):
         if self._result is not None:
@@ -611,6 +828,26 @@ class _FakeBacktestService:
             "universe_group_id": universe_group_id,
             "market": market,
         }
+
+    def get_debug_replay(self, backtest_id, market=None, date=None, ticker=None):
+        self.debug_replay_call = {
+            "backtest_id": backtest_id,
+            "market": market,
+            "date": date,
+            "ticker": ticker,
+        }
+        return {
+            "backtest_id": backtest_id,
+            "market": market,
+            "manifest": {},
+            "items": [],
+        }
+
+
+class _FakeBacktestSettings:
+    def __init__(self, root: Path):
+        self.project_root = root
+        self.models_dir = root / "models"
 
 
 if __name__ == "__main__":

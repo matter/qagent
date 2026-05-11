@@ -13,6 +13,20 @@ from backend.config import settings
 class DbPreflightService:
     """Detect common local DB operational failures before long workflows run."""
 
+    _RUNNING_API_ROUTES = [
+        "/api/diagnostics/db-preflight",
+        "/api/diagnostics/daily-bars",
+        "/api/diagnostics/factor-values",
+        "/api/tasks",
+        "/api/market-data/quality-contract",
+    ]
+    _MAINTENANCE_REQUIRED_FOR = [
+        "backup",
+        "restore",
+        "schema_migration",
+        "direct_duckdb_reads",
+    ]
+
     def check_database(self, db_path: Path | str | None = None) -> dict[str, Any]:
         path = Path(db_path) if db_path is not None else settings.db_path
         result: dict[str, Any] = {
@@ -41,6 +55,8 @@ class DbPreflightService:
                     "message": "Database is locked by another process.",
                     "detail": message,
                     "action": "Use the running API for diagnostics, or stop services with bash scripts/stop.sh before maintenance.",
+                    "running_api_routes": self._RUNNING_API_ROUTES,
+                    "maintenance_required_for": self._MAINTENANCE_REQUIRED_FOR,
                 }
             if self._is_same_process_connection_conflict(message):
                 return {
@@ -50,6 +66,8 @@ class DbPreflightService:
                     "message": "Database is already open by the running backend process.",
                     "detail": message,
                     "action": "Use the running API for diagnostics, or stop services with bash scripts/stop.sh before maintenance.",
+                    "running_api_routes": self._RUNNING_API_ROUTES,
+                    "maintenance_required_for": self._MAINTENANCE_REQUIRED_FOR,
                 }
             return {
                 **result,

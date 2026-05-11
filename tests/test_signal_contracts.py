@@ -163,6 +163,27 @@ class SignalServiceContractTests(unittest.TestCase):
         self.assertEqual(state["replay_positions_after"], {"AAA": 0.4, "BBB": 0.6})
         self.assertEqual(state["holding_days"], {})
 
+    def test_replay_only_state_fields_are_filtered_before_strategy_context(self):
+        context_kwargs = SignalService._strategy_context_portfolio_kwargs(
+            {
+                "current_weights": {"AAA": 0.4},
+                "holding_days": {"AAA": 3},
+                "avg_entry_price": {"AAA": 10.0},
+                "unrealized_pnl": {"AAA": 0.1},
+                "replay_positions_after": {"AAA": 0.4},
+            }
+        )
+
+        self.assertEqual(
+            context_kwargs,
+            {
+                "current_weights": {"AAA": 0.4},
+                "holding_days": {"AAA": 3},
+                "avg_entry_price": {"AAA": 10.0},
+                "unrealized_pnl": {"AAA": 0.1},
+            },
+        )
+
     def test_backtest_replay_overlay_returns_saved_positions_as_canonical_signals(self):
         svc = SignalService.__new__(SignalService)
 

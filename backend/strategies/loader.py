@@ -7,6 +7,7 @@ from typing import Any
 
 from backend.strategies.base import StrategyBase, StrategyContext
 from backend.logger import get_logger
+from backend.services.custom_code_runner import run_user_code_isolated
 from backend.services.custom_code_safety import validate_user_code_safety
 
 log = get_logger(__name__)
@@ -47,6 +48,55 @@ def load_strategy_from_code(source_code: str) -> StrategyBase:
         ValueError: If the code does not define a valid StrategyBase subclass.
         RuntimeError: If execution of the code fails.
     """
+    if not source_code or not source_code.strip():
+        raise ValueError("source_code is empty")
+    validate_user_code_safety(source_code, code_kind="strategy")
+    metadata = run_user_code_isolated(
+        source_code=source_code,
+        code_kind="strategy",
+        operation="metadata",
+        timeout_seconds=3,
+    )
+    return IsolatedStrategyProxy(source_code, metadata)
+
+
+class IsolatedStrategyProxy(StrategyBase):
+    """Strategy proxy that executes user code in a child process per call."""
+
+    def __init__(self, source_code: str, metadata: dict[str, Any]) -> None:
+        self._source_code = source_code
+        self._execution_timeout_seconds = 10.0
+        self.name = str(metadata.get("name") or "")
+        if not self.name:
+            raise ValueError("Strategy class must define a non-empty 'name' attribute")
+        self.description = str(metadata.get("description") or "")
+        self._required_factors = list(metadata.get("required_factors") or [])
+        self._required_models = list(metadata.get("required_models") or [])
+
+    def generate_signals(self, context: StrategyContext):
+        result = run_user_code_isolated(
+            source_code=self._source_code,
+            code_kind="strategy",
+            operation="generate_signals",
+            payload={"context": context},
+            timeout_seconds=self._execution_timeout_seconds,
+        )
+        if isinstance(result, dict) and "signals" in result:
+            diagnostics = result.get("diagnostics")
+            if isinstance(diagnostics, dict):
+                context.diagnostics.update(diagnostics)
+            return result["signals"]
+        return result
+
+    def required_factors(self) -> list[str]:
+        return self._required_factors
+
+    def required_models(self) -> list[str]:
+        return self._required_models
+
+
+def _load_strategy_instance_unsafe(source_code: str) -> StrategyBase:
+    """Load a strategy instance inside an already isolated worker process."""
     if not source_code or not source_code.strip():
         raise ValueError("source_code is empty")
     validate_user_code_safety(source_code, code_kind="strategy")

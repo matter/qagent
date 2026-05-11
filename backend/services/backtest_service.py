@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import json
 import hashlib
+import shutil
 import subprocess
 import threading
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import numpy as np
@@ -22,6 +23,7 @@ from backend.db import get_connection
 from backend.logger import get_logger
 from backend.services.backtest_engine import BacktestConfig, BacktestEngine, BacktestResult
 from backend.services import backtest_engine as backtest_engine_module
+from backend.services.calendar_service import offset_trading_days
 from backend.services.execution_model_service import _positive_float
 from backend.services.factor_engine import FactorEngine
 from backend.services.group_service import GroupService
@@ -33,7 +35,7 @@ from backend.services.market_context import (
 )
 from backend.services.model_service import ModelService
 from backend.services.strategy_service import StrategyService
-from backend.time_utils import utc_now_naive
+from backend.time_utils import utc_now_iso, utc_now_naive
 from backend.strategies.base import StrategyContext
 from backend.strategies.loader import load_strategy_from_code
 
@@ -215,6 +217,7 @@ class BacktestService:
                         )
 
         # ---- 6. Build signals for each trading day ----
+        debug_state = self._init_debug_replay_state(config_dict, market=resolved_market)
         all_trading_days = sorted(prices_close.index)
         rebalance_dates = self._backtest_engine._get_rebalance_dates(
             all_trading_days, bt_config.rebalance_freq
@@ -335,7 +338,9 @@ class BacktestService:
 
             # Generate signals
             try:
-                raw_signals = strategy_instance.generate_signals(context)
+                raw_signals = self._normalize_strategy_signals(
+                    strategy_instance.generate_signals(context)
+                )
             except Exception as exc:
                 log.warning(
                     "backtest_service.signal_failed",
@@ -368,6 +373,19 @@ class BacktestService:
                     date_key,
                     evaluation_start_date,
                 )
+                if debug_state:
+                    self._record_debug_rebalance(
+                        debug_state,
+                        date_key=date_key,
+                        model_predictions=model_predictions,
+                        factor_data=factor_data,
+                        raw_signals=raw_signals,
+                        target_weights={},
+                        adjusted_weights={},
+                        context_diagnostics=context.diagnostics,
+                        positions_before=positions_before,
+                        positions_after={},
+                    )
                 rebalance_diagnostics.append(diag_entry)
                 port_weights.clear()
                 port_holding_days.clear()
@@ -386,6 +404,19 @@ class BacktestService:
                 weights,
                 constraint_config,
             )
+            if debug_state:
+                self._record_debug_rebalance(
+                    debug_state,
+                    date_key=date_key,
+                    model_predictions=model_predictions,
+                    factor_data=factor_data,
+                    raw_signals=raw_signals,
+                    target_weights=target_weights,
+                    adjusted_weights=weights,
+                    context_diagnostics=context.diagnostics,
+                    positions_before=positions_before,
+                    positions_after=weights,
+                )
             if planned_prices is not None and planned_price_diagnostics is not None:
                 self._write_planned_prices_for_date(
                     planned_prices=planned_prices,
@@ -538,6 +569,19 @@ class BacktestService:
                 "portfolio_overlay",
                 portfolio_config,
             )
+        debug_artifact = None
+        if debug_state:
+            debug_artifact = self._write_debug_replay_bundle(
+                backtest_id=bt_id,
+                market=resolved_market,
+                strategy_id=strategy_id,
+                config=config_to_save,
+                result=result,
+                rebalance_diagnostics=rebalance_diagnostics,
+                debug_state=debug_state,
+            )
+            config_to_save["debug_mode"] = True
+            config_to_save["debug_artifact_id"] = debug_artifact["id"]
         self._save_result(
             bt_id=bt_id,
             market=resolved_market,
@@ -556,6 +600,9 @@ class BacktestService:
         result_dict["result_level"] = result_level
         result_dict["universe_group_id"] = universe_group_id
         result_dict["config"] = config_to_save
+        if debug_artifact:
+            result_dict["debug_artifact_id"] = debug_artifact["id"]
+            result_dict["debug_artifact_path"] = debug_artifact["path"]
         for key in (
             "requested_start_date",
             "requested_end_date",
@@ -931,6 +978,71 @@ class BacktestService:
         )
         log.info("backtest_service.deleted", backtest_id=backtest_id, market=resolved_market)
 
+    def get_debug_replay(
+        self,
+        backtest_id: str,
+        market: str | None = None,
+        *,
+        date: str | None = None,
+        ticker: str | None = None,
+    ) -> dict:
+        """Load an optional temporary backtest debug replay bundle."""
+        resolved_market = normalize_market(market)
+        bundle_dir = self._debug_bundle_dir(backtest_id)
+        manifest_path = bundle_dir / "manifest.json"
+        events_path = bundle_dir / "rebalance.jsonl"
+        if not manifest_path.exists() or not events_path.exists():
+            raise ValueError(f"Debug replay bundle for backtest {backtest_id} not found")
+
+        manifest = json.loads(manifest_path.read_text())
+        if normalize_market(manifest.get("market")) != resolved_market:
+            raise ValueError(f"Debug replay bundle for backtest {backtest_id} not found")
+
+        items = []
+        for line in events_path.read_text().splitlines():
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            if date and str(item.get("date"))[:10] != str(date)[:10]:
+                continue
+            if ticker:
+                item = self._filter_debug_item_by_ticker(
+                    item,
+                    normalize_ticker(ticker, resolved_market),
+                )
+            items.append(item)
+        return {
+            "backtest_id": backtest_id,
+            "market": resolved_market,
+            "manifest": manifest,
+            "items": items,
+        }
+
+    def cleanup_debug_replay(self, ttl_hours: int = 24) -> dict:
+        """Delete expired temporary debug replay bundles."""
+        root = self._debug_root()
+        if not root.exists():
+            return {"deleted": 0, "paths": []}
+        cutoff = utc_now_naive() - timedelta(hours=max(0, int(ttl_hours)))
+        deleted_paths = []
+        for bundle_dir in root.iterdir():
+            if not bundle_dir.is_dir():
+                continue
+            manifest_path = bundle_dir / "manifest.json"
+            if not manifest_path.exists():
+                continue
+            try:
+                manifest = json.loads(manifest_path.read_text())
+                created_at = datetime.fromisoformat(
+                    str(manifest.get("created_at", "")).replace("Z", "")
+                )
+            except Exception:
+                created_at = datetime.fromtimestamp(manifest_path.stat().st_mtime)
+            if created_at <= cutoff:
+                shutil.rmtree(bundle_dir, ignore_errors=True)
+                deleted_paths.append(str(bundle_dir))
+        return {"deleted": len(deleted_paths), "paths": deleted_paths}
+
     def get_stock_chart_data(
         self,
         backtest_id: str,
@@ -1169,6 +1281,220 @@ class BacktestService:
         if strategy_diagnostics:
             diag.update(strategy_diagnostics)
         return diag
+
+    @staticmethod
+    def _init_debug_replay_state(config: dict | None, market: str | None = None) -> dict | None:
+        config = config or {}
+        if not bool(config.get("debug_mode")):
+            return None
+        resolved_market = normalize_market(market)
+        level = str(config.get("debug_level") or "signals").lower()
+        if level not in {"summary", "signals", "full"}:
+            raise ValueError("debug_level must be one of: summary, signals, full")
+        tickers = config.get("debug_tickers")
+        dates = config.get("debug_dates")
+        return {
+            "debug_mode": True,
+            "debug_level": level,
+            "debug_tickers": (
+                {normalize_ticker(t, resolved_market) for t in tickers}
+                if isinstance(tickers, list)
+                else None
+            ),
+            "debug_dates": {str(d)[:10] for d in dates} if isinstance(dates, list) else None,
+            "rebalance": [],
+        }
+
+    @classmethod
+    def _record_debug_rebalance(
+        cls,
+        debug_state: dict | None,
+        *,
+        date_key: str,
+        model_predictions: dict[str, pd.Series],
+        factor_data: dict[str, pd.DataFrame],
+        raw_signals: pd.DataFrame,
+        target_weights: dict[str, float],
+        adjusted_weights: dict[str, float],
+        context_diagnostics: dict | None,
+        positions_before: dict[str, float],
+        positions_after: dict[str, float],
+    ) -> None:
+        if not debug_state:
+            return
+        debug_dates = debug_state.get("debug_dates")
+        if debug_dates and str(date_key)[:10] not in debug_dates:
+            return
+
+        tickers = debug_state.get("debug_tickers")
+        level = str(debug_state.get("debug_level") or "signals")
+        item = {
+            "date": str(date_key)[:10],
+            "target_weights": cls._weight_map_for_debug(target_weights, tickers),
+            "adjusted_weights": cls._weight_map_for_debug(adjusted_weights, tickers),
+            "positions_before": cls._weight_map_for_debug(positions_before, tickers),
+            "positions_after": cls._weight_map_for_debug(positions_after, tickers),
+            "strategy_diagnostics": _stable_json_value(context_diagnostics or {}),
+        }
+        if level in {"signals", "full"}:
+            item["model_predictions"] = {
+                str(model_id): cls._series_to_debug_map(preds, tickers)
+                for model_id, preds in (model_predictions or {}).items()
+            }
+            item["raw_signals"] = cls._frame_to_debug_map(raw_signals, tickers)
+        if level == "full":
+            item["factor_snapshots"] = cls._factor_snapshots_for_date(
+                factor_data,
+                date_key,
+                tickers,
+            )
+        debug_state.setdefault("rebalance", []).append(item)
+
+    @classmethod
+    def _write_debug_replay_bundle(
+        cls,
+        *,
+        backtest_id: str,
+        market: str,
+        strategy_id: str,
+        config: dict,
+        result: BacktestResult,
+        rebalance_diagnostics: list[dict],
+        debug_state: dict | None,
+    ) -> dict | None:
+        if not debug_state:
+            return None
+        bundle_dir = cls._debug_bundle_dir(backtest_id)
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "id": backtest_id,
+            "backtest_id": backtest_id,
+            "market": normalize_market(market),
+            "strategy_id": strategy_id,
+            "created_at": utc_now_iso(),
+            "ttl_hours": int(config.get("debug_ttl_hours", 24) or 24),
+            "debug_level": debug_state.get("debug_level"),
+            "debug_tickers": sorted(debug_state.get("debug_tickers") or []),
+            "debug_dates": sorted(debug_state.get("debug_dates") or []),
+            "summary": {
+                "total_return": result.total_return,
+                "sharpe_ratio": result.sharpe_ratio,
+                "max_drawdown": result.max_drawdown,
+                "total_trades": result.total_trades,
+                "dates": len(result.dates),
+                "rebalance_diagnostics": len(rebalance_diagnostics or []),
+            },
+            "files": {"rebalance": "rebalance.jsonl"},
+        }
+        (bundle_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, default=str)
+        )
+        with open(bundle_dir / "rebalance.jsonl", "w") as f:
+            for item in debug_state.get("rebalance", []):
+                f.write(json.dumps(_stable_json_value(item), default=str) + "\n")
+        return {
+            "id": backtest_id,
+            "path": str(bundle_dir),
+            "manifest_path": str(bundle_dir / "manifest.json"),
+        }
+
+    @staticmethod
+    def _debug_root() -> Path:
+        return settings.project_root / "data" / "backtest_debug"
+
+    @classmethod
+    def _debug_bundle_dir(cls, backtest_id: str) -> Path:
+        return cls._debug_root() / str(backtest_id)
+
+    @staticmethod
+    def _series_to_debug_map(series: pd.Series | dict | None, tickers: set[str] | None) -> dict:
+        if series is None:
+            return {}
+        if isinstance(series, dict):
+            items = series.items()
+        else:
+            items = series.items()
+        result = {}
+        for ticker, value in items:
+            key = str(ticker)
+            if tickers and key not in tickers:
+                continue
+            if value is None or pd.isna(value):
+                continue
+            result[key] = round(float(value), 6)
+        return result
+
+    @staticmethod
+    def _frame_to_debug_map(frame: pd.DataFrame | None, tickers: set[str] | None) -> dict:
+        if frame is None or frame.empty:
+            return {}
+        result = {}
+        for ticker, row in frame.iterrows():
+            key = str(ticker)
+            if tickers and key not in tickers:
+                continue
+            row_data = {}
+            for col, value in row.items():
+                if value is None or pd.isna(value):
+                    continue
+                if isinstance(value, (int, float, np.number)):
+                    row_data[str(col)] = round(float(value), 6)
+                else:
+                    row_data[str(col)] = str(value)
+            result[key] = row_data
+        return result
+
+    @classmethod
+    def _factor_snapshots_for_date(
+        cls,
+        factor_data: dict[str, pd.DataFrame],
+        date_key: str,
+        tickers: set[str] | None,
+    ) -> dict:
+        snapshots = {}
+        target_date = pd.Timestamp(date_key)
+        for factor_name, frame in (factor_data or {}).items():
+            if frame is None or frame.empty:
+                continue
+            available = frame.index[frame.index <= target_date]
+            if len(available) == 0:
+                continue
+            row = frame.loc[available[-1]]
+            snapshots[str(factor_name)] = cls._series_to_debug_map(row, tickers)
+        return snapshots
+
+    @staticmethod
+    def _weight_map_for_debug(weights: dict[str, float] | None, tickers: set[str] | None) -> dict:
+        result = {}
+        for ticker, value in (weights or {}).items():
+            key = str(ticker)
+            if tickers and key not in tickers:
+                continue
+            if value is None or pd.isna(value):
+                continue
+            result[key] = round(float(value), 6)
+        return result
+
+    @staticmethod
+    def _filter_debug_item_by_ticker(item: dict, ticker: str) -> dict:
+        filtered = dict(item)
+        for key in ("raw_signals", "target_weights", "adjusted_weights", "positions_before", "positions_after"):
+            value = filtered.get(key)
+            if isinstance(value, dict):
+                filtered[key] = {ticker: value[ticker]} if ticker in value else {}
+        model_predictions = filtered.get("model_predictions")
+        if isinstance(model_predictions, dict):
+            filtered["model_predictions"] = {
+                model_id: ({ticker: values[ticker]} if isinstance(values, dict) and ticker in values else {})
+                for model_id, values in model_predictions.items()
+            }
+        factor_snapshots = filtered.get("factor_snapshots")
+        if isinstance(factor_snapshots, dict):
+            filtered["factor_snapshots"] = {
+                factor: ({ticker: values[ticker]} if isinstance(values, dict) and ticker in values else {})
+                for factor, values in factor_snapshots.items()
+            }
+        return filtered
 
     @staticmethod
     def _build_portfolio_compliance_metrics(
@@ -1425,6 +1751,42 @@ class BacktestService:
             weights = {ticker: 1.0 / n for ticker in buys.index}
 
         return weights
+
+    @staticmethod
+    def _normalize_strategy_signals(raw_signals: Any) -> pd.DataFrame:
+        """Normalize strategy outputs into the canonical signal DataFrame."""
+        if raw_signals is None:
+            return pd.DataFrame(columns=["signal", "weight", "strength"])
+
+        if isinstance(raw_signals, pd.DataFrame):
+            signals = raw_signals.copy()
+        elif isinstance(raw_signals, dict):
+            if not raw_signals:
+                signals = pd.DataFrame(columns=["signal", "weight", "strength"])
+            else:
+                signals = pd.DataFrame.from_dict(raw_signals, orient="index")
+        elif isinstance(raw_signals, list):
+            signals = pd.DataFrame(raw_signals)
+            if "ticker" in signals.columns:
+                signals = signals.set_index("ticker")
+        else:
+            raise ValueError(
+                "Strategy generate_signals must return a DataFrame, dict, or list of signal rows"
+            )
+
+        for column, default in (("signal", 0), ("weight", 0.0), ("strength", 0.0)):
+            if column not in signals.columns:
+                signals[column] = default
+        ordered = ["signal", "weight", "strength"] + [
+            col for col in signals.columns if col not in {"signal", "weight", "strength"}
+        ]
+        signals = signals[ordered].copy()
+        if signals.index.name is None:
+            signals.index.name = "ticker"
+        signals["signal"] = pd.to_numeric(signals["signal"], errors="coerce").fillna(0).astype(int)
+        signals["weight"] = pd.to_numeric(signals["weight"], errors="coerce").fillna(0.0)
+        signals["strength"] = pd.to_numeric(signals["strength"], errors="coerce").fillna(0.0)
+        return signals
 
     @staticmethod
     def _merge_constraint_config(
@@ -2218,6 +2580,18 @@ class BacktestService:
                     except (ValueError, TypeError):
                         pass
 
+            model_window_end = model_train_end
+            label_horizon = self._extract_model_label_horizon(record, model_id)
+            if label_horizon > 0:
+                try:
+                    model_train_end = offset_trading_days(
+                        model_window_end,
+                        label_horizon,
+                        market=resolved_market,
+                    )
+                except Exception:
+                    model_train_end = model_window_end
+
             # Check time overlap: does the backtest window start before
             # the model's last seen date?
             time_overlap = bt_start <= model_train_end
@@ -2270,6 +2644,11 @@ class BacktestService:
                     f"回测起始 {bt_start} 在模型训练数据截止日 {model_train_end} 之前，"
                     f"存在 {(model_train_end - bt_start).days + 1} 天时间重叠"
                 )
+                if label_horizon > 0 and model_train_end != model_window_end:
+                    detail_parts.append(
+                        f"模型标签 horizon={label_horizon}，窗口截止 {model_window_end} "
+                        f"实际需要看到 {model_train_end} 的价格"
+                    )
             if ticker_overlap:
                 detail_parts.append("回测股票池与模型训练股票池存在重叠")
 
@@ -2280,11 +2659,81 @@ class BacktestService:
                 "ticker_overlap": ticker_overlap,
                 "overlap_level": level,
                 "model_data_end": str(model_train_end),
+                "model_window_end": str(model_window_end),
+                "label_horizon": label_horizon,
                 "backtest_start": str(bt_start),
                 "details": "；".join(detail_parts),
             })
 
         return warnings
+
+    @staticmethod
+    def _extract_model_label_horizon(record: dict, model_id: str | None = None) -> int:
+        candidates: list[Any] = []
+        for container in (
+            record,
+            record.get("eval_metrics") if isinstance(record.get("eval_metrics"), dict) else None,
+            record.get("train_config") if isinstance(record.get("train_config"), dict) else None,
+        ):
+            if not isinstance(container, dict):
+                continue
+            candidates.extend([
+                container.get("label_horizon"),
+                container.get("horizon"),
+            ])
+            label_summary = container.get("label_summary")
+            if isinstance(label_summary, dict):
+                candidates.extend([
+                    label_summary.get("horizon"),
+                    label_summary.get("label_horizon"),
+                ])
+
+        try:
+            meta_candidates = BacktestService._read_model_metadata_label_horizon(model_id)
+            candidates.extend(meta_candidates)
+        except Exception:
+            pass
+
+        for value in candidates:
+            if value is None:
+                continue
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    @staticmethod
+    def _read_model_metadata_label_horizon(model_id: str | None) -> list[Any]:
+        if not model_id:
+            return []
+        meta_path = settings.models_dir / model_id / "metadata.json"
+        if not meta_path.exists():
+            return []
+        meta = json.loads(meta_path.read_text())
+        candidates = [
+            meta.get("label_horizon"),
+            meta.get("horizon"),
+        ]
+        label_summary = meta.get("label_summary")
+        if isinstance(label_summary, dict):
+            candidates.extend([
+                label_summary.get("horizon"),
+                label_summary.get("label_horizon"),
+            ])
+        eval_metrics = meta.get("eval_metrics")
+        if isinstance(eval_metrics, dict):
+            candidates.extend([
+                eval_metrics.get("label_horizon"),
+                eval_metrics.get("horizon"),
+            ])
+            metric_label_summary = eval_metrics.get("label_summary")
+            if isinstance(metric_label_summary, dict):
+                candidates.extend([
+                    metric_label_summary.get("horizon"),
+                    metric_label_summary.get("label_horizon"),
+                ])
+        return candidates
 
     def _save_result(
         self,

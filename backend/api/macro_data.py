@@ -20,6 +20,8 @@ class FredUpdateRequest(BaseModel):
     series_ids: list[str] = Field(..., min_length=1)
     start_date: date | None = None
     end_date: date | None = None
+    realtime_start: date | None = None
+    realtime_end: date | None = None
 
 
 def _get_executor() -> TaskExecutor:
@@ -48,6 +50,8 @@ async def update_fred_series(body: FredUpdateRequest) -> dict:
             "series_ids": series_ids,
             "start_date": _date_param(body.start_date),
             "end_date": _date_param(body.end_date),
+            "realtime_start": _date_param(body.realtime_start),
+            "realtime_end": _date_param(body.realtime_end),
         },
         timeout=1800,
         source=TaskSource.UI,
@@ -78,21 +82,34 @@ async def query_macro_series(
     start_date: date | None = Query(None),
     end_date: date | None = Query(None),
     as_of: str | None = Query(None),
+    strict_pit: bool = Query(False),
     limit: int = Query(10000, ge=1, le=100000),
 ) -> dict:
     normalized = _normalize_series_ids(series_ids.split(","))
     if not normalized:
         raise HTTPException(status_code=400, detail="series_ids must not be empty")
-    rows = _get_service().query_series(
-        series_ids=normalized,
-        start_date=_date_param(start_date),
-        end_date=_date_param(end_date),
-        as_of=as_of,
-        limit=limit,
-    )
+    if strict_pit:
+        if not as_of:
+            raise HTTPException(status_code=400, detail="strict_pit requires as_of decision time")
+        rows = _get_service().query_series_as_of(
+            series_ids=normalized,
+            start_date=_date_param(start_date),
+            end_date=_date_param(end_date),
+            decision_time=as_of,
+            limit=limit,
+        )
+    else:
+        rows = _get_service().query_series(
+            series_ids=normalized,
+            start_date=_date_param(start_date),
+            end_date=_date_param(end_date),
+            as_of=as_of,
+            limit=limit,
+        )
     return {
         "provider": "fred",
         "series_ids": normalized,
+        "strict_pit": strict_pit,
         "observations": rows,
     }
 

@@ -19,6 +19,8 @@ class MacroDataApiTests(unittest.TestCase):
                         series_ids=["DGS10", "FEDFUNDS"],
                         start_date="2024-01-01",
                         end_date="2024-02-01",
+                        realtime_start="2024-01-01",
+                        realtime_end="2024-01-31",
                     )
                 )
             )
@@ -28,6 +30,8 @@ class MacroDataApiTests(unittest.TestCase):
         self.assertEqual(fake_executor.task_type, "macro_data_update")
         self.assertEqual(fake_executor.params["series_ids"], ["DGS10", "FEDFUNDS"])
         self.assertEqual(fake_executor.params["start_date"], "2024-01-01")
+        self.assertEqual(fake_executor.params["realtime_start"], "2024-01-01")
+        self.assertEqual(fake_executor.params["realtime_end"], "2024-01-31")
         self.assertIs(fake_executor.fn.__self__, fake_service)
         self.assertIs(fake_executor.fn.__func__, fake_service.update_fred_series.__func__)
 
@@ -39,6 +43,8 @@ class MacroDataApiTests(unittest.TestCase):
                     series_ids="DGS10,FEDFUNDS",
                     start_date="2024-01-01",
                     end_date="2024-02-01",
+                    as_of=None,
+                    strict_pit=False,
                 )
             )
 
@@ -46,16 +52,37 @@ class MacroDataApiTests(unittest.TestCase):
         self.assertEqual(result["series_ids"], ["DGS10", "FEDFUNDS"])
         self.assertEqual(fake_service.query_args["series_ids"], ["DGS10", "FEDFUNDS"])
 
+    def test_query_endpoint_forwards_strict_pit_as_of_request(self):
+        fake_service = _FakeMacroDataService()
+        with patch.object(macro_api, "_service", fake_service):
+            result = _run_async(
+                macro_api.query_macro_series(
+                    series_ids="DGS10",
+                    start_date="2024-01-01",
+                    end_date="2024-02-01",
+                    as_of="2024-02-15 00:00:00",
+                    strict_pit=True,
+                )
+            )
+
+        self.assertTrue(result["strict_pit"])
+        self.assertEqual(fake_service.query_as_of_args["decision_time"], "2024-02-15 00:00:00")
+
 
 class _FakeMacroDataService:
     def __init__(self):
         self.query_args = None
+        self.query_as_of_args = None
 
     def update_fred_series(self, **kwargs):
         return {"updated": kwargs}
 
     def query_series(self, **kwargs):
         self.query_args = kwargs
+        return [{"series_id": "DGS10", "date": "2024-01-01", "value": 4.0}]
+
+    def query_series_as_of(self, **kwargs):
+        self.query_as_of_args = kwargs
         return [{"series_id": "DGS10", "date": "2024-01-01", "value": 4.0}]
 
 

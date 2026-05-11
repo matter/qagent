@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -68,6 +69,72 @@ class ResearchCacheServiceTests(unittest.TestCase):
         self.assertEqual(stats["object_type"], "feature_matrix")
         self.assertGreater(stats["byte_size"], 0)
 
+    def test_feature_matrix_store_retries_transient_duckdb_conflict(self):
+        service = ResearchCacheService()
+        feature_data = {
+            "close": pd.DataFrame(
+                {"AAPL": [10.0, 11.0], "MSFT": [20.0, 21.0]},
+                index=pd.to_datetime(["2024-01-02", "2024-01-03"]),
+            )
+        }
+        conn = get_connection()
+        attempts = {"count": 0}
+
+        with patch(
+            "backend.services.research_cache_service.get_connection",
+            return_value=_FlakyResearchCacheConnection(conn, attempts),
+        ):
+            record = service.store_feature_matrix(
+                market="US",
+                feature_set_id="fs_retry",
+                tickers=["AAPL", "MSFT"],
+                start_date="2024-01-02",
+                end_date="2024-01-03",
+                factor_refs=[{"factor_id": "f_close", "factor_name": "close"}],
+                preprocessing={},
+                feature_data=feature_data,
+            )
+
+        self.assertEqual(attempts["count"], 1)
+        self.assertEqual(record["object_id"], "fs_retry")
+
+    def test_feature_matrix_store_serializes_same_cache_key_writes(self):
+        service = ResearchCacheService()
+        feature_data = {
+            "close": pd.DataFrame(
+                {"AAPL": [10.0, 11.0], "MSFT": [20.0, 21.0]},
+                index=pd.to_datetime(["2024-01-02", "2024-01-03"]),
+            )
+        }
+        errors = []
+
+        def write_cache():
+            try:
+                service.store_feature_matrix(
+                    market="US",
+                    feature_set_id="fs_lock",
+                    tickers=["AAPL", "MSFT"],
+                    start_date="2024-01-02",
+                    end_date="2024-01-03",
+                    factor_refs=[{"factor_id": "f_close", "factor_name": "close"}],
+                    preprocessing={},
+                    feature_data=feature_data,
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=write_cache) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        rows = get_connection().execute(
+            "SELECT COUNT(*) FROM research_cache_entries WHERE object_id = 'fs_lock'"
+        ).fetchone()[0]
+        self.assertEqual(errors, [])
+        self.assertEqual(rows, 1)
+
     def test_feature_matrix_key_changes_with_universe_and_preprocessing(self):
         service = ResearchCacheService()
         base = service.build_feature_matrix_key(
@@ -100,6 +167,17 @@ class ResearchCacheServiceTests(unittest.TestCase):
 
         self.assertNotEqual(base, different_universe)
         self.assertNotEqual(base, different_preprocessing)
+
+    def test_feature_matrix_cache_rejects_unversioned_latest_key(self):
+        service = ResearchCacheService()
+
+        with self.assertRaisesRegex(ValueError, "stable as_of_date"):
+            service.default_data_version("US", None)
+
+        self.assertEqual(
+            service.default_data_version("CN", "2024-01-03"),
+            "CN:asof:2024-01-03",
+        )
 
     def test_apply_expired_cache_cleanup_removes_files_and_marks_records(self):
         service = ResearchCacheService()
@@ -246,6 +324,22 @@ class _ExplodingFactorEngine:
     def load_cached_factors_bulk(self, *args, **kwargs):
         self.bulk_calls += 1
         raise AssertionError("hot feature matrix cache should be checked before bulk factor cache")
+
+
+class _FlakyResearchCacheConnection:
+    def __init__(self, conn, attempts):
+        self.conn = conn
+        self.attempts = attempts
+
+    def execute(self, sql, params=None):
+        normalized = str(sql).lstrip().upper()
+        if (
+            normalized.startswith("INSERT OR REPLACE INTO RESEARCH_CACHE_ENTRIES")
+            and self.attempts["count"] == 0
+        ):
+            self.attempts["count"] += 1
+            raise RuntimeError("TransactionContext Error: Conflict on tuple deletion!")
+        return self.conn.execute(sql, params)
 
 
 _FACTOR_SOURCE = """\

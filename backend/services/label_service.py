@@ -25,7 +25,15 @@ log = get_logger(__name__)
 # Regression types  → model trains with LGBMRegressor
 # Classification types → model trains with LGBMClassifier
 
-_REGRESSION_TARGET_TYPES = {"return", "rank", "excess_return", "path_return", "composite", "trend_continuation"}
+_REGRESSION_TARGET_TYPES = {
+    "return",
+    "rank",
+    "excess_return",
+    "path_return",
+    "composite",
+    "trend_continuation",
+    "prediction",
+}
 _CLASSIFICATION_TARGET_TYPES = {"binary", "top_quantile", "bottom_quantile", "large_move", "excess_binary", "path_quality", "triple_barrier"}
 
 _VALID_TARGET_TYPES = _REGRESSION_TARGET_TYPES | _CLASSIFICATION_TARGET_TYPES
@@ -370,7 +378,10 @@ class LabelService:
             )
         if target_type in ("excess_return", "excess_binary") and not benchmark:
             raise ValueError(f"benchmark is required for {target_type} target_type")
-        if target_type == "composite":
+        if target_type == "prediction":
+            if horizon != 0:
+                raise ValueError("horizon must be 0 for prediction labels")
+        elif target_type == "composite":
             if horizon < 0:
                 raise ValueError("horizon must be >= 0 for composite labels")
         elif horizon < 1:
@@ -511,6 +522,14 @@ class LabelService:
         horizon = label["horizon"]
         benchmark = label.get("benchmark")
         config = label.get("config") or {}
+
+        if target_type == "prediction":
+            return self._compute_prediction_label_values(
+                label,
+                tickers,
+                start_date,
+                end_date,
+            )
 
         # ---- Composite label: combine multiple sub-labels ----
         if target_type == "composite":
@@ -758,6 +777,92 @@ class LabelService:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_prediction_label_values(
+        label: dict,
+        tickers: list[str],
+        start_date: str | None,
+        end_date: str | None,
+    ) -> pd.DataFrame:
+        """Return model-prediction label values stored in label config."""
+        config = label.get("config") or {}
+        rows = config.get("values") or []
+        storage = config.get("storage")
+        if isinstance(storage, dict) and storage.get("table") == "prediction_label_values":
+            return LabelService._load_prediction_label_rows(
+                label,
+                tickers,
+                start_date,
+                end_date,
+            )
+        if not isinstance(rows, list):
+            return pd.DataFrame(columns=["ticker", "date", "label_value"])
+
+        ticker_set = set(tickers)
+        start_ts = pd.Timestamp(start_date) if start_date else None
+        end_ts = pd.Timestamp(end_date) if end_date else None
+        records = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            ticker = normalize_ticker(row.get("ticker", ""), label["market"])
+            if ticker_set and ticker not in ticker_set:
+                continue
+            raw_date = row.get("date")
+            if not raw_date:
+                continue
+            date_ts = pd.Timestamp(raw_date)
+            if start_ts is not None and date_ts < start_ts:
+                continue
+            if end_ts is not None and date_ts > end_ts:
+                continue
+            value = row.get("label_value", row.get("prediction"))
+            if value is None or pd.isna(value):
+                continue
+            records.append({
+                "ticker": ticker,
+                "date": date_ts,
+                "label_value": float(value),
+            })
+
+        if not records:
+            return pd.DataFrame(columns=["ticker", "date", "label_value"])
+        return pd.DataFrame(records).sort_values(["ticker", "date"]).reset_index(drop=True)
+
+    @staticmethod
+    def _load_prediction_label_rows(
+        label: dict,
+        tickers: list[str],
+        start_date: str | None,
+        end_date: str | None,
+    ) -> pd.DataFrame:
+        if not tickers:
+            return pd.DataFrame(columns=["ticker", "date", "label_value"])
+        placeholders = ",".join("?" for _ in tickers)
+        where_parts = [
+            "market = ?",
+            "label_id = ?",
+            f"ticker IN ({placeholders})",
+        ]
+        params: list = [label["market"], label["id"], *tickers]
+        if start_date:
+            where_parts.append("date >= ?")
+            params.append(start_date)
+        if end_date:
+            where_parts.append("date <= ?")
+            params.append(end_date)
+        conn = get_connection()
+        try:
+            return conn.execute(
+                f"""SELECT ticker, date, label_value
+                    FROM prediction_label_values
+                    WHERE {' AND '.join(where_parts)}
+                    ORDER BY ticker, date""",
+                params,
+            ).fetchdf()
+        except Exception:
+            return pd.DataFrame(columns=["ticker", "date", "label_value"])
 
     def _load_benchmark_returns(
         self,

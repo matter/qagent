@@ -7,6 +7,7 @@ from typing import Any
 
 from backend.factors.base import FactorBase
 from backend.logger import get_logger
+from backend.services.custom_code_runner import run_user_code_isolated
 from backend.services.custom_code_safety import validate_user_code_safety
 
 log = get_logger(__name__)
@@ -48,6 +49,43 @@ def load_factor_from_code(source_code: str) -> FactorBase:
         ValueError: If the code does not define a valid FactorBase subclass.
         RuntimeError: If execution of the code fails.
     """
+    if not source_code or not source_code.strip():
+        raise ValueError("source_code is empty")
+    validate_user_code_safety(source_code, code_kind="factor")
+    metadata = run_user_code_isolated(
+        source_code=source_code,
+        code_kind="factor",
+        operation="metadata",
+        timeout_seconds=3,
+    )
+    return IsolatedFactorProxy(source_code, metadata)
+
+
+class IsolatedFactorProxy(FactorBase):
+    """Factor proxy that executes user code in a child process per call."""
+
+    def __init__(self, source_code: str, metadata: dict[str, Any]) -> None:
+        self._source_code = source_code
+        self._execution_timeout_seconds = 10.0
+        self.name = str(metadata.get("name") or "")
+        if not self.name:
+            raise ValueError("Factor class must define a non-empty 'name' attribute")
+        self.description = str(metadata.get("description") or "")
+        self.params = metadata.get("params") or {}
+        self.category = str(metadata.get("category") or "custom")
+
+    def compute(self, data):
+        return run_user_code_isolated(
+            source_code=self._source_code,
+            code_kind="factor",
+            operation="compute",
+            payload={"data": data},
+            timeout_seconds=self._execution_timeout_seconds,
+        )
+
+
+def _load_factor_instance_unsafe(source_code: str) -> FactorBase:
+    """Load a factor instance inside an already isolated worker process."""
     if not source_code or not source_code.strip():
         raise ValueError("source_code is empty")
     validate_user_code_safety(source_code, code_kind="factor")

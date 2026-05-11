@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 from backend.logger import get_logger
 from backend.services.market_context import normalize_market
+from backend.tasks.json_safety import json_safe_string, json_safe_value
 from backend.tasks.models import TaskRecord, TaskSource, TaskStatus
 from backend.tasks.store import TaskStore
 from backend.time_utils import utc_now_naive
@@ -56,6 +57,7 @@ class TaskExecutor:
         timeout: int | None = None,
         source: TaskSource = TaskSource.SYSTEM,
         task_id: str | None = None,
+        on_accept: Callable[[Any, TaskRecord], Any] | None = None,
     ) -> str:
         """Submit *fn* for background execution.
 
@@ -85,14 +87,14 @@ class TaskExecutor:
             run_id=run_id,
             task_type=task_type,
             status=TaskStatus.QUEUED,
-            params=params,
+            params=json_safe_value(params),
             timeout_seconds=timeout,
             source=source,
         )
         self._store.insert(record)
         self._remember(record)
 
-        future = self._pool.submit(self._run, tid, fn, params or {}, timeout)
+        future = self._pool.submit(self._run, tid, fn, params or {}, timeout, on_accept)
         self._futures[tid] = future
         log.info("task.submitted", task_id=tid, task_type=task_type)
         return tid
@@ -267,9 +269,9 @@ class TaskExecutor:
             if completed_at is not None:
                 record.completed_at = completed_at
             if result_summary is not None:
-                record.result_summary = result_summary
+                record.result_summary = json_safe_value(result_summary)
             if error_message is not None:
-                record.error_message = error_message
+                record.error_message = json_safe_string(error_message)
 
     def _is_cancelled(self, task_id: str) -> bool:
         with self._records_lock:
@@ -290,6 +292,7 @@ class TaskExecutor:
         error_message: str,
     ) -> None:
         summary = result if isinstance(result, dict) else {"result": result}
+        summary = json_safe_value(summary)
         existing = self.get_task(task_id)
         late_summary: dict[str, Any] = {}
         if existing and isinstance(existing.result_summary, dict):
@@ -314,12 +317,37 @@ class TaskExecutor:
             error_message=error_message,
         )
 
+    def _accepted_summary(
+        self,
+        task_id: str,
+        result: Any,
+        on_accept: Callable[[Any, TaskRecord], Any] | None,
+    ) -> dict[str, Any]:
+        summary = result if isinstance(result, dict) else {"result": result}
+        summary = json_safe_value(dict(summary))
+        if on_accept is None:
+            return summary
+        record = self.get_task(task_id)
+        if record is None or record.status != TaskStatus.RUNNING:
+            summary["acceptance"] = {
+                "status": "skipped",
+                "reason": "task_not_running_at_acceptance_boundary",
+            }
+            return summary
+        accept_result = on_accept(result, record)
+        summary["acceptance"] = json_safe_value({
+            "status": "accepted",
+            "result": accept_result if accept_result is not None else None,
+        })
+        return summary
+
     def _run(
         self,
         task_id: str,
         fn: Callable[..., Any],
         params: dict[str, Any],
         timeout: int,
+        on_accept: Callable[[Any, TaskRecord], Any] | None,
     ) -> None:
         """Wrapper executed inside the thread pool."""
         started = utc_now_naive()
@@ -364,7 +392,7 @@ class TaskExecutor:
                 log.info("task.cancelled_late_result_quarantined", task_id=task_id)
                 return
             completed = utc_now_naive()
-            summary = result if isinstance(result, dict) else {"result": result}
+            summary = self._accepted_summary(task_id, result, on_accept)
             self._update_memory_status(
                 task_id,
                 TaskStatus.COMPLETED,
@@ -437,7 +465,7 @@ class TaskExecutor:
                     if self._is_cancelled(tid):
                         log.info("task.cancelled_late_error_ignored", task_id=tid)
                         return
-                    tb = traceback.format_exc()
+                    tb = json_safe_string(traceback.format_exc())
                     self._update_memory_status(
                         tid,
                         TaskStatus.FAILED,
@@ -465,7 +493,7 @@ class TaskExecutor:
 
         except Exception:
             completed = utc_now_naive()
-            tb = traceback.format_exc()
+            tb = json_safe_string(traceback.format_exc())
             self._update_memory_status(
                 task_id,
                 TaskStatus.FAILED,

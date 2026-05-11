@@ -10,6 +10,7 @@ import json
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from dataclasses import fields
 from datetime import datetime
 
 import numpy as np
@@ -676,7 +677,7 @@ class SignalService:
             factor_values=factor_data,
             model_predictions=model_predictions,
             current_date=trade_ts,
-            **portfolio_state,
+            **self._strategy_context_portfolio_kwargs(portfolio_state),
         )
 
         try:
@@ -1849,6 +1850,18 @@ class SignalService:
             "max_weight_diff": round(float(max_weight_diff), 8),
         }
         return replay_signals, replay_tickers, replay_summary
+
+    @staticmethod
+    def _strategy_context_portfolio_kwargs(portfolio_state: dict) -> dict:
+        """Return only portfolio-state fields accepted by StrategyContext."""
+        if not isinstance(portfolio_state, dict):
+            return {}
+        allowed = {field.name for field in fields(StrategyContext)}
+        return {
+            key: value
+            for key, value in portfolio_state.items()
+            if key in allowed and key != "diagnostics"
+        }
 
     def _build_auto_stage_trace(
         self,

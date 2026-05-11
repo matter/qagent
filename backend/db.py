@@ -1128,6 +1128,18 @@ CREATE TABLE IF NOT EXISTS label_definitions (
 );
 """
 
+_PREDICTION_LABEL_VALUES_DDL = """\
+CREATE TABLE IF NOT EXISTS prediction_label_values (
+    market      VARCHAR NOT NULL DEFAULT 'US',
+    label_id    VARCHAR NOT NULL,
+    ticker      VARCHAR NOT NULL,
+    date        DATE NOT NULL,
+    label_value DOUBLE NOT NULL,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (market, label_id, ticker, date)
+);
+"""
+
 _FACTORS_DDL = """\
 CREATE TABLE IF NOT EXISTS factors (
     id          VARCHAR PRIMARY KEY,
@@ -1460,6 +1472,7 @@ def init_db() -> None:
         ("stock_groups", _STOCK_GROUPS_DDL),
         ("stock_group_members", _STOCK_GROUP_MEMBERS_DDL),
         ("label_definitions", _LABEL_DEFINITIONS_DDL),
+        ("prediction_label_values", _PREDICTION_LABEL_VALUES_DDL),
         ("factors", _FACTORS_DDL),
         ("factor_values_cache", _FACTOR_VALUES_CACHE_DDL),
         ("factor_eval_results", _FACTOR_EVAL_RESULTS_DDL),

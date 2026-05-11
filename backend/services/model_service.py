@@ -80,6 +80,141 @@ class ModelService:
     # Training
     # ------------------------------------------------------------------
 
+    def create_prediction_label_from_model(
+        self,
+        *,
+        name: str,
+        teacher_model_id: str,
+        universe_group_id: str,
+        start_date: str,
+        end_date: str,
+        market: str | None = None,
+        feature_set_id: str | None = None,
+        description: str | None = None,
+    ) -> dict:
+        """Create a label whose values are frozen teacher model predictions."""
+        resolved_market = normalize_market(market)
+        teacher = self.get_model(teacher_model_id, market=resolved_market)
+        tickers = self._group_service.get_group_tickers(universe_group_id, market=resolved_market)
+        if not tickers:
+            raise ValueError(f"Universe group '{universe_group_id}' has no members")
+        tickers = [normalize_ticker(t, resolved_market) for t in tickers]
+        dates = self._load_trading_dates(tickers, start_date, end_date, market=resolved_market)
+        if not dates:
+            raise ValueError("No trading dates available for prediction-label generation")
+
+        predictions = self.predict_batch(
+            model_id=teacher_model_id,
+            tickers=tickers,
+            dates=dates,
+            feature_set_id=feature_set_id,
+            market=resolved_market,
+        )
+        values = []
+        for date_key, by_ticker in sorted(predictions.items()):
+            for ticker, value in sorted((by_ticker or {}).items()):
+                if value is None or pd.isna(value):
+                    continue
+                values.append({
+                    "date": str(date_key),
+                    "ticker": normalize_ticker(ticker, resolved_market),
+                    "label_value": float(value),
+                })
+        if not values:
+            raise ValueError("Teacher model produced no prediction labels for the requested range")
+
+        label = self._label_service.create_label(
+            name=name,
+            description=description or f"Prediction label distilled from model {teacher_model_id}",
+            target_type="prediction",
+            horizon=0,
+            config={
+                "source": "model_prediction",
+                "teacher_model_id": teacher_model_id,
+                "teacher_model_name": teacher.get("name"),
+                "teacher_feature_set_id": teacher.get("feature_set_id"),
+                "teacher_label_id": teacher.get("label_id"),
+                "teacher_task_type": teacher.get("task_type"),
+                "teacher_train_config": teacher.get("train_config"),
+                "universe_group_id": universe_group_id,
+                "start_date": str(start_date),
+                "end_date": str(end_date),
+                "cutoff_end_date": str(end_date),
+                "feature_set_id": feature_set_id or teacher.get("feature_set_id"),
+                "row_count": len(values),
+                "storage": {
+                    "table": "prediction_label_values",
+                    "primary_key": ["market", "label_id", "ticker", "date"],
+                },
+            },
+            market=resolved_market,
+        )
+        self._insert_prediction_label_values(
+            label_id=label["id"],
+            market=resolved_market,
+            values=values,
+        )
+        log.info(
+            "model.prediction_label.created",
+            label_id=label["id"],
+            teacher_model_id=teacher_model_id,
+            market=resolved_market,
+            rows=len(values),
+        )
+        return label
+
+    def train_distilled_model(
+        self,
+        *,
+        name: str,
+        teacher_model_id: str,
+        student_feature_set_id: str,
+        universe_group_id: str,
+        start_date: str,
+        end_date: str,
+        market: str | None = None,
+        model_type: str = "lightgbm",
+        model_params: dict[str, Any] | None = None,
+        train_config: dict[str, Any] | None = None,
+        sample_weight_config: dict[str, Any] | None = None,
+        objective_type: str | None = "regression",
+        ranking_config: dict[str, Any] | None = None,
+        prediction_feature_set_id: str | None = None,
+        label_name: str | None = None,
+    ) -> dict:
+        """Generate teacher prediction labels and train a student model."""
+        resolved_market = normalize_market(market)
+        label = self.create_prediction_label_from_model(
+            name=label_name or f"{name} teacher prediction label",
+            teacher_model_id=teacher_model_id,
+            universe_group_id=universe_group_id,
+            start_date=start_date,
+            end_date=end_date,
+            market=resolved_market,
+            feature_set_id=prediction_feature_set_id,
+        )
+        model = self.train_model(
+            name=name,
+            feature_set_id=student_feature_set_id,
+            label_id=label["id"],
+            model_type=model_type,
+            model_params=model_params,
+            train_config=train_config,
+            universe_group_id=universe_group_id,
+            sample_weight_config=sample_weight_config,
+            market=resolved_market,
+            objective_type=objective_type,
+            ranking_config=ranking_config,
+        )
+        model["distillation_label_id"] = label["id"]
+        model["distillation"] = {
+            "teacher_model_id": teacher_model_id,
+            "prediction_label_id": label["id"],
+            "cutoff_end_date": str(end_date),
+            "row_count": (label.get("config") or {}).get("row_count"),
+        }
+        return model
+
     def train_model(
         self,
         name: str,
@@ -228,9 +363,6 @@ class ModelService:
         else:
             task = "classification" if label_def["target_type"] in _CLASSIFICATION_TARGETS else "regression"
 
-        model_cls = _MODEL_REGISTRY[model_type]
-        model_instance: ModelBase = model_cls(task=task, params=model_params)
-
         fit_kwargs: dict[str, Any] = {}
         fit_X_train, fit_y_train = X_train, y_train
         fit_X_valid, fit_y_valid = X_valid, y_valid
@@ -275,10 +407,26 @@ class ModelService:
             if not fit_X_valid.empty:
                 fit_kwargs["eval_set"] = [(fit_X_valid, fit_y_valid)]
                 fit_kwargs["eval_group"] = [valid_rank.group_sizes]
+            max_label_gain = self._max_ranking_gain(
+                train_rank.y, valid_rank.y, test_rank.y
+            )
+            label_gain_source = None
+            if model_type == "lightgbm":
+                label_gain_source = self._ensure_lightgbm_label_gain(
+                    model_params,
+                    max_label_gain,
+                )
             ranking_summary = {
                 "query_group": "date",
                 "min_group_size": min_group_size,
                 "label_gain": label_gain,
+                "max_label_gain": max_label_gain,
+                "lightgbm_label_gain_length": (
+                    len(model_params.get("label_gain", []))
+                    if model_type == "lightgbm"
+                    else None
+                ),
+                "lightgbm_label_gain_source": label_gain_source,
                 "train_groups": len(train_rank.group_sizes),
                 "valid_groups": len(valid_rank.group_sizes),
                 "test_groups": len(test_rank.group_sizes),
@@ -290,6 +438,9 @@ class ModelService:
             ranking_summary = None
             if len(X_valid) > 0:
                 fit_kwargs["eval_set"] = [(X_valid, y_valid)]
+
+        model_cls = _MODEL_REGISTRY[model_type]
+        model_instance: ModelBase = model_cls(task=task, params=model_params)
 
         # ---- 6a. Build sample weights if configured ----
         if sample_weight_config:
@@ -330,6 +481,8 @@ class ModelService:
                 task, y_train, y_valid, y_test, preds_valid, preds_test
             )
         eval_metrics["task_type"] = task
+        eval_metrics["label_summary"] = label_summary
+        eval_metrics["label_horizon"] = label_summary.get("horizon")
 
         # Feature importance
         try:
@@ -390,6 +543,8 @@ class ModelService:
             "task": task,
             "objective_type": objective or task,
             "ranking_config": ranking_config if task == "ranking" else None,
+            "label_summary": label_summary,
+            "label_horizon": label_summary.get("horizon"),
             "feature_set_id": feature_set_id,
             "label_id": label_id,
             "model_params": model_instance.get_params(),
@@ -816,6 +971,70 @@ class ModelService:
 
         return results
 
+    @staticmethod
+    def _load_trading_dates(
+        tickers: list[str],
+        start_date: str,
+        end_date: str,
+        market: str,
+    ) -> list[str]:
+        if not tickers:
+            return []
+        placeholders = ",".join("?" for _ in tickers)
+        conn = get_connection()
+        rows = conn.execute(
+            f"""SELECT DISTINCT date
+                FROM daily_bars
+                WHERE market = ?
+                  AND ticker IN ({placeholders})
+                  AND date >= ?
+                  AND date <= ?
+                ORDER BY date""",
+            [market, *tickers, start_date, end_date],
+        ).fetchall()
+        return [str(row[0])[:10] for row in rows]
+
+    @staticmethod
+    def _insert_prediction_label_values(
+        *,
+        label_id: str,
+        market: str,
+        values: list[dict[str, Any]],
+    ) -> None:
+        if not values:
+            return
+        conn = get_connection()
+        try:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS prediction_label_values (
+                    market      VARCHAR NOT NULL DEFAULT 'US',
+                    label_id    VARCHAR NOT NULL,
+                    ticker      VARCHAR NOT NULL,
+                    date        DATE NOT NULL,
+                    label_value DOUBLE NOT NULL,
+                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (market, label_id, ticker, date)
+                )"""
+            )
+        except Exception:
+            pass
+        rows = [
+            (
+                market,
+                label_id,
+                normalize_ticker(item["ticker"], market),
+                item["date"],
+                float(item["label_value"]),
+            )
+            for item in values
+        ]
+        conn.executemany(
+            """INSERT OR REPLACE INTO prediction_label_values
+               (market, label_id, ticker, date, label_value)
+               VALUES (?, ?, ?, ?, ?)""",
+            rows,
+        )
+
     def _load_frozen_features(self, model_id: str) -> list[str] | None:
         """Load the feature name list frozen at training time from metadata.json."""
         if model_id in self._frozen_cache:
@@ -984,6 +1203,48 @@ class ModelService:
             weights /= mean_w
 
         return weights
+
+    @staticmethod
+    def _max_ranking_gain(*series_list: pd.Series) -> int:
+        max_gain = 0
+        for series in series_list:
+            if series is None or series.empty:
+                continue
+            value = series.max()
+            if pd.notna(value):
+                max_gain = max(max_gain, int(value))
+        return max_gain
+
+    @staticmethod
+    def _ensure_lightgbm_label_gain(
+        model_params: dict[str, Any],
+        max_label_gain: int,
+    ) -> str:
+        required_length = max_label_gain + 1
+        existing = model_params.get("label_gain")
+        if existing is None:
+            model_params["label_gain"] = list(range(required_length))
+            return "generated"
+
+        if isinstance(existing, str):
+            parts = [p.strip() for p in existing.split(",") if p.strip()]
+            try:
+                parsed = [float(p) for p in parts]
+            except ValueError as exc:
+                raise ValueError("model_params.label_gain must be a numeric list") from exc
+        elif isinstance(existing, (list, tuple)):
+            parsed = list(existing)
+        else:
+            raise ValueError("model_params.label_gain must be a numeric list")
+
+        if len(parsed) <= max_label_gain:
+            raise ValueError(
+                "label_gain length must be > max ordinal gain "
+                f"({len(parsed)} <= {max_label_gain}); "
+                f"use at least {required_length} entries"
+            )
+        model_params["label_gain"] = parsed
+        return "provided"
 
     @staticmethod
     def _build_X_for_date(

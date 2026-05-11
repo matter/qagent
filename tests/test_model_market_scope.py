@@ -12,6 +12,7 @@ from backend.api import models as model_api
 from backend.models.base import ModelBase
 from backend.services import model_service as model_service_module
 from backend.services.model_service import ModelService
+from fastapi import HTTPException
 
 
 class ModelMarketScopeTests(unittest.TestCase):
@@ -119,9 +120,251 @@ class ModelMarketScopeTests(unittest.TestCase):
         self.assertEqual(executor.params["objective_type"], "ranking")
         self.assertEqual(executor.params["ranking_config"]["min_group_size"], 5)
 
+    def test_distillation_api_generates_prediction_label_before_training(self):
+        executor = _FakeExecutor()
+        svc = _FakeDistillationService()
+
+        with (
+            patch.object(model_api, "_get_service", return_value=svc),
+            patch.object(model_api, "_get_executor", return_value=executor),
+        ):
+            result = asyncio.run(
+                model_api.train_model_distillation(
+                    model_api.TrainDistillationRequest(
+                        market="US",
+                        name="Student model",
+                        teacher_model_id="teacher_1",
+                        student_feature_set_id="fs_student",
+                        universe_group_id="sp500",
+                        start_date="2025-01-02",
+                        end_date="2025-12-31",
+                        train_config={
+                            "train_start": "2025-01-02",
+                            "train_end": "2025-09-30",
+                            "valid_start": "2025-10-01",
+                            "valid_end": "2025-11-14",
+                            "test_start": "2025-11-17",
+                            "test_end": "2025-12-31",
+                        },
+                    )
+                )
+            )
+
+        self.assertEqual(result["market"], "US")
+        self.assertEqual(result["task_type"], "model_distillation_train")
+        summary = executor.fn(**executor.params)
+        self.assertEqual(svc.calls[0][0], "train_distilled")
+        self.assertEqual(svc.calls[0][1]["teacher_model_id"], "teacher_1")
+        self.assertEqual(svc.calls[0][1]["student_feature_set_id"], "fs_student")
+        self.assertEqual(summary["distillation_label_id"], "distill_label_1")
+        self.assertEqual(summary["model_id"], "student_model_1")
+
+    def test_prediction_label_records_teacher_lineage_and_cutoff(self):
+        svc = ModelService()
+        svc._group_service = _FakeUsGroupService()
+        svc._feature_service = _FakeFeatureService()
+        svc._label_service = _FakeLabelService()
+        svc.predict_batch = lambda **kwargs: {
+            "2025-01-02": {"AAA": 0.7, "BBB": 0.3},
+            "2025-01-03": {"AAA": 0.8},
+        }
+
+        with patch("backend.services.model_service.get_connection", return_value=self.conn):
+            self.conn.execute(
+                """
+                INSERT INTO models
+                    (id, market, name, feature_set_id, label_id, model_type, eval_metrics)
+                VALUES
+                    ('teacher_1', 'US', 'Teacher', 'fs_teacher', 'label_teacher', 'fake',
+                     '{"task_type": "regression"}')
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE daily_bars (
+                    market VARCHAR,
+                    ticker VARCHAR,
+                    date DATE,
+                    close DOUBLE
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                INSERT INTO daily_bars VALUES
+                    ('US', 'AAA', DATE '2025-01-02', 10.0),
+                    ('US', 'BBB', DATE '2025-01-02', 20.0),
+                    ('US', 'AAA', DATE '2025-01-03', 11.0)
+                """
+            )
+            label = svc.create_prediction_label_from_model(
+                name="Teacher soft labels",
+                teacher_model_id="teacher_1",
+                universe_group_id="sp500",
+                start_date="2025-01-02",
+                end_date="2025-01-03",
+                market="US",
+            )
+            with patch("backend.services.label_service.get_connection", return_value=self.conn):
+                values = svc._label_service.compute_label_values(
+                    label["id"],
+                    ["AAA", "BBB"],
+                    "2025-01-02",
+                    "2025-01-03",
+                    market="US",
+                )
+
+        self.assertEqual(label["target_type"], "prediction")
+        self.assertEqual(label["horizon"], 0)
+        self.assertEqual(label["config"]["teacher_model_id"], "teacher_1")
+        self.assertEqual(label["config"]["cutoff_end_date"], "2025-01-03")
+        self.assertEqual(label["config"]["source"], "model_prediction")
+        self.assertEqual(label["config"]["storage"]["table"], "prediction_label_values")
+        self.assertNotIn("values", label["config"])
+        self.assertEqual(len(values), 3)
+        self.assertEqual(
+            values.sort_values(["date", "ticker"])["label_value"].round(3).tolist(),
+            [0.7, 0.3, 0.8],
+        )
+
+    def test_model_predict_api_rejects_when_prediction_slot_is_full(self):
+        acquired = []
+        for _ in range(model_api._PREDICT_API_CONCURRENCY_LIMIT):
+            if model_api._PREDICT_API_SEMAPHORE.acquire(blocking=False):
+                acquired.append(True)
+        self.addCleanup(
+            lambda: [
+                model_api._PREDICT_API_SEMAPHORE.release()
+                for _ in acquired
+            ]
+        )
+
+        with self.assertRaises(HTTPException) as ctx:
+            asyncio.run(
+                model_api.predict(
+                    "model_busy",
+                    model_api.PredictRequest(
+                        market="US",
+                        tickers=["AAPL"],
+                        date="2026-01-02",
+                    ),
+                )
+            )
+
+        self.assertEqual(ctx.exception.status_code, 429)
+
+    def test_model_predict_api_offloads_blocking_prediction_to_threadpool(self):
+        class _FakePredictService:
+            def __init__(self):
+                self.inside_threadpool = False
+
+            def predict_detailed(self, **kwargs):
+                if not self.inside_threadpool:
+                    raise AssertionError("prediction called directly on event loop")
+                return pd.DataFrame({"prediction": [0.42]}, index=["AAPL"])
+
+        svc = _FakePredictService()
+
+        async def fake_run_in_threadpool(func, *args, **kwargs):
+            svc.inside_threadpool = True
+            try:
+                return func(*args, **kwargs)
+            finally:
+                svc.inside_threadpool = False
+
+        with (
+            patch.object(model_api, "_get_service", return_value=svc),
+            patch.object(
+                model_api,
+                "run_in_threadpool",
+                side_effect=fake_run_in_threadpool,
+                create=True,
+            ) as offload,
+        ):
+            result = asyncio.run(
+                model_api.predict(
+                    "model_ok",
+                    model_api.PredictRequest(
+                        market="US",
+                        tickers=["AAPL"],
+                        date="2026-01-02",
+                    ),
+                )
+            )
+
+        self.assertTrue(offload.called)
+        self.assertEqual(result["predictions"], {"AAPL": 0.42})
+
+    def test_model_predict_batch_api_offloads_and_uses_same_concurrency_gate(self):
+        class _FakePredictService:
+            def __init__(self):
+                self.inside_threadpool = False
+
+            def predict_batch(self, **kwargs):
+                if not self.inside_threadpool:
+                    raise AssertionError("batch prediction called directly on event loop")
+                return {"2026-01-02": {"AAPL": 0.42}}
+
+        svc = _FakePredictService()
+
+        async def fake_run_in_threadpool(func, *args, **kwargs):
+            svc.inside_threadpool = True
+            try:
+                return func(*args, **kwargs)
+            finally:
+                svc.inside_threadpool = False
+
+        with (
+            patch.object(model_api, "_get_service", return_value=svc),
+            patch.object(
+                model_api,
+                "run_in_threadpool",
+                side_effect=fake_run_in_threadpool,
+            ) as offload,
+        ):
+            result = asyncio.run(
+                model_api.predict_batch(
+                    "model_ok",
+                    model_api.PredictBatchRequest(
+                        market="US",
+                        tickers=["AAPL"],
+                        dates=["2026-01-02"],
+                    ),
+                )
+            )
+
+        self.assertTrue(offload.called)
+        self.assertEqual(result["predictions"], {"2026-01-02": {"AAPL": 0.42}})
+
+        acquired = []
+        for _ in range(model_api._PREDICT_API_CONCURRENCY_LIMIT):
+            if model_api._PREDICT_API_SEMAPHORE.acquire(blocking=False):
+                acquired.append(True)
+        self.addCleanup(
+            lambda: [
+                model_api._PREDICT_API_SEMAPHORE.release()
+                for _ in acquired
+            ]
+        )
+
+        with self.assertRaises(HTTPException) as ctx:
+            asyncio.run(
+                model_api.predict_batch(
+                    "model_busy",
+                    model_api.PredictBatchRequest(
+                        market="US",
+                        tickers=["AAPL"],
+                        dates=["2026-01-02"],
+                    ),
+                )
+            )
+
+        self.assertEqual(ctx.exception.status_code, 429)
+
     def test_pairwise_objective_uses_ranking_groups_and_metadata(self):
         _FakeModel.last_task = None
         _FakeModel.last_fit_kwargs = None
+        _FakeModel.last_params = None
         svc = ModelService()
         svc._feature_service = _FakeFeatureService()
         svc._label_service = _FakeLabelService()
@@ -158,6 +401,81 @@ class ModelMarketScopeTests(unittest.TestCase):
         self.assertEqual(summary["objective_type"], "pairwise")
         self.assertEqual(summary["eval_metrics"]["pairwise_mode"], "lambdarank")
         self.assertIn("test_ndcg@1", summary["eval_metrics"])
+
+    def test_ranking_training_injects_safe_lightgbm_label_gain_length(self):
+        _FakeModel.last_params = None
+        svc = ModelService()
+        svc._feature_service = _FakeFeatureService()
+        svc._label_service = _FakeLabelService()
+        svc._group_service = _FakeGroupService()
+
+        with (
+            patch("backend.services.model_service.get_connection", return_value=self.conn),
+            patch.dict(model_service_module._MODEL_REGISTRY, {"lightgbm": _FakeModel}),
+            patch.object(model_service_module, "settings", _FakeSettings(self.models_dir)),
+        ):
+            summary = svc.train_model(
+                name="US ranker",
+                feature_set_id="fs_us",
+                label_id="label_us",
+                model_type="lightgbm",
+                model_params={"n_estimators": 3},
+                train_config={
+                    "train_start": "2024-01-02",
+                    "train_end": "2024-01-04",
+                    "valid_start": "2024-01-05",
+                    "valid_end": "2024-01-08",
+                    "test_start": "2024-01-09",
+                    "test_end": "2024-01-10",
+                    "purge_gap": 0,
+                },
+                universe_group_id="us_group",
+                market="US",
+                objective_type="ranking",
+                ranking_config={"query_group": "date", "min_group_size": 2},
+            )
+
+        self.assertEqual(_FakeModel.last_params["label_gain"], [0, 1])
+        ranking_groups = summary["eval_metrics"]["ranking_groups"]
+        self.assertEqual(ranking_groups["max_label_gain"], 1)
+        self.assertEqual(ranking_groups["lightgbm_label_gain_length"], 2)
+        self.assertEqual(ranking_groups["lightgbm_label_gain_source"], "generated")
+
+    def test_ranking_training_rejects_short_lightgbm_label_gain_before_fit(self):
+        _FakeModel.last_fit_kwargs = None
+        svc = ModelService()
+        svc._feature_service = _FakeFeatureService()
+        svc._label_service = _FakeLabelService()
+        svc._group_service = _FakeGroupService()
+
+        with (
+            patch("backend.services.model_service.get_connection", return_value=self.conn),
+            patch.dict(model_service_module._MODEL_REGISTRY, {"lightgbm": _FakeModel}),
+            patch.object(model_service_module, "settings", _FakeSettings(self.models_dir)),
+        ):
+            with self.assertRaisesRegex(ValueError, "label_gain length must be > max ordinal gain"):
+                svc.train_model(
+                    name="US ranker bad gain",
+                    feature_set_id="fs_us",
+                    label_id="label_us",
+                    model_type="lightgbm",
+                    model_params={"label_gain": [0]},
+                    train_config={
+                        "train_start": "2024-01-02",
+                        "train_end": "2024-01-04",
+                        "valid_start": "2024-01-05",
+                        "valid_end": "2024-01-08",
+                        "test_start": "2024-01-09",
+                        "test_end": "2024-01-10",
+                        "purge_gap": 0,
+                    },
+                    universe_group_id="us_group",
+                    market="US",
+                    objective_type="ranking",
+                    ranking_config={"query_group": "date", "min_group_size": 2},
+                )
+
+        self.assertIsNone(_FakeModel.last_fit_kwargs)
 
     def test_lightgbm_listwise_training_saves_ranking_task_type(self):
         svc = ModelService()
@@ -220,6 +538,19 @@ class ModelMarketScopeTests(unittest.TestCase):
             )
             """
         )
+        self.conn.execute(
+            """
+            CREATE TABLE prediction_label_values (
+                market VARCHAR NOT NULL DEFAULT 'US',
+                label_id VARCHAR NOT NULL,
+                ticker VARCHAR NOT NULL,
+                date DATE NOT NULL,
+                label_value DOUBLE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (market, label_id, ticker, date)
+            )
+            """
+        )
 
 
 class _FakeFeatureService:
@@ -264,9 +595,12 @@ class _FakeFeatureService:
 class _FakeLabelService:
     def __init__(self):
         self.calls = []
+        self.labels = {}
 
     def get_label(self, label_id, market=None):
         self.calls.append(("get", label_id, market))
+        if label_id in self.labels:
+            return self.labels[label_id]
         return {
             "id": label_id,
             "market": market,
@@ -275,8 +609,43 @@ class _FakeLabelService:
             "config": {},
         }
 
+    def create_label(
+        self,
+        name,
+        description=None,
+        target_type="return",
+        horizon=5,
+        benchmark=None,
+        config=None,
+        market=None,
+    ):
+        self.calls.append(("create", name, market))
+        label = {
+            "id": "distill_label_created",
+            "market": market,
+            "name": name,
+            "description": description,
+            "target_type": target_type,
+            "horizon": horizon,
+            "benchmark": benchmark,
+            "config": config or {},
+            "status": "draft",
+        }
+        self.labels[label["id"]] = label
+        return label
+
     def compute_label_values(self, label_id, tickers, start_date, end_date, market=None):
         self.calls.append(("compute", label_id, market))
+        label = self.labels.get(label_id)
+        if label and label["target_type"] == "prediction":
+            from backend.services.label_service import LabelService
+
+            return LabelService._compute_prediction_label_values(
+                label,
+                tickers,
+                start_date,
+                end_date,
+            )
         rows = []
         dates = pd.to_datetime(
             [
@@ -304,12 +673,23 @@ class _FakeGroupService:
         return ["sh.600000", "sh.600001"]
 
 
+class _FakeUsGroupService:
+    def __init__(self):
+        self.calls = []
+
+    def get_group_tickers(self, group_id, market=None):
+        self.calls.append(("tickers", group_id, market))
+        return ["AAA", "BBB"]
+
+
 class _FakeModel(ModelBase):
     last_task = None
     last_fit_kwargs = None
+    last_params = None
 
     def __init__(self, task="regression", params=None):
         _FakeModel.last_task = task
+        _FakeModel.last_params = dict(params or {})
         self.task = task
         self.params = params or {}
         self._feature_names = []
@@ -338,8 +718,12 @@ class _FakeExecutor:
     def __init__(self):
         self._store = _FakeStore()
         self.params = None
+        self.fn = None
+        self.task_type = None
 
     def submit(self, task_type, fn, params, timeout, source):
+        self.task_type = task_type
+        self.fn = fn
         self.params = params
         return "task_model_cn"
 
@@ -347,6 +731,43 @@ class _FakeExecutor:
 class _FakeSettings:
     def __init__(self, models_dir):
         self.models_dir = models_dir
+
+
+class _FakeDistillationService:
+    def __init__(self):
+        self.calls = []
+
+    def train_distilled_model(self, **kwargs):
+        self.calls.append(("train_distilled", kwargs))
+        return {
+            "model_id": "student_model_1",
+            "market": kwargs.get("market"),
+            "distillation_label_id": "distill_label_1",
+            "distillation": {
+                "teacher_model_id": kwargs.get("teacher_model_id"),
+                "prediction_label_id": "distill_label_1",
+                "cutoff_end_date": kwargs.get("end_date"),
+            },
+        }
+
+    def create_prediction_label_from_model(self, **kwargs):
+        self.calls.append(("distill", kwargs))
+        return {
+            "id": "distill_label_1",
+            "market": kwargs.get("market"),
+            "config": {
+                "teacher_model_id": kwargs.get("teacher_model_id"),
+                "cutoff_end_date": kwargs.get("end_date"),
+            },
+        }
+
+    def train_model(self, **kwargs):
+        self.calls.append(("train", kwargs))
+        return {
+            "model_id": "student_model_1",
+            "market": kwargs.get("market"),
+            "eval_metrics": {"time_overlap": False},
+        }
 
 
 if __name__ == "__main__":
