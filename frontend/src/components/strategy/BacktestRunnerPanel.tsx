@@ -75,6 +75,7 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
   const [executionModel, setExecutionModel] = useState<ExecutionModel>("next_open");
   const [plannedPriceBufferBps, setPlannedPriceBufferBps] = useState<number>(50);
   const [plannedPriceFallback, setPlannedPriceFallback] = useState<PlannedPriceFallback>("cancel");
+  const [useStrategyDefaults, setUseStrategyDefaults] = useState<boolean>(true);
   const [maxSingleNameWeight, setMaxSingleNameWeight] = useState<number | null>(null);
   const [weeklyTurnoverFloor, setWeeklyTurnoverFloor] = useState<number | null>(null);
   const [constraintDriftBuffer, setConstraintDriftBuffer] = useState<number | null>(null);
@@ -115,6 +116,7 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
     if (restoreConfig.plannedPriceFallback) {
       setPlannedPriceFallback(restoreConfig.plannedPriceFallback);
     }
+    setUseStrategyDefaults(false);
   }, [restoreConfig]);
 
   useEffect(() => {
@@ -138,6 +140,19 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
     setResult(null);
 
     try {
+      const strategyOwnedOverrides = useStrategyDefaults
+        ? {}
+        : {
+            max_positions: maxPositions,
+            rebalance_freq: rebalanceFreq,
+            rebalance_buffer: rebalanceBuffer,
+            min_holding_days: minHoldingDays,
+            reentry_cooldown_days: reentryCooldownDays,
+            normalize_target_weights: normalizeTargetWeights,
+            execution_model: executionModel,
+            planned_price_buffer_bps: executionModel === "planned_price" ? plannedPriceBufferBps : undefined,
+            planned_price_fallback: executionModel === "planned_price" ? plannedPriceFallback : undefined,
+          };
       const { task_id } = await runBacktest(selectedStrategy, {
         config: {
           start_date: startDate.format("YYYY-MM-DD"),
@@ -148,16 +163,8 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
           initial_capital: initialCapital,
           commission_rate: commission,
           slippage_rate: slippage,
-          max_positions: maxPositions,
           benchmark,
-          rebalance_freq: rebalanceFreq,
-          rebalance_buffer: rebalanceBuffer,
-          min_holding_days: minHoldingDays,
-          reentry_cooldown_days: reentryCooldownDays,
-          normalize_target_weights: normalizeTargetWeights,
-          execution_model: executionModel,
-          planned_price_buffer_bps: executionModel === "planned_price" ? plannedPriceBufferBps : undefined,
-          planned_price_fallback: executionModel === "planned_price" ? plannedPriceFallback : undefined,
+          ...strategyOwnedOverrides,
           constraint_config: {
             ...(maxSingleNameWeight != null ? { max_single_name_weight: maxSingleNameWeight } : {}),
             ...(weeklyTurnoverFloor != null ? { weekly_turnover_floor: weeklyTurnoverFloor } : {}),
@@ -207,6 +214,9 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
     }
   };
 
+  const selectedStrategyDef = strategies.find((s) => s.id === selectedStrategy);
+  const strategyDefaults = selectedStrategyDef?.default_backtest_config;
+
   return (
     <>
       {contextHolder}
@@ -243,6 +253,26 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
                   showSearch
                   optionFilterProp="label"
                 />
+              </Col>
+            </Row>
+            <Row gutter={12} align="middle">
+              <Col span={8}>
+                <Text type="secondary" style={{ fontSize: 12 }}>策略默认参数</Text>
+                <div style={{ marginTop: 4 }}>
+                  <Switch
+                    checked={useStrategyDefaults}
+                    onChange={setUseStrategyDefaults}
+                    checkedChildren="继承"
+                    unCheckedChildren="覆盖"
+                  />
+                </div>
+              </Col>
+              <Col span={16}>
+                {strategyDefaults && Object.keys(strategyDefaults).length > 0 && (
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    {Object.entries(strategyDefaults).slice(0, 4).map(([key, value]) => `${key}=${String(value)}`).join(" · ")}
+                  </Text>
+                )}
               </Col>
             </Row>
 
@@ -361,6 +391,7 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
                   onChange={(v) => setMaxPositions(v ?? 50)}
                   min={1}
                   max={500}
+                  disabled={useStrategyDefaults}
                 />
               </Col>
               <Col span={6}>
@@ -372,6 +403,7 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
                   buttonStyle="solid"
                   size="small"
                   style={{ marginTop: 4 }}
+                  disabled={useStrategyDefaults}
                 >
                   <Radio.Button value="daily">每日</Radio.Button>
                   <Radio.Button value="weekly">每周</Radio.Button>
@@ -391,6 +423,7 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
                   max={0.5}
                   step={0.01}
                   placeholder="权重变化低于此值不交易"
+                  disabled={useStrategyDefaults}
                 />
               </Col>
               <Col span={8}>
@@ -401,6 +434,7 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
                   onChange={(v) => setMinHoldingDays(v ?? 0)}
                   min={0}
                   max={60}
+                  disabled={useStrategyDefaults}
                 />
               </Col>
               <Col span={8}>
@@ -411,6 +445,7 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
                   onChange={(v) => setReentryCooldownDays(v ?? 0)}
                   min={0}
                   max={60}
+                  disabled={useStrategyDefaults}
                 />
               </Col>
             </Row>
@@ -424,6 +459,7 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
                     onChange={setNormalizeTargetWeights}
                     checkedChildren="满仓"
                     unCheckedChildren="保留现金"
+                    disabled={useStrategyDefaults}
                   />
                 </div>
               </Col>
@@ -436,9 +472,11 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
                   buttonStyle="solid"
                   size="small"
                   style={{ marginTop: 4 }}
+                  disabled={useStrategyDefaults}
                 >
                   <Radio.Button value="next_open">次日开盘</Radio.Button>
                   <Radio.Button value="planned_price">计划价</Radio.Button>
+                  <Radio.Button value="next_close">次日收盘</Radio.Button>
                 </Radio.Group>
               </Col>
               {executionModel === "planned_price" && (
@@ -451,6 +489,7 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
                     min={0}
                     max={4999}
                     step={10}
+                    disabled={useStrategyDefaults}
                   />
                 </Col>
               )}
@@ -466,6 +505,7 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
                       { value: "cancel", label: "取消订单" },
                       { value: "next_close", label: "次日收盘成交" },
                     ]}
+                    disabled={useStrategyDefaults}
                   />
                 </Col>
               )}

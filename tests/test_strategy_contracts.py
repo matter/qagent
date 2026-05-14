@@ -4,6 +4,54 @@ from backend.services.strategy_service import StrategyService
 
 
 class StrategyServiceContractTests(unittest.TestCase):
+    def test_extracts_strategy_default_configs_from_source_metadata(self):
+        source = '''
+from backend.strategies.base import StrategyBase
+
+class DefaultsStrategy(StrategyBase):
+    name = "Defaults Strategy"
+    default_backtest_config = {
+        "position_sizing": "raw_weight",
+        "rebalance_freq": "daily",
+        "execution_model": "planned_price",
+        "planned_price_fallback": "next_close",
+    }
+    default_paper_config = {"execution_model": "planned_price"}
+
+    def generate_signals(self, context):
+        return {}
+'''
+
+        metadata = StrategyService.extract_strategy_metadata_from_source(source)
+
+        self.assertEqual(
+            metadata["default_backtest_config"]["execution_model"],
+            "planned_price",
+        )
+        self.assertEqual(
+            metadata["default_backtest_config"]["planned_price_fallback"],
+            "next_close",
+        )
+        self.assertEqual(
+            metadata["default_paper_config"]["execution_model"],
+            "planned_price",
+        )
+
+    def test_strategy_defaults_reject_experiment_environment_fields(self):
+        source = '''
+from backend.strategies.base import StrategyBase
+
+class BadDefaultsStrategy(StrategyBase):
+    name = "Bad Defaults Strategy"
+    default_backtest_config = {"market": "CN", "initial_capital": 100}
+
+    def generate_signals(self, context):
+        return {}
+'''
+
+        with self.assertRaisesRegex(ValueError, "strategy default"):
+            StrategyService.extract_strategy_metadata_from_source(source)
+
     def test_extracts_auxiliary_model_constants_used_as_prediction_keys(self):
         source = '''
 from backend.strategies.base import StrategyBase

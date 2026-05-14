@@ -681,6 +681,63 @@ class BacktestDiagnosticsContractTests(unittest.TestCase):
             "fp_hash",
         )
 
+    def test_save_result_persists_planned_price_fallback_config(self):
+        svc = BacktestService()
+        result = BacktestResult(
+            config={"market": "US"},
+            dates=["2026-01-02"],
+            nav=[1_000_000.0],
+            benchmark_nav=[1_000_000.0],
+            drawdown=[0.0],
+            total_return=0.0,
+            annual_return=0.0,
+            annual_volatility=0.0,
+            max_drawdown=0.0,
+            sharpe_ratio=0.0,
+            calmar_ratio=0.0,
+            sortino_ratio=0.0,
+            win_rate=0.0,
+            profit_loss_ratio=0.0,
+            total_trades=0,
+            annual_turnover=0.0,
+            total_cost=0.0,
+            monthly_returns=[],
+            trades=[],
+            trade_diagnostics={
+                "planned_price_execution": {
+                    "execution_model": "planned_price",
+                    "fallback_close_count": 1,
+                },
+            },
+        )
+        conn = _BacktestSaveConnection()
+
+        with (
+            patch("backend.services.backtest_service.get_connection", return_value=conn),
+            patch.object(svc, "_build_reproducibility_fingerprint", return_value={}),
+        ):
+            svc._save_result(
+                bt_id="bt_fallback",
+                market="US",
+                strategy_id="strategy_us",
+                config={
+                    "market": "US",
+                    "execution_model": "planned_price",
+                    "planned_price_buffer_bps": 50.0,
+                    "planned_price_fallback": "next_close",
+                },
+                result=result,
+                result_level="exploratory",
+            )
+
+        config = conn.insert_params[3]
+        summary = conn.insert_params[4]
+        self.assertEqual(config["planned_price_fallback"], "next_close")
+        self.assertEqual(
+            summary["trade_diagnostics"]["planned_price_execution"]["fallback_close_count"],
+            1,
+        )
+
     def test_reproducibility_fingerprint_marks_dirty_runtime_patch_hash(self):
         svc = BacktestService.__new__(BacktestService)
         svc._strategy_service = unittest.mock.Mock()
@@ -808,6 +865,77 @@ class BacktestDiagnosticsContractTests(unittest.TestCase):
         self.assertEqual(summary["rebalance_digest"]["shown"], 2)
         self.assertEqual(summary["rebalance_digest"]["total"], 3)
         self.assertEqual(summary["decision"]["conclusion"], "promote")
+
+    def test_research_summary_explains_backend_commit_fingerprint_drift(self):
+        baseline_fingerprint = {
+            "hash": "baseline_hash",
+            "schema_version": 1,
+            "service_version": "0.1.0",
+            "git_commit": "old_commit",
+            "market": "US",
+            "strategy": {
+                "id": "strategy_1",
+                "source_hash": "strategy_hash",
+                "required_models": ["model_1"],
+                "required_factors": ["factor_1"],
+            },
+            "dependencies": {
+                "models": [{"id": "model_1", "metadata_hash": "model_hash"}],
+                "factors": [{"id": "factor_1", "source_hash": "factor_hash"}],
+            },
+            "config": {"start_date": "2026-01-02", "end_date": "2026-04-02"},
+            "data_watermark": {
+                "daily_bars": {"max_date": "2026-04-02", "rows": 100},
+                "benchmark": {"max_date": "2026-04-02", "rows": 50},
+            },
+            "runtime": {"dirty": False, "patch_hash": None},
+            "result_shape": {"dates": 60, "trades": 86},
+        }
+        trial_fingerprint = {
+            **baseline_fingerprint,
+            "hash": "trial_hash",
+            "git_commit": "new_commit",
+            "result_shape": {"dates": 60, "trades": 107},
+        }
+        svc = BacktestService.__new__(BacktestService)
+        svc.get_backtest = lambda bt_id, market=None: {
+            "id": bt_id,
+            "market": "US",
+            "strategy_id": "strategy_1",
+            "summary": {
+                "total_return": 0.49 if bt_id == "baseline" else 0.24,
+                "sharpe_ratio": 10.9 if bt_id == "baseline" else 3.6,
+                "total_trades": 86 if bt_id == "baseline" else 107,
+                "reproducibility_fingerprint": (
+                    baseline_fingerprint if bt_id == "baseline" else trial_fingerprint
+                ),
+                "rebalance_diagnostics": [],
+            },
+            "trades": [],
+        }
+
+        summary = svc.get_research_summary(
+            baseline_backtest_id="baseline",
+            trial_backtest_id="trial",
+            market="US",
+        )
+
+        diagnostics = summary["reproducibility_diagnostics"]
+        self.assertFalse(diagnostics["strictly_comparable"])
+        self.assertEqual(diagnostics["compatibility_flag"], "backend_change_same_inputs")
+        self.assertIn("backend_commit", diagnostics["difference_sources"])
+        self.assertIn("result_shape", diagnostics["difference_sources"])
+        self.assertNotIn("config", diagnostics["difference_sources"])
+        self.assertNotIn("data_watermark", diagnostics["difference_sources"])
+        self.assertNotIn("dependency_hash", diagnostics["difference_sources"])
+        self.assertEqual(
+            diagnostics["field_diffs"]["git_commit"],
+            {"baseline": "old_commit", "trial": "new_commit"},
+        )
+        self.assertEqual(
+            diagnostics["result_shape_delta"],
+            {"dates": 0, "trades": 21},
+        )
 
     def test_combine_portfolio_legs_builds_weighted_nav_and_leg_summary(self):
         svc = BacktestService()

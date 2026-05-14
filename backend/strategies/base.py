@@ -102,6 +102,8 @@ class StrategyBase(ABC):
 
     name: str
     description: str = ""
+    default_backtest_config: dict[str, Any] = {}
+    default_paper_config: dict[str, Any] = {}
 
     @abstractmethod
     def generate_signals(self, context: StrategyContext) -> pd.DataFrame:

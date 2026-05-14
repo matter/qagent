@@ -189,6 +189,7 @@ class BacktestEngine:
         signals: pd.DataFrame,
         config: BacktestConfig,
         planned_prices: pd.DataFrame | None = None,
+        execution_overrides: pd.DataFrame | None = None,
     ) -> BacktestResult:
         """Run a backtest.
 
@@ -199,6 +200,8 @@ class BacktestEngine:
             config: Backtest configuration.
             planned_prices: Optional DataFrame with columns=[ticker],
                             index=[decision_date], values=planned execution price.
+            execution_overrides: Optional DataFrame with columns=[ticker],
+                                 index=[decision_date], values=dict(order intent).
 
         Returns:
             BacktestResult with all metrics and data.
@@ -229,6 +232,9 @@ class BacktestEngine:
         if planned_prices is not None:
             planned_prices = planned_prices.copy()
             planned_prices.index = pd.to_datetime(planned_prices.index)
+        if execution_overrides is not None:
+            execution_overrides = execution_overrides.copy()
+            execution_overrides.index = pd.to_datetime(execution_overrides.index)
 
         # 3. Determine rebalance dates
         rebalance_dates = self._get_rebalance_dates(all_trading_days, config.rebalance_freq)
@@ -266,6 +272,9 @@ class BacktestEngine:
             "filled": [],
             "blocked": [],
         }
+        order_intent_records: list[dict[str, Any]] = []
+        execution_model_counts: dict[str, int] = {}
+        saw_planned_price_order = config.execution_model == "planned_price"
 
         for day_idx, trade_date in enumerate(all_trading_days):
             trade_date_ts = pd.Timestamp(trade_date)
@@ -433,23 +442,63 @@ class BacktestEngine:
                         exec_price: float | None = None
                         fill_type: str | None = None
                         fallback_reason: str | None = None
-                        if config.execution_model == "planned_price":
+                        order_override = _lookup_execution_override(
+                            execution_overrides,
+                            prev_date_ts,
+                            ticker,
+                        )
+                        order_execution_model = normalize_execution_model(
+                            str(order_override.get("execution_model") or config.execution_model)
+                        )
+                        order_buffer_bps = normalize_planned_price_buffer_bps(
+                            order_override.get(
+                                "planned_price_buffer_bps",
+                                config.planned_price_buffer_bps,
+                            )
+                        )
+                        order_fallback = normalize_planned_price_fallback(
+                            order_override.get(
+                                "planned_price_fallback",
+                                config.planned_price_fallback,
+                            )
+                        )
+                        order_reason = order_override.get("order_reason")
+                        order_record: dict[str, Any] = {
+                            "date": str(trade_date_ts.date()),
+                            "decision_date": str(prev_date_ts.date()),
+                            "execution_date": str(trade_date_ts.date()),
+                            "ticker": ticker,
+                            "target_weight": round(float(new_w), 6),
+                            "previous_weight": round(float(old_w), 6),
+                            "execution_model": order_execution_model,
+                            "price_field": order_override.get("price_field"),
+                            "time_in_force": order_override.get("time_in_force"),
+                            "order_reason": order_reason,
+                        }
+                        execution_model_counts[order_execution_model] = (
+                            execution_model_counts.get(order_execution_model, 0) + 1
+                        )
+                        if order_execution_model == "planned_price":
+                            saw_planned_price_order = True
                             planned_price = _lookup_planned_price(
                                 planned_prices=planned_prices,
                                 decision_date=prev_date_ts,
                                 ticker=ticker,
                             )
+                            order_record["planned_price"] = planned_price
+                            order_record["planned_price_buffer_bps"] = order_buffer_bps
+                            order_record["planned_price_fallback"] = order_fallback
                             high_price = _lookup_price(prices_high, trade_date_ts, ticker)
                             low_price = _lookup_price(prices_low, trade_date_ts, ticker)
                             fill_decision = evaluate_planned_price_fill(
                                 planned_price=planned_price,
                                 high=high_price,
                                 low=low_price,
-                                buffer_bps=config.planned_price_buffer_bps,
+                                buffer_bps=order_buffer_bps,
                             )
                             if not fill_decision.filled:
                                 can_fallback_to_close = (
-                                    config.planned_price_fallback == "next_close"
+                                    order_fallback == "next_close"
                                     and fill_decision.reason == "planned_price_outside_buffered_range"
                                 )
                                 close_price = (
@@ -475,11 +524,30 @@ class BacktestEngine:
                                             "close": close_price,
                                             "lower_bound": fill_decision.lower_bound,
                                             "upper_bound": fill_decision.upper_bound,
-                                            "planned_price_fallback": config.planned_price_fallback,
+                                            "planned_price_fallback": order_fallback,
                                             "planned_price_reject_reason": fill_decision.reason,
                                             "fill_type": "blocked",
                                         }
                                     )
+                                    order_record.update(
+                                        {
+                                            "fill_status": "blocked",
+                                            "fill_type": "blocked",
+                                            "fill_price": None,
+                                            "blocked_reason": (
+                                                "missing_fallback_close"
+                                                if can_fallback_to_close
+                                                else fill_decision.reason
+                                            ),
+                                            "planned_price_reject_reason": fill_decision.reason,
+                                            "high": high_price,
+                                            "low": low_price,
+                                            "close": close_price,
+                                            "lower_bound": fill_decision.lower_bound,
+                                            "upper_bound": fill_decision.upper_bound,
+                                        }
+                                    )
+                                    order_intent_records.append(order_record)
                                     continue
                                 exec_price = close_price
                                 fill_type = "fallback_close"
@@ -487,10 +555,34 @@ class BacktestEngine:
                             else:
                                 exec_price = fill_decision.fill_price
                                 fill_type = "planned_price"
+                        elif order_execution_model == "next_close":
+                            exec_price = _lookup_price(prices_close, trade_date_ts, ticker)
+                            fill_type = "next_close"
+                            if exec_price is None:
+                                order_record.update(
+                                    {
+                                        "fill_status": "blocked",
+                                        "fill_type": "blocked",
+                                        "fill_price": None,
+                                        "blocked_reason": "missing_next_close_price",
+                                    }
+                                )
+                                order_intent_records.append(order_record)
+                                continue
                         else:
                             exec_price = _lookup_price(prices_open, trade_date_ts, ticker)
                             if exec_price is None:
+                                order_record.update(
+                                    {
+                                        "fill_status": "blocked",
+                                        "fill_type": "blocked",
+                                        "fill_price": None,
+                                        "blocked_reason": "missing_next_open_price",
+                                    }
+                                )
+                                order_intent_records.append(order_record)
                                 continue
+                            fill_type = "next_open"
 
                         # Calculate target dollar amount and shares
                         target_dollar = new_w * portfolio_value
@@ -549,6 +641,17 @@ class BacktestEngine:
 
                         # Log the trade
                         action = "buy" if share_change > 0 else "sell"
+                        order_record.update(
+                            {
+                                "side": action,
+                                "fill_status": "filled",
+                                "fill_type": fill_type or order_execution_model,
+                                "fill_price": round(float(exec_price), 6),
+                                "shares": round(abs(share_change), 4),
+                                "fallback_reason": fallback_reason,
+                            }
+                        )
+                        order_intent_records.append(order_record)
                         trade_log.append(
                             {
                                 "date": str(trade_date_ts.date()),
@@ -560,9 +663,12 @@ class BacktestEngine:
                                 "trade_reason": trade_reason,
                                 "position_state": position_state,
                                 "holding_days": days_held,
+                                "execution_model": order_execution_model,
+                                "fill_type": fill_type or order_execution_model,
+                                "order_reason": order_reason,
                             }
                         )
-                        if config.execution_model == "planned_price":
+                        if order_execution_model == "planned_price":
                             planned_execution_diagnostics["filled_order_count"] += 1
                             if fill_type == "fallback_close":
                                 planned_execution_diagnostics["fallback_close_count"] += 1
@@ -684,7 +790,12 @@ class BacktestEngine:
             "last_cash_weight": round(float(last_cash_weight or 0.0), 6),
         }
         trade_diagnostics["rebalance_execution_diagnostics"] = rebalance_execution_diagnostics
-        if config.execution_model == "planned_price":
+        if order_intent_records:
+            trade_diagnostics["order_intents"] = {
+                "execution_model_counts": execution_model_counts,
+                "orders": order_intent_records[:10000],
+            }
+        if saw_planned_price_order:
             filled = int(planned_execution_diagnostics["filled_order_count"])
             blocked = int(planned_execution_diagnostics["blocked_order_count"])
             total = filled + blocked
@@ -1200,6 +1311,19 @@ def _lookup_planned_price(
     if pd.isna(value) or value <= 0:
         return None
     return float(value)
+
+
+def _lookup_execution_override(
+    execution_overrides: pd.DataFrame | None,
+    decision_date: pd.Timestamp,
+    ticker: str,
+) -> dict[str, Any]:
+    if execution_overrides is None:
+        return {}
+    if decision_date not in execution_overrides.index or ticker not in execution_overrides.columns:
+        return {}
+    value = execution_overrides.loc[decision_date, ticker]
+    return dict(value) if isinstance(value, dict) else {}
 
 
 def _calc_monthly_returns(

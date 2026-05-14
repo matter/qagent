@@ -27,6 +27,9 @@ from backend.services import backtest_engine as backtest_engine_module
 from backend.services.calendar_service import offset_trading_days
 from backend.services.execution_model_service import _positive_float
 from backend.services.execution_model_service import evaluate_planned_price_fill
+from backend.services.execution_model_service import normalize_execution_model
+from backend.services.execution_model_service import normalize_planned_price_buffer_bps
+from backend.services.execution_model_service import normalize_planned_price_fallback
 from backend.services.factor_engine import FactorEngine
 from backend.services.group_service import GroupService
 from backend.services.market_context import (
@@ -52,6 +55,34 @@ _INITIAL_ENTRY_POLICIES = {
 }
 _PREDICTION_CACHE_LOCKS_GUARD = threading.Lock()
 _PREDICTION_CACHE_LOCKS: dict[tuple, threading.Lock] = {}
+_RUN_CONFIG_DEFAULTS: dict[str, Any] = {
+    "initial_capital": 1_000_000,
+    "commission_rate": 0.001,
+    "slippage_rate": 0.001,
+    "max_positions": 50,
+    "rebalance_freq": "monthly",
+    "rebalance_buffer": 0.0,
+    "rebalance_buffer_add": None,
+    "rebalance_buffer_reduce": None,
+    "rebalance_buffer_mode": "all",
+    "rebalance_buffer_reference": "target",
+    "min_holding_days": 0,
+    "reentry_cooldown_days": 0,
+    "normalize_target_weights": True,
+    "max_position_pct": 0.10,
+    "execution_model": "next_open",
+    "planned_price_buffer_bps": 50,
+    "planned_price_fallback": "cancel",
+}
+_PER_ORDER_INTENT_COLUMNS = {
+    "execution_model",
+    "planned_price",
+    "planned_price_buffer_bps",
+    "planned_price_fallback",
+    "price_field",
+    "time_in_force",
+    "order_reason",
+}
 
 
 class BacktestService:
@@ -119,65 +150,81 @@ class BacktestService:
             raise ValueError(f"Universe group '{universe_group_id}' has no members")
         tickers = [normalize_ticker(t, resolved_market) for t in tickers]
 
-        position_sizing = strategy_def.get("position_sizing", "equal_weight")
+        strategy_default_config = self._strategy_default_config_from_instance(
+            strategy_instance,
+            strategy_def,
+            kind="default_backtest_config",
+        )
+        effective_config, config_provenance = self._merge_strategy_run_config(
+            strategy_default_config,
+            config_dict,
+            fallback_position_sizing=strategy_def.get("position_sizing", "equal_weight"),
+        )
+
+        position_sizing = effective_config.get("position_sizing", "equal_weight")
         position_sizing = StrategyService._validate_position_sizing(position_sizing)
 
         # ---- 3. Build config ----
-        benchmark = config_dict.get("benchmark") or get_default_benchmark(resolved_market)
+        benchmark = effective_config.get("benchmark") or get_default_benchmark(resolved_market)
         self._validate_benchmark_market(benchmark, resolved_market)
         constraint_config = self._resolve_run_constraint_config(
-            strategy_config=strategy_def.get("constraint_config"),
-            config_dict=config_dict,
+            strategy_config=strategy_default_config.get("constraint_config")
+            or strategy_def.get("constraint_config"),
+            config_dict=effective_config,
         )
-        warmup_start_date = config_dict.get("warmup_start_date")
-        evaluation_start_date = config_dict.get("evaluation_start_date")
-        initial_entry_policy = config_dict.get("initial_entry_policy", "wait_for_anchor")
+        warmup_start_date = effective_config.get("warmup_start_date")
+        evaluation_start_date = effective_config.get("evaluation_start_date")
+        initial_entry_policy = effective_config.get("initial_entry_policy", "wait_for_anchor")
         if initial_entry_policy not in _INITIAL_ENTRY_POLICIES:
             raise ValueError(
                 "initial_entry_policy must be one of "
                 f"{sorted(_INITIAL_ENTRY_POLICIES)}"
-            )
-        simulation_start_date = warmup_start_date or config_dict.get("start_date", "2020-01-01")
-        normalize_target_weights = config_dict.get("normalize_target_weights", True)
-        if position_sizing == "raw_weight" and "normalize_target_weights" not in config_dict:
+        )
+        simulation_start_date = warmup_start_date or effective_config.get("start_date", "2020-01-01")
+        normalize_target_weights = effective_config.get("normalize_target_weights", True)
+        if (
+            position_sizing == "raw_weight"
+            and config_provenance.get("normalize_target_weights") == "system_default"
+        ):
             normalize_target_weights = False
+            effective_config["normalize_target_weights"] = False
         execution_rebalance_buffer = self._resolve_rebalance_buffer(
-            config_dict,
+            effective_config,
             constraint_config,
         )
         execution_min_holding_days = self._resolve_min_holding_days(
-            config_dict,
+            effective_config,
             constraint_config,
         )
         bt_config = BacktestConfig(
-            initial_capital=config_dict.get("initial_capital", 1_000_000),
+            initial_capital=effective_config.get("initial_capital", 1_000_000),
             start_date=simulation_start_date,
-            end_date=config_dict.get("end_date", "2024-12-31"),
+            end_date=effective_config.get("end_date", "2024-12-31"),
             market=resolved_market,
             benchmark=benchmark,
-            commission_rate=config_dict.get("commission_rate", 0.001),
-            slippage_rate=config_dict.get("slippage_rate", 0.001),
-            max_positions=config_dict.get("max_positions", 50),
-            rebalance_freq=config_dict.get("rebalance_freq") or config_dict.get("rebalance_frequency", "monthly"),
+            commission_rate=effective_config.get("commission_rate", 0.001),
+            slippage_rate=effective_config.get("slippage_rate", 0.001),
+            max_positions=effective_config.get("max_positions", 50),
+            rebalance_freq=effective_config.get("rebalance_freq") or effective_config.get("rebalance_frequency", "monthly"),
             rebalance_buffer=execution_rebalance_buffer,
-            rebalance_buffer_add=config_dict.get("rebalance_buffer_add"),
-            rebalance_buffer_reduce=config_dict.get("rebalance_buffer_reduce"),
-            rebalance_buffer_mode=config_dict.get("rebalance_buffer_mode", "all"),
+            rebalance_buffer_add=effective_config.get("rebalance_buffer_add"),
+            rebalance_buffer_reduce=effective_config.get("rebalance_buffer_reduce"),
+            rebalance_buffer_mode=effective_config.get("rebalance_buffer_mode", "all"),
             rebalance_buffer_reference=self._resolve_rebalance_buffer_reference(
-                config_dict,
+                effective_config,
                 constraint_config,
             ),
             min_holding_days=execution_min_holding_days,
-            reentry_cooldown_days=config_dict.get("reentry_cooldown_days", 0),
+            reentry_cooldown_days=effective_config.get("reentry_cooldown_days", 0),
             normalize_target_weights=normalize_target_weights,
             max_single_name_weight=constraint_config.get("max_single_name_weight"),
             max_holding_days=self._resolve_max_holding_days(constraint_config),
-            execution_model=config_dict.get("execution_model", "next_open"),
-            planned_price_buffer_bps=config_dict.get("planned_price_buffer_bps", 50),
-            planned_price_fallback=config_dict.get("planned_price_fallback", "cancel"),
+            execution_model=effective_config.get("execution_model", "next_open"),
+            planned_price_buffer_bps=effective_config.get("planned_price_buffer_bps", 50),
+            planned_price_fallback=effective_config.get("planned_price_fallback", "cancel"),
         )
 
-        max_position_pct = config_dict.get("max_position_pct", 0.10)
+        max_position_pct = effective_config.get("max_position_pct", 0.10)
         if constraint_config.get("max_single_name_weight") is not None:
             max_position_pct = float(constraint_config["max_single_name_weight"])
 
@@ -245,15 +292,15 @@ class BacktestService:
 
         # Create weight signals: DataFrame(index=dates, columns=tickers)
         all_weights = pd.DataFrame(0.0, index=prices_close.index, columns=tickers)
-        planned_prices = None
-        planned_price_diagnostics: dict[str, Any] | None = None
-        if bt_config.execution_model == "planned_price":
-            planned_prices = pd.DataFrame(np.nan, index=prices_close.index, columns=tickers)
-            planned_price_diagnostics = {
-                "fallback_count": 0,
-                "invalid_count": 0,
-                "samples": [],
-            }
+        planned_prices = pd.DataFrame(np.nan, index=prices_close.index, columns=tickers)
+        planned_price_diagnostics: dict[str, Any] | None = {
+            "fallback_count": 0,
+            "invalid_count": 0,
+            "samples": [],
+        }
+        execution_overrides = pd.DataFrame(index=prices_close.index, columns=tickers, dtype=object)
+        has_execution_overrides = False
+        has_planned_price_inputs = bt_config.execution_model == "planned_price"
 
         # ---- 6a. Pre-compute model predictions for ALL rebalance dates at once ----
         # This avoids per-date DB lookups, model loading, feature computation
@@ -328,6 +375,7 @@ class BacktestService:
                     prices_high=prices_high,
                     prices_low=prices_low,
                     planned_prices=planned_prices,
+                    execution_overrides=execution_overrides if has_execution_overrides else None,
                     bt_config=bt_config,
                 )
                 pending_context_state = None
@@ -391,6 +439,16 @@ class BacktestService:
             if raw_signals.empty:
                 # No signals -- go to cash (all zeros)
                 all_weights.loc[trade_ts] = 0.0
+                if bt_config.execution_model == "planned_price" and planned_price_diagnostics is not None:
+                    self._write_planned_prices_for_date(
+                        planned_prices=planned_prices,
+                        raw_signals=raw_signals,
+                        selected_weights={},
+                        current_weights=positions_before,
+                        prices_close=prices_close,
+                        trade_ts=trade_ts,
+                        diagnostics=planned_price_diagnostics,
+                    )
                 prev_weights = all_weights.loc[trade_ts].values
                 diag_entry = self._build_rebalance_diagnostics(
                     date_key=date_key,
@@ -438,6 +496,19 @@ class BacktestService:
                 weights,
                 constraint_config,
             )
+            wrote_overrides, wrote_planned_inputs = self._write_execution_overrides_for_date(
+                execution_overrides=execution_overrides,
+                planned_prices=planned_prices,
+                raw_signals=raw_signals,
+                selected_weights=weights,
+                current_weights=positions_before,
+                prices_close=prices_close,
+                trade_ts=trade_ts,
+                bt_config=bt_config,
+                diagnostics=planned_price_diagnostics,
+            )
+            has_execution_overrides = has_execution_overrides or wrote_overrides
+            has_planned_price_inputs = has_planned_price_inputs or wrote_planned_inputs
             if debug_state:
                 self._record_debug_rebalance(
                     debug_state,
@@ -450,16 +521,6 @@ class BacktestService:
                     context_diagnostics=context.diagnostics,
                     positions_before=positions_before,
                     positions_after=weights,
-                )
-            if planned_prices is not None and planned_price_diagnostics is not None:
-                self._write_planned_prices_for_date(
-                    planned_prices=planned_prices,
-                    raw_signals=raw_signals,
-                    selected_weights=weights,
-                    current_weights=positions_before,
-                    prices_close=prices_close,
-                    trade_ts=trade_ts,
-                    diagnostics=planned_price_diagnostics,
                 )
 
             # Write weights for this date
@@ -503,19 +564,24 @@ class BacktestService:
                 )
 
         # ---- 8. Run BacktestEngine ----
-        if planned_prices is not None:
+        run_kwargs: dict[str, Any] = {}
+        if has_planned_price_inputs:
+            run_kwargs["planned_prices"] = planned_prices
+        if has_execution_overrides:
+            run_kwargs["execution_overrides"] = execution_overrides
+        if run_kwargs:
             overlay_result = self._backtest_engine.run(
                 all_weights,
                 bt_config,
-                planned_prices=planned_prices,
+                **run_kwargs,
             )
         else:
             overlay_result = self._backtest_engine.run(all_weights, bt_config)
-        if planned_price_diagnostics is not None:
+        if has_planned_price_inputs and planned_price_diagnostics is not None:
             overlay_result.trade_diagnostics.setdefault("planned_price_inputs", {}).update(
                 planned_price_diagnostics
             )
-        portfolio_config = config_dict.get("portfolio_overlay")
+        portfolio_config = effective_config.get("portfolio_overlay")
         if portfolio_config:
             base_result = self._run_base_portfolio_leg(
                 tickers=tickers,
@@ -546,7 +612,7 @@ class BacktestService:
             result = self._slice_result_to_evaluation(
                 result,
                 evaluation_start_date=str(evaluation_start_date),
-                evaluation_end_date=str(config_dict.get("end_date", bt_config.end_date)),
+                evaluation_end_date=str(effective_config.get("end_date", bt_config.end_date)),
                 initial_capital=float(bt_config.initial_capital),
             )
 
@@ -558,6 +624,8 @@ class BacktestService:
         bt_id = uuid.uuid4().hex[:12]
         config_to_save = bt_config.to_dict()
         config_to_save["universe_group_id"] = universe_group_id
+        config_to_save["position_sizing"] = position_sizing
+        config_to_save["max_position_pct"] = max_position_pct
         if constraint_config:
             config_to_save["constraint_config"] = constraint_config
         config_to_save["initial_entry_policy"] = initial_entry_policy
@@ -566,8 +634,8 @@ class BacktestService:
             config_to_save["simulation_start_date"] = str(bt_config.start_date)
         if evaluation_start_date:
             config_to_save["evaluation_start_date"] = str(evaluation_start_date)
-        requested_start = config_dict.get("start_date", "2020-01-01")
-        requested_end = config_dict.get("end_date", "2024-12-31")
+        requested_start = effective_config.get("start_date", "2020-01-01")
+        requested_end = effective_config.get("end_date", "2024-12-31")
         config_to_save["requested_start_date"] = str(requested_start)
         config_to_save["requested_end_date"] = str(requested_end)
         config_to_save["effective_start_date"] = str(bt_config.start_date)
@@ -585,6 +653,26 @@ class BacktestService:
                 "portfolio_overlay",
                 portfolio_config,
             )
+        effective_config_to_save = dict(effective_config)
+        effective_config_to_save.update(bt_config.to_dict())
+        effective_config_to_save["universe_group_id"] = universe_group_id
+        if constraint_config:
+            effective_config_to_save["constraint_config"] = constraint_config
+        effective_config_to_save["position_sizing"] = position_sizing
+        effective_config_to_save["max_position_pct"] = max_position_pct
+        effective_config_to_save["initial_entry_policy"] = initial_entry_policy
+        if warmup_start_date:
+            effective_config_to_save["warmup_start_date"] = str(warmup_start_date)
+            effective_config_to_save["simulation_start_date"] = str(bt_config.start_date)
+        if evaluation_start_date:
+            effective_config_to_save["evaluation_start_date"] = str(evaluation_start_date)
+        effective_config_to_save["requested_start_date"] = str(requested_start)
+        effective_config_to_save["requested_end_date"] = str(requested_end)
+        effective_config_to_save["effective_start_date"] = str(bt_config.start_date)
+        effective_config_to_save["effective_end_date"] = str(bt_config.end_date)
+        config_to_save["strategy_default_config"] = strategy_default_config
+        config_to_save["effective_config"] = effective_config_to_save
+        config_to_save["config_provenance"] = config_provenance
         debug_artifact = None
         if debug_state:
             debug_artifact = self._write_debug_replay_bundle(
@@ -781,6 +869,84 @@ class BacktestService:
         base_weights.loc[:, tickers] = weight
         return self._backtest_engine.run(base_weights, bt_config)
 
+    @staticmethod
+    def _strategy_default_config_from_instance(
+        strategy_instance: Any,
+        strategy_def: dict,
+        *,
+        kind: str,
+    ) -> dict:
+        raw = getattr(strategy_instance, kind, None)
+        if _is_mock_value(raw):
+            raw = None
+        if raw is None and isinstance(strategy_def, dict):
+            raw = strategy_def.get(kind)
+        return StrategyService._normalize_strategy_default_config(
+            raw or {},
+            kind=kind,
+        )
+
+    @staticmethod
+    def _merge_strategy_run_config(
+        strategy_defaults: dict | None,
+        run_config: dict | None,
+        *,
+        fallback_position_sizing: str,
+    ) -> tuple[dict, dict]:
+        defaults = dict(strategy_defaults or {})
+        run = dict(run_config or {})
+        if "rebalance_frequency" in defaults and "rebalance_freq" not in defaults:
+            defaults["rebalance_freq"] = defaults.get("rebalance_frequency")
+        if "rebalance_frequency" in run and "rebalance_freq" not in run:
+            run["rebalance_freq"] = run.get("rebalance_frequency")
+
+        merged = dict(_RUN_CONFIG_DEFAULTS)
+        provenance = {key: "system_default" for key in merged}
+        merged["position_sizing"] = StrategyService._validate_position_sizing(
+            fallback_position_sizing
+        )
+        provenance["position_sizing"] = "strategy_record"
+
+        for key, value in defaults.items():
+            if key == "constraint_config":
+                continue
+            if value is not None:
+                merged[key] = value
+                provenance[key] = "strategy_default"
+
+        run_constraint_config = run.get("constraint_config")
+        for key, value in run.items():
+            if key == "constraint_config":
+                continue
+            if value is not None:
+                merged[key] = value
+                provenance[key] = "run_override"
+
+        strategy_constraint_config = defaults.get("constraint_config")
+        if strategy_constraint_config or run_constraint_config:
+            merged["constraint_config"] = BacktestService._merge_constraint_config(
+                strategy_constraint_config,
+                run_constraint_config,
+            )
+            provenance["constraint_config"] = (
+                "run_override" if run_constraint_config is not None else "strategy_default"
+            )
+
+        merged["position_sizing"] = StrategyService._validate_position_sizing(
+            merged.get("position_sizing")
+        )
+        if "execution_model" in merged:
+            merged["execution_model"] = normalize_execution_model(merged.get("execution_model"))
+        if "planned_price_buffer_bps" in merged:
+            merged["planned_price_buffer_bps"] = normalize_planned_price_buffer_bps(
+                merged.get("planned_price_buffer_bps")
+            )
+        if "planned_price_fallback" in merged:
+            merged["planned_price_fallback"] = normalize_planned_price_fallback(
+                merged.get("planned_price_fallback")
+            )
+        return merged, provenance
+
     def _combine_portfolio_legs(
         self,
         *,
@@ -902,6 +1068,7 @@ class BacktestService:
         prices_high: pd.DataFrame,
         prices_low: pd.DataFrame,
         planned_prices: pd.DataFrame | None,
+        execution_overrides: pd.DataFrame | None,
         bt_config: BacktestConfig,
     ) -> None:
         """Advance StrategyContext holdings through the same low-turnover layer."""
@@ -1009,6 +1176,7 @@ class BacktestService:
             prices_high=prices_high,
             prices_low=prices_low,
             planned_prices=planned_prices,
+            execution_overrides=execution_overrides,
             bt_config=bt_config,
         )
         old_tickers = set(port_weights)
@@ -1030,6 +1198,7 @@ class BacktestService:
                     prices_high=prices_high,
                     prices_low=prices_low,
                     planned_prices=planned_prices,
+                    execution_overrides=execution_overrides,
                     bt_config=bt_config,
                 )
                 or 0.0
@@ -1049,6 +1218,7 @@ class BacktestService:
         prices_high: pd.DataFrame,
         prices_low: pd.DataFrame,
         planned_prices: pd.DataFrame | None,
+        execution_overrides: pd.DataFrame | None,
         bt_config: BacktestConfig,
     ) -> dict[str, float]:
         executable = dict(current_weights)
@@ -1068,6 +1238,7 @@ class BacktestService:
                 prices_high=prices_high,
                 prices_low=prices_low,
                 planned_prices=planned_prices,
+                execution_overrides=execution_overrides,
                 bt_config=bt_config,
             ) is None:
                 continue
@@ -1092,9 +1263,14 @@ class BacktestService:
         prices_high: pd.DataFrame,
         prices_low: pd.DataFrame,
         planned_prices: pd.DataFrame | None,
+        execution_overrides: pd.DataFrame | None,
         bt_config: BacktestConfig,
     ) -> float | None:
-        if bt_config.execution_model == "planned_price":
+        override = _lookup_execution_override(execution_overrides, decision_ts, ticker)
+        execution_model = normalize_execution_model(
+            str(override.get("execution_model") or bt_config.execution_model)
+        )
+        if execution_model == "planned_price":
             planned_price = BacktestService._context_lookup_price(
                 planned_prices,
                 decision_ts,
@@ -1114,12 +1290,18 @@ class BacktestService:
                 planned_price=planned_price,
                 high=high_price,
                 low=low_price,
-                buffer_bps=bt_config.planned_price_buffer_bps,
+                buffer_bps=override.get(
+                    "planned_price_buffer_bps",
+                    bt_config.planned_price_buffer_bps,
+                ),
             )
             if fill_decision.filled:
                 return fill_decision.fill_price
             if (
-                bt_config.planned_price_fallback == "next_close"
+                override.get(
+                    "planned_price_fallback",
+                    bt_config.planned_price_fallback,
+                ) == "next_close"
                 and fill_decision.reason == "planned_price_outside_buffered_range"
             ):
                 return BacktestService._context_lookup_price(
@@ -1128,6 +1310,12 @@ class BacktestService:
                     ticker,
                 )
             return None
+        if execution_model == "next_close":
+            return BacktestService._context_lookup_price(
+                prices_close,
+                trade_ts,
+                ticker,
+            )
         return BacktestService._context_lookup_price(
             prices_open,
             trade_ts,
@@ -1400,6 +1588,10 @@ class BacktestService:
                 "baseline_trade_count": len(baseline.get("trades") or []),
                 "trial_trade_count": len(trial.get("trades") or []),
             },
+            "reproducibility_diagnostics": self._compare_reproducibility_fingerprints(
+                baseline_summary.get("reproducibility_fingerprint"),
+                trial_summary.get("reproducibility_fingerprint"),
+            ),
             "decision": decision,
             "size_policy": {
                 "max_rebalance_items": safe_limit,
@@ -2137,6 +2329,118 @@ class BacktestService:
                         "planned_price_source": source,
                     }
                 )
+
+    @staticmethod
+    def _write_execution_overrides_for_date(
+        *,
+        execution_overrides: pd.DataFrame,
+        planned_prices: pd.DataFrame,
+        raw_signals: pd.DataFrame,
+        selected_weights: dict[str, float],
+        current_weights: dict[str, float] | None,
+        prices_close: pd.DataFrame,
+        trade_ts: pd.Timestamp,
+        bt_config: BacktestConfig,
+        diagnostics: dict[str, Any] | None,
+    ) -> tuple[bool, bool]:
+        involved_tickers = set(selected_weights) | set(current_weights or {})
+        if not involved_tickers:
+            return False, False
+
+        has_override = False
+        has_planned_input = False
+        intent_columns = set(raw_signals.columns) & _PER_ORDER_INTENT_COLUMNS
+        global_planned = bt_config.execution_model == "planned_price"
+        diag = diagnostics if diagnostics is not None else {}
+
+        for ticker in sorted(involved_tickers):
+            if ticker not in execution_overrides.columns:
+                continue
+            has_row = ticker in raw_signals.index
+            row = raw_signals.loc[ticker] if has_row else None
+            override: dict[str, Any] = {}
+            row_model = _string_value(row.get("execution_model")) if row is not None else None
+            if row_model:
+                override["execution_model"] = normalize_execution_model(row_model)
+            row_buffer = row.get("planned_price_buffer_bps") if row is not None else None
+            if row_buffer is not None and pd.notna(row_buffer):
+                override["planned_price_buffer_bps"] = normalize_planned_price_buffer_bps(
+                    row_buffer
+                )
+            row_fallback = (
+                _string_value(row.get("planned_price_fallback"))
+                if row is not None
+                else None
+            )
+            if row_fallback:
+                override["planned_price_fallback"] = normalize_planned_price_fallback(
+                    row_fallback
+                )
+            for optional_key in ("price_field", "time_in_force", "order_reason"):
+                value = _string_value(row.get(optional_key)) if row is not None else None
+                if value:
+                    override[optional_key] = value
+
+            effective_model = override.get("execution_model", bt_config.execution_model)
+            needs_planned_price = effective_model == "planned_price" or global_planned
+            if needs_planned_price:
+                planned_price, source, invalid = BacktestService._resolve_planned_price_for_signal(
+                    raw_signals=raw_signals,
+                    ticker=ticker,
+                    prices_close=prices_close,
+                    trade_ts=trade_ts,
+                )
+                if planned_price is not None and ticker in planned_prices.columns:
+                    planned_prices.at[trade_ts, ticker] = planned_price
+                    has_planned_input = True
+                    if source == "decision_close":
+                        diag["fallback_count"] = int(diag.get("fallback_count") or 0) + 1
+                    if invalid:
+                        diag["invalid_count"] = int(diag.get("invalid_count") or 0) + 1
+                    samples = diag.setdefault("samples", [])
+                    if len(samples) < 20:
+                        samples.append(
+                            {
+                                "date": str(trade_ts.date()),
+                                "ticker": str(ticker),
+                                "planned_price": round(float(planned_price), 6),
+                                "planned_price_source": source,
+                            }
+                        )
+                elif needs_planned_price:
+                    diag["invalid_count"] = int(diag.get("invalid_count") or 0) + 1
+            if intent_columns:
+                if override:
+                    execution_overrides.at[trade_ts, ticker] = override
+                    has_override = True
+                elif row_model:
+                    has_override = True
+
+        return has_override, has_planned_input
+
+    @staticmethod
+    def _resolve_planned_price_for_signal(
+        *,
+        raw_signals: pd.DataFrame,
+        ticker: str,
+        prices_close: pd.DataFrame,
+        trade_ts: pd.Timestamp,
+    ) -> tuple[float | None, str, bool]:
+        planned_price = None
+        invalid = False
+        if "planned_price" in raw_signals.columns and ticker in raw_signals.index:
+            raw_value = raw_signals.loc[ticker, "planned_price"]
+            planned_price = _positive_float(raw_value)
+            invalid = raw_value is not None and pd.notna(raw_value) and planned_price is None
+        if planned_price is not None:
+            return planned_price, "strategy_output", invalid
+
+        close_price = None
+        if trade_ts in prices_close.index and ticker in prices_close.columns:
+            close_price = _positive_float(prices_close.loc[trade_ts, ticker])
+        if close_price is None:
+            return None, "decision_close", invalid
+        return close_price, "decision_close", invalid
 
     @staticmethod
     def _apply_position_sizing(
@@ -3468,6 +3772,124 @@ class BacktestService:
         payload["hash"] = _fingerprint_hash(payload)
         return payload
 
+    @classmethod
+    def _compare_reproducibility_fingerprints(
+        cls,
+        baseline: dict | None,
+        trial: dict | None,
+    ) -> dict:
+        if not isinstance(baseline, dict) or not isinstance(trial, dict):
+            return {
+                "available": False,
+                "strictly_comparable": False,
+                "compatibility_flag": "missing_fingerprint",
+                "difference_sources": ["missing_fingerprint"],
+                "field_diffs": {},
+                "result_shape_delta": {},
+            }
+
+        field_diffs: dict[str, Any] = {}
+        difference_sources: list[str] = []
+
+        def mark(source: str) -> None:
+            if source not in difference_sources:
+                difference_sources.append(source)
+
+        scalar_fields = {
+            "schema_version": "fingerprint_schema",
+            "service_version": "service_version",
+            "git_commit": "backend_commit",
+            "market": "market",
+        }
+        for field, source in scalar_fields.items():
+            if baseline.get(field) != trial.get(field):
+                field_diffs[field] = {
+                    "baseline": baseline.get(field),
+                    "trial": trial.get(field),
+                }
+                mark(source)
+
+        section_sources = {
+            "strategy": "strategy_source",
+            "dependencies": "dependency_hash",
+            "config": "config",
+            "data_watermark": "data_watermark",
+            "runtime": "runtime",
+            "result_shape": "result_shape",
+        }
+        for section, source in section_sources.items():
+            base_value = _stable_json_value(baseline.get(section))
+            trial_value = _stable_json_value(trial.get(section))
+            if base_value != trial_value:
+                field_diffs[section] = {
+                    "baseline": baseline.get(section),
+                    "trial": trial.get(section),
+                }
+                mark(source)
+
+        result_shape_delta = cls._result_shape_delta(
+            baseline.get("result_shape"),
+            trial.get("result_shape"),
+        )
+        hash_equal = bool(baseline.get("hash")) and baseline.get("hash") == trial.get("hash")
+        strictly_comparable = bool(hash_equal and not difference_sources)
+        compatibility_flag = cls._fingerprint_compatibility_flag(difference_sources)
+        return {
+            "available": True,
+            "strictly_comparable": strictly_comparable,
+            "compatibility_flag": compatibility_flag,
+            "difference_sources": difference_sources,
+            "field_diffs": field_diffs,
+            "result_shape_delta": result_shape_delta,
+            "hashes": {
+                "baseline": baseline.get("hash"),
+                "trial": trial.get("hash"),
+            },
+        }
+
+    @staticmethod
+    def _result_shape_delta(
+        baseline_shape: Any,
+        trial_shape: Any,
+    ) -> dict[str, int | float]:
+        if not isinstance(baseline_shape, dict) or not isinstance(trial_shape, dict):
+            return {}
+        result = {}
+        for key in sorted(set(baseline_shape) | set(trial_shape)):
+            try:
+                result[str(key)] = (
+                    float(trial_shape.get(key) or 0)
+                    - float(baseline_shape.get(key) or 0)
+                )
+            except (TypeError, ValueError):
+                continue
+            if float(result[str(key)]).is_integer():
+                result[str(key)] = int(result[str(key)])
+        return result
+
+    @staticmethod
+    def _fingerprint_compatibility_flag(difference_sources: list[str]) -> str:
+        sources = set(difference_sources)
+        input_sources = {
+            "market",
+            "strategy_source",
+            "dependency_hash",
+            "config",
+            "data_watermark",
+            "runtime",
+        }
+        if not sources:
+            return "same_fingerprint"
+        if sources & input_sources:
+            return "input_or_runtime_changed"
+        if "backend_commit" in sources or "service_version" in sources:
+            if sources <= {"backend_commit", "service_version", "result_shape"}:
+                return "backend_change_same_inputs"
+            return "backend_or_service_changed"
+        if "result_shape" in sources:
+            return "result_shape_changed_same_fingerprint_inputs"
+        return "unknown_difference"
+
     @staticmethod
     def _compact_rebalance_item(item: dict) -> dict:
         positions_after = item.get("positions_after") or {}
@@ -3606,6 +4028,35 @@ def _stable_json_value(value):
     if isinstance(value, tuple):
         return [_stable_json_value(v) for v in value]
     return value
+
+
+def _string_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    return text or None
+
+
+def _lookup_execution_override(
+    execution_overrides: pd.DataFrame | None,
+    decision_date: pd.Timestamp,
+    ticker: str,
+) -> dict[str, Any]:
+    if execution_overrides is None:
+        return {}
+    if decision_date not in execution_overrides.index or ticker not in execution_overrides.columns:
+        return {}
+    value = execution_overrides.loc[decision_date, ticker]
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _is_mock_value(value: Any) -> bool:
+    return value is not None and value.__class__.__module__.startswith("unittest.mock")
 
 
 def _service_version() -> str:

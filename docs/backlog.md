@@ -6,12 +6,74 @@ This file only tracks unresolved or deferred work. Fixed and mitigated items are
 
 | Priority | Defect | Necessity | Workload |
 | --- | --- | --- | --- |
+| P0 | DuckDB-sensitive task scheduling remains process-local | High for multiple Codex windows and any accidental second process. Existing serial lanes are in-memory and only cover a subset of heavy tasks; direct scripts or another backend bypass them. | High |
 | P1 | Remaining stateful/multi-table long-running workflows need domain-specific staging | Medium. Main final-asset tasks and legacy paper trading advance now stage/promote at task acceptance, but data refresh and 3.0 graph/model/universe/research workflows are state machines, source-data updates, or cache/materialization pipelines that still need explicit resume/idempotency/rollback semantics. | High |
+| P2 | Coordinator-friendly research metadata is lightweight/manual | Medium. The coordinator can dispatch top-model Codex agents outside QAgent today; optional metadata/artifact conveniences would reduce bookkeeping without turning QAgent into an agent control plane. | Low-Medium |
+| P1 | Research cache file and metadata writes need atomic writer leases | Medium-High. Current cache locks are process-local; concurrent agents through one backend are mostly protected, but second processes or cleanup during writes can corrupt cache state. | Medium |
+| P2 | Multi-agent research observability is sparse | Medium. The coordinator can maintain an external dispatch board, but a compact QAgent view of tasks, budgets, evidence, and quarantined results would reduce manual joins. | Medium |
 | P0 | Main DuckDB has single-writer operational fragility | Medium. Preflight/API diagnostics make locks actionable, but DuckDB remains a single-file local database. For this single-user system, full replacement is not urgent unless concurrent agent writers become common. | Medium-High |
 | P1 | Free equity data is not PIT or survivorship-safe | High for publication-grade research, medium for local exploration. Free yfinance/BaoStock data cannot prove delisted assets, historical membership, symbol changes, and full corporate-action history. Current code blocks publication gates instead of pretending the data is clean. | High |
 | P3 | Legacy and 3.0 engines coexist with overlapping concepts | Medium. Migration overlap increases maintenance/audit cost, but it protects existing US workflows. Fix only after 3.0 backtest/signal/paper semantics cover the legacy surface. | High |
 
 ## Open
+
+### [2026-05-14] P0 DuckDB-sensitive task scheduling remains process-local
+
+- **Market**: US, CN
+- **Entry**: `backend/tasks/executor.py`, `backend/tasks/store.py`, data refresh tasks, research cache, dataset materialization, 3.0 model experiment, 3.0 strategy graph backtest, legacy model/backtest tasks.
+- **Current mitigation**:
+  - One backend process uses a shared `TaskExecutor` with `MAX_WORKERS=6`.
+  - Process-local serial lanes cover CN heavy legacy tasks, market-level legacy backtests, and same feature-set/universe model training.
+  - Task pause rules can prevent new submissions by `task_type/source/market`.
+- **Remaining issue**: Serial lanes are in-memory locks. They do not coordinate across processes, direct scripts, or a second backend. Coverage is partial: data update, cache writes, dataset materialize, 3.0 model experiment, 3.0 StrategyGraph backtest, and distillation can still create conflicting writes or state transitions. DuckDB itself remains a single-file local database.
+- **Expected behavior**: DuckDB-sensitive work should be scheduled through DB-backed lanes or leases with task/resource keys, concurrency limits, drain/pause/retry controls, and clear ownership. Direct-maintenance commands should preflight and refuse unsafe concurrent writes.
+- **Validation standard**: Two concurrent API submissions for the same protected resource serialize through persistent lanes; stale lane leases expire safely; a second process cannot silently bypass protected workflow writes; pause/drain state is visible through API.
+- **Fix necessity**: High if multiple Codex windows run long tasks regularly. Lower only if strict manual rule "one backend, no direct scripts" is always followed.
+- **Estimated workload**: High. Requires scheduler semantics, DB-backed lease table, migration of task submission paths, and regression tests.
+
+### [2026-05-14] P2 Coordinator-friendly research metadata is lightweight/manual
+
+- **Market**: US, CN
+- **Entry**: `docs/agent-collaboration-protocol.md`, `backend/services/agent_research_3_service.py`, `backend/api/agent_research_3.py`, MCP agent research tools, and research artifact APIs.
+- **Current mitigation**:
+  - A manual coordinator protocol defines the main coordinator, top-model specialist agents, task packets, result packets, coordinator reports, and a compact work record.
+  - Existing 3.0 agent research plans can record hypothesis, search space, budget, stop conditions, trials, trial matrix, QA, and promotion decisions.
+  - The coordinator can dispatch independent Codex threads outside QAgent and use QAgent only for execution/evidence records.
+- **Remaining issue**: Useful coordinator metadata is still mostly free-form. Plan/trial/artifact records can hold role, round, model, and result status in JSON, but MCP/REST convenience is uneven, and there is no standard result artifact schema. This increases bookkeeping, but it does not block the coordinator from operating externally.
+- **Expected behavior**: QAgent offers lightweight support for coordinator-managed work: plan metadata, standard JSON result artifacts, optional fields or filters for `round`, `agent_role`, `model`, and `result_status`, and convenient MCP/REST calls to write those records. QAgent should not be required to own Codex thread lifecycle, agent leases, or model dispatch authority.
+- **Validation standard**:
+  - MCP and REST can write/read plan metadata and JSON result artifacts.
+  - A documented result schema can capture baseline refs, role, model, changed module, frozen modules, trials, metrics, risks, and recommendation.
+  - Trial matrix or artifact listing can be filtered or grouped by round and role without requiring a full control-plane migration.
+- **Fix necessity**: Medium. It reduces manual coordination cost, but the coordinator can already operate from the Codex layer.
+- **Estimated workload**: Low-Medium.
+
+### [2026-05-14] P1 Research cache file and metadata writes need atomic writer leases
+
+- **Market**: US, CN
+- **Entry**: `backend/services/research_cache_service.py`, `backend/services/factor_engine.py`, cache cleanup APIs, model/dataset/backtest consumers.
+- **Current mitigation**:
+  - Feature/label hot cache uses process-local locks keyed by cache key.
+  - Factor cache writes use process-local locks keyed by market and factor id.
+  - Cleanup APIs exist and agents are told not to hand-delete cache files.
+- **Remaining issue**: Cache locks are not cross-process. File writes and DuckDB metadata updates are not a single atomic protocol, and cleanup does not have writer leases to fence active writers. A second process or cleanup during a write can leave orphan files, stale metadata, or corrupt partial cache entries.
+- **Expected behavior**: Cache writes use temp paths, atomic rename, DB metadata transaction, writer lease, and cleanup fencing. Active writer leases should be visible to coordinator/task diagnostics.
+- **Validation standard**: Simulated concurrent writes and cleanup leave either one valid cache entry or a clean miss; no partial file is advertised as valid metadata; stale writer lease cleanup is deterministic.
+- **Fix necessity**: Medium-High for multi-agent repeated research. Low-Medium for strictly single-process manual use.
+- **Estimated workload**: Medium.
+
+### [2026-05-14] P2 Multi-agent research observability is sparse
+
+- **Market**: US, CN
+- **Entry**: `/api/tasks`, agent research plan/trial APIs, artifact APIs, React research workbench/task management pages.
+- **Current mitigation**:
+  - `/api/tasks` lists tasks and exposes task status, late-result diagnostics, pause rules, source, and market.
+  - Manual coordinator protocol includes an external dispatch board.
+- **Remaining issue**: There is no compact operational view joining QAgent tasks, research plans, trials, artifacts, budgets, quarantined results, and evidence gaps. A human or coordinator can still operate externally, but must manually join multiple APIs and docs.
+- **Expected behavior**: A lightweight dashboard/API returns task queue, running work, budget usage, recent trials, result artifacts, pending coordinator decisions, quarantined outputs, and unsafe direct-maintenance warnings.
+- **Validation standard**: One endpoint or UI view can answer "what is running, what evidence exists, what is blocked, and what requires human decision?" for the current research round.
+- **Fix necessity**: Medium. It improves operability without moving agent orchestration into QAgent.
+- **Estimated workload**: Medium.
 
 ### [2026-05-13] P1 Remaining stateful/multi-table long-running workflows need domain-specific staging
 

@@ -76,8 +76,17 @@ class PaperTradingService:
         if not tickers:
             raise ValueError(f"Universe group '{universe_group_id}' has no members")
 
-        config = dict(config or {})
-        strategy_constraints = strategy.get("constraint_config") or {}
+        strategy_default_config = BacktestService._strategy_default_config_from_instance(
+            strategy,
+            strategy,
+            kind="default_paper_config",
+        )
+        config, config_provenance = BacktestService._merge_strategy_run_config(
+            strategy_default_config,
+            config,
+            fallback_position_sizing=strategy.get("position_sizing", "equal_weight"),
+        )
+        strategy_constraints = strategy_default_config.get("constraint_config") or strategy.get("constraint_config") or {}
         constraint_config = BacktestService._merge_constraint_config(
             strategy_constraints,
             config.get("constraint_config"),
@@ -94,6 +103,9 @@ class PaperTradingService:
                     config.setdefault("max_holding_days", int(holding["max_days"]))
             if constraint_config.get("max_single_name_weight") is not None:
                 config["max_single_name_weight"] = float(constraint_config["max_single_name_weight"])
+        config["strategy_default_config"] = strategy_default_config
+        config["effective_config"] = dict(config)
+        config["config_provenance"] = config_provenance
         initial_capital = config.get("initial_capital", 1_000_000.0)
 
         session_id = uuid.uuid4().hex[:12]
@@ -666,6 +678,11 @@ class PaperTradingService:
                     price_cache=price_cache,
                     diagnostics=planned_price_input_diagnostics,
                 )
+            execution_overrides = self._execution_overrides_from_signals(
+                signals=signals,
+                target_weights=target_weights,
+                current_weights=current_execution_weights,
+            )
 
             day_trades = self._execute_trades_cached(
                 positions, cash, target_weights,
@@ -675,6 +692,7 @@ class PaperTradingService:
                 planned_prices=planned_prices,
                 planned_price_buffer_bps=planned_price_buffer_bps,
                 planned_price_fallback=planned_price_fallback,
+                execution_overrides=execution_overrides,
             )
             if execution_model == "planned_price":
                 execution_weights = self._execution_weights_after_trades(
@@ -1798,6 +1816,20 @@ class PaperTradingService:
                     planned_price = _positive_float(row.get("planned_price"))
                     if planned_price is not None:
                         signal["planned_price"] = planned_price
+                for key in (
+                    "execution_model",
+                    "planned_price_buffer_bps",
+                    "planned_price_fallback",
+                    "price_field",
+                    "time_in_force",
+                    "order_reason",
+                ):
+                    if key not in raw_signals.columns:
+                        continue
+                    value = row.get(key)
+                    if value is None or pd.isna(value):
+                        continue
+                    signal[key] = value
                 signal_list.append(signal)
             return signal_list
         except Exception as exc:
@@ -1970,6 +2002,41 @@ class PaperTradingService:
                     }
                 )
         return planned_prices
+
+    @staticmethod
+    def _execution_overrides_from_signals(
+        *,
+        signals: list[dict],
+        target_weights: dict[str, float],
+        current_weights: dict[str, float] | None = None,
+    ) -> dict[str, dict]:
+        by_ticker = {str(sig.get("ticker")): sig for sig in signals}
+        all_tickers = set(target_weights) | set(current_weights or {})
+        overrides: dict[str, dict] = {}
+        for ticker in all_tickers:
+            signal = by_ticker.get(ticker)
+            if not signal:
+                continue
+            override: dict[str, object] = {}
+            if signal.get("execution_model"):
+                override["execution_model"] = normalize_execution_model(
+                    str(signal.get("execution_model"))
+                )
+            if signal.get("planned_price_buffer_bps") is not None:
+                override["planned_price_buffer_bps"] = normalize_planned_price_buffer_bps(
+                    signal.get("planned_price_buffer_bps")
+                )
+            if signal.get("planned_price_fallback"):
+                override["planned_price_fallback"] = normalize_planned_price_fallback(
+                    str(signal.get("planned_price_fallback"))
+                )
+            for key in ("price_field", "time_in_force", "order_reason"):
+                value = signal.get(key)
+                if value is not None and str(value).strip():
+                    override[key] = str(value)
+            if override:
+                overrides[ticker] = override
+        return overrides
 
     @staticmethod
     def _execution_weights_after_trades(
@@ -2510,6 +2577,7 @@ class PaperTradingService:
         planned_prices: dict[str, float] | None = None,
         planned_price_buffer_bps: float = 50,
         planned_price_fallback: str = "cancel",
+        execution_overrides: dict[str, dict] | None = None,
     ) -> dict:
         """Simulate trade execution using cached prices."""
         execution_model = normalize_execution_model(execution_model)
@@ -2557,17 +2625,27 @@ class PaperTradingService:
             bar = _cached_bar(day_prices.get(ticker))
             if not bar:
                 continue
-            if execution_model == "planned_price":
+            override = dict((execution_overrides or {}).get(ticker) or {})
+            order_execution_model = normalize_execution_model(
+                str(override.get("execution_model") or execution_model)
+            )
+            order_buffer_bps = normalize_planned_price_buffer_bps(
+                override.get("planned_price_buffer_bps", planned_price_buffer_bps)
+            )
+            order_fallback = normalize_planned_price_fallback(
+                override.get("planned_price_fallback", planned_price_fallback)
+            )
+            if order_execution_model == "planned_price":
                 planned_price = (planned_prices or {}).get(ticker)
                 fill_decision = evaluate_planned_price_fill(
                     planned_price=planned_price,
                     high=bar.get("high"),
                     low=bar.get("low"),
-                    buffer_bps=planned_price_buffer_bps,
+                    buffer_bps=order_buffer_bps,
                 )
                 if not fill_decision.filled:
                     can_fallback_to_close = (
-                        planned_price_fallback == "next_close"
+                        order_fallback == "next_close"
                         and fill_decision.reason == "planned_price_outside_buffered_range"
                     )
                     close_price = _positive_float(bar.get("close")) if can_fallback_to_close else None
@@ -2588,7 +2666,7 @@ class PaperTradingService:
                                 "close": bar.get("close"),
                                 "lower_bound": fill_decision.lower_bound,
                                 "upper_bound": fill_decision.upper_bound,
-                                "planned_price_fallback": planned_price_fallback,
+                                "planned_price_fallback": order_fallback,
                                 "planned_price_reject_reason": fill_decision.reason,
                                 "fill_type": "blocked",
                             }
@@ -2601,9 +2679,13 @@ class PaperTradingService:
                     price = fill_decision.fill_price
                     fill_type = "planned_price"
                     fallback_reason = None
+            elif order_execution_model == "next_close":
+                price = bar["close"]
+                fill_type = "next_close"
+                fallback_reason = None
             else:
                 price = bar["open"]
-                fill_type = None
+                fill_type = "next_open"
                 fallback_reason = None
             if price is None or price <= 0:
                 continue
@@ -2632,6 +2714,9 @@ class PaperTradingService:
                     "shares": round(share_change, 4),
                     "price": round(price, 4),
                     "cost": round(trade_cost, 4),
+                    "execution_model": order_execution_model,
+                    "fill_type": fill_type,
+                    "order_reason": override.get("order_reason"),
                 })
             else:
                 cash += abs(share_change) * price
@@ -2649,8 +2734,11 @@ class PaperTradingService:
                     "shares": round(abs(share_change), 4),
                     "price": round(price, 4),
                     "cost": round(trade_cost, 4),
+                    "execution_model": order_execution_model,
+                    "fill_type": fill_type,
+                    "order_reason": override.get("order_reason"),
                 })
-            if execution_model == "planned_price":
+            if order_execution_model == "planned_price":
                 planned_diagnostics["filled_order_count"] += 1
                 if fill_type == "fallback_close":
                     planned_diagnostics["fallback_close_count"] += 1

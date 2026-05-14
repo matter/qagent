@@ -144,6 +144,12 @@ def _run_operation(
                 "description": getattr(instance, "description", ""),
                 "required_factors": instance.required_factors(),
                 "required_models": instance.required_models(),
+                "default_backtest_config": _sanitize_diagnostics(
+                    getattr(instance, "default_backtest_config", {}) or {}
+                ),
+                "default_paper_config": _sanitize_diagnostics(
+                    getattr(instance, "default_paper_config", {}) or {}
+                ),
             }
         if operation == "generate_signals":
             context = payload["context"]

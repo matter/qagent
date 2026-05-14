@@ -15,6 +15,7 @@ import {
   Select,
   Space,
   Statistic,
+  Switch,
   Table,
   Tabs,
   Tag,
@@ -1091,6 +1092,7 @@ function CreateSessionModal({
   const [executionModel, setExecutionModel] = useState<ExecutionModel>("next_open");
   const [plannedPriceBufferBps, setPlannedPriceBufferBps] = useState(50);
   const [plannedPriceFallback, setPlannedPriceFallback] = useState<PlannedPriceFallback>("cancel");
+  const [useStrategyDefaults, setUseStrategyDefaults] = useState(true);
   const [creating, setCreating] = useState(false);
 
   useEffect(() => {
@@ -1109,6 +1111,7 @@ function CreateSessionModal({
     if (prefill.maxPositions) setMaxPositions(prefill.maxPositions);
     if (prefill.commission) setCommission(prefill.commission);
     if (prefill.slippage) setSlippage(prefill.slippage);
+    setUseStrategyDefaults(false);
   }, [prefill]);
 
   const handleCreate = async () => {
@@ -1118,6 +1121,14 @@ function CreateSessionModal({
     }
     setCreating(true);
     try {
+      const strategyOwnedOverrides = useStrategyDefaults
+        ? {}
+        : {
+            max_positions: maxPositions,
+            execution_model: executionModel,
+            planned_price_buffer_bps: executionModel === "planned_price" ? plannedPriceBufferBps : undefined,
+            planned_price_fallback: executionModel === "planned_price" ? plannedPriceFallback : undefined,
+          };
       await createPaperSession({
         strategy_id: strategyId,
         universe_group_id: groupId,
@@ -1125,12 +1136,9 @@ function CreateSessionModal({
         name: name || undefined,
         config: {
           initial_capital: initialCapital,
-          max_positions: maxPositions,
           commission_rate: commission,
           slippage_rate: slippage,
-          execution_model: executionModel,
-          planned_price_buffer_bps: executionModel === "planned_price" ? plannedPriceBufferBps : undefined,
-          planned_price_fallback: executionModel === "planned_price" ? plannedPriceFallback : undefined,
+          ...strategyOwnedOverrides,
         },
       });
       messageApi.success("模拟交易会话已创建");
@@ -1141,6 +1149,9 @@ function CreateSessionModal({
       setCreating(false);
     }
   };
+
+  const selectedStrategy = strategies.find((s) => s.id === strategyId);
+  const strategyDefaults = selectedStrategy?.default_paper_config ?? selectedStrategy?.default_backtest_config;
 
   return (
     <Modal
@@ -1194,6 +1205,26 @@ function CreateSessionModal({
             />
           </Col>
         </Row>
+        <Row gutter={12} align="middle">
+          <Col span={8}>
+            <Text type="secondary" style={{ fontSize: 12 }}>策略默认参数</Text>
+            <div style={{ marginTop: 4 }}>
+              <Switch
+                checked={useStrategyDefaults}
+                onChange={setUseStrategyDefaults}
+                checkedChildren="继承"
+                unCheckedChildren="覆盖"
+              />
+            </div>
+          </Col>
+          <Col span={16}>
+            {strategyDefaults && Object.keys(strategyDefaults).length > 0 && (
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                {Object.entries(strategyDefaults).slice(0, 4).map(([key, value]) => `${key}=${String(value)}`).join(" · ")}
+              </Text>
+            )}
+          </Col>
+        </Row>
         <Row gutter={12}>
           <Col span={8}>
             <Text type="secondary" style={{ fontSize: 12 }}>模拟起始日期</Text>
@@ -1221,6 +1252,7 @@ function CreateSessionModal({
               onChange={(v) => setMaxPositions(v ?? 50)}
               min={1}
               max={500}
+              disabled={useStrategyDefaults}
             />
           </Col>
         </Row>
@@ -1256,7 +1288,9 @@ function CreateSessionModal({
               options={[
                 { value: "next_open", label: "次日开盘" },
                 { value: "planned_price", label: "计划价" },
+                { value: "next_close", label: "次日收盘" },
               ]}
+              disabled={useStrategyDefaults}
             />
           </Col>
         </Row>
@@ -1271,6 +1305,7 @@ function CreateSessionModal({
                 min={0}
                 max={4999}
                 step={10}
+                disabled={useStrategyDefaults}
               />
             </Col>
             <Col span={8}>
@@ -1283,6 +1318,7 @@ function CreateSessionModal({
                   { value: "cancel", label: "取消订单" },
                   { value: "next_close", label: "次日收盘成交" },
                 ]}
+                disabled={useStrategyDefaults}
               />
             </Col>
           </Row>

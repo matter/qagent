@@ -200,6 +200,90 @@ class MultiFactorStrategy(StrategyBase):
         return []
 '''
 
+# ------------------------------------------------------------------
+# 4. Planned execution intent strategy
+# ------------------------------------------------------------------
+TEMPLATES["计划交易策略模板"] = '''\
+"""计划交易策略模板：在策略层声明默认参数，并为每只股票输出成交意图。
+
+策略输出的 execution_model / planned_price 等列只描述意图；
+真实成交、失败、fallback、成本和持仓变化由共享回测/模拟交易引擎判定。
+"""
+
+import pandas as pd
+from backend.strategies.base import StrategyBase, StrategyContext
+
+
+class PlannedExecutionStrategy(StrategyBase):
+    name = "计划交易策略模板"
+    description = "展示 default_backtest_config、default_paper_config 和逐订单成交意图"
+
+    default_backtest_config = {
+        "position_sizing": "raw_weight",
+        "max_positions": 20,
+        "rebalance_freq": "daily",
+        "normalize_target_weights": False,
+        "execution_model": "planned_price",
+        "planned_price_buffer_bps": 50,
+        "planned_price_fallback": "next_close",
+        "constraint_config": {"max_single_name_weight": 0.08},
+    }
+    default_paper_config = {
+        "position_sizing": "raw_weight",
+        "max_positions": 20,
+        "rebalance_freq": "daily",
+        "normalize_target_weights": False,
+        "execution_model": "planned_price",
+        "planned_price_buffer_bps": 50,
+        "planned_price_fallback": "next_close",
+        "constraint_config": {"max_single_name_weight": 0.08},
+    }
+
+    def generate_signals(self, context: StrategyContext) -> pd.DataFrame:
+        prices = context.prices
+        current_date = pd.Timestamp(context.current_date)
+        if ("close" not in prices.columns.get_level_values(0)):
+            return pd.DataFrame(columns=["signal", "weight", "strength"])
+
+        close = prices["close"]
+        available = close.index[close.index <= current_date]
+        if len(available) < 20:
+            return pd.DataFrame(columns=["signal", "weight", "strength"])
+
+        latest = available[-1]
+        momentum = close.loc[latest] / close.loc[available[-20]] - 1.0
+        ranked = momentum.dropna().nlargest(10)
+        if ranked.empty:
+            return pd.DataFrame(columns=["signal", "weight", "strength"])
+
+        rows = []
+        weight = min(0.08, 0.8 / len(ranked))
+        latest_close = close.loc[latest]
+        for ticker, score in ranked.items():
+            planned_price = float(latest_close[ticker]) * 1.002
+            rows.append(
+                {
+                    "ticker": ticker,
+                    "signal": 1,
+                    "weight": weight,
+                    "strength": float(score),
+                    "execution_model": "planned_price",
+                    "planned_price": planned_price,
+                    "planned_price_buffer_bps": 50,
+                    "planned_price_fallback": "next_close",
+                    "time_in_force": "day",
+                    "order_reason": "20d momentum planned entry",
+                }
+            )
+        return pd.DataFrame(rows).set_index("ticker")
+
+    def required_factors(self) -> list[str]:
+        return []
+
+    def required_models(self) -> list[str]:
+        return []
+'''
+
 
 def get_template_names() -> list[str]:
     """Return sorted list of all available strategy template names."""

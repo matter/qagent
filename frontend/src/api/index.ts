@@ -11,7 +11,7 @@ export {
 // ---- Types ----
 
 export type Market = "US" | "CN";
-export type ExecutionModel = "next_open" | "planned_price";
+export type ExecutionModel = "next_open" | "planned_price" | "next_close";
 export type PlannedPriceFallback = "cancel" | "next_close";
 
 export interface StockSearchResult {
@@ -790,6 +790,8 @@ export interface Strategy {
   required_models: string[] | null;
   position_sizing: string;
   constraint_config?: Record<string, unknown> | null;
+  default_backtest_config?: BacktestRunConfig | null;
+  default_paper_config?: Record<string, unknown> | null;
   status: string;
   created_at: string;
 }

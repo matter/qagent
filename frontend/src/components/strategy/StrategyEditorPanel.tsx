@@ -244,6 +244,11 @@ export default function StrategyEditorPanel({
           <Space orientation="vertical" style={{ width: "100%" }} size="small">
             <Card title="策略元信息" size="small">
               <Space orientation="vertical" style={{ width: "100%" }} size="small">
+                <Alert
+                  type="info"
+                  showIcon
+                  message="策略代码可声明 default_backtest_config / default_paper_config，并在信号行输出 execution_model、planned_price、planned_price_fallback、order_reason。"
+                />
                 <div>
                   <Text type="secondary" style={{ fontSize: 12 }}>名称</Text>
                   <Input

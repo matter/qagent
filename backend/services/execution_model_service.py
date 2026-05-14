@@ -7,13 +7,13 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-ExecutionModel = Literal["next_open", "planned_price"]
+ExecutionModel = Literal["next_open", "planned_price", "next_close"]
 PlannedPriceFallback = Literal["cancel", "next_close"]
 
 DEFAULT_EXECUTION_MODEL: ExecutionModel = "next_open"
 DEFAULT_PLANNED_PRICE_FALLBACK: PlannedPriceFallback = "cancel"
 DEFAULT_PLANNED_PRICE_BUFFER_BPS = 50.0
-SUPPORTED_EXECUTION_MODELS = {"next_open", "planned_price"}
+SUPPORTED_EXECUTION_MODELS = {"next_open", "planned_price", "next_close"}
 SUPPORTED_PLANNED_PRICE_FALLBACKS = {"cancel", "next_close"}
 
 

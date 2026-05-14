@@ -22,6 +22,44 @@ SUPPORTED_POSITION_SIZING = {
     "max_position",
     "raw_weight",
 }
+STRATEGY_DEFAULT_FORBIDDEN_KEYS = {
+    "market",
+    "universe_group_id",
+    "start_date",
+    "end_date",
+    "warmup_start_date",
+    "evaluation_start_date",
+    "benchmark",
+    "initial_capital",
+    "commission_rate",
+    "slippage_rate",
+    "debug_mode",
+    "debug_level",
+    "debug_tickers",
+    "debug_dates",
+    "result_level",
+    "task_id",
+}
+STRATEGY_DEFAULT_ALLOWED_KEYS = {
+    "position_sizing",
+    "max_positions",
+    "max_position_pct",
+    "normalize_target_weights",
+    "rebalance_freq",
+    "rebalance_frequency",
+    "rebalance_buffer",
+    "rebalance_buffer_add",
+    "rebalance_buffer_reduce",
+    "rebalance_buffer_mode",
+    "rebalance_buffer_reference",
+    "min_holding_days",
+    "reentry_cooldown_days",
+    "max_holding_days",
+    "execution_model",
+    "planned_price_buffer_bps",
+    "planned_price_fallback",
+    "constraint_config",
+}
 
 
 class StrategyService:
@@ -51,6 +89,7 @@ class StrategyService:
         # Validate source code is loadable
         try:
             instance = load_strategy_from_code(source_code)
+            metadata = self.extract_strategy_metadata_from_instance(instance)
         except Exception as exc:
             raise ValueError(f"Invalid strategy source code: {exc}") from exc
 
@@ -70,9 +109,9 @@ class StrategyService:
         now = utc_now_naive()
 
         # Extract required_factors / required_models from the instance
-        required_factors = instance.required_factors()
+        required_factors = metadata["required_factors"]
         required_models = self._merge_required_models(
-            instance.required_models(),
+            metadata["required_models"],
             self._extract_model_references(source_code),
         )
         self._validate_dependencies(required_factors, required_models, resolved_market)
@@ -103,7 +142,7 @@ class StrategyService:
                 json.dumps(required_factors),
                 json.dumps(required_models),
                 position_sizing,
-                json.dumps(constraint_config or {}, default=str) if constraint_config else None,
+            json.dumps(constraint_config or {}, default=str) if constraint_config else None,
                 now,
                 now,
             ],
@@ -116,6 +155,8 @@ class StrategyService:
             version=version,
         )
         result = self.get_strategy(strategy_id, market=resolved_market)
+        result["default_backtest_config"] = metadata["default_backtest_config"]
+        result["default_paper_config"] = metadata["default_paper_config"]
         if model_warnings:
             result["model_ref_warnings"] = model_warnings
         if weight_warnings:
@@ -146,6 +187,7 @@ class StrategyService:
             # Validate new source code
             try:
                 instance = load_strategy_from_code(source_code)
+                metadata = self.extract_strategy_metadata_from_instance(instance)
             except Exception as exc:
                 raise ValueError(f"Invalid strategy source code: {exc}") from exc
 
@@ -158,9 +200,9 @@ class StrategyService:
             new_id = uuid.uuid4().hex[:12]
             now = utc_now_naive()
 
-            required_factors = instance.required_factors()
+            required_factors = metadata["required_factors"]
             required_models = self._merge_required_models(
-                instance.required_models(),
+                metadata["required_models"],
                 self._extract_model_references(source_code),
             )
             self._validate_dependencies(required_factors, required_models, existing["market"])
@@ -211,6 +253,8 @@ class StrategyService:
                 version=new_version,
             )
             result = self.get_strategy(new_id, market=existing["market"])
+            result["default_backtest_config"] = metadata["default_backtest_config"]
+            result["default_paper_config"] = metadata["default_paper_config"]
             if model_warnings:
                 result["model_ref_warnings"] = model_warnings
             if weight_warnings:
@@ -305,6 +349,53 @@ class StrategyService:
             strategy_def.get("required_models", []),
             StrategyService._extract_model_references(strategy_def.get("source_code", "")),
         )
+
+    @staticmethod
+    def extract_strategy_metadata_from_source(source_code: str) -> dict:
+        instance = load_strategy_from_code(source_code)
+        return StrategyService.extract_strategy_metadata_from_instance(instance)
+
+    @staticmethod
+    def extract_strategy_metadata_from_instance(instance) -> dict:
+        default_backtest_config = StrategyService._normalize_strategy_default_config(
+            getattr(instance, "default_backtest_config", {}) or {},
+            kind="default_backtest_config",
+        )
+        default_paper_config = StrategyService._normalize_strategy_default_config(
+            getattr(instance, "default_paper_config", {}) or {},
+            kind="default_paper_config",
+        )
+        return {
+            "name": getattr(instance, "name", ""),
+            "description": getattr(instance, "description", ""),
+            "required_factors": list(instance.required_factors()),
+            "required_models": list(instance.required_models()),
+            "default_backtest_config": default_backtest_config,
+            "default_paper_config": default_paper_config,
+        }
+
+    @staticmethod
+    def _normalize_strategy_default_config(raw: dict | None, *, kind: str) -> dict:
+        if raw is None:
+            return {}
+        if not isinstance(raw, dict):
+            raise ValueError(f"strategy default {kind} must be a dict")
+        forbidden = sorted(set(raw) & STRATEGY_DEFAULT_FORBIDDEN_KEYS)
+        if forbidden:
+            raise ValueError(
+                f"strategy default {kind} cannot set run/session-owned fields: {forbidden}"
+            )
+        unsupported = sorted(set(raw) - STRATEGY_DEFAULT_ALLOWED_KEYS)
+        if unsupported:
+            raise ValueError(
+                f"strategy default {kind} has unsupported field(s): {unsupported}"
+            )
+        normalized = dict(raw)
+        if "position_sizing" in normalized:
+            normalized["position_sizing"] = StrategyService._validate_position_sizing(
+                normalized.get("position_sizing")
+            )
+        return normalized
 
     @staticmethod
     def _validate_dependencies(
@@ -579,6 +670,16 @@ class StrategyService:
                     return default
             return raw if raw else default
 
+        defaults = {"default_backtest_config": {}, "default_paper_config": {}}
+        try:
+            defaults = StrategyService.extract_strategy_metadata_from_source(row[5])
+        except Exception as exc:
+            log.warning(
+                "strategy.default_metadata_unavailable",
+                strategy_id=row[0],
+                error=str(exc),
+            )
+
         return {
             "id": row[0],
             "market": row[1],
@@ -593,4 +694,6 @@ class StrategyService:
             "status": row[10],
             "created_at": str(row[11]) if row[11] else None,
             "updated_at": str(row[12]) if row[12] else None,
+            "default_backtest_config": defaults.get("default_backtest_config", {}),
+            "default_paper_config": defaults.get("default_paper_config", {}),
         }

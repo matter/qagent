@@ -93,6 +93,8 @@ class IsolatedStrategyProxy(StrategyBase):
         self.description = str(metadata.get("description") or "")
         self._required_factors = list(metadata.get("required_factors") or [])
         self._required_models = list(metadata.get("required_models") or [])
+        self.default_backtest_config = dict(metadata.get("default_backtest_config") or {})
+        self.default_paper_config = dict(metadata.get("default_paper_config") or {})
 
     def generate_signals(self, context: StrategyContext):
         result = run_user_code_isolated(
