@@ -60,6 +60,8 @@ import type {
   PaperPosition,
   PaperTrade,
   PaperActionPlan,
+  ExecutionModel,
+  PlannedPriceFallback,
 } from "../api";
 
 const { Text } = Typography;
@@ -1086,6 +1088,9 @@ function CreateSessionModal({
   const [maxPositions, setMaxPositions] = useState(50);
   const [commission, setCommission] = useState(0.001);
   const [slippage, setSlippage] = useState(0.001);
+  const [executionModel, setExecutionModel] = useState<ExecutionModel>("next_open");
+  const [plannedPriceBufferBps, setPlannedPriceBufferBps] = useState(50);
+  const [plannedPriceFallback, setPlannedPriceFallback] = useState<PlannedPriceFallback>("cancel");
   const [creating, setCreating] = useState(false);
 
   useEffect(() => {
@@ -1123,6 +1128,9 @@ function CreateSessionModal({
           max_positions: maxPositions,
           commission_rate: commission,
           slippage_rate: slippage,
+          execution_model: executionModel,
+          planned_price_buffer_bps: executionModel === "planned_price" ? plannedPriceBufferBps : undefined,
+          planned_price_fallback: executionModel === "planned_price" ? plannedPriceFallback : undefined,
         },
       });
       messageApi.success("模拟交易会话已创建");
@@ -1239,7 +1247,46 @@ function CreateSessionModal({
               step={0.0001}
             />
           </Col>
+          <Col span={8}>
+            <Text type="secondary" style={{ fontSize: 12 }}>成交模式</Text>
+            <Select
+              style={{ width: "100%" }}
+              value={executionModel}
+              onChange={setExecutionModel}
+              options={[
+                { value: "next_open", label: "次日开盘" },
+                { value: "planned_price", label: "计划价" },
+              ]}
+            />
+          </Col>
         </Row>
+        {executionModel === "planned_price" && (
+          <Row gutter={12}>
+            <Col span={8}>
+              <Text type="secondary" style={{ fontSize: 12 }}>计划价缓冲 bps</Text>
+              <InputNumber
+                style={{ width: "100%" }}
+                value={plannedPriceBufferBps}
+                onChange={(v) => setPlannedPriceBufferBps(v ?? 50)}
+                min={0}
+                max={4999}
+                step={10}
+              />
+            </Col>
+            <Col span={8}>
+              <Text type="secondary" style={{ fontSize: 12 }}>未达计划价</Text>
+              <Select
+                style={{ width: "100%" }}
+                value={plannedPriceFallback}
+                onChange={setPlannedPriceFallback}
+                options={[
+                  { value: "cancel", label: "取消订单" },
+                  { value: "next_close", label: "次日收盘成交" },
+                ]}
+              />
+            </Col>
+          </Row>
+        )}
       </Space>
     </Modal>
   );

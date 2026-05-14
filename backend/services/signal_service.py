@@ -6,12 +6,14 @@ Orchestrates:
 
 from __future__ import annotations
 
+import copy
 import json
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import fields
 from datetime import datetime
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -66,6 +68,7 @@ class SignalService:
         universe_group_id: str,
         market: str | None = None,
         constraint_config: dict | None = None,
+        stage_domain_write: Any | None = None,
     ) -> dict:
         """Full signal generation pipeline.
 
@@ -295,17 +298,38 @@ class SignalService:
 
         # ---- 11. Save to DB ----
         run_id = uuid.uuid4().hex[:12]
-        signal_records = self._save_signal_run(
-            run_id=run_id,
+        signal_records = self._signal_records_from_frame(
+            raw_signals,
             market=resolved_market,
-            strategy_id=strategy_id,
-            strategy_version=strategy_def.get("version", 1),
-            target_date=target_date,
-            universe_group_id=universe_group_id,
-            result_level=result_level,
-            dependency_snapshot=dependency_snapshot,
-            raw_signals=raw_signals,
         )
+        save_payload = {
+            "run_id": run_id,
+            "market": resolved_market,
+            "strategy_id": strategy_id,
+            "strategy_version": strategy_def.get("version", 1),
+            "target_date": target_date,
+            "universe_group_id": universe_group_id,
+            "result_level": result_level,
+            "dependency_snapshot": copy.deepcopy(dependency_snapshot),
+            "raw_signals": raw_signals.copy(),
+        }
+        if callable(stage_domain_write):
+            stage_domain_write(
+                "signal_runs",
+                {
+                    "id": run_id,
+                    "market": resolved_market,
+                    "strategy_id": strategy_id,
+                    "target_date": target_date,
+                    "signal_count": len(signal_records),
+                },
+                commit=lambda conn=None, payload=save_payload: self._save_signal_run(
+                    **payload,
+                    conn=conn,
+                ),
+            )
+        else:
+            signal_records = self._save_signal_run(**save_payload)
 
         # ---- 12. Return results ----
         result = {
@@ -1509,29 +1533,16 @@ class SignalService:
         result_level: str,
         dependency_snapshot: dict,
         raw_signals: pd.DataFrame,
+        conn: Any | None = None,
     ) -> list[dict]:
         """Persist signal run and detail records. Returns list of signal dicts."""
         resolved_market = normalize_market(market)
-        conn = get_connection()
+        conn = conn or get_connection()
         now = utc_now_naive()
-
-        # Build signal records from raw_signals DataFrame
-        # raw_signals has index=ticker, columns=[signal, weight, strength]
-        signal_records: list[dict] = []
-
-        if not raw_signals.empty:
-            for ticker in raw_signals.index:
-                row = raw_signals.loc[ticker]
-                sig = int(row.get("signal", 0))
-                weight = float(row.get("weight", 0.0))
-                strength = float(row.get("strength", 0.0))
-                signal_records.append({
-                    "market": resolved_market,
-                    "ticker": normalize_ticker(str(ticker), resolved_market),
-                    "signal": sig,
-                    "target_weight": weight,
-                    "strength": strength,
-                })
+        signal_records = self._signal_records_from_frame(
+            raw_signals,
+            market=resolved_market,
+        )
 
         signal_count = len(signal_records)
 
@@ -1578,6 +1589,30 @@ class SignalService:
             market=resolved_market,
             signal_count=signal_count,
         )
+        return signal_records
+
+    @staticmethod
+    def _signal_records_from_frame(
+        raw_signals: pd.DataFrame,
+        *,
+        market: str,
+    ) -> list[dict]:
+        resolved_market = normalize_market(market)
+        signal_records: list[dict] = []
+        if raw_signals.empty:
+            return signal_records
+        for ticker in raw_signals.index:
+            row = raw_signals.loc[ticker]
+            sig = int(row.get("signal", 0))
+            weight = float(row.get("weight", 0.0))
+            strength = float(row.get("strength", 0.0))
+            signal_records.append({
+                "market": resolved_market,
+                "ticker": normalize_ticker(str(ticker), resolved_market),
+                "signal": sig,
+                "target_weight": weight,
+                "strength": strength,
+            })
         return signal_records
 
     # ------------------------------------------------------------------

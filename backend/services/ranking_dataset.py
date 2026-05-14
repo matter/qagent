@@ -152,15 +152,16 @@ def compute_ranking_metrics(
         if ic is not None and not np.isnan(ic):
             rank_ics.append(float(ic))
 
-        correct, total = _pairwise_accuracy_counts(
-            y_values,
-            p_values,
-            limit=max(1, pairwise_sample_limit - pairwise_total),
-        )
-        pairwise_correct += correct
-        pairwise_total += total
-        if pairwise_total >= pairwise_sample_limit:
-            pairwise_total = pairwise_sample_limit
+        if pairwise_total < pairwise_sample_limit:
+            correct, total = _pairwise_accuracy_counts(
+                y_values,
+                p_values,
+                limit=max(1, pairwise_sample_limit - pairwise_total),
+            )
+            pairwise_correct += correct
+            pairwise_total += total
+            if pairwise_total >= pairwise_sample_limit:
+                pairwise_total = pairwise_sample_limit
 
     for k, values in ndcg_values.items():
         if values:

@@ -183,6 +183,67 @@ class AgentResearch3ServiceContractTests(unittest.TestCase):
         self.assertEqual(len(performance["top_trials"]), 2)
         self.assertEqual(performance["metric_ranges"]["sharpe"]["count"], 3)
 
+    def test_trial_matrix_groups_hypotheses_and_surfaces_stop_promote_metadata(self):
+        service = AgentResearch3Service()
+        plan = service.create_research_plan(
+            hypothesis="Legacy strategy candidates need explicit trial matrix",
+            budget={"max_trials": 4},
+            metadata={
+                "baseline_strategy_id": "strategy_base",
+                "baseline_backtest_id": "bt_base",
+            },
+        )
+        service.record_trials(
+            plan["id"],
+            trials=[
+                {
+                    "trial_type": "legacy_strategy_backtest",
+                    "params": {
+                        "changed_module": "risk_budget",
+                        "changed_variable": {"max_weight": 0.08},
+                        "hypothesis": "lower concentration improves drawdown",
+                        "baseline_strategy_id": "strategy_base",
+                        "baseline_backtest_id": "bt_base",
+                        "config_hash": "cfg_a",
+                    },
+                    "result_refs": [{"type": "backtest", "id": "bt_a"}],
+                    "metrics": {"sharpe": 1.4, "total_return": 0.22},
+                    "status": "completed",
+                },
+                {
+                    "trial_type": "legacy_strategy_backtest",
+                    "params": {
+                        "changed_module": "entry_guard",
+                        "changed_variable": {"strict_reentry": True},
+                        "hypothesis": "strict reentry avoids churn",
+                        "baseline_strategy_id": "strategy_base",
+                        "baseline_backtest_id": "bt_base",
+                        "config_hash": "cfg_b",
+                        "conclusion": "stop",
+                        "stop_reason": "cut off main-wave candidates",
+                    },
+                    "result_refs": [{"type": "backtest", "id": "bt_b"}],
+                    "metrics": {"sharpe": 0.4, "total_return": -0.02},
+                    "status": "stopped",
+                },
+            ],
+        )
+
+        matrix = service.get_trial_matrix(
+            plan["id"],
+            primary_metric="sharpe",
+        )
+
+        self.assertEqual(matrix["baseline"]["strategy_id"], "strategy_base")
+        self.assertEqual(matrix["baseline"]["backtest_id"], "bt_base")
+        self.assertEqual(matrix["trial_count"], 2)
+        self.assertEqual(matrix["decision_counts"]["promote"], 1)
+        self.assertEqual(matrix["decision_counts"]["stop"], 1)
+        self.assertEqual(matrix["rows"][0]["decision"], "promote")
+        self.assertEqual(matrix["rows"][1]["decision"], "stop")
+        self.assertEqual(matrix["rows"][1]["stop_reason"], "cut off main-wave candidates")
+        self.assertIn("entry_guard", matrix["hypotheses"])
+
     def test_next_trial_index_avoids_empty_plan_aggregate_path(self):
         conn = _TrialIndexConnection(rows=[])
 

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,7 @@ from backend.db import get_connection
 from backend.logger import get_logger
 from backend.models.base import ModelBase
 from backend.models.lightgbm_model import LightGBMModel
-from backend.services.calendar_service import snap_to_trading_day
+from backend.services.calendar_service import offset_trading_days, snap_to_trading_day
 from backend.services.feature_service import FeatureService
 from backend.services.group_service import GroupService
 from backend.services.label_service import LabelService
@@ -60,6 +61,7 @@ _RANKING_OBJECTIVES = {"ranking", "pairwise", "listwise"}
 
 # Parameters determined by the system, not user-configurable
 _RESERVED_MODEL_PARAMS = {"task", "objective", "metric", "verbosity", "n_jobs"}
+_PREDICT_BATCH_CACHE_TTL_SECONDS = 48 * 60 * 60
 
 
 class ModelService:
@@ -75,6 +77,7 @@ class ModelService:
         self._model_cache: dict[str, ModelBase] = {}
         self._record_cache: dict[tuple[str, str], dict] = {}
         self._frozen_cache: dict[str, list[str] | None] = {}
+        self._predict_batch_cache: dict[tuple, tuple[datetime, dict[str, dict[str, float]]]] = {}
 
     # ------------------------------------------------------------------
     # Training
@@ -228,6 +231,8 @@ class ModelService:
         market: str | None = None,
         objective_type: str | None = None,
         ranking_config: dict[str, Any] | None = None,
+        progress: Any | None = None,
+        stage_domain_write: Any | None = None,
     ) -> dict:
         """End-to-end model training pipeline.
 
@@ -261,6 +266,13 @@ class ModelService:
             )
         ranking_config = ranking_config or {}
 
+        def _progress(phase: str, **payload: Any) -> None:
+            if callable(progress):
+                try:
+                    progress(phase, **payload)
+                except Exception as exc:
+                    log.warning("model.train.progress_failed", phase=phase, error=str(exc))
+
         # ---- Strip reserved params that are set by the system ----
         stripped = [k for k in model_params if k in _RESERVED_MODEL_PARAMS]
         if stripped:
@@ -273,6 +285,7 @@ class ModelService:
         train_config = self._normalize_train_config(train_config, market=resolved_market)
 
         # ---- 1. Resolve tickers ----
+        _progress("resolve_universe", percent=0.05, message="Resolving universe tickers")
         if universe_group_id:
             tickers = self._group_service.get_group_tickers(universe_group_id, market=resolved_market)
             if not tickers:
@@ -298,17 +311,39 @@ class ModelService:
             date_range=f"{overall_start} ~ {overall_end}",
         )
 
+        runtime_profile: dict[str, Any] = {
+            "feature_loader": "compute_features_from_cache",
+        }
+        train_started = time.perf_counter()
+
         # ---- 2. Compute features ----
-        feature_data = self._feature_service.compute_features(
+        _progress(
+            "feature_load",
+            percent=0.15,
+            message="Loading or computing feature matrix",
+            feature_set_id=feature_set_id,
+            tickers=len(tickers),
+        )
+        feature_started = time.perf_counter()
+        feature_data = self._feature_service.compute_features_from_cache(
             feature_set_id, tickers, overall_start, overall_end, market=resolved_market
         )
+        runtime_profile["feature_seconds"] = round(time.perf_counter() - feature_started, 6)
         # feature_data: dict[factor_name -> DataFrame(dates x tickers)]
 
         # ---- 3. Compute labels ----
+        _progress(
+            "label_load",
+            percent=0.35,
+            message="Loading or computing label values",
+            label_id=label_id,
+        )
+        label_started = time.perf_counter()
         label_def = self._label_service.get_label(label_id, market=resolved_market)
-        label_df = self._label_service.compute_label_values(
+        label_df = self._label_service.compute_label_values_cached(
             label_id, tickers, overall_start, overall_end, market=resolved_market
         )
+        runtime_profile["label_seconds"] = round(time.perf_counter() - label_started, 6)
         # label_df: DataFrame with columns [ticker, date, label_value]
 
         if label_df.empty:
@@ -318,6 +353,7 @@ class ModelService:
             "label_id": label_id,
             "target_type": label_def["target_type"],
             "horizon": label_def.get("horizon"),
+            "effective_horizon": label_def.get("effective_horizon", label_def.get("horizon")),
             "config": label_def.get("config"),
             "samples": len(label_df),
             "mean": round(float(label_df["label_value"].mean()), 6),
@@ -327,13 +363,18 @@ class ModelService:
         }
 
         # ---- 4. Build X and y aligned by (date, ticker) ----
+        _progress("build_xy", percent=0.50, message="Aligning features and labels")
+        xy_started = time.perf_counter()
         X, y = self._build_Xy(feature_data, label_df)
         if X.empty:
             raise ValueError("No aligned (date, ticker) pairs after joining features and labels")
+        runtime_profile["xy_seconds"] = round(time.perf_counter() - xy_started, 6)
 
         log.info("model.train.data_built", X_shape=X.shape, y_size=len(y))
 
         # ---- 5. Split by date ranges ----
+        _progress("split", percent=0.60, message="Splitting train/valid/test samples")
+        split_started = time.perf_counter()
         purge_gap = int(train_config.get("purge_gap", 5))
 
         # Preflight: validate date ordering and coverage
@@ -354,8 +395,11 @@ class ModelService:
 
         if len(X_train) == 0:
             raise ValueError("Training set is empty after date split")
+        runtime_profile["split_seconds"] = round(time.perf_counter() - split_started, 6)
 
         # ---- 6. Determine task type and fit ----
+        _progress("fit_prep", percent=0.68, message="Preparing model fit inputs")
+        fit_prep_started = time.perf_counter()
         if objective in _RANKING_OBJECTIVES:
             task = "ranking"
         elif objective in {"regression", "classification"}:
@@ -453,13 +497,22 @@ class ModelService:
                          weight_min=round(float(weights.min()), 4),
                          weight_max=round(float(weights.max()), 4))
 
+        runtime_profile["fit_prep_seconds"] = round(time.perf_counter() - fit_prep_started, 6)
+        _progress("fit", percent=0.75, message="Fitting model")
+        fit_started = time.perf_counter()
         model_instance.fit(fit_X_train, fit_y_train, **fit_kwargs)
+        runtime_profile["fit_seconds"] = round(time.perf_counter() - fit_started, 6)
 
         # ---- 7. Predict on valid and test sets ----
+        _progress("predict_eval", percent=0.84, message="Predicting validation and test samples")
+        predict_started = time.perf_counter()
         preds_valid = model_instance.predict(fit_X_valid) if len(fit_X_valid) > 0 else pd.Series(dtype=float)
         preds_test = model_instance.predict(fit_X_test) if len(fit_X_test) > 0 else pd.Series(dtype=float)
+        runtime_profile["predict_seconds"] = round(time.perf_counter() - predict_started, 6)
 
         # ---- 8. Calculate eval metrics ----
+        _progress("metrics", percent=0.90, message="Computing evaluation metrics")
+        metrics_started = time.perf_counter()
         if task == "ranking":
             eval_at = ranking_config.get("eval_at", [5, 10, 20])
             eval_metrics = {
@@ -482,7 +535,11 @@ class ModelService:
             )
         eval_metrics["task_type"] = task
         eval_metrics["label_summary"] = label_summary
-        eval_metrics["label_horizon"] = label_summary.get("horizon")
+        effective_label_horizon = label_summary.get("effective_horizon", label_summary.get("horizon"))
+        eval_metrics["label_horizon"] = effective_label_horizon
+        eval_metrics["effective_label_horizon"] = effective_label_horizon
+        runtime_profile["metrics_seconds"] = round(time.perf_counter() - metrics_started, 6)
+        eval_metrics["runtime_profile"] = runtime_profile
 
         # Feature importance
         try:
@@ -528,7 +585,10 @@ class ModelService:
             )
             eval_metrics["missing_features"] = missing_features
 
+        runtime_profile["total_seconds"] = round(time.perf_counter() - train_started, 6)
+
         # ---- 10. Save model file + metadata ----
+        _progress("persist", percent=0.96, message="Persisting trained model")
         model_id = uuid.uuid4().hex[:12]
         model_dir = settings.models_dir / model_id
         model_dir.mkdir(parents=True, exist_ok=True)
@@ -544,7 +604,8 @@ class ModelService:
             "objective_type": objective or task,
             "ranking_config": ranking_config if task == "ranking" else None,
             "label_summary": label_summary,
-            "label_horizon": label_summary.get("horizon"),
+            "label_horizon": effective_label_horizon,
+            "effective_label_horizon": effective_label_horizon,
             "feature_set_id": feature_set_id,
             "label_id": label_id,
             "model_params": model_instance.get_params(),
@@ -554,23 +615,39 @@ class ModelService:
             "feature_lineage": feature_lineage,
             "universe_group_id": universe_group_id,
             "sample_weight_config": sample_weight_config,
+            "runtime_profile": runtime_profile,
             "created_at": utc_now_iso(),
         }
         with open(model_dir / "metadata.json", "w") as f:
             json.dump(metadata, f, indent=2, default=str)
 
         # ---- 11. Save record to DuckDB ----
-        self._insert_model_record(
-            model_id=model_id,
-            market=resolved_market,
-            name=name,
-            feature_set_id=feature_set_id,
-            label_id=label_id,
-            model_type=model_type,
-            model_params=model_instance.get_params(),
-            train_config=train_config,
-            eval_metrics=eval_metrics,
-        )
+        save_payload = {
+            "model_id": model_id,
+            "market": resolved_market,
+            "name": name,
+            "feature_set_id": feature_set_id,
+            "label_id": label_id,
+            "model_type": model_type,
+            "model_params": model_instance.get_params(),
+            "train_config": train_config,
+            "eval_metrics": eval_metrics,
+        }
+        if callable(stage_domain_write):
+            stage_domain_write(
+                "models",
+                {
+                    "id": model_id,
+                    "market": resolved_market,
+                    "name": name,
+                },
+                commit=lambda conn=None, payload=save_payload: self._insert_model_record(
+                    **payload,
+                    conn=conn,
+                ),
+            )
+        else:
+            self._insert_model_record(**save_payload)
 
         # ---- 12. Return summary ----
         summary = {
@@ -589,8 +666,10 @@ class ModelService:
             "feature_lineage": feature_lineage,
             "eval_metrics": eval_metrics,
             "label_summary": label_summary,
+            "runtime_profile": runtime_profile,
         }
         log.info("model.train.done", model_id=model_id, market=resolved_market, features=trained_feature_count)
+        _progress("completed", percent=1.0, message="Model training completed", model_id=model_id)
         return summary
 
     # ------------------------------------------------------------------
@@ -744,7 +823,7 @@ class ModelService:
         tickers = [normalize_ticker(t, resolved_market) for t in tickers]
 
         # Compute features for the given date (use a small window around it)
-        feature_data = self._feature_service.compute_features(
+        feature_data = self._feature_service.compute_features_from_cache(
             fs_id, tickers, date, date, market=resolved_market
         )
 
@@ -803,7 +882,7 @@ class ModelService:
             raise ValueError("date must be provided")
         tickers = [normalize_ticker(t, resolved_market) for t in tickers]
 
-        feature_data = self._feature_service.compute_features(fs_id, tickers, date, date, market=resolved_market)
+        feature_data = self._feature_service.compute_features_from_cache(fs_id, tickers, date, date, market=resolved_market)
         X = self._build_X_for_date(feature_data, tickers, date)
         if X.empty:
             return pd.DataFrame()
@@ -926,6 +1005,23 @@ class ModelService:
         sorted_dates = sorted(dates)
         start_date = sorted_dates[0]
         end_date = sorted_dates[-1]
+        cache_key = (
+            resolved_market,
+            model_id,
+            fs_id,
+            tuple(sorted(set(tickers))),
+            tuple(sorted_dates),
+            record.get("updated_at"),
+        )
+        cached = self._predict_batch_cache.get(cache_key)
+        if cached is not None:
+            cached_at, cached_results = cached
+            if utc_now_naive() - cached_at <= timedelta(seconds=_PREDICT_BATCH_CACHE_TTL_SECONDS):
+                return {
+                    date_key: dict(by_ticker)
+                    for date_key, by_ticker in cached_results.items()
+                }
+            self._predict_batch_cache.pop(cache_key, None)
 
         # Single bulk feature load for the entire date range
         feature_data = self._feature_service.compute_features_from_cache(
@@ -936,39 +1032,49 @@ class ModelService:
         task = record.get("task_type") or _infer_task_from_model(model_instance)
 
         results: dict[str, dict[str, float]] = {}
-        for date in sorted_dates:
-            X = self._build_X_for_date(feature_data, tickers, date)
-            if X.empty:
-                results[date] = {}
-                continue
+        X_all = self._build_X_for_dates(feature_data, tickers, sorted_dates)
+        if frozen and not X_all.empty:
+            try:
+                X_all = self._align_features_to_frozen(X_all, frozen, model_id)
+            except ValueError:
+                return {date: {} for date in sorted_dates}
 
-            if frozen:
-                try:
-                    X = self._align_features_to_frozen(X, frozen, model_id)
-                except ValueError:
-                    results[date] = {}
-                    continue
-
+        if not X_all.empty:
             if task == "classification" and hasattr(model_instance, "predict_proba"):
-                proba = model_instance.predict_proba(X)
+                proba = model_instance.predict_proba(X_all)
                 preds = pd.Series(
                     proba[:, 1] if proba.shape[1] > 1 else proba[:, 0],
-                    index=X.index,
+                    index=X_all.index,
                 )
             else:
-                preds = model_instance.predict(X)
+                preds = model_instance.predict(X_all)
 
-            preds.index = (
-                X.index.get_level_values("ticker")
-                if "ticker" in X.index.names
-                else X.index
-            )
-            preds = self._break_prediction_ties(preds)
+            if not isinstance(preds, pd.Series):
+                preds = pd.Series(preds, index=X_all.index, name="prediction")
+            preds.index = X_all.index
 
+        for date in sorted_dates:
+            if X_all.empty:
+                results[date] = {}
+                continue
+            target_date = pd.Timestamp(date)
+            try:
+                day_preds = preds.xs(target_date, level="date")
+            except KeyError:
+                results[date] = {}
+                continue
+            day_preds = self._break_prediction_ties(day_preds)
             results[date] = {
-                str(t): round(float(v), 6) for t, v in preds.items()
+                str(t): round(float(v), 6) for t, v in day_preds.items()
             }
 
+        self._predict_batch_cache[cache_key] = (
+            utc_now_naive(),
+            {
+                date_key: dict(by_ticker)
+                for date_key, by_ticker in results.items()
+            },
+        )
         return results
 
     @staticmethod
@@ -1291,6 +1397,46 @@ class ModelService:
         # Drop rows with any NaN
         X = X.dropna()
         return X
+
+    @staticmethod
+    def _build_X_for_dates(
+        feature_data: dict[str, pd.DataFrame],
+        tickers: list[str],
+        dates: list[str],
+    ) -> pd.DataFrame:
+        """Build one prediction matrix for multiple dates.
+
+        For each requested date, use the latest factor row with date <= target,
+        matching the single-date prediction semantics while allowing one model
+        prediction call for the whole batch.
+        """
+        if not feature_data or not tickers or not dates:
+            return pd.DataFrame()
+
+        target_dates = pd.to_datetime(sorted(set(dates)))
+        frames: list[pd.DataFrame] = []
+        factor_names = sorted(feature_data.keys())
+
+        for factor_name in factor_names:
+            df = feature_data[factor_name]
+            if df.empty:
+                continue
+            available = df.copy()
+            available.index = pd.to_datetime(available.index)
+            available = available.sort_index()
+            available = available.reindex(columns=tickers)
+            aligned = available.reindex(target_dates, method="ffill")
+            stacked = aligned.stack()
+            stacked.name = factor_name
+            stacked.index.names = ["date", "ticker"]
+            frames.append(stacked)
+
+        if not frames:
+            return pd.DataFrame()
+
+        X = pd.concat(frames, axis=1)
+        X.index.names = ["date", "ticker"]
+        return X.dropna()
 
     @staticmethod
     def _break_prediction_ties(preds: pd.Series) -> pd.Series:
@@ -1623,8 +1769,9 @@ class ModelService:
         model_params: dict,
         train_config: dict,
         eval_metrics: dict,
+        conn: Any | None = None,
     ) -> None:
-        conn = get_connection()
+        conn = conn or get_connection()
         now = utc_now_naive()
         conn.execute(
             """INSERT INTO models
@@ -1672,8 +1819,9 @@ class ModelService:
                     return {}
             return raw if raw else {}
 
+        train_config = _parse_json(row[7])
         eval_metrics = _parse_json(row[8])
-        return {
+        result = {
             "id": row[0],
             "market": row[1],
             "name": row[2],
@@ -1681,13 +1829,109 @@ class ModelService:
             "label_id": row[4],
             "model_type": row[5],
             "model_params": _parse_json(row[6]),
-            "train_config": _parse_json(row[7]),
+            "train_config": train_config,
             "eval_metrics": eval_metrics,
             "task_type": eval_metrics.get("task_type"),
             "status": row[9],
             "created_at": str(row[10]) if row[10] else None,
             "updated_at": str(row[11]) if row[11] else None,
         }
+        result.update(
+            ModelService._build_model_audit_fields(
+                train_config=train_config,
+                eval_metrics=eval_metrics,
+                market=row[1],
+            )
+        )
+        return result
+
+    @staticmethod
+    def _build_model_audit_fields(
+        *,
+        train_config: dict,
+        eval_metrics: dict,
+        market: str,
+    ) -> dict:
+        split_fields = {
+            key: train_config.get(key)
+            for key in (
+                "train_start",
+                "train_end",
+                "valid_start",
+                "valid_end",
+                "test_start",
+                "test_end",
+            )
+            if train_config.get(key) is not None
+        }
+        purge_gap = train_config.get("purge_gap")
+        label_horizon = ModelService._extract_label_horizon_from_metrics(eval_metrics)
+        feature_data_end = (
+            train_config.get("test_end")
+            or train_config.get("valid_end")
+            or train_config.get("train_end")
+        )
+        label_data_end = feature_data_end
+        if feature_data_end and label_horizon > 0:
+            try:
+                label_data_end = str(
+                    offset_trading_days(
+                        str(feature_data_end),
+                        label_horizon,
+                        market=market,
+                    )
+                )
+            except Exception:
+                label_data_end = str(feature_data_end)
+        elif feature_data_end:
+            label_data_end = str(feature_data_end)
+
+        audit = {
+            "feature_data_start": train_config.get("train_start"),
+            "feature_data_end": str(feature_data_end) if feature_data_end else None,
+            "label_data_end": label_data_end,
+            "label_horizon": label_horizon,
+            "effective_label_horizon": label_horizon,
+            "purge_gap": purge_gap,
+            "audit": {
+                "cutoff_rule": "label_data_end < backtest_start",
+                "split_source": "train_config",
+                "label_horizon_source": "eval_metrics.label_summary",
+            },
+        }
+        return {
+            **split_fields,
+            "purge_gap": purge_gap,
+            "metrics": eval_metrics,
+            "label_horizon": label_horizon,
+            "effective_label_horizon": label_horizon,
+            "metadata": audit,
+        }
+
+    @staticmethod
+    def _extract_label_horizon_from_metrics(eval_metrics: dict) -> int:
+        candidates: list[Any] = [
+            eval_metrics.get("effective_label_horizon"),
+            eval_metrics.get("label_horizon"),
+            eval_metrics.get("horizon"),
+        ]
+        label_summary = eval_metrics.get("label_summary")
+        if isinstance(label_summary, dict):
+            candidates.extend([
+                label_summary.get("effective_horizon"),
+                label_summary.get("effective_label_horizon"),
+                label_summary.get("label_horizon"),
+                label_summary.get("horizon"),
+            ])
+        max_horizon = 0
+        for value in candidates:
+            if value is None:
+                continue
+            try:
+                max_horizon = max(max_horizon, int(value))
+            except (TypeError, ValueError):
+                continue
+        return max_horizon
 
 
 def _compute_daily_ic(y: pd.Series, preds: pd.Series) -> dict:

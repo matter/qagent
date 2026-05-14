@@ -20,6 +20,7 @@ from backend.services.execution_model_service import (
     evaluate_planned_price_fill,
     normalize_execution_model,
     normalize_planned_price_buffer_bps,
+    normalize_planned_price_fallback,
     _positive_float,
 )
 from backend.services.group_service import GroupService
@@ -304,6 +305,7 @@ class PaperTradingService:
         target_date: str | None = None,
         steps: int = 0,
         market: str | None = None,
+        stage_domain_write=None,
     ) -> dict:
         """Advance a session forward.
 
@@ -402,6 +404,9 @@ class PaperTradingService:
         execution_model = normalize_execution_model(config.get("execution_model"))
         planned_price_buffer_bps = normalize_planned_price_buffer_bps(
             config.get("planned_price_buffer_bps")
+        )
+        planned_price_fallback = normalize_planned_price_fallback(
+            config.get("planned_price_fallback")
         )
         planned_price_input_diagnostics = {
             "fallback_count": 0,
@@ -669,6 +674,7 @@ class PaperTradingService:
                 execution_model=execution_model,
                 planned_prices=planned_prices,
                 planned_price_buffer_bps=planned_price_buffer_bps,
+                planned_price_fallback=planned_price_fallback,
             )
             if execution_model == "planned_price":
                 execution_weights = self._execution_weights_after_trades(
@@ -722,24 +728,43 @@ class PaperTradingService:
             ))
             days_processed += 1
 
+        last_date = trading_days[-1] if trading_days else None
+        last_nav = daily_snapshots[-1][3] if daily_snapshots else None
         if daily_snapshots:
-            conn.executemany(
-                """INSERT OR REPLACE INTO paper_trading_daily
-                   (session_id, market, date, nav, cash, positions_json, trades_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                daily_snapshots,
-            )
-            last_date = trading_days[-1] if trading_days else None
-            last_nav = daily_snapshots[-1][3] if daily_snapshots else None
-            conn.execute(
-                """UPDATE paper_trading_sessions
-                   SET current_date = ?, current_nav = ?,
-                       total_trades = total_trades + ?,
-                       updated_at = ?
-                   WHERE id = ? AND market = ?""",
-                [last_date, last_nav, total_new_trades,
-                 utc_now_naive(), session_id, resolved_market],
-            )
+            if callable(stage_domain_write):
+                stage_domain_write(
+                    "paper_trading_advance",
+                    {
+                        "session_id": session_id,
+                        "market": resolved_market,
+                        "days": len(daily_snapshots),
+                        "from_date": str(daily_snapshots[0][2]),
+                        "to_date": str(last_date),
+                    },
+                    commit=lambda conn=None,
+                    snapshots=list(daily_snapshots),
+                    last_date=last_date,
+                    last_nav=last_nav,
+                    total_new_trades=total_new_trades: self._commit_advance_snapshots(
+                        conn=conn,
+                        session_id=session_id,
+                        market=resolved_market,
+                        snapshots=snapshots,
+                        last_date=last_date,
+                        last_nav=last_nav,
+                        total_new_trades=total_new_trades,
+                    ),
+                )
+            else:
+                self._commit_advance_snapshots(
+                    conn=conn,
+                    session_id=session_id,
+                    market=resolved_market,
+                    snapshots=daily_snapshots,
+                    last_date=last_date,
+                    last_nav=last_nav,
+                    total_new_trades=total_new_trades,
+                )
 
         log.info(
             "paper_trading.advance_done",
@@ -759,6 +784,7 @@ class PaperTradingService:
             "rebalance_freq": rebalance_freq,
             "rebalance_executions": len(rebalance_execution_days),
             "execution_model": execution_model,
+            "planned_price_fallback": planned_price_fallback,
             "execution_rule": (
                 f"T+1 {execution_model}, {rebalance_freq} rebalance; a fresh session records "
                 "its first trading day as a no-trade baseline and starts "
@@ -774,6 +800,40 @@ class PaperTradingService:
                 f"（数据截止 {latest_bar_date}）。"
             )
         return result
+
+    @staticmethod
+    def _commit_advance_snapshots(
+        *,
+        conn,
+        session_id: str,
+        market: str,
+        snapshots: list[tuple],
+        last_date,
+        last_nav,
+        total_new_trades: int,
+    ) -> None:
+        conn = conn or get_connection()
+        conn.executemany(
+            """INSERT OR REPLACE INTO paper_trading_daily
+               (session_id, market, date, nav, cash, positions_json, trades_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            snapshots,
+        )
+        conn.execute(
+            """UPDATE paper_trading_sessions
+               SET current_date = ?, current_nav = ?,
+                   total_trades = total_trades + ?,
+                   updated_at = ?
+               WHERE id = ? AND market = ?""",
+            [
+                last_date,
+                last_nav,
+                total_new_trades,
+                utc_now_naive(),
+                session_id,
+                market,
+            ],
+        )
 
     # ------------------------------------------------------------------
     # Latest signals / T+1 action plan
@@ -2449,17 +2509,22 @@ class PaperTradingService:
         execution_model: str = "next_open",
         planned_prices: dict[str, float] | None = None,
         planned_price_buffer_bps: float = 50,
+        planned_price_fallback: str = "cancel",
     ) -> dict:
         """Simulate trade execution using cached prices."""
         execution_model = normalize_execution_model(execution_model)
         planned_price_buffer_bps = normalize_planned_price_buffer_bps(planned_price_buffer_bps)
+        planned_price_fallback = normalize_planned_price_fallback(planned_price_fallback)
         day_prices = price_cache.get(trade_date, {})
         all_tickers = set(positions.keys()) | set(target_weights.keys())
         no_trade_tickers = no_trade_tickers or set()
         planned_diagnostics = {
             "execution_model": execution_model,
             "planned_price_buffer_bps": planned_price_buffer_bps,
+            "planned_price_fallback": planned_price_fallback,
             "filled_order_count": 0,
+            "planned_fill_count": 0,
+            "fallback_close_count": 0,
             "blocked_order_count": 0,
             "filled": [],
             "blocked": [],
@@ -2501,23 +2566,45 @@ class PaperTradingService:
                     buffer_bps=planned_price_buffer_bps,
                 )
                 if not fill_decision.filled:
-                    planned_diagnostics["blocked_order_count"] += 1
-                    planned_diagnostics["blocked"].append(
-                        {
-                            "ticker": ticker,
-                            "date": str(trade_date),
-                            "reason": fill_decision.reason,
-                            "planned_price": planned_price,
-                            "high": bar.get("high"),
-                            "low": bar.get("low"),
-                            "lower_bound": fill_decision.lower_bound,
-                            "upper_bound": fill_decision.upper_bound,
-                        }
+                    can_fallback_to_close = (
+                        planned_price_fallback == "next_close"
+                        and fill_decision.reason == "planned_price_outside_buffered_range"
                     )
-                    continue
-                price = fill_decision.fill_price
+                    close_price = _positive_float(bar.get("close")) if can_fallback_to_close else None
+                    if close_price is None:
+                        planned_diagnostics["blocked_order_count"] += 1
+                        planned_diagnostics["blocked"].append(
+                            {
+                                "ticker": ticker,
+                                "date": str(trade_date),
+                                "reason": (
+                                    "missing_fallback_close"
+                                    if can_fallback_to_close
+                                    else fill_decision.reason
+                                ),
+                                "planned_price": planned_price,
+                                "high": bar.get("high"),
+                                "low": bar.get("low"),
+                                "close": bar.get("close"),
+                                "lower_bound": fill_decision.lower_bound,
+                                "upper_bound": fill_decision.upper_bound,
+                                "planned_price_fallback": planned_price_fallback,
+                                "planned_price_reject_reason": fill_decision.reason,
+                                "fill_type": "blocked",
+                            }
+                        )
+                        continue
+                    price = close_price
+                    fill_type = "fallback_close"
+                    fallback_reason = fill_decision.reason
+                else:
+                    price = fill_decision.fill_price
+                    fill_type = "planned_price"
+                    fallback_reason = None
             else:
                 price = bar["open"]
+                fill_type = None
+                fallback_reason = None
             if price is None or price <= 0:
                 continue
 
@@ -2565,11 +2652,18 @@ class PaperTradingService:
                 })
             if execution_model == "planned_price":
                 planned_diagnostics["filled_order_count"] += 1
+                if fill_type == "fallback_close":
+                    planned_diagnostics["fallback_close_count"] += 1
+                else:
+                    planned_diagnostics["planned_fill_count"] += 1
                 planned_diagnostics["filled"].append(
                     {
                         "ticker": ticker,
                         "date": str(trade_date),
                         "price": round(float(price), 4),
+                        "planned_price": planned_price,
+                        "fill_type": fill_type or "planned_price",
+                        "fallback_reason": fallback_reason,
                         "shares": round(abs(share_change), 4),
                         "action": "buy" if share_change > 0 else "sell",
                     }
@@ -2587,6 +2681,18 @@ class PaperTradingService:
             )
             planned_diagnostics["fill_rate"] = (
                 round(planned_diagnostics["filled_order_count"] / total, 6)
+                if total else None
+            )
+            planned_diagnostics["planned_fill_rate"] = (
+                round(planned_diagnostics["planned_fill_count"] / total, 6)
+                if total else None
+            )
+            planned_diagnostics["fallback_close_rate"] = (
+                round(planned_diagnostics["fallback_close_count"] / total, 6)
+                if total else None
+            )
+            planned_diagnostics["blocked_rate"] = (
+                round(planned_diagnostics["blocked_order_count"] / total, 6)
                 if total else None
             )
         result["diagnostics"] = {"planned_price_execution": planned_diagnostics}

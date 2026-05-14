@@ -285,7 +285,7 @@ class FactorEngine3Service:
 
         symbol_by_asset = dict(zip(frame["asset_id"], frame["symbol"]))
         tickers = sorted(set(symbol_by_asset.values()))
-        label_values = self._label_service.compute_label_values(
+        label_values = self._label_service.compute_label_values_cached(
             label_id,
             tickers,
             start_date or source_run["start_date"],

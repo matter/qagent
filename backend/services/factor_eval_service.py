@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import uuid
 from datetime import datetime
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -46,6 +48,7 @@ class FactorEvalService:
         start_date: str,
         end_date: str,
         market: str | None = None,
+        stage_domain_write: Any | None = None,
     ) -> dict:
         """Run a full factor evaluation and persist the results.
 
@@ -111,7 +114,7 @@ class FactorEvalService:
         factor_def = self._factor_service.get_factor(factor_id, market=resolved_market)
 
         # --- 3. Compute label values ---
-        label_long = self._label_service.compute_label_values(
+        label_long = self._label_service.compute_label_values_cached(
             label_id, tickers, start_date, end_date, market=resolved_market
         )
         if label_long.empty:
@@ -204,18 +207,34 @@ class FactorEvalService:
         # --- 6. Persist ---
         eval_id = uuid.uuid4().hex[:12]
         result["id"] = eval_id
-        self._save_result(
-            eval_id=eval_id,
-            factor_id=factor_id,
-            label_id=label_id,
-            universe_group_id=universe_group_id,
-            start_date=start_date,
-            end_date=end_date,
-            summary=summary,
-            ic_series=ic_series,
-            group_returns=group_returns,
-            market=resolved_market,
-        )
+        save_payload = {
+            "eval_id": eval_id,
+            "factor_id": factor_id,
+            "label_id": label_id,
+            "universe_group_id": universe_group_id,
+            "start_date": start_date,
+            "end_date": end_date,
+            "summary": copy.deepcopy(summary),
+            "ic_series": copy.deepcopy(ic_series),
+            "group_returns": copy.deepcopy(group_returns),
+            "market": resolved_market,
+        }
+        if callable(stage_domain_write):
+            stage_domain_write(
+                "factor_eval_results",
+                {
+                    "id": eval_id,
+                    "market": resolved_market,
+                    "factor_id": factor_id,
+                    "label_id": label_id,
+                },
+                commit=lambda conn=None, payload=save_payload: self._save_result(
+                    **payload,
+                    conn=conn,
+                ),
+            )
+        else:
+            self._save_result(**save_payload)
 
         log.info("factor_eval.done", eval_id=eval_id, ic_mean=summary["ic_mean"])
         return result
@@ -531,10 +550,11 @@ class FactorEvalService:
         ic_series: list,
         group_returns: dict,
         market: str | None = None,
+        conn: Any | None = None,
     ) -> None:
         """Persist evaluation result to the factor_eval_results table."""
         resolved_market = normalize_market(market)
-        conn = get_connection()
+        conn = conn or get_connection()
         conn.execute(
             """INSERT INTO factor_eval_results
                (id, market, factor_id, label_id, universe_group_id,

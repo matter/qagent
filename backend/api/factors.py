@@ -315,6 +315,7 @@ async def evaluate_factor(factor_id: str, body: EvaluateFactorRequest) -> dict:
         start_date: str,
         end_date: str,
         market: str | None,
+        stage_domain_write=None,
     ) -> dict:
         return eval_svc.evaluate_factor(
             factor_id=factor_id,
@@ -323,6 +324,7 @@ async def evaluate_factor(factor_id: str, body: EvaluateFactorRequest) -> dict:
             start_date=start_date,
             end_date=end_date,
             market=market,
+            stage_domain_write=stage_domain_write,
         )
 
     task_id = executor.submit(

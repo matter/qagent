@@ -1229,6 +1229,18 @@ def get_agent_research_plan_performance_3_0(
 
 
 @mcp.tool()
+def get_agent_research_trial_matrix_3_0(
+    plan_id: str,
+    primary_metric: str = "sharpe",
+) -> dict:
+    """Return structured trial matrix with stop/promote metadata."""
+    return _agent_research_3_service().get_trial_matrix(
+        plan_id,
+        primary_metric=primary_metric,
+    )
+
+
+@mcp.tool()
 def evaluate_qa_gate_3_0(
     source_type: str,
     source_id: str,
@@ -1527,6 +1539,7 @@ def evaluate_factor(
         start_date: str,
         end_date: str,
         market: str,
+        stage_domain_write=None,
     ) -> dict:
         return eval_svc.evaluate_factor(
             factor_id=factor_id,
@@ -1535,6 +1548,7 @@ def evaluate_factor(
             start_date=start_date,
             end_date=end_date,
             market=market,
+            stage_domain_write=stage_domain_write,
         )
 
     task_id = executor.submit(
@@ -1663,6 +1677,7 @@ def train_model(
         market: str,
         objective_type: str | None,
         ranking_config: dict | None,
+        stage_domain_write=None,
     ) -> dict:
         return svc.train_model(
             name=name,
@@ -1675,6 +1690,7 @@ def train_model(
             market=market,
             objective_type=objective_type,
             ranking_config=ranking_config,
+            stage_domain_write=stage_domain_write,
         )
 
     task_id = executor.submit(
@@ -1885,12 +1901,14 @@ def run_backtest(
         config: dict,
         universe_group_id: str,
         market: str,
+        stage_domain_write=None,
     ) -> dict:
         return bt_svc.run_backtest(
             strategy_id=strategy_id,
             config_dict=config,
             universe_group_id=universe_group_id,
             market=market,
+            stage_domain_write=stage_domain_write,
         )
 
     task_id = executor.submit(
@@ -1928,6 +1946,29 @@ def get_backtest_debug_replay(
         market=resolved_market,
         date=date,
         ticker=ticker,
+    )
+
+
+@mcp.tool()
+def get_backtest_research_summary(
+    baseline_backtest_id: str,
+    trial_backtest_id: str,
+    market: str | None = None,
+    changed_variable: dict | None = None,
+    conclusion: str | None = None,
+    reason: str | None = None,
+    max_rebalance_items: int = 20,
+) -> dict:
+    """Return compact bounded legacy backtest comparison for agent research."""
+    resolved_market = _resolve_market(market)
+    return _backtest_service().get_research_summary(
+        baseline_backtest_id=baseline_backtest_id,
+        trial_backtest_id=trial_backtest_id,
+        market=resolved_market,
+        changed_variable=changed_variable,
+        conclusion=conclusion,
+        reason=reason,
+        max_rebalance_items=max_rebalance_items,
     )
 
 
@@ -1971,6 +2012,7 @@ def generate_signals(
         universe_group_id: str,
         market: str,
         constraint_config: dict | None,
+        stage_domain_write=None,
     ) -> dict:
         return sig_svc.generate_signals(
             strategy_id=strategy_id,
@@ -1978,6 +2020,7 @@ def generate_signals(
             universe_group_id=universe_group_id,
             market=market,
             constraint_config=constraint_config,
+            stage_domain_write=stage_domain_write,
         )
 
     task_id = executor.submit(

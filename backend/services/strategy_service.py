@@ -16,6 +16,13 @@ from backend.strategies.loader import load_strategy_from_code
 
 log = get_logger(__name__)
 
+SUPPORTED_POSITION_SIZING = {
+    "equal_weight",
+    "signal_weight",
+    "max_position",
+    "raw_weight",
+}
+
 
 class StrategyService:
     """CRUD operations for strategy definitions stored in DuckDB."""
@@ -39,6 +46,7 @@ class StrategyService:
         incremented automatically.
         """
         resolved_market = normalize_market(market)
+        position_sizing = self._validate_position_sizing(position_sizing)
 
         # Validate source code is loadable
         try:
@@ -131,6 +139,8 @@ class StrategyService:
         existing = self._fetch_row(strategy_id, market=resolved_market)
         if existing is None:
             raise ValueError(f"Strategy {strategy_id} not found")
+        if position_sizing is not None:
+            position_sizing = self._validate_position_sizing(position_sizing)
 
         if source_code is not None and source_code != existing["source_code"]:
             # Validate new source code
@@ -548,6 +558,16 @@ class StrategyService:
                 conn.execute("ALTER TABLE strategies ADD COLUMN constraint_config JSON")
         except Exception:
             pass
+
+    @staticmethod
+    def _validate_position_sizing(position_sizing: str | None) -> str:
+        value = (position_sizing or "equal_weight").strip()
+        if value not in SUPPORTED_POSITION_SIZING:
+            raise ValueError(
+                "Unsupported position_sizing "
+                f"'{value}'. Supported values: {sorted(SUPPORTED_POSITION_SIZING)}"
+            )
+        return value
 
     @staticmethod
     def _row_to_dict(row) -> dict:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -84,6 +85,7 @@ class PredictBatchRequest(BaseModel):
     tickers: list[str]
     dates: list[str]
     feature_set_id: Optional[str] = None
+    async_mode: bool = False
 
 
 # ------------------------------------------------------------------
@@ -131,6 +133,8 @@ async def train_model(body: TrainModelRequest) -> dict:
         market: str | None,
         objective_type: str | None,
         ranking_config: dict | None,
+        progress=None,
+        stage_domain_write=None,
     ) -> dict:
         return svc.train_model(
             name=name,
@@ -144,6 +148,8 @@ async def train_model(body: TrainModelRequest) -> dict:
             market=market,
             objective_type=objective_type,
             ranking_config=ranking_config,
+            progress=progress,
+            stage_domain_write=stage_domain_write,
         )
 
     task_id = executor.submit(
@@ -360,6 +366,61 @@ async def predict_batch(model_id: str, body: PredictBatchRequest) -> dict:
     predicts per date.  Much faster than calling predict() per date.
     """
     svc = _get_service()
+    try:
+        resolved_market = normalize_market(body.market)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if body.async_mode:
+        executor = _get_executor()
+
+        def _do_predict_batch(
+            model_id: str,
+            tickers: list[str],
+            dates: list[str],
+            feature_set_id: str | None,
+            market: str,
+        ) -> dict:
+            started = time.perf_counter()
+            results = svc.predict_batch(
+                model_id=model_id,
+                tickers=tickers,
+                dates=dates,
+                feature_set_id=feature_set_id,
+                market=market,
+            )
+            total = sum(len(v) for v in results.values())
+            return {
+                "model_id": model_id,
+                "market": market,
+                "dates": dates,
+                "predictions": results,
+                "total_predictions": total,
+                "runtime_seconds": round(time.perf_counter() - started, 6),
+            }
+
+        task_id = executor.submit(
+            task_type="model_predict_batch",
+            fn=_do_predict_batch,
+            params={
+                "model_id": model_id,
+                "tickers": body.tickers,
+                "dates": body.dates,
+                "feature_set_id": body.feature_set_id,
+                "market": resolved_market,
+            },
+            timeout=600,
+            source=TaskSource.UI,
+        )
+        return {
+            "task_id": task_id,
+            "status": "queued",
+            "task_type": "model_predict_batch",
+            "model_id": model_id,
+            "market": resolved_market,
+            "poll_url": f"/api/tasks/{task_id}",
+        }
+
     acquired = _PREDICT_API_SEMAPHORE.acquire(blocking=False)
     if not acquired:
         raise HTTPException(
@@ -370,7 +431,7 @@ async def predict_batch(model_id: str, body: PredictBatchRequest) -> dict:
             ),
         )
     try:
-        resolved_market = normalize_market(body.market)
+        started = time.perf_counter()
         results = await run_in_threadpool(
             svc.predict_batch,
             model_id=model_id,
@@ -386,6 +447,7 @@ async def predict_batch(model_id: str, body: PredictBatchRequest) -> dict:
             "dates": body.dates,
             "predictions": results,
             "total_predictions": total,
+            "runtime_seconds": round(time.perf_counter() - started, 6),
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

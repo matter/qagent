@@ -3,7 +3,8 @@ import unittest
 import pandas as pd
 
 from backend.models.lightgbm_model import LightGBMModel
-from backend.services.ranking_dataset import build_date_groups
+from backend.services import ranking_dataset
+from backend.services.ranking_dataset import build_date_groups, compute_ranking_metrics
 
 
 class RankingDatasetTests(unittest.TestCase):
@@ -74,6 +75,30 @@ class RankingDatasetTests(unittest.TestCase):
 
         self.assertEqual(model.get_params()["task"], "ranking")
         self.assertEqual(len(preds), len(X))
+
+    def test_ranking_metrics_stop_pairwise_sampling_at_limit(self):
+        idx = pd.MultiIndex.from_product(
+            [pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"]), ["A", "B", "C"]],
+            names=["date", "ticker"],
+        )
+        raw_y = pd.Series(range(len(idx)), index=idx, dtype=float)
+        preds = pd.Series(range(len(idx)), index=idx, dtype=float)
+        calls = 0
+
+        def fake_pairwise_counts(y_true, y_score, *, limit):
+            nonlocal calls
+            calls += 1
+            return 1, 1
+
+        original = ranking_dataset._pairwise_accuracy_counts
+        try:
+            ranking_dataset._pairwise_accuracy_counts = fake_pairwise_counts
+            metrics = compute_ranking_metrics(raw_y, preds, pairwise_sample_limit=1)
+        finally:
+            ranking_dataset._pairwise_accuracy_counts = original
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(metrics["pairwise_pairs_sampled"], 1)
 
 
 if __name__ == "__main__":

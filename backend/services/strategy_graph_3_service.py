@@ -18,6 +18,7 @@ from backend.services.calendar_service import get_trading_days
 from backend.services.execution_model_service import (
     evaluate_planned_price_fill,
     normalize_planned_price_buffer_bps,
+    normalize_planned_price_fallback,
 )
 from backend.services.market_context import normalize_market
 from backend.services.market_data_foundation_service import MarketDataFoundationService
@@ -969,6 +970,8 @@ class StrategyGraph3Service:
                     planned_price = prices.get((asset_id, str(order.get("decision_date")), "close"))
                 high_price = prices.get((asset_id, execution_date, "high"))
                 low_price = prices.get((asset_id, execution_date, "low"))
+                close_price = prices.get((asset_id, execution_date, "close"))
+                fill_fallback = normalize_planned_price_fallback(order.get("fill_fallback"))
                 fill_decision = evaluate_planned_price_fill(
                     planned_price=planned_price,
                     high=high_price,
@@ -977,11 +980,25 @@ class StrategyGraph3Service:
                 )
                 price = fill_decision.fill_price
                 planned_block_reason = fill_decision.reason
+                fill_type = "planned_price" if fill_decision.filled else "blocked"
+                if (
+                    not fill_decision.filled
+                    and fill_fallback == "next_close"
+                    and planned_block_reason == "planned_price_outside_buffered_range"
+                    and close_price is not None
+                    and close_price > 0
+                ):
+                    price = float(close_price)
+                    planned_block_reason = None
+                    fill_type = "fallback_close"
             else:
                 planned_price = None
                 planned_price_source = None
                 high_price = None
                 low_price = None
+                close_price = None
+                fill_fallback = None
+                fill_type = None
                 fill_decision = None
                 planned_block_reason = None
                 price = prices.get((asset_id, execution_date, price_field))
@@ -1004,8 +1021,11 @@ class StrategyGraph3Service:
                 metadata["planned_price_buffer_bps"] = normalize_planned_price_buffer_bps(
                     order.get("planned_price_buffer_bps")
                 )
+                metadata["fill_fallback"] = fill_fallback
+                metadata["fill_type"] = fill_type
                 metadata["execution_high"] = high_price
                 metadata["execution_low"] = low_price
+                metadata["execution_close"] = close_price
             if fill_decision is not None:
                 metadata["planned_price_bounds"] = {
                     "lower": fill_decision.lower_bound,
@@ -1030,8 +1050,11 @@ class StrategyGraph3Service:
                             {
                                 "planned_price": planned_price,
                                 "planned_price_source": planned_price_source,
+                                "fill_fallback": fill_fallback,
+                                "fill_type": "blocked",
                                 "high": high_price,
                                 "low": low_price,
+                                "close": close_price,
                             }
                             if execution_model == "planned_price"
                             else {}
@@ -1085,6 +1108,8 @@ class StrategyGraph3Service:
                                 {
                                     "planned_price": planned_price,
                                     "planned_price_source": planned_price_source,
+                                    "fill_fallback": fill_fallback,
+                                    "fill_type": fill_type,
                                 }
                                 if execution_model == "planned_price"
                                 else {}

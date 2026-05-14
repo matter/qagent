@@ -8,10 +8,13 @@ from typing import Literal
 
 
 ExecutionModel = Literal["next_open", "planned_price"]
+PlannedPriceFallback = Literal["cancel", "next_close"]
 
 DEFAULT_EXECUTION_MODEL: ExecutionModel = "next_open"
+DEFAULT_PLANNED_PRICE_FALLBACK: PlannedPriceFallback = "cancel"
 DEFAULT_PLANNED_PRICE_BUFFER_BPS = 50.0
 SUPPORTED_EXECUTION_MODELS = {"next_open", "planned_price"}
+SUPPORTED_PLANNED_PRICE_FALLBACKS = {"cancel", "next_close"}
 
 
 @dataclass(frozen=True)
@@ -29,6 +32,16 @@ def normalize_execution_model(value: str | None) -> ExecutionModel:
     if model not in SUPPORTED_EXECUTION_MODELS:
         raise ValueError(f"Unsupported execution_model {value!r}")
     return model  # type: ignore[return-value]
+
+
+def normalize_planned_price_fallback(value: str | None) -> PlannedPriceFallback:
+    fallback = (value or DEFAULT_PLANNED_PRICE_FALLBACK).strip()
+    if fallback not in SUPPORTED_PLANNED_PRICE_FALLBACKS:
+        raise ValueError(
+            "Unsupported planned_price_fallback "
+            f"{value!r}; supported values: {sorted(SUPPORTED_PLANNED_PRICE_FALLBACKS)}"
+        )
+    return fallback  # type: ignore[return-value]
 
 
 def normalize_planned_price_buffer_bps(value: int | float | None) -> float:

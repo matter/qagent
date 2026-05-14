@@ -61,7 +61,7 @@ class ModelMarketScopeTests(unittest.TestCase):
         self.assertEqual(
             svc._feature_service.calls,
             [
-                ("compute", "fs_cn", "CN"),
+                ("compute_from_cache", "fs_cn", "CN"),
                 ("get", "fs_cn", "CN"),
             ],
         )
@@ -69,7 +69,7 @@ class ModelMarketScopeTests(unittest.TestCase):
             svc._label_service.calls,
             [
                 ("get", "label_cn", "CN"),
-                ("compute", "label_cn", "CN"),
+                ("compute_cached", "label_cn", "CN"),
             ],
         )
 
@@ -82,6 +82,10 @@ class ModelMarketScopeTests(unittest.TestCase):
         metadata = json.loads((self.models_dir / summary["model_id"] / "metadata.json").read_text())
         self.assertEqual(metadata["market"], "CN")
         self.assertEqual(metadata["feature_names"], ["close"])
+        self.assertEqual(metadata["runtime_profile"]["feature_loader"], "compute_features_from_cache")
+        self.assertGreaterEqual(metadata["runtime_profile"]["feature_seconds"], 0)
+        self.assertGreaterEqual(metadata["runtime_profile"]["fit_seconds"], 0)
+        self.assertEqual(summary["runtime_profile"]["feature_loader"], "compute_features_from_cache")
         self.assertEqual(
             metadata["feature_lineage"]["trained"],
             [{"factor_id": "factor_close_id", "factor_name": "close"}],
@@ -94,6 +98,144 @@ class ModelMarketScopeTests(unittest.TestCase):
         with patch("backend.services.model_service.get_connection", return_value=self.conn):
             self.assertEqual(ModelService().list_models("CN")[0]["market"], "CN")
             self.assertEqual(ModelService().list_models(), [])
+
+    def test_train_model_reports_coarse_progress_phases(self):
+        svc = ModelService()
+        svc._feature_service = _FakeFeatureService()
+        svc._label_service = _FakeLabelService()
+        svc._group_service = _FakeGroupService()
+        progress_events = []
+
+        with (
+            patch("backend.services.model_service.get_connection", return_value=self.conn),
+            patch.dict(model_service_module._MODEL_REGISTRY, {"fake": _FakeModel}),
+            patch.object(model_service_module, "settings", _FakeSettings(self.models_dir)),
+        ):
+            svc.train_model(
+                name="CN model progress",
+                feature_set_id="fs_cn",
+                label_id="label_cn",
+                model_type="fake",
+                train_config={
+                    "train_start": "2024-01-02",
+                    "train_end": "2024-01-04",
+                    "valid_start": "2024-01-05",
+                    "valid_end": "2024-01-08",
+                    "test_start": "2024-01-09",
+                    "test_end": "2024-01-10",
+                    "purge_gap": 0,
+                },
+                universe_group_id="cn_all_a",
+                market="CN",
+                progress=lambda phase, **payload: progress_events.append((phase, payload)),
+            )
+
+        phases = [phase for phase, _payload in progress_events]
+        self.assertIn("feature_load", phases)
+        self.assertIn("label_load", phases)
+        self.assertIn("fit", phases)
+        self.assertIn("persist", phases)
+
+    def test_train_model_persists_effective_composite_label_horizon(self):
+        svc = ModelService()
+        svc._feature_service = _FakeFeatureService()
+        svc._label_service = _FakeLabelService()
+        svc._group_service = _FakeGroupService()
+        svc._label_service.labels["label_composite"] = {
+            "id": "label_composite",
+            "market": "CN",
+            "target_type": "composite",
+            "horizon": 10,
+            "effective_horizon": 20,
+            "config": {
+                "components": [
+                    {"label_id": "inner_20d", "weight": 1.0},
+                ],
+            },
+        }
+
+        with (
+            patch("backend.services.model_service.get_connection", return_value=self.conn),
+            patch.dict(model_service_module._MODEL_REGISTRY, {"fake": _FakeModel}),
+            patch.object(model_service_module, "settings", _FakeSettings(self.models_dir)),
+        ):
+            summary = svc.train_model(
+                name="CN composite model",
+                feature_set_id="fs_cn",
+                label_id="label_composite",
+                model_type="fake",
+                train_config={
+                    "train_start": "2024-01-02",
+                    "train_end": "2024-01-04",
+                    "valid_start": "2024-01-05",
+                    "valid_end": "2024-01-08",
+                    "test_start": "2024-01-09",
+                    "test_end": "2024-01-10",
+                    "purge_gap": 0,
+                },
+                universe_group_id="cn_all_a",
+                market="CN",
+            )
+
+        metadata = json.loads((self.models_dir / summary["model_id"] / "metadata.json").read_text())
+        self.assertEqual(summary["label_summary"]["horizon"], 10)
+        self.assertEqual(summary["label_summary"]["effective_horizon"], 20)
+        self.assertEqual(summary["eval_metrics"]["label_horizon"], 20)
+        self.assertEqual(summary["eval_metrics"]["effective_label_horizon"], 20)
+        self.assertEqual(metadata["label_horizon"], 20)
+        self.assertEqual(metadata["effective_label_horizon"], 20)
+
+    def test_model_detail_exposes_top_level_audit_metadata(self):
+        model_id = "audit_model"
+        self.conn.execute(
+            """INSERT INTO models
+               (id, market, name, feature_set_id, label_id, model_type,
+                model_params, train_config, eval_metrics, status)
+               VALUES (?, 'US', 'Audit model', 'fs_audit', 'preset_fwd_rank_20d',
+                       'lightgbm', '{}', ?, ?, 'trained')""",
+            [
+                model_id,
+                json.dumps(
+                    {
+                        "train_start": "2025-01-02",
+                        "train_end": "2025-09-30",
+                        "valid_start": "2025-10-01",
+                        "valid_end": "2025-11-28",
+                        "test_start": "2025-12-01",
+                        "test_end": "2025-12-31",
+                        "purge_gap": 5,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "label_summary": {
+                            "label_id": "preset_fwd_rank_20d",
+                            "horizon": 20,
+                            "effective_horizon": 20,
+                        },
+                        "test_rank_ic": 0.12,
+                    }
+                ),
+            ],
+        )
+
+        with patch("backend.services.model_service.get_connection", return_value=self.conn):
+            detail = ModelService().get_model(model_id, market="US")
+
+        self.assertEqual(detail["train_start"], "2025-01-02")
+        self.assertEqual(detail["train_end"], "2025-09-30")
+        self.assertEqual(detail["test_start"], "2025-12-01")
+        self.assertEqual(detail["test_end"], "2025-12-31")
+        self.assertEqual(detail["purge_gap"], 5)
+        self.assertEqual(detail["metrics"]["test_rank_ic"], 0.12)
+        self.assertEqual(detail["label_horizon"], 20)
+        self.assertEqual(detail["effective_label_horizon"], 20)
+        self.assertEqual(detail["metadata"]["feature_data_end"], "2025-12-31")
+        self.assertEqual(detail["metadata"]["label_data_end"], "2026-01-30")
+        self.assertEqual(
+            detail["metadata"]["audit"]["cutoff_rule"],
+            "label_data_end < backtest_start",
+        )
 
     def test_model_api_forwards_market_to_training_task(self):
         executor = _FakeExecutor()
@@ -361,6 +503,105 @@ class ModelMarketScopeTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.status_code, 429)
 
+    def test_model_predict_batch_api_can_submit_async_task(self):
+        class _FakeExecutor:
+            def __init__(self):
+                self.submission = None
+
+            def submit(self, task_type, fn, params, timeout, source):
+                self.submission = {
+                    "task_type": task_type,
+                    "fn": fn,
+                    "params": params,
+                    "timeout": timeout,
+                    "source": source,
+                }
+                return "task_predict_batch"
+
+        class _FakePredictService:
+            def predict_batch(self, **kwargs):
+                return {"2026-01-02": {"AAPL": 0.42}}
+
+        executor = _FakeExecutor()
+        svc = _FakePredictService()
+        with (
+            patch.object(model_api, "_get_service", return_value=svc),
+            patch.object(model_api, "_get_executor", return_value=executor),
+        ):
+            result = asyncio.run(
+                model_api.predict_batch(
+                    "model_async",
+                    model_api.PredictBatchRequest(
+                        market="US",
+                        tickers=["AAPL"],
+                        dates=["2026-01-02"],
+                        async_mode=True,
+                    ),
+                )
+            )
+
+        self.assertEqual(result["task_id"], "task_predict_batch")
+        self.assertEqual(result["task_type"], "model_predict_batch")
+        self.assertEqual(executor.submission["task_type"], "model_predict_batch")
+        summary = executor.submission["fn"](**executor.submission["params"])
+        self.assertEqual(summary["total_predictions"], 1)
+        self.assertEqual(summary["predictions"], {"2026-01-02": {"AAPL": 0.42}})
+
+    def test_predict_batch_runs_model_once_for_all_dates(self):
+        svc = ModelService()
+        svc._feature_service = _FakeFeatureService()
+        model = _CountingPredictModel()
+        svc.get_model = lambda model_id, market=None: {
+            "id": model_id,
+            "market": "CN",
+            "feature_set_id": "fs_cn",
+            "task_type": "regression",
+        }
+        svc.load_model = lambda model_id, market=None: model
+        svc._load_frozen_features = lambda model_id: ["close"]
+
+        result = svc.predict_batch(
+            "model_cn",
+            tickers=["sh.600000", "sh.600001"],
+            dates=["2024-01-02", "2024-01-03", "2024-01-04"],
+            market="CN",
+        )
+
+        self.assertEqual(model.predict_calls, 1)
+        self.assertEqual(set(result), {"2024-01-02", "2024-01-03", "2024-01-04"})
+        self.assertEqual(set(result["2024-01-02"]), {"sh.600000", "sh.600001"})
+        self.assertEqual(set(result["2024-01-03"]), {"sh.600000", "sh.600001"})
+        self.assertEqual(set(result["2024-01-04"]), {"sh.600000", "sh.600001"})
+
+    def test_predict_batch_reuses_short_lived_result_cache(self):
+        svc = ModelService()
+        svc._feature_service = _FakeFeatureService()
+        model = _CountingPredictModel()
+        svc.get_model = lambda model_id, market=None: {
+            "id": model_id,
+            "market": "CN",
+            "feature_set_id": "fs_cn",
+            "task_type": "regression",
+        }
+        svc.load_model = lambda model_id, market=None: model
+        svc._load_frozen_features = lambda model_id: ["close"]
+
+        first = svc.predict_batch(
+            "model_cn",
+            tickers=["sh.600000", "sh.600001"],
+            dates=["2024-01-02", "2024-01-03"],
+            market="CN",
+        )
+        second = svc.predict_batch(
+            "model_cn",
+            tickers=["sh.600001", "sh.600000"],
+            dates=["2024-01-03", "2024-01-02"],
+            market="CN",
+        )
+
+        self.assertEqual(model.predict_calls, 1)
+        self.assertEqual(second, first)
+
     def test_pairwise_objective_uses_ranking_groups_and_metadata(self):
         _FakeModel.last_task = None
         _FakeModel.last_fit_kwargs = None
@@ -519,6 +760,31 @@ class ModelMarketScopeTests(unittest.TestCase):
             saved_metrics = json.loads(saved_metrics)
         self.assertEqual(saved_metrics["task_type"], "ranking")
 
+    def test_single_date_predict_uses_feature_hot_cache_path(self):
+        svc = ModelService()
+        feature_service = _FakeFeatureService()
+        svc._feature_service = feature_service
+        svc._record_cache[("CN", "model_cached")] = {
+            "id": "model_cached",
+            "market": "CN",
+            "feature_set_id": "fs_cn",
+            "task_type": "regression",
+            "model_type": "fake",
+            "eval_metrics": {},
+            "model_params": {},
+        }
+        svc._model_cache["model_cached"] = _FakeModel()
+
+        result = svc.predict(
+            "model_cached",
+            tickers=["sh.600000", "sh.600001"],
+            date="2024-01-03",
+            market="CN",
+        )
+
+        self.assertEqual(feature_service.calls, [("compute_from_cache", "fs_cn", "CN")])
+        self.assertEqual(list(result.index), ["sh.600000", "sh.600001"])
+
     def _create_schema(self):
         self.conn.execute(
             """
@@ -557,8 +823,16 @@ class _FakeFeatureService:
     def __init__(self):
         self.calls = []
 
+    def compute_features_from_cache(self, feature_set_id, tickers, start_date, end_date, market=None):
+        self.calls.append(("compute_from_cache", feature_set_id, market))
+        return self._feature_data()
+
     def compute_features(self, feature_set_id, tickers, start_date, end_date, market=None):
         self.calls.append(("compute", feature_set_id, market))
+        return self._feature_data()
+
+    @staticmethod
+    def _feature_data():
         dates = pd.to_datetime(
             [
                 "2024-01-02",
@@ -636,6 +910,13 @@ class _FakeLabelService:
 
     def compute_label_values(self, label_id, tickers, start_date, end_date, market=None):
         self.calls.append(("compute", label_id, market))
+        return self._label_values(label_id, tickers, start_date, end_date, market=market)
+
+    def compute_label_values_cached(self, label_id, tickers, start_date, end_date, market=None):
+        self.calls.append(("compute_cached", label_id, market))
+        return self._label_values(label_id, tickers, start_date, end_date, market=market)
+
+    def _label_values(self, label_id, tickers, start_date, end_date, market=None):
         label = self.labels.get(label_id)
         if label and label["target_type"] == "prediction":
             from backend.services.label_service import LabelService
@@ -707,6 +988,21 @@ class _FakeModel(ModelBase):
 
     def feature_importance(self):
         return pd.Series(1.0, index=self._feature_names)
+
+
+class _CountingPredictModel(ModelBase):
+    def __init__(self):
+        self.predict_calls = 0
+
+    def fit(self, X, y, **kwargs):
+        return self
+
+    def predict(self, X):
+        self.predict_calls += 1
+        return pd.Series(range(len(X)), index=X.index, dtype=float, name="prediction")
+
+    def get_params(self):
+        return {}
 
 
 class _FakeStore:

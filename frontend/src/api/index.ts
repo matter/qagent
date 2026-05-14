@@ -12,6 +12,7 @@ export {
 
 export type Market = "US" | "CN";
 export type ExecutionModel = "next_open" | "planned_price";
+export type PlannedPriceFallback = "cancel" | "next_close";
 
 export interface StockSearchResult {
   market: Market;
@@ -855,6 +856,7 @@ export interface BacktestRunConfig {
   normalize_target_weights?: boolean;
   execution_model?: ExecutionModel;
   planned_price_buffer_bps?: number;
+  planned_price_fallback?: PlannedPriceFallback;
   universe_group_id?: string;
   constraint_config?: Record<string, unknown>;
   [key: string]: unknown;

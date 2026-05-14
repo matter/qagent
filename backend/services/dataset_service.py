@@ -299,14 +299,14 @@ class DatasetService:
         if not feature_set_id or not label_id:
             raise ValueError("M4 datasets require legacy feature_set and label sources")
 
-        feature_data = self._feature_service.compute_features(
+        feature_data = self._feature_service.compute_features_from_cache(
             feature_set_id,
             tickers,
             dataset["start_date"],
             dataset["end_date"],
             market=market,
         )
-        label_df = self._label_service.compute_label_values(
+        label_df = self._label_service.compute_label_values_cached(
             label_id,
             tickers,
             dataset["start_date"],

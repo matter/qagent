@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
+import threading
 from typing import Any
 
 from backend.strategies.base import StrategyBase, StrategyContext
@@ -11,6 +13,9 @@ from backend.services.custom_code_runner import run_user_code_isolated
 from backend.services.custom_code_safety import validate_user_code_safety
 
 log = get_logger(__name__)
+_STRATEGY_METADATA_CACHE: dict[str, dict[str, Any]] = {}
+_STRATEGY_METADATA_LOCKS: dict[str, threading.Lock] = {}
+_STRATEGY_METADATA_LOCKS_GUARD = threading.Lock()
 
 # Modules that strategy source code is allowed to import.
 _ALLOWED_MODULES = {
@@ -51,13 +56,29 @@ def load_strategy_from_code(source_code: str) -> StrategyBase:
     if not source_code or not source_code.strip():
         raise ValueError("source_code is empty")
     validate_user_code_safety(source_code, code_kind="strategy")
-    metadata = run_user_code_isolated(
-        source_code=source_code,
-        code_kind="strategy",
-        operation="metadata",
-        timeout_seconds=3,
-    )
+    cache_key = hashlib.sha256(source_code.encode("utf-8")).hexdigest()
+    metadata = _STRATEGY_METADATA_CACHE.get(cache_key)
+    if metadata is None:
+        with _strategy_metadata_lock(cache_key):
+            metadata = _STRATEGY_METADATA_CACHE.get(cache_key)
+            if metadata is None:
+                metadata = run_user_code_isolated(
+                    source_code=source_code,
+                    code_kind="strategy",
+                    operation="metadata",
+                    timeout_seconds=10,
+                )
+                _STRATEGY_METADATA_CACHE[cache_key] = dict(metadata)
     return IsolatedStrategyProxy(source_code, metadata)
+
+
+def _strategy_metadata_lock(cache_key: str) -> threading.Lock:
+    with _STRATEGY_METADATA_LOCKS_GUARD:
+        lock = _STRATEGY_METADATA_LOCKS.get(cache_key)
+        if lock is None:
+            lock = threading.Lock()
+            _STRATEGY_METADATA_LOCKS[cache_key] = lock
+        return lock
 
 
 class IsolatedStrategyProxy(StrategyBase):

@@ -77,6 +77,16 @@ class CompareBacktestsRequest(BaseModel):
     backtest_ids: list[str]
 
 
+class ResearchSummaryRequest(BaseModel):
+    market: Optional[str] = None
+    baseline_backtest_id: str
+    trial_backtest_id: str
+    changed_variable: dict | None = None
+    conclusion: str | None = None
+    reason: str | None = None
+    max_rebalance_items: int = 20
+
+
 # ------------------------------------------------------------------
 # Strategy CRUD
 # ------------------------------------------------------------------
@@ -260,6 +270,24 @@ async def compare_backtests(body: CompareBacktestsRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.post("/strategies/backtests/research-summary")
+async def get_backtest_research_summary(body: ResearchSummaryRequest) -> dict:
+    """Return a compact bounded comparison summary for agent research."""
+    svc = _get_backtest_service()
+    try:
+        return svc.get_research_summary(
+            baseline_backtest_id=body.baseline_backtest_id,
+            trial_backtest_id=body.trial_backtest_id,
+            market=body.market,
+            changed_variable=body.changed_variable,
+            conclusion=body.conclusion,
+            reason=body.reason,
+            max_rebalance_items=body.max_rebalance_items,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.get("/strategies/{strategy_id}")
 async def get_strategy(
     strategy_id: str,
@@ -343,12 +371,14 @@ async def run_backtest(strategy_id: str, body: RunBacktestRequest) -> dict:
         config: dict,
         universe_group_id: str,
         market: str,
+        stage_domain_write=None,
     ) -> dict:
         full = bt_svc.run_backtest(
             strategy_id=strategy_id,
             config_dict=config,
             universe_group_id=universe_group_id,
             market=market,
+            stage_domain_write=stage_domain_write,
         )
         # Return compact summary for task store; full result is persisted in
         # backtest_results table and retrievable via GET /backtests/{id}.

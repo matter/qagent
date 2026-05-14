@@ -118,6 +118,20 @@ async def get_plan_performance(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/plans/{plan_id}/trial-matrix")
+async def get_trial_matrix(
+    plan_id: str,
+    primary_metric: str = Query("sharpe"),
+) -> dict:
+    try:
+        return _svc().get_trial_matrix(
+            plan_id,
+            primary_metric=primary_metric,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/plans/{plan_id}/budget")
 async def check_plan_budget(plan_id: str) -> dict:
     try:

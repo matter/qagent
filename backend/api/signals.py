@@ -90,6 +90,7 @@ async def generate_signals(body: GenerateSignalsRequest) -> dict:
         universe_group_id: str,
         market: str,
         constraint_config: dict | None,
+        stage_domain_write=None,
     ) -> dict:
         return svc.generate_signals(
             strategy_id=strategy_id,
@@ -97,6 +98,7 @@ async def generate_signals(body: GenerateSignalsRequest) -> dict:
             universe_group_id=universe_group_id,
             market=market,
             constraint_config=constraint_config,
+            stage_domain_write=stage_domain_write,
         )
 
     task_id = executor.submit(

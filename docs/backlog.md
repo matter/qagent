@@ -6,23 +6,27 @@ This file only tracks unresolved or deferred work. Fixed and mitigated items are
 
 | Priority | Defect | Necessity | Workload |
 | --- | --- | --- | --- |
-| P0 | Domain writes are not transactionally staged by task acceptance | High. Late task return payloads are quarantined and accepted callbacks now exist, but long-running domain services still write directly during computation. Cancel/timeout can still leave partial final rows until each write-heavy workflow adopts stage-then-promote. | High |
+| P1 | Remaining stateful/multi-table long-running workflows need domain-specific staging | Medium. Main final-asset tasks and legacy paper trading advance now stage/promote at task acceptance, but data refresh and 3.0 graph/model/universe/research workflows are state machines, source-data updates, or cache/materialization pipelines that still need explicit resume/idempotency/rollback semantics. | High |
 | P0 | Main DuckDB has single-writer operational fragility | Medium. Preflight/API diagnostics make locks actionable, but DuckDB remains a single-file local database. For this single-user system, full replacement is not urgent unless concurrent agent writers become common. | Medium-High |
 | P1 | Free equity data is not PIT or survivorship-safe | High for publication-grade research, medium for local exploration. Free yfinance/BaoStock data cannot prove delisted assets, historical membership, symbol changes, and full corporate-action history. Current code blocks publication gates instead of pretending the data is clean. | High |
 | P3 | Legacy and 3.0 engines coexist with overlapping concepts | Medium. Migration overlap increases maintenance/audit cost, but it protects existing US workflows. Fix only after 3.0 backtest/signal/paper semantics cover the legacy surface. | High |
 
 ## Open
 
-### [2026-05-08] P0 Domain writes are not transactionally staged by task acceptance
+### [2026-05-13] P1 Remaining stateful/multi-table long-running workflows need domain-specific staging
 
 - **Market**: US, CN
-- **Entry**: Long-running service methods that write before task completion.
-- **Current mitigation**: `TaskExecutor.submit(..., on_accept=...)` can run commit callbacks only at the accepted completion boundary, and timeout/cancel late results are quarantined.
-- **Remaining issue**: Existing service methods still insert domain rows during computation before returning. Those paths have not all been migrated to staging tables/artifacts plus accepted promotion callbacks.
-- **Expected behavior**: Long task outputs should write to staging artifacts/runs and be promoted only if the task is still accepted.
-- **Validation standard**: A synthetic long-running write task cancelled mid-run leaves no final domain rows unless explicitly resumed or accepted.
-- **Fix necessity**: High for autonomous agent workflows that create research assets in batches; lower for manually supervised single short tasks.
-- **Estimated workload**: High. Requires inventorying write-heavy workflows, adding staging/promote contracts, and migrating backtest/model/factor/signal/paper task entry points incrementally.
+- **Entry**: data refresh tasks, 3.0 strategy graph/model experiment/universe/research workflows, and cache/materialization tasks.
+- **Current mitigation**:
+  - `TaskExecutor.submit()` now injects `stage_domain_write` for task functions that explicitly accept it.
+  - Staged commit callbacks run only at accepted completion boundary and execute inside one DuckDB transaction.
+  - Late timeout/cancel results remain quarantined and do not run staged commits.
+  - Migrated final-asset tasks: legacy backtest (`backtest_results`), model train (`models` DB row), factor evaluation (`factor_eval_results`), signal generation (`signal_runs` / `signal_details`), and legacy paper trading advance (`paper_trading_daily` / `paper_trading_sessions`).
+- **Remaining issue**: Remaining stateful workflows still write intermediate or state-transition rows during execution. They cannot be safely migrated by a single final-row commit callback because their correctness depends on resume points, idempotent day advancement, source-data semantics, cache invalidation, and rollback policy.
+- **Expected behavior**: Each stateful workflow defines its own staging/resume/idempotency contract. Accepted completion should promote final state atomically; timeout/cancel should either leave a clearly resumable staging state or roll back final domain state.
+- **Validation standard**: Synthetic timeout/cancel cases for each migrated workflow leave no partial final state, or leave only documented resumable staging rows with a recovery command.
+- **Fix necessity**: Medium-High for autonomous batch agents. Lower for manually supervised single-user runs where paper/data updates are intentionally stateful.
+- **Estimated workload**: High. Requires workflow-by-workflow design rather than generic wrapping.
 
 ### [2026-05-08] P0 Main DuckDB has single-writer operational fragility
 

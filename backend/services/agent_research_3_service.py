@@ -440,6 +440,57 @@ class AgentResearch3Service:
             "budget_state": plan["budget_state"],
         }
 
+    def get_trial_matrix(
+        self,
+        plan_id: str,
+        *,
+        primary_metric: str = "sharpe",
+    ) -> dict:
+        """Return structured trial lineage for agent/human research review."""
+        plan = self.get_plan(plan_id)
+        trials = self.list_trials(plan_id, limit=1000)
+        rows = [
+            self._trial_matrix_row(trial, primary_metric=primary_metric)
+            for trial in trials
+        ]
+        ranked_rows = sorted(
+            rows,
+            key=lambda row: (
+                row.get("primary_metric_value") is not None,
+                row.get("primary_metric_value") or float("-inf"),
+            ),
+            reverse=True,
+        )
+        decision_counts = {"promote": 0, "continue": 0, "stop": 0}
+        hypotheses: dict[str, list[dict[str, Any]]] = {}
+        for row in ranked_rows:
+            decision = row["decision"]
+            decision_counts[decision] = decision_counts.get(decision, 0) + 1
+            group_key = row.get("changed_module") or row.get("trial_type") or "unknown"
+            hypotheses.setdefault(str(group_key), []).append(
+                {
+                    "trial_id": row["trial_id"],
+                    "hypothesis": row.get("hypothesis"),
+                    "decision": decision,
+                    "primary_metric_value": row.get("primary_metric_value"),
+                    "stop_reason": row.get("stop_reason"),
+                }
+            )
+        metadata = plan.get("metadata") or {}
+        return {
+            "plan_id": plan_id,
+            "plan": plan,
+            "primary_metric": primary_metric,
+            "baseline": {
+                "strategy_id": metadata.get("baseline_strategy_id"),
+                "backtest_id": metadata.get("baseline_backtest_id"),
+            },
+            "trial_count": len(ranked_rows),
+            "decision_counts": decision_counts,
+            "rows": ranked_rows,
+            "hypotheses": hypotheses,
+        }
+
     # ------------------------------------------------------------------
     # QA gate and promotion
     # ------------------------------------------------------------------
@@ -762,6 +813,41 @@ class AgentResearch3Service:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _trial_matrix_row(trial: dict, *, primary_metric: str) -> dict:
+        params = trial.get("params") or {}
+        metrics = trial.get("metrics") or {}
+        metric_value = AgentResearch3Service._metric_number(metrics, primary_metric)
+        explicit_conclusion = str(params.get("conclusion") or "").strip().lower()
+        if explicit_conclusion in {"promote", "continue", "stop"}:
+            decision = explicit_conclusion
+        elif trial.get("status") in {"stopped", "failed"}:
+            decision = "stop"
+        elif metric_value is not None:
+            decision = "promote"
+        else:
+            decision = "continue"
+        return {
+            "trial_id": trial["id"],
+            "trial_index": trial["trial_index"],
+            "trial_type": trial["trial_type"],
+            "status": trial["status"],
+            "baseline_strategy_id": params.get("baseline_strategy_id"),
+            "baseline_backtest_id": params.get("baseline_backtest_id"),
+            "changed_module": params.get("changed_module"),
+            "changed_variable": params.get("changed_variable"),
+            "hypothesis": params.get("hypothesis"),
+            "config_hash": params.get("config_hash") or params.get("_trial_params_hash"),
+            "model_dependency_safety": params.get("model_dependency_safety"),
+            "metrics": metrics,
+            "primary_metric": primary_metric,
+            "primary_metric_value": metric_value,
+            "decision": decision,
+            "stop_reason": params.get("stop_reason") or params.get("reason"),
+            "result_refs": trial.get("result_refs") or [],
+            "created_at": trial.get("created_at"),
+        }
 
     def _metric_ranges(self, trials: list[dict]) -> dict[str, dict[str, float | int]]:
         values_by_metric: dict[str, list[float]] = {}

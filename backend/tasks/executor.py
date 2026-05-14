@@ -5,10 +5,12 @@ from __future__ import annotations
 import threading
 import traceback
 import uuid
+import inspect
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from datetime import datetime
 from typing import Any, Callable
 
+from backend.db import get_connection
 from backend.logger import get_logger
 from backend.services.market_context import normalize_market
 from backend.tasks.json_safety import json_safe_string, json_safe_value
@@ -58,6 +60,7 @@ class TaskExecutor:
         source: TaskSource = TaskSource.SYSTEM,
         task_id: str | None = None,
         on_accept: Callable[[Any, TaskRecord], Any] | None = None,
+        staged_domain_writes: list[dict[str, Any]] | None = None,
     ) -> str:
         """Submit *fn* for background execution.
 
@@ -94,7 +97,15 @@ class TaskExecutor:
         self._store.insert(record)
         self._remember(record)
 
-        future = self._pool.submit(self._run, tid, fn, params or {}, timeout, on_accept)
+        future = self._pool.submit(
+            self._run,
+            tid,
+            fn,
+            params or {},
+            timeout,
+            on_accept,
+            staged_domain_writes,
+        )
         self._futures[tid] = future
         log.info("task.submitted", task_id=tid, task_type=task_type)
         return tid
@@ -125,6 +136,13 @@ class TaskExecutor:
         market = TaskExecutor._pause_rule_market(params)
         if market == "CN" and task_type in {"strategy_backtest", "model_train"}:
             return "CN:heavy-research"
+        if task_type == "strategy_backtest":
+            return f"{market or 'US'}:legacy-backtest"
+        if task_type == "model_train":
+            feature_set_id = str((params or {}).get("feature_set_id") or "")
+            universe_group_id = str((params or {}).get("universe_group_id") or "")
+            if feature_set_id and universe_group_id:
+                return f"{market or 'US'}:model-train:{feature_set_id}:{universe_group_id}"
         return None
 
     def _get_serial_lock(self, key: str) -> threading.Lock:
@@ -273,6 +291,142 @@ class TaskExecutor:
             if error_message is not None:
                 record.error_message = json_safe_string(error_message)
 
+    def _update_progress(self, task_id: str, phase: str, **payload: Any) -> None:
+        existing = self.get_task(task_id)
+        if existing is None or existing.status != TaskStatus.RUNNING:
+            return
+        summary: dict[str, Any] = {}
+        if isinstance(existing.result_summary, dict):
+            summary.update(existing.result_summary)
+        progress = {
+            "phase": json_safe_string(phase),
+            "updated_at": utc_now_naive().isoformat(),
+            **json_safe_value(payload),
+        }
+        history = list(summary.get("progress_history") or [])
+        history.append(progress)
+        summary["progress"] = progress
+        summary["progress_history"] = history[-20:]
+        self._update_memory_status(
+            task_id,
+            TaskStatus.RUNNING,
+            result_summary=summary,
+        )
+        self._store.update_status(
+            task_id,
+            TaskStatus.RUNNING,
+            result_summary=summary,
+        )
+
+    @staticmethod
+    def _supports_progress(fn: Callable[..., Any]) -> bool:
+        return TaskExecutor._supports_injected_param(fn, "progress")
+
+    @staticmethod
+    def _supports_stage_domain_write(fn: Callable[..., Any]) -> bool:
+        return TaskExecutor._supports_injected_param(fn, "stage_domain_write")
+
+    @staticmethod
+    def _supports_injected_param(fn: Callable[..., Any], name: str) -> bool:
+        try:
+            signature = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return False
+        for param in signature.parameters.values():
+            if param.kind == param.VAR_KEYWORD:
+                return True
+            if param.name == name:
+                return True
+        return False
+
+    @staticmethod
+    def _make_stage_domain_write(staged_writes: list[dict[str, Any]]) -> Callable[..., int]:
+        def _stage_domain_write(
+            table: str,
+            payload: Any | None = None,
+            *,
+            commit: Callable[[], Any] | None = None,
+        ) -> int:
+            staged_writes.append({
+                "table": json_safe_string(table),
+                "payload": json_safe_value(payload if payload is not None else {}),
+                "commit": commit,
+            })
+            return len(staged_writes)
+
+        return _stage_domain_write
+
+    @staticmethod
+    def _staged_write_summary(write: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "table": json_safe_string(write.get("table", "")),
+            "payload": json_safe_value(write.get("payload", {})),
+            "has_commit": callable(write.get("commit")),
+        }
+
+    @staticmethod
+    def _commit_staged_domain_writes(
+        staged_writes: list[dict[str, Any]],
+        accepted_sink: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        committed: list[dict[str, Any]] = []
+        if not staged_writes:
+            return committed
+        if not any(callable(write.get("commit")) for write in staged_writes):
+            for write in staged_writes:
+                summary = TaskExecutor._staged_write_summary(write)
+                if accepted_sink is not None:
+                    accepted_sink.append({
+                        "table": summary["table"],
+                        "payload": summary["payload"],
+                    })
+                committed.append(summary)
+            return committed
+        conn = get_connection()
+        accepted_rows: list[dict[str, Any]] = []
+        try:
+            conn.execute("BEGIN TRANSACTION")
+            for write in staged_writes:
+                commit = write.get("commit")
+                commit_result = (
+                    TaskExecutor._call_staged_commit(commit, conn)
+                    if callable(commit)
+                    else None
+                )
+                summary = TaskExecutor._staged_write_summary(write)
+                if commit_result is not None:
+                    summary["commit_result"] = json_safe_value(commit_result)
+                if accepted_sink is not None:
+                    accepted_rows.append({
+                        "table": summary["table"],
+                        "payload": summary["payload"],
+                    })
+                committed.append(summary)
+            conn.execute("COMMIT")
+            if accepted_sink is not None:
+                accepted_sink.extend(accepted_rows)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception as rollback_exc:
+                log.warning(
+                    "task.staged_domain_write.rollback_failed",
+                    error=str(rollback_exc),
+                )
+            raise
+        return committed
+
+    @staticmethod
+    def _call_staged_commit(commit: Callable[..., Any], conn: Any) -> Any:
+        try:
+            signature = inspect.signature(commit)
+        except (TypeError, ValueError):
+            return commit()
+        for param in signature.parameters.values():
+            if param.kind == param.VAR_KEYWORD or param.name == "conn":
+                return commit(conn=conn)
+        return commit()
+
     def _is_cancelled(self, task_id: str) -> bool:
         with self._records_lock:
             record = self._records.get(task_id)
@@ -322,23 +476,39 @@ class TaskExecutor:
         task_id: str,
         result: Any,
         on_accept: Callable[[Any, TaskRecord], Any] | None,
+        staged_writes: list[dict[str, Any]] | None = None,
+        staged_domain_writes: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         summary = result if isinstance(result, dict) else {"result": result}
         summary = json_safe_value(dict(summary))
-        if on_accept is None:
+        existing = self.get_task(task_id)
+        if existing and isinstance(existing.result_summary, dict):
+            for key in ("progress", "progress_history"):
+                if key in existing.result_summary and key not in summary:
+                    summary[key] = existing.result_summary[key]
+        staged_writes = staged_writes or []
+        if on_accept is None and not staged_writes:
             return summary
-        record = self.get_task(task_id)
+        record = existing or self.get_task(task_id)
         if record is None or record.status != TaskStatus.RUNNING:
             summary["acceptance"] = {
                 "status": "skipped",
                 "reason": "task_not_running_at_acceptance_boundary",
             }
             return summary
-        accept_result = on_accept(result, record)
-        summary["acceptance"] = json_safe_value({
+        accept_result = on_accept(result, record) if on_accept is not None else None
+        committed_writes = self._commit_staged_domain_writes(
+            staged_writes,
+            staged_domain_writes,
+        )
+        acceptance = {
             "status": "accepted",
             "result": accept_result if accept_result is not None else None,
-        })
+        }
+        if staged_writes:
+            acceptance["staged_write_count"] = len(staged_writes)
+            acceptance["staged_writes"] = committed_writes
+        summary["acceptance"] = json_safe_value(acceptance)
         return summary
 
     def _run(
@@ -348,6 +518,7 @@ class TaskExecutor:
         params: dict[str, Any],
         timeout: int,
         on_accept: Callable[[Any, TaskRecord], Any] | None,
+        staged_domain_writes: list[dict[str, Any]] | None,
     ) -> None:
         """Wrapper executed inside the thread pool."""
         started = utc_now_naive()
@@ -365,8 +536,20 @@ class TaskExecutor:
         )
         serial_lock = self._get_serial_lock(serial_key) if serial_key else None
         if serial_lock is not None:
+            self._update_progress(
+                task_id,
+                "serial_wait",
+                serial_key=serial_key,
+                message=f"Waiting for serial lane {serial_key}",
+            )
             log.info("task.serial_wait", task_id=task_id, serial_key=serial_key)
             serial_lock.acquire()
+            self._update_progress(
+                task_id,
+                "serial_acquired",
+                serial_key=serial_key,
+                message=f"Acquired serial lane {serial_key}",
+            )
             log.info("task.serial_acquired", task_id=task_id, serial_key=serial_key)
             if self._is_cancelled(task_id):
                 log.info("task.cancelled_before_serial_work", task_id=task_id)
@@ -377,7 +560,19 @@ class TaskExecutor:
         # the calling thread.  The outer thread-pool thread blocks here
         # until the inner future completes or times out.
         inner_pool = ThreadPoolExecutor(max_workers=1)
-        inner_future = inner_pool.submit(fn, **params)
+        call_params = dict(params)
+        staged_writes: list[dict[str, Any]] = []
+        if self._supports_progress(fn):
+            call_params["progress"] = lambda phase, **payload: self._update_progress(
+                task_id,
+                phase,
+                **payload,
+            )
+        if self._supports_stage_domain_write(fn):
+            call_params["stage_domain_write"] = self._make_stage_domain_write(
+                staged_writes
+            )
+        inner_future = inner_pool.submit(fn, **call_params)
         release_serial_in_finally = True
 
         try:
@@ -392,7 +587,13 @@ class TaskExecutor:
                 log.info("task.cancelled_late_result_quarantined", task_id=task_id)
                 return
             completed = utc_now_naive()
-            summary = self._accepted_summary(task_id, result, on_accept)
+            summary = self._accepted_summary(
+                task_id,
+                result,
+                on_accept,
+                staged_writes,
+                staged_domain_writes,
+            )
             self._update_memory_status(
                 task_id,
                 TaskStatus.COMPLETED,

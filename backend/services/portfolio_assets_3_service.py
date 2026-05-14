@@ -16,7 +16,10 @@ import pandas as pd
 
 from backend.db import get_connection
 from backend.services.calendar_service import offset_trading_days
-from backend.services.execution_model_service import normalize_planned_price_buffer_bps
+from backend.services.execution_model_service import (
+    normalize_planned_price_buffer_bps,
+    normalize_planned_price_fallback,
+)
 from backend.services.market_context import normalize_market
 from backend.services.research_kernel_service import ResearchKernelService
 from backend.time_utils import utc_now_naive
@@ -217,6 +220,9 @@ class PortfolioAssets3Service:
             if fallback != "decision_close":
                 raise ValueError("planned_price fallback must be 'decision_close'")
             normalized["fallback"] = fallback
+            normalized["fill_fallback"] = normalize_planned_price_fallback(
+                normalized.get("fill_fallback")
+            )
             order_ttl = normalized.get("order_ttl", "same_day")
             if order_ttl != "same_day":
                 raise ValueError("planned_price order_ttl must be 'same_day'")
@@ -847,6 +853,7 @@ class PortfolioAssets3Service:
                     params.get("planned_price_buffer_bps", 50)
                 )
                 order["fallback"] = params.get("fallback", "decision_close")
+                order["fill_fallback"] = params.get("fill_fallback", "cancel")
                 order["order_ttl"] = params.get("order_ttl", "same_day")
                 order["reason"] = "move current portfolio toward target at planned price"
             else:

@@ -330,8 +330,14 @@ class FeatureService:
         for ref in factor_refs:
             fid = ref["factor_id"]
             fname = ref.get("factor_name", fid)
-            if fid in cached and not cached[fid].empty:
-                raw_data[fname] = cached[fid]
+            cached_df = cached.get(fid)
+            if cached_df is not None and not cached_df.empty and self._factor_cache_covers_request(
+                cached_df,
+                tickers,
+                start_date,
+                end_date,
+            ):
+                raw_data[fname] = cached_df
             else:
                 missing_refs.append(ref)
 
@@ -390,6 +396,29 @@ class FeatureService:
         )
         return result
 
+    @staticmethod
+    def _factor_cache_covers_request(
+        df: pd.DataFrame,
+        tickers: list[str],
+        start_date: str,
+        end_date: str,
+    ) -> bool:
+        """Return whether a cached factor frame covers the requested panel."""
+        if df.empty:
+            return False
+        missing_tickers = set(tickers).difference(set(df.columns.astype(str)))
+        if missing_tickers:
+            return False
+        index = pd.to_datetime(df.index)
+        start = pd.Timestamp(start_date)
+        end = pd.Timestamp(end_date)
+        if index.min() > start or index.max() < end:
+            return False
+        in_range = df.loc[(index >= start) & (index <= end), tickers]
+        if in_range.empty:
+            return False
+        return True
+
     # ------------------------------------------------------------------
     # Correlation matrix
     # ------------------------------------------------------------------
@@ -407,7 +436,7 @@ class FeatureService:
         Returns:
             {factor_names: [...], matrix: [[...]]}
         """
-        feature_data = self.compute_features(fs_id, tickers, start_date, end_date, market=market)
+        feature_data = self.compute_features_from_cache(fs_id, tickers, start_date, end_date, market=market)
 
         factor_names = sorted(feature_data.keys())
         n = len(factor_names)

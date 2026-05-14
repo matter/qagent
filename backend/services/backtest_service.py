@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import threading
 import uuid
+import copy
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -25,6 +26,7 @@ from backend.services.backtest_engine import BacktestConfig, BacktestEngine, Bac
 from backend.services import backtest_engine as backtest_engine_module
 from backend.services.calendar_service import offset_trading_days
 from backend.services.execution_model_service import _positive_float
+from backend.services.execution_model_service import evaluate_planned_price_fill
 from backend.services.factor_engine import FactorEngine
 from backend.services.group_service import GroupService
 from backend.services.market_context import (
@@ -34,7 +36,7 @@ from backend.services.market_context import (
     normalize_ticker,
 )
 from backend.services.model_service import ModelService
-from backend.services.strategy_service import StrategyService
+from backend.services.strategy_service import SUPPORTED_POSITION_SIZING, StrategyService
 from backend.time_utils import utc_now_iso, utc_now_naive
 from backend.strategies.base import StrategyContext
 from backend.strategies.loader import load_strategy_from_code
@@ -72,6 +74,7 @@ class BacktestService:
         config_dict: dict,
         universe_group_id: str,
         market: str | None = None,
+        stage_domain_write: Any | None = None,
     ) -> dict:
         """Full backtest pipeline orchestrator.
 
@@ -117,13 +120,14 @@ class BacktestService:
         tickers = [normalize_ticker(t, resolved_market) for t in tickers]
 
         position_sizing = strategy_def.get("position_sizing", "equal_weight")
+        position_sizing = StrategyService._validate_position_sizing(position_sizing)
 
         # ---- 3. Build config ----
         benchmark = config_dict.get("benchmark") or get_default_benchmark(resolved_market)
         self._validate_benchmark_market(benchmark, resolved_market)
-        constraint_config = self._merge_constraint_config(
-            strategy_def.get("constraint_config"),
-            config_dict.get("constraint_config"),
+        constraint_config = self._resolve_run_constraint_config(
+            strategy_config=strategy_def.get("constraint_config"),
+            config_dict=config_dict,
         )
         warmup_start_date = config_dict.get("warmup_start_date")
         evaluation_start_date = config_dict.get("evaluation_start_date")
@@ -137,6 +141,14 @@ class BacktestService:
         normalize_target_weights = config_dict.get("normalize_target_weights", True)
         if position_sizing == "raw_weight" and "normalize_target_weights" not in config_dict:
             normalize_target_weights = False
+        execution_rebalance_buffer = self._resolve_rebalance_buffer(
+            config_dict,
+            constraint_config,
+        )
+        execution_min_holding_days = self._resolve_min_holding_days(
+            config_dict,
+            constraint_config,
+        )
         bt_config = BacktestConfig(
             initial_capital=config_dict.get("initial_capital", 1_000_000),
             start_date=simulation_start_date,
@@ -147,7 +159,7 @@ class BacktestService:
             slippage_rate=config_dict.get("slippage_rate", 0.001),
             max_positions=config_dict.get("max_positions", 50),
             rebalance_freq=config_dict.get("rebalance_freq") or config_dict.get("rebalance_frequency", "monthly"),
-            rebalance_buffer=self._resolve_rebalance_buffer(config_dict, constraint_config),
+            rebalance_buffer=execution_rebalance_buffer,
             rebalance_buffer_add=config_dict.get("rebalance_buffer_add"),
             rebalance_buffer_reduce=config_dict.get("rebalance_buffer_reduce"),
             rebalance_buffer_mode=config_dict.get("rebalance_buffer_mode", "all"),
@@ -155,13 +167,14 @@ class BacktestService:
                 config_dict,
                 constraint_config,
             ),
-            min_holding_days=self._resolve_min_holding_days(config_dict, constraint_config),
+            min_holding_days=execution_min_holding_days,
             reentry_cooldown_days=config_dict.get("reentry_cooldown_days", 0),
             normalize_target_weights=normalize_target_weights,
             max_single_name_weight=constraint_config.get("max_single_name_weight"),
             max_holding_days=self._resolve_max_holding_days(constraint_config),
             execution_model=config_dict.get("execution_model", "next_open"),
             planned_price_buffer_bps=config_dict.get("planned_price_buffer_bps", 50),
+            planned_price_fallback=config_dict.get("planned_price_fallback", "cancel"),
         )
 
         max_position_pct = config_dict.get("max_position_pct", 0.10)
@@ -292,13 +305,32 @@ class BacktestService:
         port_weights: dict[str, float] = {}     # current weight per ticker
         port_holding_days: dict[str, int] = {}   # consecutive days held
         port_entry_price: dict[str, float] = {}  # avg entry price per ticker
+        port_exit_idx: dict[str, int] = {}
+        pending_context_state: dict | None = None
 
-        for trade_date in all_trading_days:
+        for day_idx, trade_date in enumerate(all_trading_days):
             trade_ts = pd.Timestamp(trade_date)
 
             # Update holding_days for all held tickers
             for t in list(port_holding_days):
                 port_holding_days[t] += 1
+            if pending_context_state is not None:
+                self._apply_pending_context_execution_state(
+                    pending_context_state,
+                    trade_ts=trade_ts,
+                    day_idx=day_idx,
+                    port_weights=port_weights,
+                    port_holding_days=port_holding_days,
+                    port_entry_price=port_entry_price,
+                    port_exit_idx=port_exit_idx,
+                    prices_close=prices_close,
+                    prices_open=prices_open,
+                    prices_high=prices_high,
+                    prices_low=prices_low,
+                    planned_prices=planned_prices,
+                    bt_config=bt_config,
+                )
+                pending_context_state = None
 
             # Compute unrealized P&L from entry prices
             port_unrealized: dict[str, float] = {}
@@ -387,9 +419,11 @@ class BacktestService:
                         positions_after={},
                     )
                 rebalance_diagnostics.append(diag_entry)
-                port_weights.clear()
-                port_holding_days.clear()
-                port_entry_price.clear()
+                pending_context_state = {
+                    "target_weights": {},
+                    "decision_date": trade_ts,
+                    "positions_before": positions_before,
+                }
                 continue
 
             # Apply position sizing
@@ -422,6 +456,7 @@ class BacktestService:
                     planned_prices=planned_prices,
                     raw_signals=raw_signals,
                     selected_weights=weights,
+                    current_weights=positions_before,
                     prices_close=prices_close,
                     trade_ts=trade_ts,
                     diagnostics=planned_price_diagnostics,
@@ -433,30 +468,11 @@ class BacktestService:
                     all_weights.loc[trade_ts, ticker] = w
             prev_weights = all_weights.loc[trade_ts].values
 
-            # Update portfolio state tracking
-            new_held = {t for t, w in weights.items() if w > 1e-8}
-            old_held = set(port_weights.keys())
-
-            # Exited tickers
-            for t in old_held - new_held:
-                port_weights.pop(t, None)
-                port_holding_days.pop(t, None)
-                port_entry_price.pop(t, None)
-
-            # New entries — record entry price from current close
-            for t in new_held - old_held:
-                port_holding_days[t] = 0
-                if (
-                    trade_ts in prices_close.index
-                    and t in prices_close.columns
-                ):
-                    p = prices_close.loc[trade_ts, t]
-                    port_entry_price[t] = float(p) if pd.notna(p) else 0.0
-                else:
-                    port_entry_price[t] = 0.0
-
-            # Update weights for all held tickers
-            port_weights = {t: w for t, w in weights.items() if w > 1e-8}
+            pending_context_state = {
+                "target_weights": weights,
+                "decision_date": trade_ts,
+                "positions_before": positions_before,
+            }
 
             diag_entry = self._build_rebalance_diagnostics(
                 date_key=date_key,
@@ -582,14 +598,29 @@ class BacktestService:
             )
             config_to_save["debug_mode"] = True
             config_to_save["debug_artifact_id"] = debug_artifact["id"]
-        self._save_result(
-            bt_id=bt_id,
-            market=resolved_market,
-            strategy_id=strategy_id,
-            config=config_to_save,
-            result=result,
-            result_level=result_level,
-        )
+        save_payload = {
+            "bt_id": bt_id,
+            "market": resolved_market,
+            "strategy_id": strategy_id,
+            "config": copy.deepcopy(config_to_save),
+            "result": result,
+            "result_level": result_level,
+        }
+        if callable(stage_domain_write):
+            stage_domain_write(
+                "backtest_results",
+                {
+                    "id": bt_id,
+                    "market": resolved_market,
+                    "strategy_id": strategy_id,
+                },
+                commit=lambda conn=None, payload=save_payload: self._save_result(
+                    **payload,
+                    conn=conn,
+                ),
+            )
+        else:
+            self._save_result(**save_payload)
 
         # ---- 10. Return result ----
         result_dict = result.to_dict()
@@ -642,35 +673,52 @@ class BacktestService:
             )
             result_dict["portfolio_compliance"] = portfolio_compliance
             # Persist diagnostics into stored summary
-            conn = get_connection()
-            row = conn.execute(
-                "SELECT summary FROM backtest_results WHERE id = ? AND market = ?",
-                [bt_id, resolved_market],
-            ).fetchone()
-            if row:
-                summary_data = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
-                summary_data["rebalance_diagnostics"] = rebalance_diagnostics
-                summary_data["portfolio_compliance"] = portfolio_compliance
-                summary_data["constraint_report"] = constraint_report
-                summary_data["constraint_pass"] = constraint_report["constraint_pass"]
-                summary_data["failed_constraints"] = constraint_report["failed_constraints"]
-                if startup_state_report:
-                    summary_data["startup_state_report"] = startup_state_report
-                conn.execute(
-                    "UPDATE backtest_results SET summary = ? WHERE id = ? AND market = ?",
-                    [json.dumps(summary_data, default=str), bt_id, resolved_market],
+            if callable(stage_domain_write):
+                self._update_staged_result_summary(
+                    save_payload,
+                    {
+                        "rebalance_diagnostics": rebalance_diagnostics,
+                        "portfolio_compliance": portfolio_compliance,
+                        "constraint_report": constraint_report,
+                        "constraint_pass": constraint_report["constraint_pass"],
+                        "failed_constraints": constraint_report["failed_constraints"],
+                        **({"startup_state_report": startup_state_report} if startup_state_report else {}),
+                    },
                 )
+            else:
+                conn = get_connection()
+                row = conn.execute(
+                    "SELECT summary FROM backtest_results WHERE id = ? AND market = ?",
+                    [bt_id, resolved_market],
+                ).fetchone()
+                if row:
+                    summary_data = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
+                    summary_data["rebalance_diagnostics"] = rebalance_diagnostics
+                    summary_data["portfolio_compliance"] = portfolio_compliance
+                    summary_data["constraint_report"] = constraint_report
+                    summary_data["constraint_pass"] = constraint_report["constraint_pass"]
+                    summary_data["failed_constraints"] = constraint_report["failed_constraints"]
+                    if startup_state_report:
+                        summary_data["startup_state_report"] = startup_state_report
+                    conn.execute(
+                        "UPDATE backtest_results SET summary = ? WHERE id = ? AND market = ?",
+                        [json.dumps(summary_data, default=str), bt_id, resolved_market],
+                    )
         else:
-            self._update_result_summary(
-                bt_id=bt_id,
-                market=resolved_market,
-                updates={
-                    "constraint_report": constraint_report,
-                    "constraint_pass": constraint_report["constraint_pass"],
-                    "failed_constraints": constraint_report["failed_constraints"],
-                    **({"startup_state_report": startup_state_report} if startup_state_report else {}),
-                },
-            )
+            updates = {
+                "constraint_report": constraint_report,
+                "constraint_pass": constraint_report["constraint_pass"],
+                "failed_constraints": constraint_report["failed_constraints"],
+                **({"startup_state_report": startup_state_report} if startup_state_report else {}),
+            }
+            if callable(stage_domain_write):
+                self._update_staged_result_summary(save_payload, updates)
+            else:
+                self._update_result_summary(
+                    bt_id=bt_id,
+                    market=resolved_market,
+                    updates=updates,
+                )
 
         # ---- 11. Check for data leakage ----
         leakage_warnings = self._check_data_leakage(
@@ -679,18 +727,24 @@ class BacktestService:
         if leakage_warnings:
             result_dict["leakage_warnings"] = leakage_warnings
             # Persist warnings into the stored summary
-            conn = get_connection()
-            row = conn.execute(
-                "SELECT summary FROM backtest_results WHERE id = ? AND market = ?",
-                [bt_id, resolved_market],
-            ).fetchone()
-            if row:
-                summary_data = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
-                summary_data["leakage_warnings"] = leakage_warnings
-                conn.execute(
-                    "UPDATE backtest_results SET summary = ? WHERE id = ? AND market = ?",
-                    [json.dumps(summary_data, default=str), bt_id, resolved_market],
+            if callable(stage_domain_write):
+                self._update_staged_result_summary(
+                    save_payload,
+                    {"leakage_warnings": leakage_warnings},
                 )
+            else:
+                conn = get_connection()
+                row = conn.execute(
+                    "SELECT summary FROM backtest_results WHERE id = ? AND market = ?",
+                    [bt_id, resolved_market],
+                ).fetchone()
+                if row:
+                    summary_data = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or {})
+                    summary_data["leakage_warnings"] = leakage_warnings
+                    conn.execute(
+                        "UPDATE backtest_results SET summary = ? WHERE id = ? AND market = ?",
+                        [json.dumps(summary_data, default=str), bt_id, resolved_market],
+                    )
             log.warning(
                 "backtest_service.leakage_detected",
                 backtest_id=bt_id,
@@ -833,6 +887,309 @@ class BacktestService:
             trade_diagnostics=trade_diagnostics,
         )
 
+    @staticmethod
+    def _apply_pending_context_execution_state(
+        pending_state: dict,
+        *,
+        trade_ts: pd.Timestamp,
+        day_idx: int,
+        port_weights: dict[str, float],
+        port_holding_days: dict[str, int],
+        port_entry_price: dict[str, float],
+        port_exit_idx: dict[str, int],
+        prices_open: pd.DataFrame,
+        prices_close: pd.DataFrame,
+        prices_high: pd.DataFrame,
+        prices_low: pd.DataFrame,
+        planned_prices: pd.DataFrame | None,
+        bt_config: BacktestConfig,
+    ) -> None:
+        """Advance StrategyContext holdings through the same low-turnover layer."""
+        target_weights = {
+            str(t): float(w)
+            for t, w in (pending_state.get("target_weights") or {}).items()
+            if float(w) > 1e-8
+        }
+        effective_targets = dict(target_weights)
+        actual_open_weights = BacktestService._context_actual_open_weights(
+            port_weights,
+            port_entry_price,
+            prices_open,
+            trade_ts,
+        )
+
+        if (
+            bt_config.rebalance_buffer > 0
+            or bt_config.min_holding_days > 0
+            or bt_config.reentry_cooldown_days > 0
+            or bt_config.max_holding_days is not None
+        ):
+            all_tickers = set(port_weights) | set(target_weights)
+            for ticker in all_tickers:
+                old_w = float(port_weights.get(ticker, 0.0))
+                reference_w = old_w
+                if bt_config.rebalance_buffer_reference == "actual_open":
+                    reference_w = actual_open_weights.get(ticker, 0.0)
+                new_w = float(target_weights.get(ticker, 0.0))
+
+                buffer_applies = True
+                if bt_config.rebalance_buffer_mode == "hold_overlap_only":
+                    buffer_applies = reference_w > 0 and new_w > 0
+                direction_buffer = bt_config.rebalance_buffer
+                if new_w > reference_w and bt_config.rebalance_buffer_add is not None:
+                    direction_buffer = bt_config.rebalance_buffer_add
+                elif new_w < reference_w and bt_config.rebalance_buffer_reduce is not None:
+                    direction_buffer = bt_config.rebalance_buffer_reduce
+                if (
+                    direction_buffer > 0
+                    and buffer_applies
+                    and abs(new_w - reference_w) < direction_buffer
+                ):
+                    effective_targets[ticker] = reference_w
+                    continue
+
+                if (
+                    bt_config.min_holding_days > 0
+                    and reference_w > 0
+                    and new_w < reference_w
+                    and port_holding_days.get(ticker, 0) < bt_config.min_holding_days
+                ):
+                    effective_targets[ticker] = reference_w
+                    continue
+
+                if (
+                    bt_config.reentry_cooldown_days > 0
+                    and reference_w == 0
+                    and new_w > 0
+                ):
+                    exit_idx = port_exit_idx.get(ticker)
+                    if (
+                        exit_idx is not None
+                        and (day_idx - exit_idx) < bt_config.reentry_cooldown_days
+                    ):
+                        effective_targets.pop(ticker, None)
+                        continue
+
+                if bt_config.max_holding_days is not None and reference_w > 0:
+                    days_held = port_holding_days.get(ticker, 0)
+                    if days_held >= int(bt_config.max_holding_days):
+                        effective_targets.pop(ticker, None)
+                        continue
+
+            eff_sum = sum(w for w in effective_targets.values() if w > 0)
+            if (
+                eff_sum > 0
+                and bt_config.normalize_target_weights
+                and bt_config.rebalance_buffer_mode != "hold_overlap_only"
+            ):
+                effective_targets = {
+                    t: float(w) / eff_sum
+                    for t, w in effective_targets.items()
+                    if float(w) > 0
+                }
+
+        if bt_config.max_single_name_weight is not None:
+            effective_targets = backtest_engine_module._cap_absolute_weights(
+                effective_targets,
+                float(bt_config.max_single_name_weight),
+            )
+
+        new_weights = {
+            str(t): float(w)
+            for t, w in effective_targets.items()
+            if float(w) > 1e-8
+        }
+        new_weights = BacktestService._filter_context_executable_targets(
+            current_weights=port_weights,
+            target_weights=new_weights,
+            decision_date=pending_state.get("decision_date"),
+            trade_ts=trade_ts,
+            prices_close=prices_close,
+            prices_open=prices_open,
+            prices_high=prices_high,
+            prices_low=prices_low,
+            planned_prices=planned_prices,
+            bt_config=bt_config,
+        )
+        old_tickers = set(port_weights)
+        new_tickers = set(new_weights)
+        for ticker in old_tickers - new_tickers:
+            port_weights.pop(ticker, None)
+            port_holding_days.pop(ticker, None)
+            port_entry_price.pop(ticker, None)
+            port_exit_idx[ticker] = day_idx
+        for ticker in new_tickers - old_tickers:
+            port_holding_days[ticker] = 0
+            port_entry_price[ticker] = (
+                BacktestService._context_execution_price(
+                    ticker=ticker,
+                    decision_ts=pd.Timestamp(pending_state.get("decision_date")),
+                    trade_ts=trade_ts,
+                    prices_close=prices_close,
+                    prices_open=prices_open,
+                    prices_high=prices_high,
+                    prices_low=prices_low,
+                    planned_prices=planned_prices,
+                    bt_config=bt_config,
+                )
+                or 0.0
+            )
+        port_weights.clear()
+        port_weights.update(new_weights)
+
+    @staticmethod
+    def _filter_context_executable_targets(
+        *,
+        current_weights: dict[str, float],
+        target_weights: dict[str, float],
+        decision_date: Any,
+        trade_ts: pd.Timestamp,
+        prices_close: pd.DataFrame,
+        prices_open: pd.DataFrame,
+        prices_high: pd.DataFrame,
+        prices_low: pd.DataFrame,
+        planned_prices: pd.DataFrame | None,
+        bt_config: BacktestConfig,
+    ) -> dict[str, float]:
+        executable = dict(current_weights)
+        all_tickers = set(current_weights) | set(target_weights)
+        decision_ts = pd.Timestamp(decision_date) if decision_date is not None else trade_ts
+        for ticker in all_tickers:
+            old_w = float(current_weights.get(ticker, 0.0))
+            new_w = float(target_weights.get(ticker, 0.0))
+            if abs(new_w - old_w) < 1e-8:
+                continue
+            if BacktestService._context_execution_price(
+                ticker=ticker,
+                decision_ts=decision_ts,
+                trade_ts=trade_ts,
+                prices_close=prices_close,
+                prices_open=prices_open,
+                prices_high=prices_high,
+                prices_low=prices_low,
+                planned_prices=planned_prices,
+                bt_config=bt_config,
+            ) is None:
+                continue
+            if new_w > 1e-8:
+                executable[ticker] = new_w
+            else:
+                executable.pop(ticker, None)
+        return {
+            str(ticker): float(weight)
+            for ticker, weight in executable.items()
+            if float(weight) > 1e-8
+        }
+
+    @staticmethod
+    def _context_execution_price(
+        *,
+        ticker: str,
+        decision_ts: pd.Timestamp,
+        trade_ts: pd.Timestamp,
+        prices_close: pd.DataFrame,
+        prices_open: pd.DataFrame,
+        prices_high: pd.DataFrame,
+        prices_low: pd.DataFrame,
+        planned_prices: pd.DataFrame | None,
+        bt_config: BacktestConfig,
+    ) -> float | None:
+        if bt_config.execution_model == "planned_price":
+            planned_price = BacktestService._context_lookup_price(
+                planned_prices,
+                decision_ts,
+                ticker,
+            )
+            high_price = BacktestService._context_lookup_price(
+                prices_high,
+                trade_ts,
+                ticker,
+            )
+            low_price = BacktestService._context_lookup_price(
+                prices_low,
+                trade_ts,
+                ticker,
+            )
+            fill_decision = evaluate_planned_price_fill(
+                planned_price=planned_price,
+                high=high_price,
+                low=low_price,
+                buffer_bps=bt_config.planned_price_buffer_bps,
+            )
+            if fill_decision.filled:
+                return fill_decision.fill_price
+            if (
+                bt_config.planned_price_fallback == "next_close"
+                and fill_decision.reason == "planned_price_outside_buffered_range"
+            ):
+                return BacktestService._context_lookup_price(
+                    prices_close,
+                    trade_ts,
+                    ticker,
+                )
+            return None
+        return BacktestService._context_lookup_price(
+            prices_open,
+            trade_ts,
+            ticker,
+        )
+
+    @staticmethod
+    def _context_lookup_price(
+        prices: pd.DataFrame | None,
+        trade_ts: pd.Timestamp,
+        ticker: str,
+    ) -> float | None:
+        if prices is None or trade_ts not in prices.index or ticker not in prices.columns:
+            return None
+        value = prices.loc[trade_ts, ticker]
+        if pd.isna(value) or value <= 0:
+            return None
+        return float(value)
+
+    @staticmethod
+    def _context_actual_open_weights(
+        port_weights: dict[str, float],
+        port_entry_price: dict[str, float],
+        prices_open: pd.DataFrame,
+        trade_ts: pd.Timestamp,
+    ) -> dict[str, float]:
+        if not port_weights:
+            return {}
+        raw_values: dict[str, float] = {}
+        for ticker, weight in port_weights.items():
+            if trade_ts not in prices_open.index or ticker not in prices_open.columns:
+                raw_values[ticker] = float(weight)
+                continue
+            price = prices_open.loc[trade_ts, ticker]
+            if pd.notna(price) and price > 0:
+                entry_price = float(port_entry_price.get(ticker) or 0.0)
+                price_ratio = float(price) / entry_price if entry_price > 0 else 1.0
+                raw_values[ticker] = float(weight) * price_ratio
+            else:
+                raw_values[ticker] = float(weight)
+        cash_weight = max(0.0, 1.0 - sum(float(w) for w in port_weights.values() if w > 0))
+        total = cash_weight + sum(value for value in raw_values.values() if value > 0)
+        if total <= 0:
+            return dict(port_weights)
+        return {
+            ticker: value / total
+            for ticker, value in raw_values.items()
+            if value > 0
+        }
+
+    @staticmethod
+    def _context_entry_price(
+        ticker: str,
+        prices_open: pd.DataFrame,
+        trade_ts: pd.Timestamp,
+    ) -> float:
+        if trade_ts in prices_open.index and ticker in prices_open.columns:
+            price = prices_open.loc[trade_ts, ticker]
+            if pd.notna(price) and price > 0:
+                return float(price)
+        return 0.0
+
     # ------------------------------------------------------------------
     # CRUD for backtest results
     # ------------------------------------------------------------------
@@ -959,6 +1316,95 @@ class BacktestService:
             "offset": safe_offset,
             "limit": safe_limit,
             "items": items,
+        }
+
+    def get_research_summary(
+        self,
+        *,
+        baseline_backtest_id: str,
+        trial_backtest_id: str,
+        market: str | None = None,
+        changed_variable: dict | None = None,
+        conclusion: str | None = None,
+        reason: str | None = None,
+        max_rebalance_items: int = 20,
+    ) -> dict:
+        """Return a compact, bounded comparison artifact for agent research."""
+        resolved_market = normalize_market(market)
+        baseline = self.get_backtest(baseline_backtest_id, market=resolved_market)
+        trial = self.get_backtest(trial_backtest_id, market=resolved_market)
+        baseline_summary = baseline.get("summary") or {}
+        trial_summary = trial.get("summary") or {}
+        metric_keys = [
+            "total_return",
+            "annual_return",
+            "sharpe_ratio",
+            "max_drawdown",
+            "annual_turnover",
+            "total_trades",
+        ]
+        baseline_metrics = {
+            key: baseline_summary.get(key)
+            for key in metric_keys
+            if baseline_summary.get(key) is not None
+        }
+        trial_metrics = {
+            key: trial_summary.get(key)
+            for key in metric_keys
+            if trial_summary.get(key) is not None
+        }
+        metric_delta = {}
+        for key in metric_keys:
+            if baseline_metrics.get(key) is None or trial_metrics.get(key) is None:
+                continue
+            try:
+                metric_delta[key] = round(
+                    float(trial_metrics[key]) - float(baseline_metrics[key]),
+                    6,
+                )
+            except (TypeError, ValueError):
+                continue
+
+        trial_rebalances = trial_summary.get("rebalance_diagnostics") or []
+        if not isinstance(trial_rebalances, list):
+            trial_rebalances = []
+        safe_limit = max(0, min(int(max_rebalance_items), 200))
+        digest_items = [
+            self._compact_rebalance_item(item)
+            for item in trial_rebalances[:safe_limit]
+            if isinstance(item, dict)
+        ]
+        decision = self._research_decision_from_metrics(
+            metric_delta,
+            conclusion=conclusion,
+            reason=reason,
+        )
+        return {
+            "market": resolved_market,
+            "baseline_id": baseline_backtest_id,
+            "trial_id": trial_backtest_id,
+            "baseline_strategy_id": baseline.get("strategy_id"),
+            "trial_strategy_id": trial.get("strategy_id"),
+            "changed_variable": changed_variable or {},
+            "metrics": {
+                "baseline": baseline_metrics,
+                "trial": trial_metrics,
+            },
+            "metric_delta": metric_delta,
+            "rebalance_digest": {
+                "total": len(trial_rebalances),
+                "shown": len(digest_items),
+                "items": digest_items,
+            },
+            "trade_digest": {
+                "baseline_trade_count": len(baseline.get("trades") or []),
+                "trial_trade_count": len(trial.get("trades") or []),
+            },
+            "decision": decision,
+            "size_policy": {
+                "max_rebalance_items": safe_limit,
+                "heavy_payloads_omitted": True,
+            },
         }
 
     def delete_backtest(self, backtest_id: str, market: str | None = None) -> None:
@@ -1303,6 +1749,9 @@ class BacktestService:
             ),
             "debug_dates": {str(d)[:10] for d in dates} if isinstance(dates, list) else None,
             "rebalance": [],
+            "captured_items": 0,
+            "skipped_items": 0,
+            "skipped_by_date": 0,
         }
 
     @classmethod
@@ -1324,6 +1773,8 @@ class BacktestService:
             return
         debug_dates = debug_state.get("debug_dates")
         if debug_dates and str(date_key)[:10] not in debug_dates:
+            debug_state["skipped_items"] = int(debug_state.get("skipped_items") or 0) + 1
+            debug_state["skipped_by_date"] = int(debug_state.get("skipped_by_date") or 0) + 1
             return
 
         tickers = debug_state.get("debug_tickers")
@@ -1349,6 +1800,7 @@ class BacktestService:
                 tickers,
             )
         debug_state.setdefault("rebalance", []).append(item)
+        debug_state["captured_items"] = int(debug_state.get("captured_items") or 0) + 1
 
     @classmethod
     def _write_debug_replay_bundle(
@@ -1383,6 +1835,9 @@ class BacktestService:
                 "total_trades": result.total_trades,
                 "dates": len(result.dates),
                 "rebalance_diagnostics": len(rebalance_diagnostics or []),
+                "captured_items": int(debug_state.get("captured_items") or 0),
+                "skipped_items": int(debug_state.get("skipped_items") or 0),
+                "skipped_by_date": int(debug_state.get("skipped_by_date") or 0),
             },
             "files": {"rebalance": "rebalance.jsonl"},
         }
@@ -1641,11 +2096,13 @@ class BacktestService:
         planned_prices: pd.DataFrame,
         raw_signals: pd.DataFrame,
         selected_weights: dict[str, float],
+        current_weights: dict[str, float] | None = None,
         prices_close: pd.DataFrame,
         trade_ts: pd.Timestamp,
         diagnostics: dict[str, Any],
     ) -> None:
-        for ticker in selected_weights:
+        involved_tickers = set(selected_weights) | set(current_weights or {})
+        for ticker in sorted(involved_tickers):
             if ticker not in planned_prices.columns:
                 continue
             source = "strategy_output"
@@ -1746,9 +2203,10 @@ class BacktestService:
             }
 
         else:
-            # Default to equal weight
-            n = len(buys)
-            weights = {ticker: 1.0 / n for ticker in buys.index}
+            raise ValueError(
+                "Unsupported position_sizing "
+                f"'{method}'. Supported values: {sorted(SUPPORTED_POSITION_SIZING)}"
+            )
 
         return weights
 
@@ -1833,6 +2291,31 @@ class BacktestService:
             else:
                 normalized[key] = value
         return normalized
+
+    @staticmethod
+    def _resolve_run_constraint_config(
+        *,
+        strategy_config: dict | None,
+        config_dict: dict | None,
+    ) -> dict:
+        """Merge strategy constraints, nested run constraints, and legacy top-level run fields."""
+        run = config_dict if isinstance(config_dict, dict) else {}
+        top_level: dict[str, Any] = {}
+        for key in {
+            "max_single_name_weight",
+            "weekly_turnover_floor",
+            "weekly_turnover_exclude_initial",
+            "rebalance_drift_buffer",
+        }:
+            if key in run:
+                top_level[key] = run[key]
+        if "holding_period" in run:
+            top_level["holding_period"] = run["holding_period"]
+        merged_run = BacktestService._merge_constraint_config(
+            run.get("constraint_config"),
+            top_level,
+        )
+        return BacktestService._merge_constraint_config(strategy_config, merged_run)
 
     @staticmethod
     def _resolve_rebalance_buffer(config_dict: dict, constraint_config: dict) -> float:
@@ -2349,9 +2832,25 @@ class BacktestService:
                     log.warning("backtest_service.batch_predict.empty_X", model_id=model_id)
                     continue
 
+                load_frozen = getattr(self._model_service, "_load_frozen_features", None)
+                frozen = load_frozen(model_id) if callable(load_frozen) else None
+                if frozen:
+                    align_frozen = getattr(self._model_service, "_align_features_to_frozen", None)
+                    if not callable(align_frozen):
+                        raise ValueError(
+                            f"Model {model_id} has frozen features but model service cannot align them"
+                        )
+                    X_model = align_frozen(
+                        X,
+                        frozen,
+                        model_id,
+                    )
+                else:
+                    X_model = X
+
                 # Run prediction on entire X at once
-                all_preds = model_instance.predict(X)
-                all_preds.index = X.index
+                all_preds = model_instance.predict(X_model)
+                all_preds.index = X_model.index
 
                 # Slice by date and store
                 dates_in_X = all_preds.index.get_level_values("date").unique()
@@ -2678,12 +3177,15 @@ class BacktestService:
             if not isinstance(container, dict):
                 continue
             candidates.extend([
+                container.get("effective_label_horizon"),
                 container.get("label_horizon"),
                 container.get("horizon"),
             ])
             label_summary = container.get("label_summary")
             if isinstance(label_summary, dict):
                 candidates.extend([
+                    label_summary.get("effective_horizon"),
+                    label_summary.get("effective_label_horizon"),
                     label_summary.get("horizon"),
                     label_summary.get("label_horizon"),
                 ])
@@ -2694,14 +3196,15 @@ class BacktestService:
         except Exception:
             pass
 
+        max_horizon = 0
         for value in candidates:
             if value is None:
                 continue
             try:
-                return max(0, int(value))
+                max_horizon = max(max_horizon, int(value))
             except (TypeError, ValueError):
                 continue
-        return 0
+        return max(0, max_horizon)
 
     @staticmethod
     def _read_model_metadata_label_horizon(model_id: str | None) -> list[Any]:
@@ -2712,24 +3215,30 @@ class BacktestService:
             return []
         meta = json.loads(meta_path.read_text())
         candidates = [
+            meta.get("effective_label_horizon"),
             meta.get("label_horizon"),
             meta.get("horizon"),
         ]
         label_summary = meta.get("label_summary")
         if isinstance(label_summary, dict):
             candidates.extend([
+                label_summary.get("effective_horizon"),
+                label_summary.get("effective_label_horizon"),
                 label_summary.get("horizon"),
                 label_summary.get("label_horizon"),
             ])
         eval_metrics = meta.get("eval_metrics")
         if isinstance(eval_metrics, dict):
             candidates.extend([
+                eval_metrics.get("effective_label_horizon"),
                 eval_metrics.get("label_horizon"),
                 eval_metrics.get("horizon"),
             ])
             metric_label_summary = eval_metrics.get("label_summary")
             if isinstance(metric_label_summary, dict):
                 candidates.extend([
+                    metric_label_summary.get("effective_horizon"),
+                    metric_label_summary.get("effective_label_horizon"),
                     metric_label_summary.get("horizon"),
                     metric_label_summary.get("label_horizon"),
                 ])
@@ -2743,12 +3252,15 @@ class BacktestService:
         config: dict,
         result: BacktestResult,
         result_level: str,
+        conn: Any | None = None,
     ) -> None:
         """Persist backtest result to DuckDB."""
-        conn = get_connection()
+        conn = conn or get_connection()
         now = utc_now_naive()
 
         resolved_market = normalize_market(market)
+        trade_diagnostics = dict(result.trade_diagnostics or {})
+        staged_summary_updates = trade_diagnostics.pop("staged_summary_updates", None)
         summary = {
             "market": resolved_market,
             "total_return": result.total_return,
@@ -2763,7 +3275,7 @@ class BacktestService:
             "total_trades": result.total_trades,
             "annual_turnover": result.annual_turnover,
             "total_cost": result.total_cost,
-            "trade_diagnostics": result.trade_diagnostics,
+            "trade_diagnostics": trade_diagnostics,
         }
         summary["reproducibility_fingerprint"] = self._build_reproducibility_fingerprint(
             strategy_id=strategy_id,
@@ -2771,6 +3283,8 @@ class BacktestService:
             config=config,
             result=result,
         )
+        if isinstance(staged_summary_updates, dict):
+            summary.update(staged_summary_updates)
 
         # Build nav_series as {dates: [...], values: [...]}
         nav_series_data = {
@@ -2942,8 +3456,83 @@ class BacktestService:
                 "trades": result.total_trades,
             },
         }
+        runtime_state = _git_runtime_state()
+        payload["runtime"] = runtime_state
+        comparability_warnings = []
+        if runtime_state.get("dirty"):
+            comparability_warnings.append("dirty_worktree")
+        payload["comparability"] = {
+            "clean_runtime": not bool(runtime_state.get("dirty")),
+            "warnings": comparability_warnings,
+        }
         payload["hash"] = _fingerprint_hash(payload)
         return payload
+
+    @staticmethod
+    def _compact_rebalance_item(item: dict) -> dict:
+        positions_after = item.get("positions_after") or {}
+        target_after = item.get("target_positions_after") or {}
+        if not isinstance(positions_after, dict):
+            positions_after = {}
+        if not isinstance(target_after, dict):
+            target_after = {}
+        return {
+            "date": item.get("date"),
+            "phase": item.get("phase"),
+            "added": list(item.get("added") or [])[:20],
+            "removed": list(item.get("removed") or [])[:20],
+            "increased": list(item.get("increased") or [])[:20],
+            "decreased": list(item.get("decreased") or [])[:20],
+            "turnover": item.get("turnover"),
+            "target_turnover": item.get("target_turnover"),
+            "position_count": len(positions_after),
+            "target_position_count": len(target_after),
+            "top_positions_after": BacktestService._top_weight_items(positions_after, limit=10),
+        }
+
+    @staticmethod
+    def _top_weight_items(weights: dict, *, limit: int) -> list[dict]:
+        items = []
+        for ticker, weight in weights.items():
+            try:
+                items.append({"ticker": str(ticker), "weight": round(float(weight), 6)})
+            except (TypeError, ValueError):
+                continue
+        return sorted(items, key=lambda item: abs(item["weight"]), reverse=True)[:limit]
+
+    @staticmethod
+    def _research_decision_from_metrics(
+        metric_delta: dict,
+        *,
+        conclusion: str | None,
+        reason: str | None,
+    ) -> dict:
+        normalized = (conclusion or "").strip().lower()
+        if normalized not in {"promote", "continue", "stop"}:
+            sharpe_delta = metric_delta.get("sharpe_ratio")
+            return_delta = metric_delta.get("total_return")
+            drawdown_delta = metric_delta.get("max_drawdown")
+            if (
+                sharpe_delta is not None
+                and return_delta is not None
+                and float(sharpe_delta) > 0
+                and float(return_delta) > 0
+                and (drawdown_delta is None or float(drawdown_delta) >= 0)
+            ):
+                normalized = "promote"
+            elif (
+                sharpe_delta is not None
+                and return_delta is not None
+                and float(sharpe_delta) < 0
+                and float(return_delta) <= 0
+            ):
+                normalized = "stop"
+            else:
+                normalized = "continue"
+        return {
+            "conclusion": normalized,
+            "reason": reason or "derived_from_metric_delta",
+        }
 
     @staticmethod
     def _update_result_summary(
@@ -2965,6 +3554,22 @@ class BacktestService:
             "UPDATE backtest_results SET summary = ? WHERE id = ? AND market = ?",
             [json.dumps(summary_data, default=str), bt_id, market],
         )
+
+    @staticmethod
+    def _update_staged_result_summary(
+        save_payload: dict,
+        updates: dict,
+    ) -> None:
+        result = save_payload.get("result")
+        if not isinstance(result, BacktestResult):
+            return
+        trade_diagnostics = dict(result.trade_diagnostics or {})
+        staged_summary_updates = trade_diagnostics.setdefault(
+            "staged_summary_updates",
+            {},
+        )
+        staged_summary_updates.update(updates)
+        result.trade_diagnostics = trade_diagnostics
 
 
 # ------------------------------------------------------------------
@@ -3027,6 +3632,63 @@ def _git_commit_hash() -> str | None:
         return result.stdout.strip() or None
     except Exception:
         return None
+
+
+def _git_runtime_state() -> dict:
+    try:
+        diff_result = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--",
+                "backend/services",
+                "backend/factors",
+                "backend/models",
+                "backend/strategies",
+                "backend/tasks",
+            ],
+            cwd=settings.project_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        status_result = subprocess.run(
+            [
+                "git",
+                "status",
+                "--short",
+                "--",
+                "backend/services",
+                "backend/factors",
+                "backend/models",
+                "backend/strategies",
+                "backend/tasks",
+            ],
+            cwd=settings.project_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        diff_text = diff_result.stdout or ""
+        status_lines = [
+            line.strip()
+            for line in (status_result.stdout or "").splitlines()
+            if line.strip()
+        ]
+        return {
+            "dirty": bool(diff_text.strip() or status_lines),
+            "dirty_paths": [line[3:] if len(line) > 3 else line for line in status_lines],
+            "patch_hash": _sha256_text(diff_text) if diff_text.strip() else None,
+        }
+    except Exception as exc:
+        return {
+            "dirty": None,
+            "dirty_paths": [],
+            "patch_hash": None,
+            "error": str(exc),
+        }
 
 
 def _compute_stock_pnl(trades: list[dict]) -> list[dict]:

@@ -1,8 +1,12 @@
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
+from unittest.mock import patch
 
 import pandas as pd
 
 from backend.factors.loader import load_factor_from_code
+from backend.strategies import loader as strategy_loader
 from backend.strategies.base import StrategyContext
 from backend.strategies.loader import load_strategy_from_code
 from backend.services.custom_code_runner import UserCodeExecutionError
@@ -103,6 +107,41 @@ class BuyStrategy(StrategyBase):
         self.assertEqual(strategy.name, "buy_strategy")
         self.assertEqual(strategy.required_factors(), ["momentum_20"])
         self.assertEqual(result.loc["AAA", "signal"], 1)
+
+    def test_strategy_loader_serializes_and_caches_same_source_metadata(self):
+        source = """
+from backend.strategies.base import StrategyBase
+
+class CachedStrategy(StrategyBase):
+    name = "cached_strategy"
+
+    def generate_signals(self, context):
+        return {}
+"""
+        strategy_loader._STRATEGY_METADATA_CACHE.clear()
+        calls = 0
+        inside_first = Event()
+        release_first = Event()
+
+        def fake_run_user_code_isolated(**kwargs):
+            nonlocal calls
+            calls += 1
+            inside_first.set()
+            release_first.wait(timeout=1)
+            return {"name": "cached_strategy", "required_factors": [], "required_models": []}
+
+        with patch.object(strategy_loader, "run_user_code_isolated", side_effect=fake_run_user_code_isolated):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                future_a = pool.submit(load_strategy_from_code, source)
+                self.assertTrue(inside_first.wait(timeout=1))
+                future_b = pool.submit(load_strategy_from_code, source)
+                release_first.set()
+                strategy_a = future_a.result(timeout=2)
+                strategy_b = future_b.result(timeout=2)
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(strategy_a.name, "cached_strategy")
+        self.assertEqual(strategy_b.name, "cached_strategy")
 
     def test_isolated_strategy_propagates_context_diagnostics(self):
         source = """

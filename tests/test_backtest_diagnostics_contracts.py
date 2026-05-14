@@ -126,6 +126,39 @@ class BacktestDiagnosticsContractTests(unittest.TestCase):
             any(sample["planned_price_source"] == "decision_close" for sample in diagnostics["samples"])
         )
 
+    def test_planned_price_matrix_includes_positions_removed_from_target(self):
+        dates = pd.to_datetime(["2026-04-06"])
+        prices_close = pd.DataFrame(
+            {"AAA": [10.0], "BBB": [20.0]},
+            index=dates,
+        )
+        raw_signals = pd.DataFrame(
+            {
+                "signal": [1],
+                "weight": [0.5],
+                "strength": [3.0],
+                "planned_price": [10.5],
+            },
+            index=["AAA"],
+        )
+        planned_prices = pd.DataFrame(index=dates, columns=["AAA", "BBB"], dtype=float)
+        diagnostics = {"fallback_count": 0, "invalid_count": 0, "samples": []}
+
+        BacktestService._write_planned_prices_for_date(
+            planned_prices=planned_prices,
+            raw_signals=raw_signals,
+            selected_weights={"AAA": 0.5},
+            current_weights={"BBB": 0.5},
+            prices_close=prices_close,
+            trade_ts=dates[0],
+            diagnostics=diagnostics,
+        )
+
+        self.assertEqual(float(planned_prices.loc[dates[0], "AAA"]), 10.5)
+        self.assertEqual(float(planned_prices.loc[dates[0], "BBB"]), 20.0)
+        bbb_sample = next(sample for sample in diagnostics["samples"] if sample["ticker"] == "BBB")
+        self.assertEqual(bbb_sample["planned_price_source"], "decision_close")
+
     def test_portfolio_compliance_metrics_flag_concentration_without_default_holding_violation(self):
         metrics = BacktestService._build_portfolio_compliance_metrics(
             rebalance_diagnostics=[
@@ -250,6 +283,92 @@ class BacktestDiagnosticsContractTests(unittest.TestCase):
         self.assertFalse(report["constraint_pass"])
         self.assertIn("weekly_turnover_floor", report["failed_constraints"])
         self.assertEqual(report["weekly_turnover"]["weeks"][1]["pass"], False)
+
+    def test_top_level_backtest_constraint_config_is_preserved(self):
+        constraints = BacktestService._resolve_run_constraint_config(
+            strategy_config=None,
+            config_dict={"max_single_name_weight": 0.20},
+        )
+
+        weights, actions = BacktestService._apply_weight_constraints(
+            {"AAPL": 0.40, "MSFT": 0.10},
+            constraints,
+        )
+        report = BacktestService._build_constraint_report(
+            constraint_config=constraints,
+            rebalance_diagnostics=[
+                {
+                    "date": "2026-01-09",
+                    "positions_after": weights,
+                    "turnover": 1.0,
+                    "constraint_actions": actions,
+                },
+            ],
+            trades=[],
+            startup_state_report=None,
+        )
+
+        self.assertEqual(constraints["max_single_name_weight"], 0.20)
+        self.assertEqual(weights["AAPL"], 0.20)
+        self.assertEqual(report["max_single_name_weight"]["limit"], 0.20)
+        self.assertEqual(report["max_single_name_weight"]["clipped_events"], 1)
+
+    def test_apply_position_sizing_rejects_unsupported_mode(self):
+        raw_signals = pd.DataFrame(
+            {"signal": [1], "weight": [0.5], "strength": [1.0]},
+            index=["AAPL"],
+        )
+
+        with self.assertRaisesRegex(ValueError, "Unsupported position_sizing"):
+            BacktestService._apply_position_sizing(
+                raw_signals,
+                "custom",
+                max_positions=10,
+            )
+
+    def test_filtered_full_debug_replay_reports_skipped_counts(self):
+        debug_state = BacktestService._init_debug_replay_state(
+            {
+                "debug_mode": True,
+                "debug_level": "full",
+                "debug_tickers": ["AAPL"],
+                "debug_dates": ["2026-01-09"],
+            },
+            market="US",
+        )
+
+        BacktestService._record_debug_rebalance(
+            debug_state,
+            date_key="2026-01-08",
+            model_predictions={},
+            factor_data={},
+            raw_signals=pd.DataFrame(),
+            target_weights={},
+            adjusted_weights={},
+            context_diagnostics=None,
+            positions_before={},
+            positions_after={},
+        )
+        BacktestService._record_debug_rebalance(
+            debug_state,
+            date_key="2026-01-09",
+            model_predictions={},
+            factor_data={},
+            raw_signals=pd.DataFrame(
+                {"signal": [1, 1], "weight": [0.5, 0.5], "strength": [1.0, 0.9]},
+                index=["AAPL", "MSFT"],
+            ),
+            target_weights={"AAPL": 0.5, "MSFT": 0.5},
+            adjusted_weights={"AAPL": 0.5, "MSFT": 0.5},
+            context_diagnostics=None,
+            positions_before={"MSFT": 0.5},
+            positions_after={"AAPL": 0.5, "MSFT": 0.5},
+        )
+
+        self.assertEqual(debug_state["captured_items"], 1)
+        self.assertEqual(debug_state["skipped_items"], 1)
+        self.assertEqual(debug_state["skipped_by_date"], 1)
+        self.assertEqual(len(debug_state["rebalance"]), 1)
 
     def test_constraint_report_fails_raw_target_budget_before_single_name_cap(self):
         weights, actions = BacktestService._apply_weight_constraints(
@@ -419,6 +538,56 @@ class BacktestDiagnosticsContractTests(unittest.TestCase):
         self.assertIn("model_a", result["2024-01-03"])
         self.assertIn("model_b", result["2024-01-03"])
 
+    def test_batch_predict_aligns_features_to_frozen_model_schema(self):
+        svc = BacktestService()
+        svc._model_service = _FrozenFeatureModelService(
+            feature_data={
+                "close": pd.DataFrame(
+                    {"AAA": [10.0, 11.0], "BBB": [20.0, 21.0]},
+                    index=pd.to_datetime(["2024-01-02", "2024-01-03"]),
+                ),
+                "extra_current_factor": pd.DataFrame(
+                    {"AAA": [1.0, 1.0], "BBB": [1.0, 1.0]},
+                    index=pd.to_datetime(["2024-01-02", "2024-01-03"]),
+                ),
+            },
+            frozen=["close"],
+        )
+
+        result = svc._batch_predict_all_dates(
+            ["model_frozen"],
+            tickers=["AAA", "BBB"],
+            start_date="2024-01-02",
+            end_date="2024-01-03",
+            rebalance_days=["2024-01-03"],
+            market="US",
+        )
+
+        self.assertEqual(svc._model_service.loaded_model.seen_columns, [["close"]])
+        self.assertIn("model_frozen", result["2024-01-03"])
+
+    def test_batch_predict_missing_frozen_feature_raises_clear_error(self):
+        svc = BacktestService()
+        svc._model_service = _FrozenFeatureModelService(
+            feature_data={
+                "extra_current_factor": pd.DataFrame(
+                    {"AAA": [1.0, 1.0], "BBB": [1.0, 1.0]},
+                    index=pd.to_datetime(["2024-01-02", "2024-01-03"]),
+                ),
+            },
+            frozen=["close"],
+        )
+
+        with self.assertRaisesRegex(ValueError, "missing frozen feature"):
+            svc._batch_predict_all_dates(
+                ["model_frozen"],
+                tickers=["AAA", "BBB"],
+                start_date="2024-01-02",
+                end_date="2024-01-03",
+                rebalance_days=["2024-01-03"],
+                market="US",
+            )
+
     def test_batch_predict_serializes_shared_feature_matrix_cache_builds(self):
         fake_model_service = _ConcurrentFeatureModelService()
         svc_a = BacktestService()
@@ -511,6 +680,134 @@ class BacktestDiagnosticsContractTests(unittest.TestCase):
             BacktestService._list_summary(summary)["reproducibility_hash"],
             "fp_hash",
         )
+
+    def test_reproducibility_fingerprint_marks_dirty_runtime_patch_hash(self):
+        svc = BacktestService.__new__(BacktestService)
+        svc._strategy_service = unittest.mock.Mock()
+        svc._model_service = unittest.mock.Mock()
+        svc._strategy_service.get_strategy.return_value = {
+            "id": "strategy_dirty",
+            "market": "US",
+            "name": "Dirty Strategy",
+            "version": 1,
+            "position_sizing": "equal_weight",
+            "source_code": "class S: pass",
+            "required_factors": [],
+            "required_models": [],
+        }
+        result = BacktestResult(
+            config={},
+            dates=["2026-01-02"],
+            nav=[1_000_000.0],
+            benchmark_nav=[1_000_000.0],
+            drawdown=[0.0],
+            total_return=0.0,
+            annual_return=0.0,
+            annual_volatility=0.0,
+            max_drawdown=0.0,
+            sharpe_ratio=0.0,
+            calmar_ratio=0.0,
+            sortino_ratio=0.0,
+            win_rate=0.0,
+            profit_loss_ratio=0.0,
+            total_trades=0,
+            annual_turnover=0.0,
+            total_cost=0.0,
+            monthly_returns=[],
+            trades=[],
+            trade_diagnostics={},
+        )
+
+        class _Conn:
+            def execute(self, sql, params=None):
+                return self
+
+            def fetchone(self):
+                return (None, None, 0, 0)
+
+        with (
+            patch("backend.services.backtest_service.get_connection", return_value=_Conn()),
+            patch("backend.services.backtest_service._git_commit_hash", return_value="abc123"),
+            patch(
+                "backend.services.backtest_service._git_runtime_state",
+                return_value={
+                    "dirty": True,
+                    "dirty_paths": ["backend/services/backtest_service.py"],
+                    "patch_hash": "patch123",
+                },
+            ),
+        ):
+            fingerprint = svc._build_reproducibility_fingerprint(
+                strategy_id="strategy_dirty",
+                market="US",
+                config={
+                    "start_date": "2026-01-02",
+                    "end_date": "2026-01-02",
+                    "benchmark": "SPY",
+                },
+                result=result,
+            )
+
+        self.assertTrue(fingerprint["runtime"]["dirty"])
+        self.assertEqual(fingerprint["runtime"]["patch_hash"], "patch123")
+        self.assertFalse(fingerprint["comparability"]["clean_runtime"])
+        self.assertIn("dirty_worktree", fingerprint["comparability"]["warnings"])
+
+    def test_compact_research_summary_bounds_rebalance_payload_and_reports_deltas(self):
+        svc = BacktestService.__new__(BacktestService)
+        svc.get_backtest = lambda bt_id, market=None: {
+            "id": bt_id,
+            "market": "US",
+            "strategy_id": f"strategy_{bt_id}",
+            "summary": {
+                "total_return": 0.10 if bt_id == "baseline" else 0.14,
+                "sharpe_ratio": 1.0 if bt_id == "baseline" else 1.3,
+                "max_drawdown": -0.10 if bt_id == "baseline" else -0.09,
+                "total_trades": 12 if bt_id == "baseline" else 14,
+                "rebalance_diagnostics": [
+                    {
+                        "date": "2026-01-05",
+                        "added": ["AAA"] if bt_id == "trial" else ["BBB"],
+                        "removed": ["CCC"] if bt_id == "trial" else [],
+                        "positions_after": {"AAA": 0.6, "BBB": 0.4},
+                    },
+                    {
+                        "date": "2026-01-06",
+                        "added": ["DDD"],
+                        "removed": [],
+                        "positions_after": {"DDD": 1.0},
+                    },
+                    {
+                        "date": "2026-01-07",
+                        "added": ["EEE"],
+                        "removed": [],
+                        "positions_after": {"EEE": 1.0},
+                    },
+                ],
+            },
+            "trades": [
+                {"ticker": "AAA", "action": "buy", "shares": 10, "price": 10.0},
+            ],
+        }
+
+        summary = svc.get_research_summary(
+            baseline_backtest_id="baseline",
+            trial_backtest_id="trial",
+            market="US",
+            changed_variable={"entry_guard": "relaxed"},
+            conclusion="promote",
+            reason="Sharpe improved with smaller drawdown",
+            max_rebalance_items=2,
+        )
+
+        self.assertEqual(summary["baseline_id"], "baseline")
+        self.assertEqual(summary["trial_id"], "trial")
+        self.assertEqual(summary["changed_variable"], {"entry_guard": "relaxed"})
+        self.assertEqual(summary["metric_delta"]["total_return"], 0.04)
+        self.assertEqual(summary["metric_delta"]["sharpe_ratio"], 0.3)
+        self.assertEqual(summary["rebalance_digest"]["shown"], 2)
+        self.assertEqual(summary["rebalance_digest"]["total"], 3)
+        self.assertEqual(summary["decision"]["conclusion"], "promote")
 
     def test_combine_portfolio_legs_builds_weighted_nav_and_leg_summary(self):
         svc = BacktestService()
@@ -704,6 +1001,43 @@ class _LinearPredictModel:
     def predict(self, X):
         base = 1.0 if self.model_id == "model_a" else 2.0
         return pd.Series(base + X["close"].astype(float), index=X.index)
+
+
+class _FrozenFeatureModelService(_SharedFeatureModelService):
+    def __init__(self, feature_data, frozen):
+        super().__init__()
+        self.feature_data = feature_data
+        self.frozen = frozen
+        self.loaded_model = _SchemaCheckingPredictModel()
+
+    def get_model(self, model_id, market=None):
+        return {"id": model_id, "feature_set_id": "shared_fs"}
+
+    def load_model(self, model_id, market=None):
+        self.load_model_calls.append(model_id)
+        return self.loaded_model
+
+    def compute_features_from_cache(self, fs_id, tickers, start_date, end_date, market=None):
+        self.feature_compute_calls += 1
+        return self.feature_data
+
+    def _load_frozen_features(self, model_id):
+        return self.frozen
+
+    def _align_features_to_frozen(self, X, frozen, model_id):
+        missing = [name for name in frozen if name not in X.columns]
+        if missing:
+            raise ValueError(f"missing frozen feature(s) for {model_id}: {missing}")
+        return X[frozen]
+
+
+class _SchemaCheckingPredictModel:
+    def __init__(self):
+        self.seen_columns = []
+
+    def predict(self, X):
+        self.seen_columns.append(list(X.columns))
+        return pd.Series(X.iloc[:, 0].astype(float), index=X.index)
 
 
 if __name__ == "__main__":

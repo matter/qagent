@@ -184,6 +184,80 @@ class SignalPaperMarketScopeTests(unittest.TestCase):
         self.assertEqual(advanced["market"], "CN")
         self.assertEqual(executor.params["market"], "CN")
 
+    def test_paper_advance_task_exposes_staged_domain_write_contract(self):
+        executor = _InlineExecutor()
+        service = _FakePaperAdvanceStagingService()
+
+        with (
+            patch.object(paper_api, "_get_executor", return_value=executor),
+            patch.object(paper_api, "_get_svc", return_value=service),
+        ):
+            response = asyncio.run(
+                paper_api.advance_session(
+                    "session_cn",
+                    paper_api.AdvanceRequest(market="CN", steps=1),
+                )
+            )
+
+        self.assertEqual(response["task_id"], "task_inline")
+        self.assertTrue(callable(service.stage_domain_write_seen))
+        self.assertEqual(executor.staged[0]["table"], "paper_trading_advance")
+        self.assertEqual(executor.result["staging"]["workflow"], "paper_trading_advance")
+
+    def test_paper_advance_stages_daily_and_session_updates_until_commit(self):
+        with self._patch_connections():
+            strategy = StrategyService().create_strategy(
+                "CN staged paper strategy",
+                _SIGNAL_STRATEGY_SOURCE,
+                market="CN",
+            )
+            self._insert_group("cn_group", "CN", ["sh.600000"])
+            self._insert_daily_bars("CN", "sh.600000", close=10.5)
+            session = PaperTradingService().create_session(
+                strategy_id=strategy["id"],
+                universe_group_id="cn_group",
+                start_date="2024-01-02",
+                market="CN",
+            )
+            staged = []
+            result = PaperTradingService().advance(
+                session["id"],
+                steps=1,
+                market="CN",
+                stage_domain_write=lambda table, payload=None, commit=None: staged.append(
+                    {"table": table, "payload": payload or {}, "commit": commit}
+                ),
+            )
+
+        self.assertEqual(result["days_processed"], 1)
+        self.assertEqual(staged[0]["table"], "paper_trading_advance")
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM paper_trading_daily WHERE session_id = ? AND market = 'CN'",
+                [session["id"]],
+            ).fetchone()[0],
+            0,
+        )
+
+        staged[0]["commit"](conn=self.conn)
+
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM paper_trading_daily WHERE session_id = ? AND market = 'CN'",
+                [session["id"]],
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            str(
+                self.conn.execute(
+                    "SELECT current_date FROM paper_trading_sessions WHERE id = ? AND market = 'CN'",
+                    [session["id"]],
+                ).fetchone()[0]
+            ),
+            "2024-01-02",
+        )
+
     def _insert_group(self, group_id: str, market: str, tickers: list[str]):
         self.conn.execute(
             """
@@ -421,6 +495,39 @@ class _FakePaperService:
 
     def advance(self, session_id, target_date=None, steps=0, market=None):
         return {"session_id": session_id, "market": market}
+
+
+class _FakePaperAdvanceStagingService:
+    def __init__(self):
+        self.stage_domain_write_seen = None
+
+    def advance(self, session_id, target_date=None, steps=0, market=None, stage_domain_write=None):
+        self.stage_domain_write_seen = stage_domain_write
+        if callable(stage_domain_write):
+            stage_domain_write(
+                "paper_trading_advance",
+                {"session_id": session_id, "market": market},
+            )
+        return {
+            "session_id": session_id,
+            "market": market,
+            "staging": {"workflow": "paper_trading_advance"},
+        }
+
+
+class _InlineExecutor:
+    def __init__(self):
+        self.staged = []
+        self.result = None
+
+    def submit(self, task_type, fn, params, timeout, source=None):
+        self.result = fn(
+            **params,
+            stage_domain_write=lambda table, payload=None, commit=None: self.staged.append(
+                {"table": table, "payload": payload or {}, "has_commit": callable(commit)}
+            ),
+        )
+        return "task_inline"
 
 
 if __name__ == "__main__":

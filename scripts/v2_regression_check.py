@@ -80,7 +80,7 @@ def check_market_context_defaults() -> CheckResult:
             "us_benchmark": "SPY",
             "cn_benchmark": "sh.000300",
             "us_group": "us_all_market",
-            "cn_group": "cn_all_a",
+            "cn_group": "cn_a_core_indices_union",
         }
         mismatches = {
             key: {"actual": checks[key], "expected": expected[key]}

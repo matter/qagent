@@ -43,6 +43,78 @@ class ModelStrategy(StrategyBase):
 """
 
 
+_STATEFUL_BUFFER_STRATEGY_SOURCE = """\
+import pandas as pd
+from backend.strategies.base import StrategyBase, StrategyContext
+
+
+class StatefulBufferStrategy(StrategyBase):
+    name = "StatefulBuffer"
+
+    def generate_signals(self, context: StrategyContext) -> pd.DataFrame:
+        date_key = str(context.current_date.date())
+        context.diagnostics["context_weights"] = dict(context.current_weights)
+        if date_key == "2026-04-06":
+            return pd.DataFrame(
+                {"signal": [1, 1], "weight": [0.50, 0.50], "strength": [1.0, 1.0]},
+                index=["AAA", "BBB"],
+            )
+        if date_key == "2026-04-07":
+            return pd.DataFrame(
+                {"signal": [1, 1], "weight": [0.54, 0.46], "strength": [1.0, 1.0]},
+                index=["AAA", "BBB"],
+            )
+        return pd.DataFrame(
+            {"signal": [1, 1], "weight": [0.54, 0.46], "strength": [1.0, 1.0]},
+            index=["AAA", "BBB"],
+        )
+"""
+
+
+_STATEFUL_PLANNED_BLOCK_STRATEGY_SOURCE = """\
+import pandas as pd
+from backend.strategies.base import StrategyBase, StrategyContext
+
+
+class StatefulPlannedBlockStrategy(StrategyBase):
+    name = "StatefulPlannedBlock"
+
+    def generate_signals(self, context: StrategyContext) -> pd.DataFrame:
+        context.diagnostics["context_weights"] = dict(context.current_weights)
+        return pd.DataFrame(
+            {
+                "signal": [1],
+                "weight": [0.50],
+                "strength": [1.0],
+                "planned_price": [20.0],
+            },
+            index=["AAA"],
+        )
+"""
+
+
+_STATEFUL_ACTUAL_OPEN_CASH_BUFFER_STRATEGY_SOURCE = """\
+import pandas as pd
+from backend.strategies.base import StrategyBase, StrategyContext
+
+
+class StatefulActualOpenCashBufferStrategy(StrategyBase):
+    name = "StatefulActualOpenCashBuffer"
+
+    def generate_signals(self, context: StrategyContext) -> pd.DataFrame:
+        date_key = str(context.current_date.date())
+        context.diagnostics["context_weights"] = dict(context.current_weights)
+        if date_key == "2026-04-06":
+            weight = 0.50
+        else:
+            weight = 0.54
+        return pd.DataFrame(
+            {"signal": [1], "weight": [weight], "strength": [1.0]},
+            index=["AAA"],
+        )
+"""
+
+
 class StrategyBacktestMarketScopeTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -142,6 +214,50 @@ class StrategyBacktestMarketScopeTests(unittest.TestCase):
         self.assertEqual(open_df.loc["2024-01-02", "sh.600000"], 10)
         self.assertEqual(float(benchmark.iloc[0]), 3000.5)
 
+    def test_backtest_engine_planned_price_can_fallback_to_next_close(self):
+        dates = pd.to_datetime(["2026-04-06", "2026-04-07"])
+        signals = pd.DataFrame({"AAA": [1.0, 1.0]}, index=dates)
+        planned_prices = pd.DataFrame({"AAA": [10.81, 10.81]}, index=dates)
+        close = pd.DataFrame({"AAA": [10.0, 12.0]}, index=dates)
+        open_ = pd.DataFrame({"AAA": [10.0, 11.0]}, index=dates)
+        high = pd.DataFrame({"AAA": [10.2, 12.0]}, index=dates)
+        low = pd.DataFrame({"AAA": [9.8, 10.8]}, index=dates)
+        volume = pd.DataFrame({"AAA": [100.0, 100.0]}, index=dates)
+        engine = BacktestEngine()
+
+        with (
+            patch.object(
+                engine,
+                "_load_prices",
+                return_value=(close, open_, high, low, volume),
+            ),
+            patch.object(engine, "_load_benchmark", return_value=close["AAA"]),
+        ):
+            result = engine.run(
+                signals,
+                BacktestConfig(
+                    start_date="2026-04-06",
+                    end_date="2026-04-07",
+                    market="US",
+                    benchmark="SPY",
+                    initial_capital=1200.0,
+                    commission_rate=0.0,
+                    slippage_rate=0.0,
+                    rebalance_freq="daily",
+                    execution_model="planned_price",
+                    planned_price_buffer_bps=50,
+                    planned_price_fallback="next_close",
+                ),
+                planned_prices=planned_prices,
+            )
+
+        self.assertEqual(len(result.trades), 1)
+        self.assertEqual(result.trades[0]["price"], 12.0)
+        planned_diag = result.trade_diagnostics["planned_price_execution"]
+        self.assertEqual(planned_diag["planned_fill_count"], 0)
+        self.assertEqual(planned_diag["fallback_close_count"], 1)
+        self.assertEqual(planned_diag["filled"][0]["fill_type"], "fallback_close")
+
     def test_raw_weight_position_sizing_preserves_strategy_cash_budget(self):
         raw_signals = pd.DataFrame(
             {
@@ -186,6 +302,16 @@ class StrategyBacktestMarketScopeTests(unittest.TestCase):
         self.assertIn("planned_price", normalized.columns)
         self.assertEqual(float(normalized.loc["AAA", "planned_price"]), 10.5)
 
+    def test_create_strategy_rejects_unsupported_position_sizing(self):
+        with self._patch_connections():
+            with self.assertRaisesRegex(ValueError, "Unsupported position_sizing"):
+                StrategyService().create_strategy(
+                    name="bad sizing",
+                    source_code=_BASIC_STRATEGY_SOURCE,
+                    position_sizing="custom",
+                    market="US",
+                )
+
     def test_leakage_audit_uses_forward_label_horizon_effective_data_end(self):
         svc = BacktestService.__new__(BacktestService)
         svc._model_service = unittest.mock.Mock()
@@ -219,6 +345,40 @@ class StrategyBacktestMarketScopeTests(unittest.TestCase):
         self.assertEqual(warnings[0]["model_data_end"], "2026-01-30")
         self.assertEqual(warnings[0]["model_window_end"], "2025-12-31")
         self.assertEqual(warnings[0]["label_horizon"], 20)
+
+    def test_leakage_audit_prefers_effective_label_horizon(self):
+        svc = BacktestService.__new__(BacktestService)
+        svc._model_service = unittest.mock.Mock()
+        svc._group_service = unittest.mock.Mock()
+        svc._model_service.get_model.return_value = {
+            "id": "model_composite",
+            "name": "Composite 10 outer 20 effective",
+            "market": "US",
+            "train_config": {
+                "train_start": "2025-01-02",
+                "train_end": "2025-10-31",
+                "valid_end": "2025-11-28",
+                "test_end": "2025-12-31",
+            },
+            "eval_metrics": {
+                "label_horizon": 10,
+                "effective_label_horizon": 20,
+                "label_summary": {"horizon": 10, "effective_horizon": 20},
+            },
+        }
+        svc._group_service.get_group_tickers.return_value = ["AAPL"]
+
+        warnings = svc._check_data_leakage(
+            ["model_composite"],
+            BacktestConfig(start_date="2026-01-02", end_date="2026-02-27", market="US"),
+            ["AAPL"],
+            "sp500",
+            market="US",
+        )
+
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(warnings[0]["label_horizon"], 20)
+        self.assertEqual(warnings[0]["model_data_end"], "2026-01-30")
 
     def test_leakage_audit_allows_safe_forward_label_horizon_cutoff(self):
         svc = BacktestService.__new__(BacktestService)
@@ -340,6 +500,263 @@ class StrategyBacktestMarketScopeTests(unittest.TestCase):
 
         self.assertFalse(captured["config"].normalize_target_weights)
         self.assertEqual(float(captured["weights"].loc[pd.Timestamp("2026-04-06"), "AAA"]), 0.5)
+
+    def test_strategy_context_tracks_engine_holdings_after_rebalance_buffer(self):
+        captured_diagnostics = {}
+        svc = BacktestService.__new__(BacktestService)
+        svc._strategy_service = unittest.mock.Mock()
+        svc._strategy_service.get_strategy.return_value = {
+            "id": "strategy-stateful-buffer",
+            "name": "Stateful Buffer Strategy",
+            "version": 1,
+            "source_code": _STATEFUL_BUFFER_STRATEGY_SOURCE,
+            "required_factors": [],
+            "required_models": [],
+            "position_sizing": "raw_weight",
+        }
+        svc._group_service = unittest.mock.Mock()
+        svc._group_service.get_group_tickers.return_value = ["AAA", "BBB"]
+        svc._model_service = unittest.mock.Mock()
+        svc._factor_engine = unittest.mock.Mock()
+        svc._backtest_engine = BacktestEngine()
+
+        dates = pd.to_datetime(["2026-04-06", "2026-04-07", "2026-04-08", "2026-04-09"])
+        prices = pd.DataFrame(
+            {
+                "AAA": [10.0, 10.0, 10.0, 10.0],
+                "BBB": [10.0, 10.0, 10.0, 10.0],
+            },
+            index=dates,
+        )
+        prices_empty = pd.DataFrame(
+            {
+                "AAA": [0.0, 0.0, 0.0, 0.0],
+                "BBB": [0.0, 0.0, 0.0, 0.0],
+            },
+            index=dates,
+        )
+
+        original_merge = BacktestService._merge_engine_rebalance_diagnostics
+
+        def capture_merge(service_diagnostics, engine_diagnostics):
+            captured_diagnostics["service"] = service_diagnostics
+            captured_diagnostics["engine"] = engine_diagnostics
+            return original_merge(
+                service_diagnostics,
+                engine_diagnostics,
+            )
+
+        with (
+            patch.object(BacktestService, "_validate_benchmark_market"),
+            patch.object(StrategyService, "_validate_dependencies"),
+            patch.object(
+                svc._backtest_engine,
+                "_load_prices",
+                return_value=(prices, prices, prices_empty, prices_empty, prices_empty),
+            ),
+            patch.object(svc._backtest_engine, "_load_benchmark", return_value=prices["AAA"]),
+            patch.object(BacktestService, "_resolve_factor_ids", return_value={}),
+            patch.object(BacktestService, "_batch_predict_all_dates", return_value={}),
+            patch.object(BacktestService, "_save_result"),
+            patch.object(BacktestService, "_build_reproducibility_fingerprint", return_value={}),
+            patch.object(BacktestService, "_check_data_leakage", return_value=[]),
+            patch.object(BacktestService, "_merge_engine_rebalance_diagnostics", side_effect=capture_merge),
+            patch("backend.services.backtest_service.get_connection", return_value=self.conn),
+        ):
+            svc.run_backtest(
+                "strategy-stateful-buffer",
+                {
+                    "start_date": "2026-04-06",
+                    "end_date": "2026-04-09",
+                    "benchmark": "SPY",
+                    "rebalance_freq": "daily",
+                    "rebalance_buffer": 0.05,
+                    "rebalance_buffer_mode": "hold_overlap_only",
+                    "normalize_target_weights": False,
+                },
+                "sp500",
+                market="US",
+            )
+
+        service_diag_by_date = {
+            item["date"]: item
+            for item in captured_diagnostics["service"]
+        }
+        engine_diag_by_date = {
+            item["date"]: item
+            for item in captured_diagnostics["engine"]
+        }
+
+        self.assertEqual(
+            engine_diag_by_date["2026-04-08"]["executed_positions_after"],
+            {"AAA": 0.5, "BBB": 0.5},
+        )
+        self.assertEqual(
+            service_diag_by_date["2026-04-08"]["context_weights"],
+            {"AAA": 0.5, "BBB": 0.5},
+        )
+
+    def test_strategy_context_does_not_assume_blocked_planned_price_fill(self):
+        captured_diagnostics = {}
+        svc = BacktestService.__new__(BacktestService)
+        svc._strategy_service = unittest.mock.Mock()
+        svc._strategy_service.get_strategy.return_value = {
+            "id": "strategy-planned-block",
+            "name": "Stateful Planned Block Strategy",
+            "version": 1,
+            "source_code": _STATEFUL_PLANNED_BLOCK_STRATEGY_SOURCE,
+            "required_factors": [],
+            "required_models": [],
+            "position_sizing": "raw_weight",
+        }
+        svc._group_service = unittest.mock.Mock()
+        svc._group_service.get_group_tickers.return_value = ["AAA"]
+        svc._model_service = unittest.mock.Mock()
+        svc._factor_engine = unittest.mock.Mock()
+        svc._backtest_engine = BacktestEngine()
+
+        dates = pd.to_datetime(["2026-04-06", "2026-04-07", "2026-04-08"])
+        close = pd.DataFrame({"AAA": [10.0, 10.0, 10.0]}, index=dates)
+        open_ = pd.DataFrame({"AAA": [10.0, 10.0, 10.0]}, index=dates)
+        high = pd.DataFrame({"AAA": [10.1, 10.1, 10.1]}, index=dates)
+        low = pd.DataFrame({"AAA": [9.9, 9.9, 9.9]}, index=dates)
+        volume = pd.DataFrame({"AAA": [100.0, 100.0, 100.0]}, index=dates)
+
+        original_merge = BacktestService._merge_engine_rebalance_diagnostics
+
+        def capture_merge(service_diagnostics, engine_diagnostics):
+            captured_diagnostics["service"] = service_diagnostics
+            captured_diagnostics["engine"] = engine_diagnostics
+            return original_merge(service_diagnostics, engine_diagnostics)
+
+        with (
+            patch.object(BacktestService, "_validate_benchmark_market"),
+            patch.object(StrategyService, "_validate_dependencies"),
+            patch.object(
+                svc._backtest_engine,
+                "_load_prices",
+                return_value=(close, open_, high, low, volume),
+            ),
+            patch.object(svc._backtest_engine, "_load_benchmark", return_value=close["AAA"]),
+            patch.object(BacktestService, "_resolve_factor_ids", return_value={}),
+            patch.object(BacktestService, "_batch_predict_all_dates", return_value={}),
+            patch.object(BacktestService, "_save_result"),
+            patch.object(BacktestService, "_build_reproducibility_fingerprint", return_value={}),
+            patch.object(BacktestService, "_check_data_leakage", return_value=[]),
+            patch.object(BacktestService, "_merge_engine_rebalance_diagnostics", side_effect=capture_merge),
+            patch("backend.services.backtest_service.get_connection", return_value=self.conn),
+        ):
+            svc.run_backtest(
+                "strategy-planned-block",
+                {
+                    "start_date": "2026-04-06",
+                    "end_date": "2026-04-08",
+                    "benchmark": "SPY",
+                    "rebalance_freq": "daily",
+                    "execution_model": "planned_price",
+                    "planned_price_buffer_bps": 50,
+                    "normalize_target_weights": False,
+                },
+                "sp500",
+                market="US",
+            )
+
+        service_diag_by_date = {
+            item["date"]: item
+            for item in captured_diagnostics["service"]
+        }
+        engine_diag_by_date = {
+            item["date"]: item
+            for item in captured_diagnostics["engine"]
+        }
+
+        self.assertEqual(
+            engine_diag_by_date["2026-04-07"]["executed_positions_after"],
+            {},
+        )
+        self.assertEqual(
+            service_diag_by_date["2026-04-07"]["context_weights"],
+            {},
+        )
+
+    def test_strategy_context_actual_open_buffer_preserves_cash_weight(self):
+        captured_diagnostics = {}
+        svc = BacktestService.__new__(BacktestService)
+        svc._strategy_service = unittest.mock.Mock()
+        svc._strategy_service.get_strategy.return_value = {
+            "id": "strategy-actual-open-cash-buffer",
+            "name": "Stateful Actual Open Cash Buffer Strategy",
+            "version": 1,
+            "source_code": _STATEFUL_ACTUAL_OPEN_CASH_BUFFER_STRATEGY_SOURCE,
+            "required_factors": [],
+            "required_models": [],
+            "position_sizing": "raw_weight",
+        }
+        svc._group_service = unittest.mock.Mock()
+        svc._group_service.get_group_tickers.return_value = ["AAA"]
+        svc._model_service = unittest.mock.Mock()
+        svc._factor_engine = unittest.mock.Mock()
+        svc._backtest_engine = BacktestEngine()
+
+        dates = pd.to_datetime(["2026-04-06", "2026-04-07", "2026-04-08"])
+        prices = pd.DataFrame({"AAA": [10.0, 10.0, 10.0]}, index=dates)
+        prices_empty = pd.DataFrame({"AAA": [0.0, 0.0, 0.0]}, index=dates)
+        original_merge = BacktestService._merge_engine_rebalance_diagnostics
+
+        def capture_merge(service_diagnostics, engine_diagnostics):
+            captured_diagnostics["service"] = service_diagnostics
+            captured_diagnostics["engine"] = engine_diagnostics
+            return original_merge(service_diagnostics, engine_diagnostics)
+
+        with (
+            patch.object(BacktestService, "_validate_benchmark_market"),
+            patch.object(StrategyService, "_validate_dependencies"),
+            patch.object(
+                svc._backtest_engine,
+                "_load_prices",
+                return_value=(prices, prices, prices_empty, prices_empty, prices_empty),
+            ),
+            patch.object(svc._backtest_engine, "_load_benchmark", return_value=prices["AAA"]),
+            patch.object(BacktestService, "_resolve_factor_ids", return_value={}),
+            patch.object(BacktestService, "_batch_predict_all_dates", return_value={}),
+            patch.object(BacktestService, "_save_result"),
+            patch.object(BacktestService, "_build_reproducibility_fingerprint", return_value={}),
+            patch.object(BacktestService, "_check_data_leakage", return_value=[]),
+            patch.object(BacktestService, "_merge_engine_rebalance_diagnostics", side_effect=capture_merge),
+            patch("backend.services.backtest_service.get_connection", return_value=self.conn),
+        ):
+            svc.run_backtest(
+                "strategy-actual-open-cash-buffer",
+                {
+                    "start_date": "2026-04-06",
+                    "end_date": "2026-04-08",
+                    "benchmark": "SPY",
+                    "rebalance_freq": "daily",
+                    "rebalance_buffer": 0.10,
+                    "rebalance_buffer_reference": "actual_open",
+                    "normalize_target_weights": False,
+                },
+                "sp500",
+                market="US",
+            )
+
+        service_diag_by_date = {
+            item["date"]: item
+            for item in captured_diagnostics["service"]
+        }
+        engine_diag_by_date = {
+            item["date"]: item
+            for item in captured_diagnostics["engine"]
+        }
+
+        self.assertEqual(
+            engine_diag_by_date["2026-04-08"]["executed_positions_after"],
+            {"AAA": 0.5},
+        )
+        self.assertEqual(
+            service_diag_by_date["2026-04-08"]["context_weights"],
+            {"AAA": 0.5},
+        )
 
     def test_cn_backtest_rejects_us_benchmark_before_loading_prices(self):
         with self._patch_connections():
@@ -811,7 +1228,7 @@ class _FakeBacktestService:
         self._result = result
         self.debug_replay_call = None
 
-    def run_backtest(self, strategy_id, config_dict, universe_group_id, market=None):
+    def run_backtest(self, strategy_id, config_dict, universe_group_id, market=None, **_kwargs):
         if self._result is not None:
             return {
                 "strategy_id": strategy_id,

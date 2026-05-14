@@ -23,7 +23,8 @@ from backend.time_utils import utc_now_naive
 log = get_logger(__name__)
 
 _FEATURE_MATRIX_SCHEMA_VERSION = "1"
-_DEFAULT_DAILY_HOT_DAYS = 20
+_LABEL_VALUES_SCHEMA_VERSION = "1"
+_DEFAULT_DAILY_HOT_DAYS = 2
 _CACHE_WRITE_LOCKS_GUARD = threading.Lock()
 _CACHE_WRITE_LOCKS: dict[str, threading.Lock] = {}
 _TRANSIENT_DUCKDB_MARKERS = (
@@ -76,6 +77,33 @@ class ResearchCacheService:
         digest = hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
         return f"feature_matrix:{digest}"
 
+    def build_label_values_key(
+        self,
+        *,
+        market: str | None,
+        label_id: str,
+        tickers: list[str],
+        start_date: str | None,
+        end_date: str | None,
+        label_definition: dict,
+        data_version: str | None = None,
+    ) -> str:
+        resolved_market = normalize_market(market)
+        normalized_tickers = sorted({normalize_ticker(t, resolved_market) for t in tickers})
+        payload = {
+            "schema_version": _LABEL_VALUES_SCHEMA_VERSION,
+            "object_type": "label_values",
+            "market": resolved_market,
+            "label_id": label_id,
+            "tickers": normalized_tickers,
+            "start_date": str(start_date) if start_date else None,
+            "end_date": str(end_date) if end_date else None,
+            "label_definition": _label_definition_fingerprint(label_definition),
+            "data_version": data_version or self.default_data_version(resolved_market, end_date),
+        }
+        digest = hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+        return f"label_values:{digest}"
+
     def load_feature_matrix(
         self,
         *,
@@ -101,6 +129,9 @@ class ResearchCacheService:
         record = self.get_cache_stats(cache_key)
         if record is None or record.get("status") != "active" or not record.get("uri"):
             return None
+        if self._is_expired(record):
+            self._record_miss(cache_key)
+            return None
 
         path = Path(record["uri"])
         if not path.exists():
@@ -117,6 +148,50 @@ class ResearchCacheService:
         return {
             "record": self.get_cache_stats(cache_key),
             "feature_data": self._wide_frame_to_feature_data(frame),
+        }
+
+    def load_label_values(
+        self,
+        *,
+        market: str | None,
+        label_id: str,
+        tickers: list[str],
+        start_date: str | None,
+        end_date: str | None,
+        label_definition: dict,
+        data_version: str | None = None,
+    ) -> dict[str, Any] | None:
+        cache_key = self.build_label_values_key(
+            market=market,
+            label_id=label_id,
+            tickers=tickers,
+            start_date=start_date,
+            end_date=end_date,
+            label_definition=label_definition,
+            data_version=data_version,
+        )
+        record = self.get_cache_stats(cache_key)
+        if record is None or record.get("status") != "active" or not record.get("uri"):
+            return None
+        if self._is_expired(record):
+            self._record_miss(cache_key)
+            return None
+
+        path = Path(record["uri"])
+        if not path.exists():
+            self._record_miss(cache_key)
+            return None
+
+        try:
+            frame = pd.read_parquet(path)
+        except Exception as exc:
+            log.warning("research_cache.label_values.load_failed", cache_key=cache_key, error=str(exc))
+            self._record_miss(cache_key)
+            return None
+        self._record_hit(cache_key)
+        return {
+            "record": self.get_cache_stats(cache_key),
+            "label_values": _normalize_label_values_frame(frame),
         }
 
     def store_feature_matrix(
@@ -166,6 +241,7 @@ class ResearchCacheService:
 
         insert_params = [
             cache_key,
+            "feature_matrix",
             resolved_market,
             feature_set_id,
             str(path),
@@ -193,15 +269,97 @@ class ResearchCacheService:
             frame.to_parquet(path, index=True)
             byte_size = path.stat().st_size
             content_hash = _file_hash(path)
-            insert_params[3] = str(path)
-            insert_params[5] = byte_size
-            insert_params[6] = content_hash
+            insert_params[4] = str(path)
+            insert_params[6] = byte_size
+            insert_params[7] = content_hash
             self._execute_cache_metadata_write(insert_params, cache_key)
         log.info(
             "research_cache.feature_matrix.stored",
             cache_key=cache_key,
             market=resolved_market,
             feature_set_id=feature_set_id,
+            rows=len(frame),
+            bytes=byte_size,
+        )
+        return self.get_cache_stats(cache_key)
+
+    def store_label_values(
+        self,
+        *,
+        market: str | None,
+        label_id: str,
+        tickers: list[str],
+        start_date: str | None,
+        end_date: str | None,
+        label_definition: dict,
+        label_values: pd.DataFrame,
+        data_version: str | None = None,
+        retention_class: str = "daily_hot",
+        ttl_days: int = _DEFAULT_DAILY_HOT_DAYS,
+    ) -> dict[str, Any]:
+        resolved_market = normalize_market(market)
+        normalized_tickers = sorted({normalize_ticker(t, resolved_market) for t in tickers})
+        resolved_data_version = data_version or self.default_data_version(resolved_market, end_date)
+        cache_key = self.build_label_values_key(
+            market=resolved_market,
+            label_id=label_id,
+            tickers=normalized_tickers,
+            start_date=start_date,
+            end_date=end_date,
+            label_definition=label_definition,
+            data_version=resolved_data_version,
+        )
+        frame = _normalize_label_values_frame(label_values)
+        if frame.empty:
+            raise ValueError("label_values must not be empty")
+
+        path = self._label_values_path(resolved_market, label_id, cache_key)
+        metadata = {
+            "tickers": normalized_tickers,
+            "label_definition": _label_definition_fingerprint(label_definition),
+            "data_version": resolved_data_version,
+        }
+        now = utc_now_naive()
+        expires_at = now + timedelta(days=ttl_days) if ttl_days > 0 else None
+        insert_params = [
+            cache_key,
+            "label_values",
+            resolved_market,
+            label_id,
+            str(path),
+            _LABEL_VALUES_SCHEMA_VERSION,
+            0,
+            "",
+            int(len(frame)),
+            0,
+            int(len(normalized_tickers)),
+            start_date,
+            end_date,
+            resolved_data_version,
+            retention_class,
+            json.dumps(metadata, default=str),
+            cache_key,
+            now,
+            now,
+            expires_at,
+            cache_key,
+            cache_key,
+        ]
+        with _cache_write_lock(cache_key):
+            path = self._label_values_path(resolved_market, label_id, cache_key)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            frame.to_parquet(path, index=False)
+            byte_size = path.stat().st_size
+            content_hash = _file_hash(path)
+            insert_params[4] = str(path)
+            insert_params[6] = byte_size
+            insert_params[7] = content_hash
+            self._execute_cache_metadata_write(insert_params, cache_key)
+        log.info(
+            "research_cache.label_values.stored",
+            cache_key=cache_key,
+            market=resolved_market,
+            label_id=label_id,
             rows=len(frame),
             bytes=byte_size,
         )
@@ -486,6 +644,20 @@ class ResearchCacheService:
         digest = cache_key.split(":", 1)[1]
         return self._cache_root / "feature_matrix" / market / feature_set_id / f"{digest}.parquet"
 
+    def _label_values_path(self, market: str, label_id: str, cache_key: str) -> Path:
+        digest = cache_key.split(":", 1)[1]
+        return self._cache_root / "label_values" / market / label_id / f"{digest}.parquet"
+
+    @staticmethod
+    def _is_expired(record: dict[str, Any]) -> bool:
+        raw = record.get("expires_at")
+        if not raw:
+            return False
+        try:
+            return pd.Timestamp(raw).to_pydatetime().replace(tzinfo=None) <= utc_now_naive()
+        except Exception:
+            return False
+
     @staticmethod
     def _feature_data_to_wide_frame(feature_data: dict[str, pd.DataFrame]) -> pd.DataFrame:
         pieces: list[pd.DataFrame] = []
@@ -542,7 +714,7 @@ class ResearchCacheService:
             feature_count, ticker_count, start_date, end_date, data_version,
             retention_class, rebuildable, status, metadata, created_at,
             updated_at, expires_at, last_accessed_at, hit_count, miss_count)
-           VALUES (?, 'feature_matrix', ?, ?, ?, 'parquet', ?, ?, ?, ?,
+           VALUES (?, ?, ?, ?, ?, 'parquet', ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, TRUE, 'active', ?, COALESCE(
                        (SELECT created_at FROM research_cache_entries WHERE cache_key = ?),
                        ?
@@ -579,6 +751,34 @@ def _canonical_jsonable(value: Any) -> Any:
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(_canonical_jsonable(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _label_definition_fingerprint(label_definition: dict) -> dict[str, Any]:
+    return _canonical_jsonable(
+        {
+            "id": label_definition.get("id"),
+            "target_type": label_definition.get("target_type"),
+            "horizon": label_definition.get("horizon"),
+            "effective_horizon": label_definition.get(
+                "effective_horizon",
+                label_definition.get("horizon"),
+            ),
+            "benchmark": label_definition.get("benchmark"),
+            "config": label_definition.get("config") or {},
+            "updated_at": label_definition.get("updated_at"),
+        }
+    )
+
+
+def _normalize_label_values_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame(columns=["ticker", "date", "label_value"])
+    result = frame[["ticker", "date", "label_value"]].copy()
+    result["ticker"] = result["ticker"].astype(str)
+    result["date"] = pd.to_datetime(result["date"])
+    result["label_value"] = pd.to_numeric(result["label_value"], errors="coerce")
+    result = result.dropna(subset=["ticker", "date", "label_value"])
+    return result.sort_values(["ticker", "date"]).reset_index(drop=True)
 
 
 @contextmanager

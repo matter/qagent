@@ -30,6 +30,7 @@ import type {
   StockGroup,
   BacktestResultDetail,
   ExecutionModel,
+  PlannedPriceFallback,
 } from "../../api";
 import {
   BacktestSummaryCards,
@@ -73,6 +74,7 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
   const [initialEntryPolicy, setInitialEntryPolicy] = useState("wait_for_anchor");
   const [executionModel, setExecutionModel] = useState<ExecutionModel>("next_open");
   const [plannedPriceBufferBps, setPlannedPriceBufferBps] = useState<number>(50);
+  const [plannedPriceFallback, setPlannedPriceFallback] = useState<PlannedPriceFallback>("cancel");
   const [maxSingleNameWeight, setMaxSingleNameWeight] = useState<number | null>(null);
   const [weeklyTurnoverFloor, setWeeklyTurnoverFloor] = useState<number | null>(null);
   const [constraintDriftBuffer, setConstraintDriftBuffer] = useState<number | null>(null);
@@ -109,6 +111,9 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
     if (restoreConfig.executionModel) setExecutionModel(restoreConfig.executionModel);
     if (restoreConfig.plannedPriceBufferBps != null) {
       setPlannedPriceBufferBps(restoreConfig.plannedPriceBufferBps);
+    }
+    if (restoreConfig.plannedPriceFallback) {
+      setPlannedPriceFallback(restoreConfig.plannedPriceFallback);
     }
   }, [restoreConfig]);
 
@@ -152,6 +157,7 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
           normalize_target_weights: normalizeTargetWeights,
           execution_model: executionModel,
           planned_price_buffer_bps: executionModel === "planned_price" ? plannedPriceBufferBps : undefined,
+          planned_price_fallback: executionModel === "planned_price" ? plannedPriceFallback : undefined,
           constraint_config: {
             ...(maxSingleNameWeight != null ? { max_single_name_weight: maxSingleNameWeight } : {}),
             ...(weeklyTurnoverFloor != null ? { weekly_turnover_floor: weeklyTurnoverFloor } : {}),
@@ -445,6 +451,21 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
                     min={0}
                     max={4999}
                     step={10}
+                  />
+                </Col>
+              )}
+              {executionModel === "planned_price" && (
+                <Col span={8}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>未达计划价</Text>
+                  <Select
+                    value={plannedPriceFallback}
+                    onChange={setPlannedPriceFallback}
+                    size="small"
+                    style={{ width: "100%", marginTop: 4 }}
+                    options={[
+                      { value: "cancel", label: "取消订单" },
+                      { value: "next_close", label: "次日收盘成交" },
+                    ]}
                   />
                 </Col>
               )}

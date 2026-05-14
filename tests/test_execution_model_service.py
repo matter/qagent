@@ -5,6 +5,7 @@ from backend.services.execution_model_service import (
     evaluate_planned_price_fill,
     normalize_execution_model,
     normalize_planned_price_buffer_bps,
+    normalize_planned_price_fallback,
 )
 
 
@@ -70,6 +71,13 @@ class ExecutionModelServiceTests(unittest.TestCase):
             normalize_execution_model("close")
         with self.assertRaises(ValueError):
             normalize_planned_price_buffer_bps(-1)
+
+    def test_normalizes_planned_price_fallback(self):
+        self.assertEqual(normalize_planned_price_fallback(None), "cancel")
+        self.assertEqual(normalize_planned_price_fallback("next_close"), "next_close")
+
+        with self.assertRaises(ValueError):
+            normalize_planned_price_fallback("same_day_close")
 
 
 if __name__ == "__main__":

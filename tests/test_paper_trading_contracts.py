@@ -703,6 +703,54 @@ class PaperTradingServiceContractTests(unittest.TestCase):
         blocked = result["diagnostics"]["planned_price_execution"]["blocked"]
         self.assertEqual(blocked[0]["reason"], "planned_price_outside_buffered_range")
 
+    def test_execute_trades_planned_price_can_fallback_to_next_close(self):
+        result = PaperTradingService._execute_trades_cached(
+            positions={},
+            cash=1200.0,
+            target_weights={"AAA": 1.0},
+            trade_date=date(2026, 4, 10),
+            cost_rate=0.0,
+            price_cache={
+                date(2026, 4, 10): {
+                    "AAA": {"open": 11.0, "high": 12.0, "low": 10.8, "close": 12.0}
+                }
+            },
+            execution_model="planned_price",
+            planned_prices={"AAA": 10.81},
+            planned_price_buffer_bps=50,
+            planned_price_fallback="next_close",
+        )
+
+        self.assertEqual(len(result["trades"]), 1)
+        self.assertEqual(result["trades"][0]["price"], 12.0)
+        self.assertEqual(result["positions_after"]["AAA"]["shares"], 100.0)
+        diag = result["diagnostics"]["planned_price_execution"]
+        self.assertEqual(diag["planned_fill_count"], 0)
+        self.assertEqual(diag["fallback_close_count"], 1)
+        self.assertEqual(diag["filled"][0]["fill_type"], "fallback_close")
+
+    def test_execute_trades_planned_price_fallback_does_not_fill_invalid_plan(self):
+        result = PaperTradingService._execute_trades_cached(
+            positions={},
+            cash=1200.0,
+            target_weights={"AAA": 1.0},
+            trade_date=date(2026, 4, 10),
+            cost_rate=0.0,
+            price_cache={
+                date(2026, 4, 10): {
+                    "AAA": {"open": 11.0, "high": 12.0, "low": 10.8, "close": 12.0}
+                }
+            },
+            execution_model="planned_price",
+            planned_prices={"AAA": None},
+            planned_price_buffer_bps=50,
+            planned_price_fallback="next_close",
+        )
+
+        self.assertEqual(result["trades"], [])
+        blocked = result["diagnostics"]["planned_price_execution"]["blocked"]
+        self.assertEqual(blocked[0]["reason"], "invalid_planned_price")
+
 
 if __name__ == "__main__":
     unittest.main()

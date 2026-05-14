@@ -1,6 +1,7 @@
 import tempfile
 import threading
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -68,6 +69,110 @@ class ResearchCacheServiceTests(unittest.TestCase):
         self.assertEqual(stats["miss_count"], 0)
         self.assertEqual(stats["object_type"], "feature_matrix")
         self.assertGreater(stats["byte_size"], 0)
+
+    def test_feature_matrix_default_hot_ttl_is_48_hours(self):
+        service = ResearchCacheService()
+        feature_data = {
+            "close": pd.DataFrame(
+                {"AAPL": [10.0]},
+                index=pd.to_datetime(["2024-01-02"]),
+            )
+        }
+
+        record = service.store_feature_matrix(
+            market="US",
+            feature_set_id="fs_hot_ttl",
+            tickers=["AAPL"],
+            start_date="2024-01-02",
+            end_date="2024-01-02",
+            factor_refs=[{"factor_id": "f_close", "factor_name": "close"}],
+            preprocessing={},
+            feature_data=feature_data,
+        )
+
+        created_at = pd.Timestamp(record["created_at"])
+        expires_at = pd.Timestamp(record["expires_at"])
+        self.assertLess(abs((expires_at - created_at) - timedelta(hours=48)), timedelta(seconds=5))
+
+    def test_label_values_cache_round_trips_frames_and_updates_stats(self):
+        service = ResearchCacheService()
+        labels = pd.DataFrame(
+            {
+                "ticker": ["AAPL", "MSFT"],
+                "date": pd.to_datetime(["2024-01-02", "2024-01-02"]),
+                "label_value": [0.03, -0.01],
+            }
+        )
+        label_definition = {
+            "id": "label_5d",
+            "target_type": "return",
+            "horizon": 5,
+            "effective_horizon": 5,
+            "config": {"vol_adjust": False},
+        }
+
+        record = service.store_label_values(
+            market="US",
+            label_id="label_5d",
+            tickers=["MSFT", "AAPL"],
+            start_date="2024-01-02",
+            end_date="2024-01-02",
+            label_definition=label_definition,
+            label_values=labels,
+        )
+        loaded = service.load_label_values(
+            market="US",
+            label_id="label_5d",
+            tickers=["AAPL", "MSFT"],
+            start_date="2024-01-02",
+            end_date="2024-01-02",
+            label_definition=label_definition,
+        )
+
+        self.assertIsNotNone(loaded)
+        self.assertEqual(record["cache_key"], loaded["record"]["cache_key"])
+        pd.testing.assert_frame_equal(
+            loaded["label_values"].sort_values(["ticker", "date"]).reset_index(drop=True),
+            labels.sort_values(["ticker", "date"]).reset_index(drop=True),
+        )
+        stats = service.get_cache_stats(record["cache_key"])
+        self.assertEqual(stats["object_type"], "label_values")
+        self.assertEqual(stats["hit_count"], 1)
+
+    def test_label_values_cache_skips_expired_entries(self):
+        service = ResearchCacheService()
+        labels = pd.DataFrame(
+            {
+                "ticker": ["AAPL"],
+                "date": pd.to_datetime(["2024-01-02"]),
+                "label_value": [0.03],
+            }
+        )
+        label_definition = {"id": "label_expired", "target_type": "return", "horizon": 5}
+        record = service.store_label_values(
+            market="US",
+            label_id="label_expired",
+            tickers=["AAPL"],
+            start_date="2024-01-02",
+            end_date="2024-01-02",
+            label_definition=label_definition,
+            label_values=labels,
+        )
+        get_connection().execute(
+            "UPDATE research_cache_entries SET expires_at = TIMESTAMP '2000-01-01' WHERE cache_key = ?",
+            [record["cache_key"]],
+        )
+
+        loaded = service.load_label_values(
+            market="US",
+            label_id="label_expired",
+            tickers=["AAPL"],
+            start_date="2024-01-02",
+            end_date="2024-01-02",
+            label_definition=label_definition,
+        )
+
+        self.assertIsNone(loaded)
 
     def test_feature_matrix_store_retries_transient_duckdb_conflict(self):
         service = ResearchCacheService()
@@ -257,6 +362,32 @@ class ResearchCacheServiceTests(unittest.TestCase):
         self.assertEqual(engine.bulk_calls, 0)
         pd.testing.assert_frame_equal(result["close"], feature_data["close"])
 
+    def test_feature_service_recomputes_partial_bulk_factor_cache(self):
+        conn = get_connection()
+        conn.execute(
+            """INSERT INTO feature_sets
+               (id, market, name, factor_refs, preprocessing, status)
+               VALUES ('fs_partial', 'US', 'Partial FS', ?, ?, 'active')""",
+            [
+                '[{"factor_id": "f_close", "factor_name": "close"}]',
+                '{}',
+            ],
+        )
+
+        engine = _PartialBulkCacheFactorEngine()
+        service = FeatureService(factor_engine=engine)
+        result = service.compute_features_from_cache(
+            "fs_partial",
+            ["AAPL", "MSFT"],
+            "2024-01-02",
+            "2024-01-03",
+            market="US",
+        )
+
+        self.assertEqual(engine.compute_calls, [("f_close", ("AAPL", "MSFT"))])
+        self.assertEqual(list(result["close"].columns), ["AAPL", "MSFT"])
+        self.assertEqual(result["close"].loc[pd.Timestamp("2024-01-03"), "MSFT"], 21.0)
+
     def test_preview_and_apply_draft_factor_cleanup_preserves_referenced_and_active(self):
         conn = get_connection()
         conn.execute(
@@ -324,6 +455,26 @@ class _ExplodingFactorEngine:
     def load_cached_factors_bulk(self, *args, **kwargs):
         self.bulk_calls += 1
         raise AssertionError("hot feature matrix cache should be checked before bulk factor cache")
+
+
+class _PartialBulkCacheFactorEngine:
+    def __init__(self):
+        self.compute_calls = []
+
+    def load_cached_factors_bulk(self, factor_ids, tickers, start_date, end_date, market=None):
+        return {
+            "f_close": pd.DataFrame(
+                {"AAPL": [10.0, 11.0]},
+                index=pd.to_datetime(["2024-01-02", "2024-01-03"]),
+            )
+        }
+
+    def compute_factor(self, factor_id, tickers, start_date, end_date, market=None):
+        self.compute_calls.append((factor_id, tuple(tickers)))
+        return pd.DataFrame(
+            {"AAPL": [10.0, 11.0], "MSFT": [20.0, 21.0]},
+            index=pd.to_datetime(["2024-01-02", "2024-01-03"]),
+        )
 
 
 class _FlakyResearchCacheConnection:

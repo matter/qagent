@@ -74,6 +74,7 @@ export interface BacktestRestoreConfig {
   reentryCooldownDays?: number;
   executionModel?: ExecutionModel;
   plannedPriceBufferBps?: number;
+  plannedPriceFallback?: "cancel" | "next_close";
 }
 
 interface BacktestHistoryProps {
@@ -153,6 +154,7 @@ export default function BacktestHistory({ refreshKey, onRestoreConfig }: Backtes
       reentryCooldownDays: (cfg?.reentry_cooldown_days as number) ?? 0,
       executionModel: cfg?.execution_model,
       plannedPriceBufferBps: (cfg?.planned_price_buffer_bps as number) ?? 50,
+      plannedPriceFallback: (cfg?.planned_price_fallback as "cancel" | "next_close") ?? "cancel",
     });
     messageApi.success("已还原回测配置");
   };

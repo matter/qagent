@@ -21,9 +21,11 @@ from backend.logger import get_logger
 from backend.services.calendar_service import snap_to_trading_day
 from backend.services.execution_model_service import (
     DEFAULT_PLANNED_PRICE_BUFFER_BPS,
+    DEFAULT_PLANNED_PRICE_FALLBACK,
     evaluate_planned_price_fill,
     normalize_execution_model,
     normalize_planned_price_buffer_bps,
+    normalize_planned_price_fallback,
 )
 from backend.services.market_context import normalize_market, normalize_ticker
 from backend.services.sql_filters import registered_values_table
@@ -61,12 +63,16 @@ class BacktestConfig:
     max_holding_days: int | None = None           # force exit after N holding days
     execution_model: str = "next_open"
     planned_price_buffer_bps: float = DEFAULT_PLANNED_PRICE_BUFFER_BPS
+    planned_price_fallback: str = DEFAULT_PLANNED_PRICE_FALLBACK
 
     def __post_init__(self) -> None:
         self.market = normalize_market(self.market)
         self.execution_model = normalize_execution_model(self.execution_model)
         self.planned_price_buffer_bps = normalize_planned_price_buffer_bps(
             self.planned_price_buffer_bps
+        )
+        self.planned_price_fallback = normalize_planned_price_fallback(
+            self.planned_price_fallback
         )
         if isinstance(self.start_date, str):
             self.start_date = date.fromisoformat(self.start_date)
@@ -103,6 +109,7 @@ class BacktestConfig:
             "max_holding_days": self.max_holding_days,
             "execution_model": self.execution_model,
             "planned_price_buffer_bps": self.planned_price_buffer_bps,
+            "planned_price_fallback": self.planned_price_fallback,
         }
 
 
@@ -251,7 +258,10 @@ class BacktestEngine:
         planned_execution_diagnostics: dict[str, Any] = {
             "execution_model": config.execution_model,
             "planned_price_buffer_bps": config.planned_price_buffer_bps,
+            "planned_price_fallback": config.planned_price_fallback,
             "filled_order_count": 0,
+            "planned_fill_count": 0,
+            "fallback_close_count": 0,
             "blocked_order_count": 0,
             "filled": [],
             "blocked": [],
@@ -421,6 +431,8 @@ class BacktestEngine:
 
                         # Get execution price.
                         exec_price: float | None = None
+                        fill_type: str | None = None
+                        fallback_reason: str | None = None
                         if config.execution_model == "planned_price":
                             planned_price = _lookup_planned_price(
                                 planned_prices=planned_prices,
@@ -436,22 +448,45 @@ class BacktestEngine:
                                 buffer_bps=config.planned_price_buffer_bps,
                             )
                             if not fill_decision.filled:
-                                planned_execution_diagnostics["blocked_order_count"] += 1
-                                planned_execution_diagnostics["blocked"].append(
-                                    {
-                                        "date": str(trade_date_ts.date()),
-                                        "decision_date": str(prev_date_ts.date()),
-                                        "ticker": ticker,
-                                        "reason": fill_decision.reason,
-                                        "planned_price": planned_price,
-                                        "high": high_price,
-                                        "low": low_price,
-                                        "lower_bound": fill_decision.lower_bound,
-                                        "upper_bound": fill_decision.upper_bound,
-                                    }
+                                can_fallback_to_close = (
+                                    config.planned_price_fallback == "next_close"
+                                    and fill_decision.reason == "planned_price_outside_buffered_range"
                                 )
-                                continue
-                            exec_price = fill_decision.fill_price
+                                close_price = (
+                                    _lookup_price(prices_close, trade_date_ts, ticker)
+                                    if can_fallback_to_close
+                                    else None
+                                )
+                                if close_price is None:
+                                    planned_execution_diagnostics["blocked_order_count"] += 1
+                                    planned_execution_diagnostics["blocked"].append(
+                                        {
+                                            "date": str(trade_date_ts.date()),
+                                            "decision_date": str(prev_date_ts.date()),
+                                            "ticker": ticker,
+                                            "reason": (
+                                                "missing_fallback_close"
+                                                if can_fallback_to_close
+                                                else fill_decision.reason
+                                            ),
+                                            "planned_price": planned_price,
+                                            "high": high_price,
+                                            "low": low_price,
+                                            "close": close_price,
+                                            "lower_bound": fill_decision.lower_bound,
+                                            "upper_bound": fill_decision.upper_bound,
+                                            "planned_price_fallback": config.planned_price_fallback,
+                                            "planned_price_reject_reason": fill_decision.reason,
+                                            "fill_type": "blocked",
+                                        }
+                                    )
+                                    continue
+                                exec_price = close_price
+                                fill_type = "fallback_close"
+                                fallback_reason = fill_decision.reason
+                            else:
+                                exec_price = fill_decision.fill_price
+                                fill_type = "planned_price"
                         else:
                             exec_price = _lookup_price(prices_open, trade_date_ts, ticker)
                             if exec_price is None:
@@ -529,12 +564,30 @@ class BacktestEngine:
                         )
                         if config.execution_model == "planned_price":
                             planned_execution_diagnostics["filled_order_count"] += 1
+                            if fill_type == "fallback_close":
+                                planned_execution_diagnostics["fallback_close_count"] += 1
+                            else:
+                                planned_execution_diagnostics["planned_fill_count"] += 1
                             planned_execution_diagnostics["filled"].append(
                                 {
                                     "date": str(trade_date_ts.date()),
                                     "decision_date": str(prev_date_ts.date()),
                                     "ticker": ticker,
-                                    "planned_price": round(float(exec_price), 6),
+                                    "price": round(float(exec_price), 6),
+                                    "planned_price": (
+                                        round(float(planned_price), 6)
+                                        if planned_price is not None
+                                        else None
+                                    ),
+                                    "high": high_price,
+                                    "low": low_price,
+                                    "close": (
+                                        _lookup_price(prices_close, trade_date_ts, ticker)
+                                        if fill_type == "fallback_close"
+                                        else None
+                                    ),
+                                    "fill_type": fill_type or "planned_price",
+                                    "fallback_reason": fallback_reason,
                                     "shares": round(abs(share_change), 4),
                                     "action": action,
                                 }
@@ -637,6 +690,17 @@ class BacktestEngine:
             total = filled + blocked
             planned_execution_diagnostics["fill_rate"] = (
                 round(filled / total, 6) if total else None
+            )
+            planned_execution_diagnostics["planned_fill_rate"] = (
+                round(int(planned_execution_diagnostics["planned_fill_count"]) / total, 6)
+                if total else None
+            )
+            planned_execution_diagnostics["fallback_close_rate"] = (
+                round(int(planned_execution_diagnostics["fallback_close_count"]) / total, 6)
+                if total else None
+            )
+            planned_execution_diagnostics["blocked_rate"] = (
+                round(blocked / total, 6) if total else None
             )
             trade_diagnostics["planned_price_execution"] = planned_execution_diagnostics
 

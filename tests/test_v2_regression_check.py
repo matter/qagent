@@ -83,6 +83,14 @@ class V2RegressionCheckTests(unittest.TestCase):
         self.assertIn("http://example.test/api/stocks/search?q=AAPL&limit=1", session.urls)
         self.assertTrue(all("market=" not in url for url in session.urls))
 
+    def test_market_context_defaults_expect_current_cn_core_union(self):
+        module = load_script_module()
+
+        result = module.check_market_context_defaults()
+
+        self.assertEqual(result.status, "passed", result.data)
+        self.assertEqual(result.data["cn_group"], "cn_a_core_indices_union")
+
     def test_cn_provider_failure_check_verifies_us_through_api(self):
         module = load_script_module()
         session = _FakeSession()

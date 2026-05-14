@@ -300,6 +300,61 @@ class StrategyGraph3ServiceContractTests(unittest.TestCase):
         )
         self.assertEqual(result["summary"]["fill_diagnostics"]["execution_model"], "planned_price")
 
+    def test_backtest_graph_planned_price_can_fallback_to_next_close(self):
+        conn = get_connection()
+        conn.execute(
+            """INSERT INTO stocks
+               (market, ticker, name, exchange, sector, status, updated_at)
+               VALUES ('US', 'AAA', 'AAA Inc', 'NYSE', 'Test', 'active', current_timestamp)"""
+        )
+        conn.executemany(
+            """INSERT INTO daily_bars
+               (market, ticker, date, open, high, low, close, volume, adj_factor)
+               VALUES ('US', 'AAA', ?, ?, ?, ?, ?, 1000, 1.0)""",
+            [
+                ("2024-01-02", 10.0, 10.2, 9.8, 10.0),
+                ("2024-01-03", 11.0, 12.0, 10.8, 12.0),
+            ],
+        )
+        planned_execution = self.portfolio_service.create_execution_policy_spec(
+            name="M8 planned price close fallback",
+            policy_type="planned_price",
+            params={"planned_price_buffer_bps": 50, "fill_fallback": "next_close"},
+        )
+        service = StrategyGraph3Service()
+        graph = service.create_builtin_alpha_graph(
+            name="M8 planned fallback graph",
+            selection_policy={"top_n": 1, "score_column": "score"},
+            portfolio_construction_spec_id=self.portfolio["id"],
+            risk_control_spec_id=None,
+            execution_policy_spec_id=planned_execution["id"],
+        )
+
+        result = service.backtest_graph(
+            graph["id"],
+            start_date="2024-01-02",
+            end_date="2024-01-03",
+            alpha_frames_by_date={
+                "2024-01-02": [
+                    {"asset_id": "US_EQ:AAA", "score": 1.0, "planned_price": 10.81},
+                ],
+                "2024-01-03": [
+                    {"asset_id": "US_EQ:AAA", "score": 1.0, "planned_price": 10.81},
+                ],
+            },
+            initial_capital=1_000_000,
+        )
+
+        row = conn.execute(
+            """SELECT quantity, price, metadata
+               FROM backtest_trades
+               WHERE backtest_run_id = ?""",
+            [result["backtest_run"]["id"]],
+        ).fetchone()
+        self.assertIsNotNone(row[0])
+        self.assertEqual(row[1], 12.0)
+        self.assertIn('"fill_type": "fallback_close"', row[2])
+
     def test_backtest_graph_blocks_cn_st_limit_and_missing_price_orders(self):
         conn = get_connection()
         conn.executemany(

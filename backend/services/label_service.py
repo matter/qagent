@@ -17,6 +17,7 @@ from backend.services.market_context import (
     normalize_market,
     normalize_ticker,
 )
+from backend.services.research_cache_service import ResearchCacheService
 from backend.time_utils import utc_now_naive
 
 log = get_logger(__name__)
@@ -302,6 +303,9 @@ _PRESET_LABELS = [
 class LabelService:
     """CRUD and computation for prediction-target label definitions."""
 
+    def __init__(self, cache_service: ResearchCacheService | None = None) -> None:
+        self._cache_service = cache_service or ResearchCacheService()
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -480,6 +484,7 @@ class LabelService:
         row = self._fetch_row(label_id, market)
         if row is None:
             raise ValueError(f"Label {label_id} not found")
+        row["effective_horizon"] = self.resolve_effective_horizon(row["id"], market=row["market"])
         return row
 
     def list_labels(self, market: str | None = None) -> list[dict]:
@@ -494,7 +499,50 @@ class LabelService:
                ORDER BY created_at""",
             [resolved_market],
         ).fetchall()
-        return [self._row_to_dict(r) for r in rows]
+        labels = [self._row_to_dict(r) for r in rows]
+        for label in labels:
+            try:
+                label["effective_horizon"] = self.resolve_effective_horizon(
+                    label["id"],
+                    market=resolved_market,
+                )
+            except Exception:
+                label["effective_horizon"] = label.get("horizon")
+        return labels
+
+    def resolve_effective_horizon(
+        self,
+        label_id: str,
+        market: str | None = None,
+        *,
+        _seen: set[str] | None = None,
+    ) -> int:
+        """Return max forward horizon used by a label, recursing composites."""
+        resolved_market = normalize_market(market)
+        seen = set(_seen or set())
+        if label_id in seen:
+            raise ValueError(f"Composite label cycle detected at {label_id}")
+        seen.add(label_id)
+
+        row = self._fetch_row(label_id, resolved_market)
+        if row is None:
+            raise ValueError(f"Label {label_id} not found")
+        horizon = max(0, int(row.get("horizon") or 0))
+        if row.get("target_type") != "composite":
+            return horizon
+
+        max_horizon = horizon
+        config = row.get("config") or {}
+        for comp in config.get("components") or []:
+            if not isinstance(comp, dict) or not comp.get("label_id"):
+                continue
+            child_horizon = self.resolve_effective_horizon(
+                str(comp["label_id"]),
+                market=resolved_market,
+                _seen=seen,
+            )
+            max_horizon = max(max_horizon, child_horizon)
+        return max_horizon
 
     @staticmethod
     def get_task_type(target_type: str) -> str:
@@ -572,45 +620,32 @@ class LabelService:
         if bars_df.empty:
             return pd.DataFrame(columns=["ticker", "date", "label_value"])
 
-        # Compute forward returns per ticker
-        result_frames: list[pd.DataFrame] = []
-        for ticker, grp in bars_df.groupby("ticker"):
-            grp = grp.sort_values("date").reset_index(drop=True)
-            fwd_close = grp["close"].shift(-horizon)
-            fwd_return = (fwd_close - grp["close"]) / grp["close"]
-
-            sub = pd.DataFrame({
-                "ticker": ticker,
-                "date": grp["date"],
-                "fwd_return": fwd_return,
-            })
-            result_frames.append(sub)
-
-        if not result_frames:
+        # Compute forward returns as one panel operation.  This path is used by
+        # model training on large universes, so avoid per-ticker DataFrame
+        # construction and concat overhead.
+        bars_df = bars_df.sort_values(["ticker", "date"]).reset_index(drop=True)
+        if bars_df.empty:
             return pd.DataFrame(columns=["ticker", "date", "label_value"])
 
-        combined = pd.concat(result_frames, ignore_index=True)
+        fwd_close = bars_df.groupby("ticker", sort=False)["close"].shift(-horizon)
+        fwd_return = (fwd_close - bars_df["close"]) / bars_df["close"]
+        combined = bars_df[["ticker", "date"]].copy()
+        combined["fwd_return"] = fwd_return
 
         # ---- Dispatch by target_type ----
         if target_type == "return":
             vol_adjust = config.get("vol_adjust", False)
             if vol_adjust:
                 vol_window = config.get("vol_window", 20)
-                # Compute realized volatility per ticker and divide fwd_return by it
-                for ticker, grp_idx in combined.groupby("ticker").groups.items():
-                    sub = combined.loc[grp_idx].sort_values("date")
-                    # Need daily returns to compute realized vol; re-derive from bars
-                    ticker_bars = bars_df[bars_df["ticker"] == ticker].sort_values("date")
-                    daily_ret = ticker_bars["close"].pct_change()
-                    realized_vol = daily_ret.rolling(vol_window).std()
-                    # Align realized_vol with combined index via date
-                    vol_map = dict(zip(ticker_bars["date"], realized_vol))
-                    vol_series = sub["date"].map(vol_map)
-                    # Avoid division by zero: replace 0/NaN vol with NaN
-                    vol_series = vol_series.replace(0, np.nan)
-                    combined.loc[grp_idx, "label_value"] = (
-                        combined.loc[grp_idx, "fwd_return"] / vol_series.values
-                    )
+                daily_ret = bars_df.groupby("ticker", sort=False)["close"].pct_change()
+                realized_vol = (
+                    daily_ret.groupby(bars_df["ticker"], sort=False)
+                    .rolling(vol_window)
+                    .std()
+                    .reset_index(level=0, drop=True)
+                    .replace(0, np.nan)
+                )
+                combined["label_value"] = combined["fwd_return"] / realized_vol.to_numpy()
             else:
                 combined["label_value"] = combined["fwd_return"]
 
@@ -773,6 +808,77 @@ class LabelService:
             combined = combined[combined["date"] <= pd.Timestamp(end_date)]
 
         return combined
+
+    def compute_label_values_cached(
+        self,
+        label_id: str,
+        tickers: list[str],
+        start_date: str | None = None,
+        end_date: str | None = None,
+        market: str | None = None,
+    ) -> pd.DataFrame:
+        """Compute label values through a short-lived reusable hot cache."""
+        label = self.get_label(label_id, market=market)
+        resolved_market = label["market"]
+        normalized_tickers = [
+            normalize_ticker(t, resolved_market)
+            for t in tickers
+            if str(t).strip()
+        ]
+        if not normalized_tickers:
+            return pd.DataFrame(columns=["ticker", "date", "label_value"])
+        if not end_date:
+            return self.compute_label_values(
+                label_id,
+                normalized_tickers,
+                start_date,
+                end_date,
+                market=resolved_market,
+            )
+
+        cached = self._cache_service.load_label_values(
+            market=resolved_market,
+            label_id=label_id,
+            tickers=normalized_tickers,
+            start_date=start_date,
+            end_date=end_date,
+            label_definition=label,
+        )
+        if cached is not None:
+            log.info(
+                "label.compute.cache_hit",
+                label_id=label_id,
+                market=resolved_market,
+                cache_key=cached["record"]["cache_key"],
+            )
+            return cached["label_values"]
+
+        label_values = self.compute_label_values(
+            label_id,
+            normalized_tickers,
+            start_date,
+            end_date,
+            market=resolved_market,
+        )
+        if not label_values.empty:
+            try:
+                self._cache_service.store_label_values(
+                    market=resolved_market,
+                    label_id=label_id,
+                    tickers=normalized_tickers,
+                    start_date=start_date,
+                    end_date=end_date,
+                    label_definition=label,
+                    label_values=label_values,
+                )
+            except Exception as exc:
+                log.warning(
+                    "label.compute.cache_store_failed",
+                    label_id=label_id,
+                    market=resolved_market,
+                    error=str(exc),
+                )
+        return label_values
 
     # ------------------------------------------------------------------
     # Internal helpers

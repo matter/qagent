@@ -232,6 +232,76 @@ class SignalServiceContractTests(unittest.TestCase):
         self.assertEqual(report["clipped_orders"][0]["ticker"], "AAA")
         self.assertTrue(report["constraint_pass"])
 
+    def test_signal_service_can_stage_final_run_until_task_acceptance(self):
+        svc = SignalService.__new__(SignalService)
+        raw_signals = pd.DataFrame(
+            {"signal": [1], "weight": [1.0], "strength": [2.0]},
+            index=["AAA"],
+        )
+        staged = []
+        saved = []
+
+        def stage_domain_write(table, payload, commit=None):
+            staged.append((table, payload, commit))
+
+        class _PriceLookbackConnection:
+            def execute(self, query, params=None):
+                return self
+
+            def fetchone(self):
+                return ("2024-01-02",)
+
+        prices = (
+            pd.DataFrame({"AAA": [10.0]}, index=pd.to_datetime(["2024-01-02"])),
+            pd.DataFrame({"AAA": [10.0]}, index=pd.to_datetime(["2024-01-02"])),
+            pd.DataFrame({"AAA": [10.0]}, index=pd.to_datetime(["2024-01-02"])),
+            pd.DataFrame({"AAA": [10.0]}, index=pd.to_datetime(["2024-01-02"])),
+            pd.DataFrame({"AAA": [100]}, index=pd.to_datetime(["2024-01-02"])),
+        )
+
+        with (
+            patch.object(svc, "_validate_dependency_chain", return_value={"blocked": False, "errors": [], "warnings": []}),
+            patch("backend.services.signal_service.get_connection", return_value=_PriceLookbackConnection()),
+            patch.object(svc, "_load_prices", return_value=prices),
+            patch.object(svc, "_determine_result_level", return_value="exploratory"),
+            patch.object(svc, "_build_dependency_snapshot", return_value={}),
+            patch.object(svc, "_save_signal_run", side_effect=lambda **kwargs: saved.append(kwargs) or [{"ticker": "AAA"}]),
+        ):
+            svc._strategy_service = unittest.mock.Mock()
+            strategy = unittest.mock.Mock()
+            strategy.generate_signals.return_value = raw_signals
+            svc._strategy_service.get_strategy.return_value = {
+                "id": "strategy_stage",
+                "name": "Stage Signal",
+                "version": 1,
+                "source_code": "source",
+                "required_factors": [],
+                "required_models": [],
+                "position_sizing": "raw_weight",
+            }
+            svc._group_service = unittest.mock.Mock()
+            svc._group_service.get_group_tickers.return_value = ["AAA"]
+            svc._factor_engine = unittest.mock.Mock()
+            svc._model_service = unittest.mock.Mock()
+
+            with (
+                patch("backend.services.signal_service.load_strategy_from_code", return_value=strategy),
+                patch("backend.services.signal_service.StrategyService._validate_dependencies"),
+            ):
+                result = svc.generate_signals(
+                    strategy_id="strategy_stage",
+                    target_date="2024-01-02",
+                    universe_group_id="group_stage",
+                    market="US",
+                    stage_domain_write=stage_domain_write,
+                )
+                self.assertEqual(saved, [])
+                self.assertEqual(staged[0][0], "signal_runs")
+                staged[0][2]()
+
+        self.assertEqual(result["signal_count"], 1)
+        self.assertEqual(saved[0]["run_id"], result["run_id"])
+
 class _BacktestReplayDiagnosticsConnection:
     def execute(self, query, params=None):
         self.query = query

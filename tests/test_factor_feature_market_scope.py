@@ -199,6 +199,58 @@ class FactorFeatureMarketScopeTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in cn_results], ["cn_eval"])
         self.assertEqual(cn_results[0]["market"], "CN")
 
+    def test_factor_eval_can_stage_final_result_until_task_acceptance(self):
+        svc = FactorEvalService.__new__(FactorEvalService)
+        staged = []
+        saved = []
+
+        def stage_domain_write(table, payload, commit=None):
+            staged.append((table, payload, commit))
+
+        with (
+            patch.object(svc, "_save_result", side_effect=lambda **kwargs: saved.append(kwargs)),
+            patch.object(svc, "_compute_ic_series", return_value=[]),
+            patch.object(svc, "_compute_group_returns", return_value={"groups": {"long_short": []}}),
+            patch.object(svc, "_compute_turnover", return_value=0.0),
+            patch.object(svc, "_compute_coverage", return_value=1.0),
+        ):
+            svc._group_service = unittest.mock.Mock()
+            svc._group_service.get_group_tickers.return_value = ["AAA", "BBB"]
+            svc._group_service.get_group.return_value = {"name": "Test Group"}
+            dates = pd.to_datetime(["2024-01-02", "2024-01-03"])
+            svc._factor_engine = unittest.mock.Mock()
+            svc._factor_engine.compute_factor.return_value = pd.DataFrame(
+                {"AAA": [1.0, 2.0], "BBB": [2.0, 3.0]},
+                index=dates,
+            )
+            svc._factor_service = unittest.mock.Mock()
+            svc._factor_service.get_factor.return_value = {"name": "Factor"}
+            svc._label_service = unittest.mock.Mock()
+            svc._label_service.compute_label_values_cached.return_value = pd.DataFrame(
+                {
+                    "date": [dates[0], dates[0], dates[1], dates[1]],
+                    "ticker": ["AAA", "BBB", "AAA", "BBB"],
+                    "label_value": [0.1, 0.2, 0.3, 0.4],
+                }
+            )
+            svc._label_service.get_label.return_value = {"name": "Label"}
+
+            result = svc.evaluate_factor(
+                factor_id="factor_stage",
+                label_id="label_stage",
+                universe_group_id="group_stage",
+                start_date="2024-01-02",
+                end_date="2024-01-03",
+                market="US",
+                stage_domain_write=stage_domain_write,
+            )
+            self.assertEqual(saved, [])
+            self.assertEqual(staged[0][0], "factor_eval_results")
+            staged[0][2]()
+
+        self.assertEqual(result["market"], "US")
+        self.assertEqual(saved[0]["eval_id"], result["id"])
+
     def test_factor_api_forwards_market_scope(self):
         fake_service = _FakeFactorService()
         fake_eval_service = _FakeFactorEvalService()
