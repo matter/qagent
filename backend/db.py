@@ -1010,9 +1010,27 @@ CREATE TABLE IF NOT EXISTS task_pause_rules (
 );
 """
 
+_TASK_RESOURCE_LEASES_DDL = """\
+CREATE TABLE IF NOT EXISTS task_resource_leases (
+    resource_key   VARCHAR PRIMARY KEY,
+    task_id        VARCHAR NOT NULL,
+    task_type      VARCHAR NOT NULL,
+    market         VARCHAR,
+    status         VARCHAR NOT NULL DEFAULT 'active',
+    acquired_at    TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    heartbeat_at   TIMESTAMP NOT NULL DEFAULT current_timestamp,
+    expires_at     TIMESTAMP NOT NULL,
+    released_at    TIMESTAMP,
+    release_reason VARCHAR,
+    metadata       JSON
+);
+"""
+
 _PERFORMANCE_INDEX_DDLS = [
     "CREATE INDEX IF NOT EXISTS idx_task_runs_status_type_created ON task_runs(status, task_type, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_task_runs_source_created ON task_runs(source, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_task_resource_leases_task ON task_resource_leases(task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_task_resource_leases_status_expires ON task_resource_leases(status, expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_research_runs_project_created ON research_runs(project_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_research_runs_type_status ON research_runs(run_type, status)",
     "CREATE INDEX IF NOT EXISTS idx_artifacts_project_created ON artifacts(project_id, created_at)",
@@ -1465,6 +1483,7 @@ def init_db() -> None:
         ("promotion_policies", _PROMOTION_POLICIES_DDL),
         ("research_playbooks", _RESEARCH_PLAYBOOKS_DDL),
         ("task_pause_rules", _TASK_PAUSE_RULES_DDL),
+        ("task_resource_leases", _TASK_RESOURCE_LEASES_DDL),
         ("stocks", _STOCKS_DDL),
         ("daily_bars", _DAILY_BARS_DDL),
         ("index_bars", _INDEX_BARS_DDL),

@@ -95,6 +95,7 @@ curl -fsS http://127.0.0.1:8000/api/tasks/<task_id>
 | `GET` | `/api/tasks/pause-rules` | 查询任务暂停规则 |
 | `POST` | `/api/tasks/pause-rules` | 创建暂停规则 |
 | `DELETE` | `/api/tasks/pause-rules/{rule_id}` | 删除暂停规则 |
+| `GET` | `/api/tasks/resource-leases` | 查询 DB-backed resource lease，定位跨进程排队和 stale lease |
 
 常见长任务：
 
@@ -112,7 +113,9 @@ curl -fsS http://127.0.0.1:8000/api/tasks/<task_id>
 - 用户没有明确要求时，不调用 `/api/data/update`、`/api/data/update/markets`、MCP `update_data`、MCP `update_data_markets`。
 - 不要为了 smoke test 启动 full backfill。使用小 ticker、小日期区间、只读查询验证。
 - `cancel_requested` 或 `timeout` 后，任务终态以 `authoritative_terminal=true` 为准。晚到结果只会出现在 `late_result_diagnostics`，并标记 `late_result_quarantined=true`；不要把其中的 backtest/model/run id 当成已验收资产继续使用。
-- 串行任务会在 `/api/tasks/{task_id}.result.progress` 中暴露 `serial_wait` 和 `serial_acquired`，并带 `serial_key`。`strategy_backtest` 使用类似 `US:legacy-backtest` 的串行 lane；看到 `serial_wait` 时说明任务是在排队，不等于计算卡死。
+- 串行任务会在 `/api/tasks/{task_id}.result.progress` 中暴露 `serial_wait` 和 `serial_acquired`。当前正式协调机制是 DuckDB 持久化 `task_resource_leases`，progress 会带 `resource_keys`、`blocked_by`、`leases`，并兼容保留旧 `serial_key` 字段。看到 `serial_wait` 时说明任务正在等资源租约，不等于计算卡死。
+- 资源租约可通过 `GET /api/tasks/resource-leases?active_only=true&limit=100` 或 MCP `list_task_resource_leases` 查看。重点字段：`resource_key` 是被保护的资源，`task_id` 是持有者，`heartbeat_at` 是续租时间，`expires_at` 是无心跳后的自动过期时间，`released_at/release_reason` 表示释放原因。stale active lease 会在下一次 acquire 或显式列表/清理路径中过期。
+- 已保护的资源包括 legacy `strategy_backtest`、`model_train`、`model_distillation_train`、`factor_compute`、3.0 `factor_materialize_3_0`、`model_train_experiment_3_0`、`strategy_graph_backtest`、`data_update`、`data_update_markets` 和 research cache warmup。CN legacy 回测和模型训练共享 `market:CN:heavy-research`，保留原有重任务串行语义。
 - 支持 `stage_domain_write` 的长任务会先暂存最终业务写入，只在任务仍处于 accepted completion boundary 时提交。`timeout`、`cancel` 或晚到结果不会发布 staged domain rows。
 
 ## 5. 3.0 REST API 完整索引
@@ -944,7 +947,7 @@ MCP 工具调用同一 service layer。3.0 工具通常以 `_3_0` 结尾；legac
 - Model: `list_models`, `train_model`
 - Strategy/backtest: `list_strategies`, `create_strategy`, `run_backtest`
 - Signal: `generate_signals`
-- Task: `get_task_status`, `cancel_task`
+- Task: `get_task_status`, `cancel_task`, `list_task_resource_leases`
 - Group: `list_groups`, `create_group`, `refresh_index_groups`
 - Label: `list_labels`, `create_label`
 - Feature set: `list_feature_sets`, `create_feature_set`

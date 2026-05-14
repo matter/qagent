@@ -6,6 +6,7 @@ import threading
 import traceback
 import uuid
 import inspect
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from datetime import datetime
 from typing import Any, Callable
@@ -144,6 +145,67 @@ class TaskExecutor:
             if feature_set_id and universe_group_id:
                 return f"{market or 'US'}:model-train:{feature_set_id}:{universe_group_id}"
         return None
+
+    @staticmethod
+    def _resource_keys(task_type: str, params: dict[str, Any] | None) -> list[str]:
+        params = params or {}
+        market = TaskExecutor._pause_rule_market(params) or "US"
+        if market == "CN" and task_type in {"strategy_backtest", "model_train"}:
+            return ["market:CN:heavy-research"]
+        if task_type == "strategy_backtest":
+            return [f"market:{market}:legacy-backtest"]
+        if task_type == "model_train":
+            feature_set_id = str(params.get("feature_set_id") or "")
+            universe_group_id = str(params.get("universe_group_id") or "")
+            if feature_set_id and universe_group_id:
+                return [f"market:{market}:model-train:{feature_set_id}:{universe_group_id}"]
+            return []
+        if task_type in {"model_train_distillation", "model_distillation_train"}:
+            feature_set_id = str(params.get("student_feature_set_id") or "")
+            universe_group_id = str(params.get("universe_group_id") or "")
+            if feature_set_id and universe_group_id:
+                return [f"market:{market}:model-train:{feature_set_id}:{universe_group_id}"]
+            return []
+        if task_type == "factor_compute":
+            factor_id = str(params.get("factor_id") or "")
+            return [f"market:{market}:factor:{factor_id}"] if factor_id else []
+        if task_type == "factor_materialize_3_0":
+            factor_spec_id = str(params.get("factor_spec_id") or "")
+            universe_id = str(params.get("universe_id") or "")
+            market_profile_id = str(params.get("market_profile_id") or "")
+            if factor_spec_id and universe_id:
+                prefix = (
+                    f"market_profile:{market_profile_id}:"
+                    if market_profile_id
+                    else ""
+                )
+                return [f"{prefix}factor_spec:{factor_spec_id}:universe:{universe_id}"]
+            return []
+        if task_type == "model_train_experiment_3_0":
+            payload = params.get("payload") if isinstance(params.get("payload"), dict) else {}
+            dataset_id = str(params.get("dataset_id") or payload.get("dataset_id") or "")
+            return [f"dataset:{dataset_id}:model-train-experiment"] if dataset_id else []
+        if task_type == "strategy_graph_backtest":
+            strategy_graph_id = str(params.get("strategy_graph_id") or "")
+            return [f"strategy_graph:{strategy_graph_id}:backtest"] if strategy_graph_id else []
+        if task_type == "data_update":
+            return [f"market:{market}:data-update"]
+        if task_type == "data_update_markets":
+            return ["global:data-update"]
+        if task_type in {"research_cache_warmup", "cache_feature_matrix_warmup"}:
+            cache_key = str(params.get("cache_key") or "")
+            if cache_key:
+                return [f"cache:{cache_key}"]
+            feature_set_id = str(params.get("feature_set_id") or "")
+            universe_group_id = str(params.get("universe_group_id") or "")
+            if feature_set_id and universe_group_id:
+                return [f"market:{market}:research-cache:{feature_set_id}:{universe_group_id}"]
+            return [f"market:{market}:research-cache"]
+        return []
+
+    @staticmethod
+    def _lease_ttl(timeout: int | None) -> int:
+        return max(120, min(int(timeout or DEFAULT_TIMEOUT), 900))
 
     def _get_serial_lock(self, key: str) -> threading.Lock:
         with self._serial_locks_lock:
@@ -511,6 +573,210 @@ class TaskExecutor:
         summary["acceptance"] = json_safe_value(acceptance)
         return summary
 
+    def _lease_store_available(self) -> bool:
+        return callable(getattr(self._store, "acquire_resource_leases", None))
+
+    def _acquire_resource_leases_for_task(
+        self,
+        *,
+        task_id: str,
+        task_type: str,
+        params: dict[str, Any],
+        timeout: int,
+    ) -> dict[str, Any]:
+        resource_keys = self._resource_keys(task_type, params)
+        if not resource_keys or not self._lease_store_available():
+            return {
+                "resource_keys": [],
+                "leases": [],
+                "ttl_seconds": self._lease_ttl(timeout),
+                "timed_out": False,
+                "cancelled": False,
+            }
+        acquire = getattr(self._store, "acquire_resource_leases")
+        ttl_seconds = self._lease_ttl(timeout)
+        serial_key = self._serial_key(task_type, params)
+        market = self._pause_rule_market(params)
+        deadline = time.monotonic() + float(timeout or DEFAULT_TIMEOUT)
+        delay = 0.25
+        last_progress_at = 0.0
+        while True:
+            if self._is_cancelled(task_id):
+                return {
+                    "resource_keys": resource_keys,
+                    "leases": [],
+                    "ttl_seconds": ttl_seconds,
+                    "timed_out": False,
+                    "cancelled": True,
+                }
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                completed = utc_now_naive()
+                self._update_memory_status(
+                    task_id,
+                    TaskStatus.TIMEOUT,
+                    completed_at=completed,
+                    result_summary={
+                        "compute_may_continue": False,
+                        "authoritative_terminal": True,
+                        "message": "Task timed out while waiting for resource leases.",
+                        "resource_keys": resource_keys,
+                    },
+                    error_message=f"Task timed out after {timeout}s while waiting for resource leases",
+                )
+                self._store.update_status(
+                    task_id,
+                    TaskStatus.TIMEOUT,
+                    completed_at=completed,
+                    result_summary={
+                        "compute_may_continue": False,
+                        "authoritative_terminal": True,
+                        "message": "Task timed out while waiting for resource leases.",
+                        "resource_keys": resource_keys,
+                    },
+                    error_message=f"Task timed out after {timeout}s while waiting for resource leases",
+                )
+                return {
+                    "resource_keys": resource_keys,
+                    "leases": [],
+                    "ttl_seconds": ttl_seconds,
+                    "timed_out": True,
+                    "cancelled": False,
+                }
+            result = acquire(
+                task_id=task_id,
+                task_type=task_type,
+                resource_keys=resource_keys,
+                market=market,
+                ttl_seconds=ttl_seconds,
+                metadata={"params": params, "timeout_seconds": timeout},
+            )
+            if result.get("acquired"):
+                self._update_progress(
+                    task_id,
+                    "serial_acquired",
+                    serial_key=serial_key,
+                    resource_keys=resource_keys,
+                    leases=result.get("leases") or [],
+                    message=f"Acquired resource lease {', '.join(resource_keys)}",
+                )
+                log.info(
+                    "task.resource_leases_acquired",
+                    task_id=task_id,
+                    resource_keys=resource_keys,
+                )
+                return {
+                    "resource_keys": resource_keys,
+                    "leases": result.get("leases") or [],
+                    "ttl_seconds": ttl_seconds,
+                    "timed_out": False,
+                    "cancelled": False,
+                }
+            now = time.monotonic()
+            if last_progress_at == 0.0 or now - last_progress_at >= 1.0:
+                self._update_progress(
+                    task_id,
+                    "serial_wait",
+                    serial_key=serial_key,
+                    resource_keys=resource_keys,
+                    blocked_by=result.get("blocked") or [],
+                    message=f"Waiting for resource lease {', '.join(resource_keys)}",
+                )
+                log.info(
+                    "task.resource_leases_wait",
+                    task_id=task_id,
+                    resource_keys=resource_keys,
+                    blocked_by=result.get("blocked") or [],
+                )
+                last_progress_at = now
+            time.sleep(min(delay, max(0.01, remaining)))
+            delay = min(2.0, delay * 1.5)
+
+    def _start_resource_heartbeat(
+        self,
+        task_id: str,
+        resource_keys: list[str],
+        ttl_seconds: int,
+    ) -> threading.Event | None:
+        heartbeat = getattr(self._store, "heartbeat_resource_leases", None)
+        if not resource_keys or not callable(heartbeat):
+            return None
+        stop_event = threading.Event()
+        interval = max(1.0, min(30.0, ttl_seconds / 3.0))
+
+        def _heartbeat_loop() -> None:
+            while not stop_event.wait(interval):
+                try:
+                    heartbeat(task_id, resource_keys, ttl_seconds)
+                except Exception as exc:
+                    log.warning(
+                        "task.resource_lease_heartbeat_failed",
+                        task_id=task_id,
+                        error=str(exc),
+                    )
+
+        thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+        thread.start()
+        return stop_event
+
+    @staticmethod
+    def _stop_resource_heartbeat(stop_event: threading.Event | None) -> None:
+        if stop_event is not None:
+            stop_event.set()
+
+    def _release_resource_leases(
+        self,
+        task_id: str,
+        resource_keys: list[str],
+        reason: str,
+    ) -> None:
+        release = getattr(self._store, "release_resource_leases", None)
+        if not resource_keys or not callable(release):
+            return
+        try:
+            release(task_id, resource_keys, reason=reason)
+            log.info(
+                "task.resource_leases_released",
+                task_id=task_id,
+                resource_keys=resource_keys,
+                reason=reason,
+            )
+        except Exception as exc:
+            log.warning(
+                "task.resource_lease_release_failed",
+                task_id=task_id,
+                reason=reason,
+                error=str(exc),
+            )
+
+    def _acquire_local_serial_lock(
+        self,
+        *,
+        task_id: str,
+        task_type: str,
+        params: dict[str, Any],
+    ) -> threading.Lock | None:
+        serial_key = self._serial_key(task_type, params)
+        serial_lock = self._get_serial_lock(serial_key) if serial_key else None
+        if serial_lock is None:
+            return None
+        self._update_progress(
+            task_id,
+            "serial_wait",
+            serial_key=serial_key,
+            message=f"Waiting for serial lane {serial_key}",
+        )
+        log.info("task.serial_wait", task_id=task_id, serial_key=serial_key)
+        serial_lock.acquire()
+        self._update_progress(
+            task_id,
+            "serial_acquired",
+            serial_key=serial_key,
+            message=f"Acquired serial lane {serial_key}",
+        )
+        log.info("task.serial_acquired", task_id=task_id, serial_key=serial_key)
+        return serial_lock
+
     def _run(
         self,
         task_id: str,
@@ -530,28 +796,42 @@ class TaskExecutor:
         )
         log.info("task.running", task_id=task_id)
 
-        serial_key = self._serial_key(
-            self.get_task(task_id).task_type if self.get_task(task_id) else "",
-            params,
-        )
-        serial_lock = self._get_serial_lock(serial_key) if serial_key else None
-        if serial_lock is not None:
-            self._update_progress(
-                task_id,
-                "serial_wait",
-                serial_key=serial_key,
-                message=f"Waiting for serial lane {serial_key}",
+        task_record = self.get_task(task_id)
+        task_type = task_record.task_type if task_record else ""
+        resource_keys: list[str] = []
+        heartbeat_stop: threading.Event | None = None
+        serial_lock: threading.Lock | None = None
+        if self._lease_store_available():
+            lease_state = self._acquire_resource_leases_for_task(
+                task_id=task_id,
+                task_type=task_type,
+                params=params,
+                timeout=timeout,
             )
-            log.info("task.serial_wait", task_id=task_id, serial_key=serial_key)
-            serial_lock.acquire()
-            self._update_progress(
+            if lease_state.get("timed_out") or lease_state.get("cancelled"):
+                return
+            resource_keys = list(lease_state.get("resource_keys") or [])
+            heartbeat_stop = self._start_resource_heartbeat(
                 task_id,
-                "serial_acquired",
-                serial_key=serial_key,
-                message=f"Acquired serial lane {serial_key}",
+                resource_keys,
+                int(lease_state.get("ttl_seconds") or self._lease_ttl(timeout)),
             )
-            log.info("task.serial_acquired", task_id=task_id, serial_key=serial_key)
             if self._is_cancelled(task_id):
+                log.info("task.cancelled_before_resource_work", task_id=task_id)
+                self._release_resource_leases(
+                    task_id,
+                    resource_keys,
+                    "cancelled_before_work",
+                )
+                self._stop_resource_heartbeat(heartbeat_stop)
+                return
+        else:
+            serial_lock = self._acquire_local_serial_lock(
+                task_id=task_id,
+                task_type=task_type,
+                params=params,
+            )
+            if serial_lock is not None and self._is_cancelled(task_id):
                 log.info("task.cancelled_before_serial_work", task_id=task_id)
                 serial_lock.release()
                 return
@@ -573,7 +853,8 @@ class TaskExecutor:
                 staged_writes
             )
         inner_future = inner_pool.submit(fn, **call_params)
-        release_serial_in_finally = True
+        release_resources_in_finally = True
+        release_reason = "completed"
 
         try:
             result = inner_future.result(timeout=timeout)
@@ -585,6 +866,7 @@ class TaskExecutor:
                     error_message="Cancelled by user; late result quarantined",
                 )
                 log.info("task.cancelled_late_result_quarantined", task_id=task_id)
+                release_reason = "cancelled_late_completed"
                 return
             completed = utc_now_naive()
             summary = self._accepted_summary(
@@ -607,6 +889,7 @@ class TaskExecutor:
                 result_summary=summary,
             )
             log.info("task.completed", task_id=task_id)
+            release_reason = "completed"
 
         except TimeoutError:
             completed = utc_now_naive()
@@ -643,7 +926,10 @@ class TaskExecutor:
                 tid: str,
                 store: TaskStore,
                 serial_release_lock: threading.Lock | None,
+                leased_resource_keys: list[str],
+                heartbeat_event: threading.Event | None,
             ) -> None:
+                reason = "timeout_late_failed"
                 try:
                     result = fut.result()  # blocks until inner completes
                     if self._is_cancelled(tid):
@@ -654,6 +940,7 @@ class TaskExecutor:
                             error_message="Cancelled by user; late result quarantined",
                         )
                         log.info("task.cancelled_late_result_quarantined", task_id=tid)
+                        reason = "cancelled_late_completed"
                         return
                     self._quarantine_late_result(
                         tid,
@@ -662,9 +949,11 @@ class TaskExecutor:
                         error_message=f"Task timed out after {timeout}s; late result quarantined",
                     )
                     log.info("task.late_result_quarantined", task_id=tid)
+                    reason = "timeout_late_completed"
                 except Exception:
                     if self._is_cancelled(tid):
                         log.info("task.cancelled_late_error_ignored", task_id=tid)
+                        reason = "cancelled_late_failed"
                         return
                     tb = json_safe_string(traceback.format_exc())
                     self._update_memory_status(
@@ -680,14 +969,17 @@ class TaskExecutor:
                         error_message=tb,
                     )
                     log.error("task.late_failed", task_id=tid, error=tb)
+                    reason = "timeout_late_failed"
                 finally:
+                    self._release_resource_leases(tid, leased_resource_keys, reason)
+                    self._stop_resource_heartbeat(heartbeat_event)
                     if serial_release_lock is not None:
                         serial_release_lock.release()
 
-            release_serial_in_finally = False
+            release_resources_in_finally = False
             watcher = threading.Thread(
                 target=_watch_completion,
-                args=(inner_future, task_id, self._store, serial_lock),
+                args=(inner_future, task_id, self._store, serial_lock, resource_keys, heartbeat_stop),
                 daemon=True,
             )
             watcher.start()
@@ -708,9 +1000,14 @@ class TaskExecutor:
                 error_message=tb,
             )
             log.error("task.failed", task_id=task_id, error=tb)
+            release_reason = "failed"
 
         finally:
-            if serial_lock is not None and release_serial_in_finally:
+            if resource_keys and release_resources_in_finally:
+                self._release_resource_leases(task_id, resource_keys, release_reason)
+            if release_resources_in_finally:
+                self._stop_resource_heartbeat(heartbeat_stop)
+            if serial_lock is not None and release_resources_in_finally:
                 serial_lock.release()
             inner_pool.shutdown(wait=False)
 

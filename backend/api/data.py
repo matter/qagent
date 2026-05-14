@@ -168,7 +168,7 @@ async def trigger_multi_market_update(body: MultiMarketUpdateRequest) -> dict:
         )
 
     task_id = executor.submit(
-        task_type="data_update",
+        task_type="data_update_markets",
         fn=svc.update_markets,
         params={
             "mode": body.mode,
@@ -182,6 +182,7 @@ async def trigger_multi_market_update(body: MultiMarketUpdateRequest) -> dict:
     return {
         "task_id": task_id,
         "status": "queued",
+        "task_type": "data_update_markets",
         "markets": markets,
         "mode": body.mode,
         "history_years": body.history_years,

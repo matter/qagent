@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from backend.db import close_db, get_connection
+from backend.db import close_db, get_connection, init_db
 
 from backend.tasks.executor import TaskExecutor, TaskSubmissionPaused
 from backend.tasks.models import TaskRecord, TaskSource, TaskStatus
@@ -30,6 +30,139 @@ class MemoryOnlyStore:
 
 
 class TaskExecutorContractTests(unittest.TestCase):
+    def _init_temp_db(self, filename: str = "tasks.duckdb") -> None:
+        db_path = Path(tempfile.mkdtemp()) / filename
+        close_db()
+        patcher = patch("backend.config.settings.data.db_path", str(db_path))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(close_db)
+        init_db()
+
+    def test_task_store_acquires_and_rejects_active_resource_lease(self):
+        self._init_temp_db()
+        store = TaskStore()
+
+        first = store.acquire_resource_leases(
+            task_id="task_1",
+            task_type="strategy_backtest",
+            resource_keys=["market:US:legacy-backtest"],
+            market="US",
+            ttl_seconds=120,
+        )
+        second = store.acquire_resource_leases(
+            task_id="task_2",
+            task_type="strategy_backtest",
+            resource_keys=["market:US:legacy-backtest"],
+            market="US",
+            ttl_seconds=120,
+        )
+
+        self.assertTrue(first["acquired"])
+        self.assertEqual(first["blocked"], [])
+        self.assertFalse(second["acquired"])
+        self.assertEqual(second["blocked"][0]["resource_key"], "market:US:legacy-backtest")
+        self.assertEqual(second["blocked"][0]["task_id"], "task_1")
+
+    def test_task_store_expires_stale_resource_lease_before_acquiring(self):
+        self._init_temp_db()
+        store = TaskStore()
+        conn = get_connection()
+        conn.execute(
+            """
+            INSERT INTO task_resource_leases
+                (resource_key, task_id, task_type, market, status, expires_at)
+            VALUES
+                ('market:US:legacy-backtest', 'task_old', 'strategy_backtest',
+                 'US', 'active', current_timestamp - INTERVAL 1 SECOND)
+            """
+        )
+
+        acquired = store.acquire_resource_leases(
+            task_id="task_new",
+            task_type="strategy_backtest",
+            resource_keys=["market:US:legacy-backtest"],
+            market="US",
+            ttl_seconds=120,
+        )
+
+        self.assertTrue(acquired["acquired"])
+        leases = store.list_resource_leases(active_only=False, limit=10)
+        self.assertEqual(leases[0]["task_id"], "task_new")
+        self.assertEqual(leases[0]["status"], "active")
+
+    def test_two_executors_serialize_same_resource_through_store_lease(self):
+        self._init_temp_db()
+        store_1 = TaskStore()
+        store_2 = TaskStore()
+        executor_1 = TaskExecutor(store=store_1, max_workers=1)
+        executor_2 = TaskExecutor(store=store_2, max_workers=1)
+        first_started = threading.Event()
+        release_first = threading.Event()
+        second_started = threading.Event()
+
+        def first_work(**_kwargs):
+            first_started.set()
+            release_first.wait(timeout=2)
+            return {"first": True}
+
+        def second_work(**_kwargs):
+            second_started.set()
+            return {"second": True}
+
+        executor_1.submit(
+            "strategy_backtest",
+            fn=first_work,
+            params={"market": "US"},
+            timeout=5,
+        )
+        self.assertTrue(first_started.wait(timeout=2))
+        second_id = executor_2.submit(
+            "strategy_backtest",
+            fn=second_work,
+            params={"market": "US"},
+            timeout=5,
+        )
+
+        try:
+            deadline = time.time() + 2
+            second_record = executor_2.get_task(second_id)
+            while time.time() < deadline:
+                second_record = executor_2.get_task(second_id)
+                progress = (second_record.result_summary or {}).get("progress")
+                if progress and progress.get("phase") == "serial_wait":
+                    break
+                time.sleep(0.01)
+            self.assertEqual(second_record.result_summary["progress"]["phase"], "serial_wait")
+            self.assertFalse(second_started.is_set())
+        finally:
+            release_first.set()
+            executor_1.shutdown(wait=True)
+            executor_2.shutdown(wait=True)
+
+        self.assertTrue(second_started.is_set())
+        self.assertEqual(executor_2.get_task(second_id).status, TaskStatus.COMPLETED)
+
+    def test_task_releases_resource_lease_after_completion(self):
+        self._init_temp_db()
+        store = TaskStore()
+        executor = TaskExecutor(store=store, max_workers=1)
+
+        task_id = executor.submit(
+            "strategy_backtest",
+            fn=lambda **_kwargs: {"ok": True},
+            params={"market": "US"},
+            timeout=5,
+        )
+        executor.shutdown(wait=True)
+
+        record = executor.get_task(task_id)
+        leases = store.list_resource_leases(active_only=False, limit=10)
+        self.assertEqual(record.status, TaskStatus.COMPLETED)
+        self.assertEqual(leases[0]["task_id"], task_id)
+        self.assertEqual(leases[0]["status"], "released")
+        self.assertEqual(leases[0]["release_reason"], "completed")
+
     def test_get_task_prefers_in_memory_record(self):
         store = MemoryOnlyStore()
         executor = TaskExecutor(store=store, max_workers=1)
@@ -331,6 +464,26 @@ class TaskExecutorContractTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.status_code, 400)
 
+    def test_task_api_lists_resource_leases(self):
+        from backend.api import tasks
+
+        class LeaseListingStore:
+            def list_resource_leases(self, active_only=True, limit=100):
+                return [{
+                    "resource_key": "market:US:legacy-backtest",
+                    "task_id": "task_lease",
+                    "status": "active",
+                    "active_only": active_only,
+                    "limit": limit,
+                }]
+
+        with patch.object(tasks, "_get_store", return_value=LeaseListingStore()):
+            leases = asyncio.run(tasks.list_resource_leases(active_only=False, limit=25))
+
+        self.assertEqual(leases[0]["resource_key"], "market:US:legacy-backtest")
+        self.assertFalse(leases[0]["active_only"])
+        self.assertEqual(leases[0]["limit"], 25)
+
     def test_stale_running_tasks_are_marked_retryable_interrupted(self):
         store = StaleRecordingStore()
 
@@ -382,6 +535,89 @@ class TaskExecutorContractTests(unittest.TestCase):
                     "feature_set_id": "fs_alpha",
                     "universe_group_id": "sp500",
                     "label_id": "different_label",
+                },
+            ),
+        )
+
+    def test_protected_task_resource_key_coverage(self):
+        self.assertIn(
+            "market:US:legacy-backtest",
+            TaskExecutor._resource_keys("strategy_backtest", {"market": "US"}),
+        )
+        self.assertIn(
+            "market:CN:heavy-research",
+            TaskExecutor._resource_keys("strategy_backtest", {"market": "CN"}),
+        )
+        self.assertIn(
+            "market:US:model-train:fs_alpha:sp500",
+            TaskExecutor._resource_keys(
+                "model_train",
+                {
+                    "market": "US",
+                    "feature_set_id": "fs_alpha",
+                    "universe_group_id": "sp500",
+                },
+            ),
+        )
+        self.assertIn(
+            "market:US:model-train:fs_student:sp500",
+            TaskExecutor._resource_keys(
+                "model_distillation_train",
+                {
+                    "market": "US",
+                    "student_feature_set_id": "fs_student",
+                    "universe_group_id": "sp500",
+                },
+            ),
+        )
+        self.assertIn(
+            "market:US:factor:factor_1",
+            TaskExecutor._resource_keys(
+                "factor_compute",
+                {"market": "US", "factor_id": "factor_1"},
+            ),
+        )
+        self.assertIn(
+            "market_profile:US_EQ:factor_spec:factor_spec_1:universe:universe_1",
+            TaskExecutor._resource_keys(
+                "factor_materialize_3_0",
+                {
+                    "market_profile_id": "US_EQ",
+                    "factor_spec_id": "factor_spec_1",
+                    "universe_id": "universe_1",
+                },
+            ),
+        )
+        self.assertIn(
+            "dataset:dataset_1:model-train-experiment",
+            TaskExecutor._resource_keys(
+                "model_train_experiment_3_0",
+                {"payload": {"dataset_id": "dataset_1"}},
+            ),
+        )
+        self.assertIn(
+            "strategy_graph:graph_1:backtest",
+            TaskExecutor._resource_keys(
+                "strategy_graph_backtest",
+                {"strategy_graph_id": "graph_1"},
+            ),
+        )
+        self.assertIn(
+            "market:US:data-update",
+            TaskExecutor._resource_keys("data_update", {"market": "US"}),
+        )
+        self.assertIn(
+            "global:data-update",
+            TaskExecutor._resource_keys("data_update_markets", {}),
+        )
+        self.assertIn(
+            "market:US:research-cache:fs_alpha:sp500",
+            TaskExecutor._resource_keys(
+                "cache_feature_matrix_warmup",
+                {
+                    "market": "US",
+                    "feature_set_id": "fs_alpha",
+                    "universe_group_id": "sp500",
                 },
             ),
         )
@@ -689,6 +925,7 @@ class StaleRecordingStore(TaskStore):
         self.status = None
         self.result_summary = None
         self.error_message = None
+        self.released = []
 
     def list_matching_active(self, **kwargs):
         return [
@@ -700,6 +937,10 @@ class StaleRecordingStore(TaskStore):
         self.status = status
         self.result_summary = kwargs.get("result_summary")
         self.error_message = kwargs.get("error_message")
+
+    def release_resource_leases(self, task_id, resource_keys=None, reason="completed"):
+        self.released.append((task_id, resource_keys, reason))
+        return 1
 
 
 if __name__ == "__main__":

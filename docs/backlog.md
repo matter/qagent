@@ -6,7 +6,6 @@ This file only tracks unresolved or deferred work. Fixed and mitigated items are
 
 | Priority | Defect | Necessity | Workload |
 | --- | --- | --- | --- |
-| P0 | DuckDB-sensitive task scheduling remains process-local | High for multiple Codex windows and any accidental second process. Existing serial lanes are in-memory and only cover a subset of heavy tasks; direct scripts or another backend bypass them. | High |
 | P1 | Remaining stateful/multi-table long-running workflows need domain-specific staging | Medium. Main final-asset tasks and legacy paper trading advance now stage/promote at task acceptance, but data refresh and 3.0 graph/model/universe/research workflows are state machines, source-data updates, or cache/materialization pipelines that still need explicit resume/idempotency/rollback semantics. | High |
 | P2 | Coordinator-friendly research metadata is lightweight/manual | Medium. The coordinator can dispatch top-model Codex agents outside QAgent today; optional metadata/artifact conveniences would reduce bookkeeping without turning QAgent into an agent control plane. | Low-Medium |
 | P1 | Research cache file and metadata writes need atomic writer leases | Medium-High. Current cache locks are process-local; concurrent agents through one backend are mostly protected, but second processes or cleanup during writes can corrupt cache state. | Medium |
@@ -16,20 +15,6 @@ This file only tracks unresolved or deferred work. Fixed and mitigated items are
 | P3 | Legacy and 3.0 engines coexist with overlapping concepts | Medium. Migration overlap increases maintenance/audit cost, but it protects existing US workflows. Fix only after 3.0 backtest/signal/paper semantics cover the legacy surface. | High |
 
 ## Open
-
-### [2026-05-14] P0 DuckDB-sensitive task scheduling remains process-local
-
-- **Market**: US, CN
-- **Entry**: `backend/tasks/executor.py`, `backend/tasks/store.py`, data refresh tasks, research cache, dataset materialization, 3.0 model experiment, 3.0 strategy graph backtest, legacy model/backtest tasks.
-- **Current mitigation**:
-  - One backend process uses a shared `TaskExecutor` with `MAX_WORKERS=6`.
-  - Process-local serial lanes cover CN heavy legacy tasks, market-level legacy backtests, and same feature-set/universe model training.
-  - Task pause rules can prevent new submissions by `task_type/source/market`.
-- **Remaining issue**: Serial lanes are in-memory locks. They do not coordinate across processes, direct scripts, or a second backend. Coverage is partial: data update, cache writes, dataset materialize, 3.0 model experiment, 3.0 StrategyGraph backtest, and distillation can still create conflicting writes or state transitions. DuckDB itself remains a single-file local database.
-- **Expected behavior**: DuckDB-sensitive work should be scheduled through DB-backed lanes or leases with task/resource keys, concurrency limits, drain/pause/retry controls, and clear ownership. Direct-maintenance commands should preflight and refuse unsafe concurrent writes.
-- **Validation standard**: Two concurrent API submissions for the same protected resource serialize through persistent lanes; stale lane leases expire safely; a second process cannot silently bypass protected workflow writes; pause/drain state is visible through API.
-- **Fix necessity**: High if multiple Codex windows run long tasks regularly. Lower only if strict manual rule "one backend, no direct scripts" is always followed.
-- **Estimated workload**: High. Requires scheduler semantics, DB-backed lease table, migration of task submission paths, and regression tests.
 
 ### [2026-05-14] P2 Coordinator-friendly research metadata is lightweight/manual
 

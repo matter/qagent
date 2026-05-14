@@ -108,10 +108,200 @@ class TaskStore:
                     "rerun with the same params."
                 ),
             )
+            try:
+                self.release_resource_leases(record.id, reason="server_restarted")
+            except Exception as exc:
+                log.warning(
+                    "task.stale_resource_lease_release_failed",
+                    task_id=record.id,
+                    error=str(exc),
+                )
         count = len(stale_records)
         if count > 0:
             log.info("task.stale_cleaned", count=count)
         return count
+
+    def acquire_resource_leases(
+        self,
+        *,
+        task_id: str,
+        task_type: str,
+        resource_keys: list[str],
+        market: str | None,
+        ttl_seconds: int,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Atomically acquire one or more task resource leases."""
+        keys = self._clean_resource_keys(resource_keys)
+        if not keys:
+            return {"acquired": True, "leases": [], "blocked": []}
+        ttl = max(1, int(ttl_seconds))
+        market_value = normalize_market(market) if market else None
+        metadata_json = json.dumps(json_safe_value(metadata or {}))
+        conn = get_connection()
+        try:
+            conn.execute("BEGIN TRANSACTION")
+            now = self._lease_now(conn)
+            expires_at = self._lease_expires_at(conn, ttl)
+            self._expire_stale_resource_leases(conn, now)
+            placeholders = ", ".join(["?"] * len(keys))
+            rows = conn.execute(
+                f"""
+                SELECT resource_key, task_id, task_type, market, status,
+                       acquired_at, heartbeat_at, expires_at, released_at,
+                       release_reason, metadata
+                  FROM task_resource_leases
+                 WHERE status = 'active'
+                   AND expires_at > ?
+                   AND resource_key IN ({placeholders})
+                 ORDER BY resource_key
+                """,
+                [now, *keys],
+            ).fetchall()
+            if rows:
+                blocked = [
+                    {
+                        "resource_key": row[0],
+                        "task_id": row[1],
+                        "task_type": row[2],
+                        "market": row[3],
+                        "expires_at": str(row[7]) if row[7] else None,
+                    }
+                    for row in rows
+                ]
+                conn.execute("COMMIT")
+                return {"acquired": False, "leases": [], "blocked": blocked}
+
+            leases: list[dict[str, Any]] = []
+            for key in keys:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO task_resource_leases
+                        (resource_key, task_id, task_type, market, status,
+                         acquired_at, heartbeat_at, expires_at, released_at,
+                         release_reason, metadata)
+                    VALUES
+                        (?, ?, ?, ?, 'active', ?, ?, ?, NULL, NULL, ?)
+                    """,
+                    [
+                        key,
+                        task_id,
+                        task_type,
+                        market_value,
+                        now,
+                        now,
+                        expires_at,
+                        metadata_json,
+                    ],
+                )
+                leases.append({
+                    "resource_key": key,
+                    "task_id": task_id,
+                    "task_type": task_type,
+                    "market": market_value,
+                    "status": "active",
+                    "acquired_at": str(now),
+                    "heartbeat_at": str(now),
+                    "expires_at": str(expires_at),
+                    "metadata": json_safe_value(metadata or {}),
+                })
+            conn.execute("COMMIT")
+            return {"acquired": True, "leases": leases, "blocked": []}
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+
+    def heartbeat_resource_leases(
+        self,
+        task_id: str,
+        resource_keys: list[str],
+        ttl_seconds: int,
+    ) -> None:
+        """Extend active leases owned by a task."""
+        keys = self._clean_resource_keys(resource_keys)
+        if not keys:
+            return
+        placeholders = ", ".join(["?"] * len(keys))
+        conn = get_connection()
+        now = self._lease_now(conn)
+        conn.execute(
+            f"""
+            UPDATE task_resource_leases
+               SET heartbeat_at = ?,
+                   expires_at = current_timestamp + INTERVAL {int(max(1, ttl_seconds))} SECOND
+             WHERE task_id = ?
+               AND status = 'active'
+               AND resource_key IN ({placeholders})
+            """,
+            [now, task_id, *keys],
+        )
+
+    def release_resource_leases(
+        self,
+        task_id: str,
+        resource_keys: list[str] | None = None,
+        reason: str = "completed",
+    ) -> int:
+        """Release active leases owned by a task."""
+        keys = self._clean_resource_keys(resource_keys or [])
+        conn = get_connection()
+        now = self._lease_now(conn)
+        params: list[Any] = [now, json_safe_string(reason), task_id]
+        key_clause = ""
+        if keys:
+            placeholders = ", ".join(["?"] * len(keys))
+            key_clause = f" AND resource_key IN ({placeholders})"
+            params.extend(keys)
+        existing = conn.execute(
+            f"""
+            SELECT COUNT(*)
+              FROM task_resource_leases
+             WHERE task_id = ?
+               AND status = 'active'{key_clause}
+            """,
+            [task_id, *keys] if keys else [task_id],
+        ).fetchone()[0]
+        conn.execute(
+            f"""
+            UPDATE task_resource_leases
+               SET status = 'released',
+                   released_at = ?,
+                   release_reason = ?
+             WHERE task_id = ?
+               AND status = 'active'{key_clause}
+            """,
+            params,
+        )
+        return int(existing)
+
+    def expire_stale_resource_leases(self, now: datetime | None = None) -> int:
+        """Expire active leases whose TTL has elapsed."""
+        conn = get_connection()
+        return self._expire_stale_resource_leases(conn, now or self._lease_now(conn))
+
+    def list_resource_leases(
+        self,
+        active_only: bool = True,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List active or recent task resource leases."""
+        clauses = ["status = 'active'"] if active_only else []
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = get_connection().execute(
+            f"""
+            SELECT resource_key, task_id, task_type, market, status,
+                   acquired_at, heartbeat_at, expires_at, released_at,
+                   release_reason, metadata
+              FROM task_resource_leases{where}
+             ORDER BY acquired_at DESC
+             LIMIT ?
+            """,
+            [limit],
+        ).fetchall()
+        return [self._lease_row_to_dict(row) for row in rows]
 
     # ------------------------------------------------------------------
     # Read
@@ -329,6 +519,66 @@ class TaskStore:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _clean_resource_keys(resource_keys: list[str]) -> list[str]:
+        return sorted({str(key) for key in resource_keys if str(key or "").strip()})
+
+    @staticmethod
+    def _lease_now(conn) -> Any:
+        return conn.execute("SELECT current_timestamp").fetchone()[0]
+
+    @staticmethod
+    def _lease_expires_at(conn, ttl_seconds: int) -> Any:
+        return conn.execute(
+            f"SELECT current_timestamp + INTERVAL {int(max(1, ttl_seconds))} SECOND"
+        ).fetchone()[0]
+
+    @staticmethod
+    def _expire_stale_resource_leases(conn, now: datetime) -> int:
+        existing = conn.execute(
+            """
+            SELECT COUNT(*)
+              FROM task_resource_leases
+             WHERE status = 'active'
+               AND expires_at <= ?
+            """,
+            [now],
+        ).fetchone()[0]
+        conn.execute(
+            """
+            UPDATE task_resource_leases
+               SET status = 'expired',
+                   released_at = ?,
+                   release_reason = 'stale_expired'
+             WHERE status = 'active'
+               AND expires_at <= ?
+            """,
+            [now, now],
+        )
+        return int(existing)
+
+    @staticmethod
+    def _lease_row_to_dict(row: tuple) -> dict[str, Any]:
+        metadata = None
+        if row[10]:
+            try:
+                metadata = json_safe_value(json.loads(row[10]))
+            except Exception:
+                metadata = json_safe_string(row[10])
+        return {
+            "resource_key": row[0],
+            "task_id": row[1],
+            "task_type": row[2],
+            "market": row[3],
+            "status": row[4],
+            "acquired_at": str(row[5]) if row[5] else None,
+            "heartbeat_at": str(row[6]) if row[6] else None,
+            "expires_at": str(row[7]) if row[7] else None,
+            "released_at": str(row[8]) if row[8] else None,
+            "release_reason": row[9],
+            "metadata": metadata,
+        }
 
     @staticmethod
     def _row_to_record(row: tuple) -> TaskRecord:

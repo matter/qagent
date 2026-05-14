@@ -147,6 +147,15 @@ async def list_pause_rules(active_only: bool = Query(True)) -> list[dict]:
     return _get_store().list_pause_rules(active_only=active_only)
 
 
+@router.get("/resource-leases")
+async def list_resource_leases(
+    active_only: bool = Query(True),
+    limit: int = Query(100, ge=1, le=500),
+) -> list[dict]:
+    """List active or recent DB-backed task resource leases."""
+    return _get_store().list_resource_leases(active_only=active_only, limit=limit)
+
+
 @router.post("/pause-rules")
 async def create_pause_rule(body: PauseRuleRequest) -> dict:
     """Pause future task submissions matching optional type/source/market filters."""

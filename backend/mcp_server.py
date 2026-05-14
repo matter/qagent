@@ -1424,7 +1424,7 @@ def update_data_markets(
     executor = _task_executor()
 
     task_id = executor.submit(
-        task_type="data_update",
+        task_type="data_update_markets",
         fn=svc.update_markets,
         params={
             "mode": mode,
@@ -1439,7 +1439,7 @@ def update_data_markets(
     return {
         "task_id": task_id,
         "status": "queued",
-        "task_type": "data_update",
+        "task_type": "data_update_markets",
         "markets": resolved_markets,
         "asset_scope": {"markets": resolved_markets},
         "poll_url": f"/api/tasks/{task_id}",
@@ -2108,6 +2108,18 @@ def cancel_task(task_id: str) -> dict:
     if not ok:
         return {"task_id": task_id, "status": "not_cancelled", "reason": "Task not found or not cancellable"}
     return {"task_id": task_id, "status": "cancelled"}
+
+
+@mcp.tool()
+def list_task_resource_leases(active_only: bool = True, limit: int = 100) -> list[dict]:
+    """List active or recent DB-backed task resource leases."""
+    from backend.tasks.store import TaskStore
+
+    bounded_limit = max(1, min(int(limit), 500))
+    return TaskStore().list_resource_leases(
+        active_only=active_only,
+        limit=bounded_limit,
+    )
 
 
 # ======================================================================
