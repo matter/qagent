@@ -26,6 +26,7 @@ log = get_logger(__name__)
 _FEATURE_MATRIX_SCHEMA_VERSION = "1"
 _LABEL_VALUES_SCHEMA_VERSION = "1"
 _DEFAULT_DAILY_HOT_DAYS = 2
+_DEFAULT_ORPHAN_FILE_MIN_AGE_SECONDS = 3600
 _CACHE_WRITE_LOCKS_GUARD = threading.Lock()
 _CACHE_WRITE_LOCKS: dict[str, threading.Lock] = {}
 _PROCESS_FEATURE_MATRIX_CACHE_TTL_SECONDS = 48 * 60 * 60
@@ -487,6 +488,7 @@ class ResearchCacheService:
         object_type: str | None = None,
         status: str = "active",
         limit: int = 100,
+        include_metadata: bool = False,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -514,7 +516,11 @@ class ResearchCacheService:
                 LIMIT ?""",
             params,
         ).fetchall()
-        return [_cache_row(row) for row in rows]
+        entries = [_cache_row(row) for row in rows]
+        if not include_metadata:
+            for entry in entries:
+                entry.pop("metadata", None)
+        return entries
 
     def inventory_summary(self, *, market: str | None = None) -> dict[str, Any]:
         resolved_market = normalize_market(market) if market else None
@@ -600,6 +606,91 @@ class ResearchCacheService:
             "deleted_bytes": deleted_bytes,
             "deleted_cache_keys": deleted_keys,
         }
+
+    def preview_orphan_file_cleanup(
+        self,
+        *,
+        limit: int = 100,
+        min_age_seconds: int = _DEFAULT_ORPHAN_FILE_MIN_AGE_SECONDS,
+    ) -> dict[str, Any]:
+        min_updated_at = time.time() - max(0, int(min_age_seconds))
+        tracked_uris = {
+            str(row[0])
+            for row in get_connection().execute(
+                """SELECT uri
+                   FROM research_cache_entries
+                   WHERE uri IS NOT NULL
+                     AND status = 'active'"""
+            ).fetchall()
+            if row and row[0]
+        }
+        candidates: list[dict[str, Any]] = []
+        for path in self._iter_cache_files():
+            path_str = str(path)
+            if path_str in tracked_uris:
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if stat.st_mtime > min_updated_at:
+                continue
+            candidates.append(
+                {
+                    "path": path_str,
+                    "byte_size": int(stat.st_size),
+                    "updated_at": _timestamp_to_iso(stat.st_mtime),
+                    "reason": "untracked_research_cache_file",
+                }
+            )
+            if len(candidates) >= max(1, int(limit)):
+                break
+        return {
+            "summary": {
+                "candidate_count": len(candidates),
+                "candidate_bytes": sum(item["byte_size"] for item in candidates),
+                "min_age_seconds": max(0, int(min_age_seconds)),
+                "policy": (
+                    "delete files under data/research_cache not referenced by active "
+                    "research_cache_entries and older than min_age_seconds"
+                ),
+            },
+            "candidates": candidates,
+        }
+
+    def apply_orphan_file_cleanup(
+        self,
+        *,
+        limit: int = 100,
+        min_age_seconds: int = _DEFAULT_ORPHAN_FILE_MIN_AGE_SECONDS,
+    ) -> dict[str, Any]:
+        preview = self.preview_orphan_file_cleanup(limit=limit, min_age_seconds=min_age_seconds)
+        deleted: list[dict[str, Any]] = []
+        deleted_bytes = 0
+        for item in preview["candidates"]:
+            path = Path(item["path"])
+            try:
+                path.unlink()
+            except OSError as exc:
+                log.warning("research_cache.orphan_delete_failed", path=str(path), error=str(exc))
+                continue
+            deleted.append(item)
+            deleted_bytes += int(item.get("byte_size") or 0)
+        return {
+            "deleted_files": len(deleted),
+            "deleted_bytes": deleted_bytes,
+            "deleted": deleted,
+            "preview": preview,
+        }
+
+    def _iter_cache_files(self) -> Iterator[Path]:
+        if not self._cache_root.exists():
+            return iter(())
+        return (
+            path
+            for path in sorted(self._cache_root.rglob("*"))
+            if path.is_file()
+        )
 
     # ------------------------------------------------------------------
     # Factor cache cleanup
@@ -833,6 +924,10 @@ def _canonical_jsonable(value: Any) -> Any:
     if isinstance(value, list):
         return [_canonical_jsonable(item) for item in value]
     return value
+
+
+def _timestamp_to_iso(timestamp: float) -> str:
+    return pd.Timestamp.fromtimestamp(timestamp).isoformat()
 
 
 def _canonical_json(value: Any) -> str:

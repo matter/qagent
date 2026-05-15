@@ -756,9 +756,16 @@ export async function trainModel(params: {
   return data;
 }
 
-export async function listModels(market?: string): Promise<Model[]> {
+export async function listModels(
+  market?: string,
+  options: { limit?: number; offset?: number } = {},
+): Promise<Model[]> {
   const { data } = await client.get<Model[]>("/models", {
-    params: { market: market || undefined },
+    params: {
+      market: market || undefined,
+      limit: options.limit,
+      offset: options.offset,
+    },
   });
   return data;
 }

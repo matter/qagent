@@ -8,6 +8,7 @@ from unittest.mock import patch
 import duckdb
 import pandas as pd
 
+from backend.config import settings
 from backend.db import close_db, get_connection, init_db
 from backend.services.feature_service import FeatureService
 from backend.services.research_cache_service import ResearchCacheService
@@ -22,6 +23,9 @@ class ResearchCacheServiceTests(unittest.TestCase):
         patcher = patch("backend.config.settings.data.db_path", str(self.db_path))
         patcher.start()
         self.addCleanup(patcher.stop)
+        project_root_patcher = patch.object(settings, "project_root", Path(self._tmp.name))
+        project_root_patcher.start()
+        self.addCleanup(project_root_patcher.stop)
         self.addCleanup(close_db)
         init_db()
 
@@ -315,6 +319,29 @@ class ResearchCacheServiceTests(unittest.TestCase):
         self.assertEqual(applied["deleted_entries"], 1)
         self.assertFalse(path.exists())
         self.assertEqual(updated["status"], "deleted")
+
+    def test_preview_orphan_file_cleanup_finds_untracked_cache_files(self):
+        service = ResearchCacheService()
+        orphan = Path(self._tmp.name) / "data" / "research_cache" / "feature_matrix" / "US" / "fs_orphan" / "orphan.parquet"
+        orphan.parent.mkdir(parents=True)
+        orphan.write_bytes(b"orphan")
+
+        preview = service.preview_orphan_file_cleanup(limit=10, min_age_seconds=0)
+
+        self.assertEqual(preview["summary"]["candidate_count"], 1)
+        self.assertEqual(preview["summary"]["candidate_bytes"], len(b"orphan"))
+        self.assertEqual(preview["candidates"][0]["path"], str(orphan))
+
+    def test_preview_orphan_file_cleanup_skips_fresh_untracked_cache_files(self):
+        service = ResearchCacheService()
+        fresh = Path(self._tmp.name) / "data" / "research_cache" / "feature_matrix" / "US" / "fs_orphan" / "fresh.parquet"
+        fresh.parent.mkdir(parents=True)
+        fresh.write_bytes(b"fresh")
+
+        preview = service.preview_orphan_file_cleanup(limit=10, min_age_seconds=3600)
+
+        self.assertEqual(preview["summary"]["candidate_count"], 0)
+        self.assertEqual(preview["candidates"], [])
 
     def test_feature_service_uses_hot_feature_matrix_before_factor_bulk_load(self):
         conn = get_connection()

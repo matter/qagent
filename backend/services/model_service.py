@@ -676,20 +676,30 @@ class ModelService:
     # CRUD
     # ------------------------------------------------------------------
 
-    def list_models(self, market: str | None = None) -> list[dict]:
+    def list_models(
+        self,
+        market: str | None = None,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[dict]:
         """List all model records."""
         resolved_market = normalize_market(market)
         conn = get_connection()
-        rows = conn.execute(
-            """SELECT id, market, name, feature_set_id, label_id, model_type,
-                      model_params, train_config, eval_metrics,
-                      status, created_at, updated_at
-               FROM models
-               WHERE market = ?
-               ORDER BY created_at DESC""",
-            [resolved_market],
-        ).fetchall()
-        return [self._row_to_dict(r) for r in rows]
+        params: list[Any] = [resolved_market]
+        query = """SELECT id, market, name, feature_set_id, label_id, model_type,
+                          model_params, train_config, eval_metrics,
+                          status, created_at, updated_at
+                   FROM models
+                   WHERE market = ?
+                   ORDER BY created_at DESC"""
+        if limit is not None:
+            safe_limit = max(1, min(int(limit), 1000))
+            safe_offset = max(0, int(offset or 0))
+            query += " LIMIT ? OFFSET ?"
+            params.extend([safe_limit, safe_offset])
+        rows = conn.execute(query, params).fetchall()
+        return [self._row_to_dict(r, include_audit_fields=False) for r in rows]
 
     def get_model(self, model_id: str, market: str | None = None) -> dict:
         """Return a single model record including eval_metrics and feature_names."""
@@ -1810,7 +1820,7 @@ class ModelService:
         return self._row_to_dict(row)
 
     @staticmethod
-    def _row_to_dict(row) -> dict:
+    def _row_to_dict(row, *, include_audit_fields: bool = True) -> dict:
         def _parse_json(raw):
             if isinstance(raw, str):
                 try:
@@ -1836,13 +1846,27 @@ class ModelService:
             "created_at": str(row[10]) if row[10] else None,
             "updated_at": str(row[11]) if row[11] else None,
         }
-        result.update(
-            ModelService._build_model_audit_fields(
-                train_config=train_config,
-                eval_metrics=eval_metrics,
-                market=row[1],
-            )
+        audit_fields = ModelService._build_model_audit_fields(
+            train_config=train_config,
+            eval_metrics=eval_metrics,
+            market=row[1],
         )
+        if include_audit_fields:
+            result.update(audit_fields)
+        else:
+            for key in (
+                "train_start",
+                "train_end",
+                "valid_start",
+                "valid_end",
+                "test_start",
+                "test_end",
+                "purge_gap",
+                "label_horizon",
+                "effective_label_horizon",
+            ):
+                if key in audit_fields:
+                    result[key] = audit_fields[key]
         return result
 
     @staticmethod

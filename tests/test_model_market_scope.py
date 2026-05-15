@@ -99,6 +99,49 @@ class ModelMarketScopeTests(unittest.TestCase):
             self.assertEqual(ModelService().list_models("CN")[0]["market"], "CN")
             self.assertEqual(ModelService().list_models(), [])
 
+    def test_list_models_respects_limit_and_offset(self):
+        conn = self.conn
+        for idx in range(3):
+            conn.execute(
+                """INSERT INTO models
+                   (id, market, name, feature_set_id, label_id, model_type,
+                    model_params, train_config, eval_metrics, status, created_at, updated_at)
+                   VALUES (?, 'US', ?, 'fs', 'label', 'lightgbm',
+                           '{}', '{}', '{}', 'trained', ?, ?)""",
+                [
+                    f"model_{idx}",
+                    f"Model {idx}",
+                    f"2024-01-0{idx + 1} 00:00:00",
+                    f"2024-01-0{idx + 1} 00:00:00",
+                ],
+            )
+
+        with patch("backend.services.model_service.get_connection", return_value=conn):
+            models = ModelService().list_models("US", limit=1, offset=1)
+
+        self.assertEqual([model["id"] for model in models], ["model_1"])
+
+    def test_list_models_omits_heavy_audit_fields_by_default(self):
+        conn = self.conn
+        conn.execute(
+            """INSERT INTO models
+               (id, market, name, feature_set_id, label_id, model_type,
+                model_params, train_config, eval_metrics, status, created_at, updated_at)
+               VALUES ('model_heavy', 'US', 'Heavy', 'fs', 'label', 'lightgbm',
+                       '{}', '{"train_start":"2024-01-01"}',
+                       '{"ic_mean":0.1,"feature_importance":{"close":1.0}}',
+                       'trained', '2024-01-01 00:00:00', '2024-01-01 00:00:00')"""
+        )
+
+        with patch("backend.services.model_service.get_connection", return_value=conn):
+            summary = ModelService().list_models("US")[0]
+            detail = ModelService().get_model("model_heavy", market="US")
+
+        self.assertNotIn("metrics", summary)
+        self.assertNotIn("metadata", summary)
+        self.assertIn("metrics", detail)
+        self.assertIn("metadata", detail)
+
     def test_train_model_reports_coarse_progress_phases(self):
         svc = ModelService()
         svc._feature_service = _FakeFeatureService()

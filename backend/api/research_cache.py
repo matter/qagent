@@ -63,6 +63,7 @@ async def cache_inventory(
     market: Optional[str] = Query(None),
     object_type: Optional[str] = Query(None),
     limit: int = Query(100, ge=1, le=1000),
+    include_metadata: bool = False,
 ) -> dict:
     svc = _get_service()
     try:
@@ -72,6 +73,7 @@ async def cache_inventory(
                 market=market,
                 object_type=object_type,
                 limit=limit,
+                include_metadata=include_metadata,
             ),
         }
     except ValueError as exc:
@@ -184,3 +186,19 @@ async def apply_expired_cache_cleanup(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/orphan-files/cleanup-preview")
+async def preview_orphan_file_cleanup(
+    limit: int = Query(100, ge=1, le=1000),
+    min_age_seconds: int = Query(3600, ge=0, le=86400),
+) -> dict:
+    return _get_service().preview_orphan_file_cleanup(limit=limit, min_age_seconds=min_age_seconds)
+
+
+@router.post("/orphan-files/cleanup-apply")
+async def apply_orphan_file_cleanup(
+    limit: int = Query(100, ge=1, le=1000),
+    min_age_seconds: int = Query(3600, ge=0, le=86400),
+) -> dict:
+    return _get_service().apply_orphan_file_cleanup(limit=limit, min_age_seconds=min_age_seconds)

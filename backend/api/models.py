@@ -262,11 +262,15 @@ async def train_model_distillation(body: TrainDistillationRequest) -> dict:
 
 
 @router.get("/models")
-async def list_models(market: Optional[str] = Query(None)) -> list[dict]:
+async def list_models(
+    market: Optional[str] = Query(None),
+    limit: Optional[int] = Query(None, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> list[dict]:
     """List all trained models."""
     svc = _get_service()
     try:
-        return svc.list_models(market=market)
+        return svc.list_models(market=market, limit=limit, offset=offset)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

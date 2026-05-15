@@ -37,6 +37,7 @@ from backend.api.production_signal_3 import router as production_signal_3_router
 from backend.config import settings
 from backend.db import close_db, init_db
 from backend.logger import get_logger, setup_logging
+from backend.services.startup_maintenance_service import StartupMaintenanceService
 from backend.tasks.executor import TaskSubmissionPaused
 from backend.tasks.store import TaskStore
 
@@ -61,7 +62,20 @@ async def lifespan(app: FastAPI):
     ):
         d.mkdir(parents=True, exist_ok=True)
 
+    maintenance = StartupMaintenanceService()
+    try:
+        temp_cleanup = maintenance.cleanup_stale_duckdb_temp_files()
+        if temp_cleanup.get("deleted_files") or temp_cleanup.get("errors"):
+            log.info("app.startup.temp_cleanup", **temp_cleanup)
+    except Exception as exc:
+        log.warning("app.startup.temp_cleanup_failed", error=str(exc))
+
     init_db()
+
+    try:
+        maintenance.run_after_db_init()
+    except Exception as exc:
+        log.warning("app.startup.cache_maintenance_failed", error=str(exc))
 
     # Mark any tasks left running/queued from a previous server run as failed
     TaskStore().mark_stale_running()
