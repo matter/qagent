@@ -29,7 +29,7 @@ import {
   exportSignals,
 } from "../../api";
 import type {
-  Strategy,
+  StrategySummary,
   StockGroup,
   SignalRun,
 } from "../../api";
@@ -45,7 +45,7 @@ interface SignalGeneratorPanelProps {
 }
 
 export default function SignalGeneratorPanel({ onSignalComplete, restoreConfig }: SignalGeneratorPanelProps) {
-  const [strategies, setStrategies] = useState<Strategy[]>([]);
+  const [strategies, setStrategies] = useState<StrategySummary[]>([]);
   const [groups, setGroups] = useState<StockGroup[]>([]);
 
   const [selectedStrategy, setSelectedStrategy] = useState<string>("");

@@ -1,9 +1,40 @@
 import unittest
+from unittest.mock import patch
 
 from backend.services.strategy_service import StrategyService
 
 
 class StrategyServiceContractTests(unittest.TestCase):
+    def test_list_strategy_row_is_summary_without_source_code(self):
+        row = (
+            "strategy_1",
+            "US",
+            "Fast List Strategy",
+            1,
+            "description",
+            "from backend.strategies.base import StrategyBase\n",
+            "[]",
+            "[]",
+            "equal_weight",
+            None,
+            "draft",
+            "2026-05-15 10:00:00",
+            "2026-05-15 10:00:00",
+        )
+
+        with patch.object(
+            StrategyService,
+            "extract_strategy_metadata_from_source",
+            side_effect=AssertionError("list rows must not parse strategy source"),
+        ):
+            summary = StrategyService._row_to_summary_dict(row)
+
+        self.assertEqual(summary["id"], "strategy_1")
+        self.assertEqual(summary["name"], "Fast List Strategy")
+        self.assertNotIn("source_code", summary)
+        self.assertEqual(summary["default_backtest_config"], {})
+        self.assertEqual(summary["default_paper_config"], {})
+
     def test_extracts_strategy_default_configs_from_source_metadata(self):
         source = '''
 from backend.strategies.base import StrategyBase

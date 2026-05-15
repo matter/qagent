@@ -318,6 +318,7 @@ class ResearchCacheServiceTests(unittest.TestCase):
 
     def test_feature_service_uses_hot_feature_matrix_before_factor_bulk_load(self):
         conn = get_connection()
+        ResearchCacheService.clear_process_feature_matrix_cache()
         conn.execute(
             """INSERT INTO factors (id, market, name, version, source_code, status)
                VALUES ('f_close', 'US', 'Close', 1, ?, 'active')""",
@@ -361,6 +362,57 @@ class ResearchCacheServiceTests(unittest.TestCase):
 
         self.assertEqual(engine.bulk_calls, 0)
         pd.testing.assert_frame_equal(result["close"], feature_data["close"])
+
+    def test_feature_service_reuses_process_feature_matrix_cache(self):
+        conn = get_connection()
+        ResearchCacheService.clear_process_feature_matrix_cache()
+        conn.execute(
+            """INSERT INTO feature_sets
+               (id, market, name, factor_refs, preprocessing, status)
+               VALUES ('fs_hot_process', 'US', 'Hot Process FS', ?, ?, 'active')""",
+            [
+                '[{"factor_id": "f_close", "factor_name": "close"}]',
+                '{"normalize": null}',
+            ],
+        )
+        feature_data = {
+            "close": pd.DataFrame(
+                {"AAPL": [10.0], "MSFT": [20.0]},
+                index=pd.to_datetime(["2024-01-03"]),
+            )
+        }
+        ResearchCacheService().store_feature_matrix(
+            market="US",
+            feature_set_id="fs_hot_process",
+            tickers=["AAPL", "MSFT"],
+            start_date="2024-01-03",
+            end_date="2024-01-03",
+            factor_refs=[{"factor_id": "f_close", "factor_name": "close"}],
+            preprocessing={"normalize": None},
+            feature_data=feature_data,
+        )
+
+        service = FeatureService(factor_engine=_ExplodingFactorEngine())
+        first = service.compute_features_from_cache(
+            "fs_hot_process",
+            ["AAPL", "MSFT"],
+            "2024-01-03",
+            "2024-01-03",
+            market="US",
+        )
+        with patch(
+            "backend.services.research_cache_service.pd.read_parquet",
+            side_effect=AssertionError("second load should use process cache"),
+        ):
+            second = service.compute_features_from_cache(
+                "fs_hot_process",
+                ["MSFT", "AAPL"],
+                "2024-01-03",
+                "2024-01-03",
+                market="US",
+            )
+
+        pd.testing.assert_frame_equal(first["close"], second["close"])
 
     def test_feature_service_recomputes_partial_bulk_factor_cache(self):
         conn = get_connection()

@@ -6,6 +6,7 @@ import hashlib
 import json
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import timedelta
@@ -27,6 +28,13 @@ _LABEL_VALUES_SCHEMA_VERSION = "1"
 _DEFAULT_DAILY_HOT_DAYS = 2
 _CACHE_WRITE_LOCKS_GUARD = threading.Lock()
 _CACHE_WRITE_LOCKS: dict[str, threading.Lock] = {}
+_PROCESS_FEATURE_MATRIX_CACHE_TTL_SECONDS = 48 * 60 * 60
+_PROCESS_FEATURE_MATRIX_CACHE_MAX_ENTRIES = 8
+_PROCESS_FEATURE_MATRIX_CACHE_LOCK = threading.Lock()
+_PROCESS_FEATURE_MATRIX_CACHE: OrderedDict[
+    str,
+    tuple[float, dict[str, Any], dict[str, pd.DataFrame]],
+] = OrderedDict()
 _TRANSIENT_DUCKDB_MARKERS = (
     "TransactionContext Error",
     "Conflict on tuple deletion",
@@ -126,6 +134,10 @@ class ResearchCacheService:
             preprocessing=preprocessing,
             data_version=data_version,
         )
+        cached = self._load_process_feature_matrix(cache_key)
+        if cached is not None:
+            return cached
+
         record = self.get_cache_stats(cache_key)
         if record is None or record.get("status") != "active" or not record.get("uri"):
             return None
@@ -145,10 +157,16 @@ class ResearchCacheService:
             self._record_miss(cache_key)
             return None
         self._record_hit(cache_key)
-        return {
+        payload = {
             "record": self.get_cache_stats(cache_key),
             "feature_data": self._wide_frame_to_feature_data(frame),
         }
+        self._store_process_feature_matrix(
+            cache_key,
+            payload["record"],
+            payload["feature_data"],
+        )
+        return payload
 
     def load_label_values(
         self,
@@ -282,6 +300,74 @@ class ResearchCacheService:
             bytes=byte_size,
         )
         return self.get_cache_stats(cache_key)
+
+    @classmethod
+    def clear_process_feature_matrix_cache(cls) -> None:
+        with _PROCESS_FEATURE_MATRIX_CACHE_LOCK:
+            _PROCESS_FEATURE_MATRIX_CACHE.clear()
+
+    @classmethod
+    def process_feature_matrix_cache_stats(cls) -> dict[str, Any]:
+        with _PROCESS_FEATURE_MATRIX_CACHE_LOCK:
+            cls._prune_process_feature_matrix_cache_locked()
+            return {
+                "entries": len(_PROCESS_FEATURE_MATRIX_CACHE),
+                "ttl_seconds": _PROCESS_FEATURE_MATRIX_CACHE_TTL_SECONDS,
+                "max_entries": _PROCESS_FEATURE_MATRIX_CACHE_MAX_ENTRIES,
+                "keys": list(_PROCESS_FEATURE_MATRIX_CACHE.keys()),
+            }
+
+    @classmethod
+    def _load_process_feature_matrix(cls, cache_key: str) -> dict[str, Any] | None:
+        with _PROCESS_FEATURE_MATRIX_CACHE_LOCK:
+            cls._prune_process_feature_matrix_cache_locked()
+            cached = _PROCESS_FEATURE_MATRIX_CACHE.get(cache_key)
+            if cached is None:
+                return None
+            stored_at, record, feature_data = cached
+            if time.time() - stored_at > _PROCESS_FEATURE_MATRIX_CACHE_TTL_SECONDS:
+                _PROCESS_FEATURE_MATRIX_CACHE.pop(cache_key, None)
+                return None
+            _PROCESS_FEATURE_MATRIX_CACHE.move_to_end(cache_key)
+            return {
+                "record": dict(record or {}),
+                "feature_data": cls._copy_feature_data(feature_data),
+            }
+
+    @classmethod
+    def _store_process_feature_matrix(
+        cls,
+        cache_key: str,
+        record: dict[str, Any] | None,
+        feature_data: dict[str, pd.DataFrame],
+    ) -> None:
+        if not feature_data:
+            return
+        with _PROCESS_FEATURE_MATRIX_CACHE_LOCK:
+            cls._prune_process_feature_matrix_cache_locked()
+            _PROCESS_FEATURE_MATRIX_CACHE[cache_key] = (
+                time.time(),
+                dict(record or {}),
+                cls._copy_feature_data(feature_data),
+            )
+            _PROCESS_FEATURE_MATRIX_CACHE.move_to_end(cache_key)
+            while len(_PROCESS_FEATURE_MATRIX_CACHE) > _PROCESS_FEATURE_MATRIX_CACHE_MAX_ENTRIES:
+                _PROCESS_FEATURE_MATRIX_CACHE.popitem(last=False)
+
+    @classmethod
+    def _prune_process_feature_matrix_cache_locked(cls) -> None:
+        now = time.time()
+        expired = [
+            key
+            for key, (stored_at, _record, _feature_data) in _PROCESS_FEATURE_MATRIX_CACHE.items()
+            if now - stored_at > _PROCESS_FEATURE_MATRIX_CACHE_TTL_SECONDS
+        ]
+        for key in expired:
+            _PROCESS_FEATURE_MATRIX_CACHE.pop(key, None)
+
+    @staticmethod
+    def _copy_feature_data(feature_data: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+        return {str(name): frame.copy(deep=True) for name, frame in feature_data.items()}
 
     def store_label_values(
         self,

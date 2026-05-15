@@ -50,9 +50,11 @@ import {
   getPaperLatestSignals,
   getPaperStockChart,
   getTaskStatus,
+  getStrategy,
 } from "../api";
 import type {
   Strategy,
+  StrategySummary,
   StockGroup,
   StockChartData,
   Market,
@@ -1079,7 +1081,8 @@ function CreateSessionModal({
   messageApi: ReturnType<typeof message.useMessage>[0];
   prefill?: PaperTradingPrefill | null;
 }) {
-  const [strategies, setStrategies] = useState<Strategy[]>([]);
+  const [strategies, setStrategies] = useState<StrategySummary[]>([]);
+  const [selectedStrategyDetail, setSelectedStrategyDetail] = useState<Strategy | null>(null);
   const [groups, setGroups] = useState<StockGroup[]>([]);
   const [strategyId, setStrategyId] = useState("");
   const [groupId, setGroupId] = useState("");
@@ -1101,6 +1104,24 @@ function CreateSessionModal({
       listGroups().then(setGroups).catch(() => {});
     }
   }, [open]);
+
+  useEffect(() => {
+    if (!open || !strategyId) {
+      setSelectedStrategyDetail(null);
+      return;
+    }
+    let cancelled = false;
+    getStrategy(strategyId)
+      .then((detail) => {
+        if (!cancelled) setSelectedStrategyDetail(detail);
+      })
+      .catch(() => {
+        if (!cancelled) setSelectedStrategyDetail(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, strategyId]);
 
   // Apply prefill values from backtest history
   useEffect(() => {
@@ -1150,7 +1171,7 @@ function CreateSessionModal({
     }
   };
 
-  const selectedStrategy = strategies.find((s) => s.id === strategyId);
+  const selectedStrategy = selectedStrategyDetail ?? strategies.find((s) => s.id === strategyId);
   const strategyDefaults = selectedStrategy?.default_paper_config ?? selectedStrategy?.default_backtest_config;
 
   return (

@@ -11,6 +11,7 @@ import hashlib
 import shutil
 import subprocess
 import threading
+import time
 import uuid
 import copy
 from datetime import date, datetime, timedelta
@@ -124,6 +125,9 @@ class BacktestService:
         10. Return result dict.
         """
         resolved_market = normalize_market(market)
+        run_started = time.perf_counter()
+        setup_started = run_started
+        runtime_profile: dict[str, Any] = {"market": resolved_market}
 
         # ---- 1. Load strategy ----
         strategy_def = self._strategy_service.get_strategy(strategy_id, market=resolved_market)
@@ -149,6 +153,7 @@ class BacktestService:
         if not tickers:
             raise ValueError(f"Universe group '{universe_group_id}' has no members")
         tickers = [normalize_ticker(t, resolved_market) for t in tickers]
+        runtime_profile["ticker_count"] = len(tickers)
 
         strategy_default_config = self._strategy_default_config_from_instance(
             strategy_instance,
@@ -237,17 +242,21 @@ class BacktestService:
 
         start_str = str(bt_config.start_date)
         end_str = str(bt_config.end_date)
+        runtime_profile["setup_seconds"] = round(time.perf_counter() - setup_started, 6)
 
         # ---- 4. Load OHLCV price data ----
+        price_started = time.perf_counter()
         prices_close, prices_open, prices_high, prices_low, prices_volume = (
             self._backtest_engine._load_prices(
                 tickers, start_str, end_str, market=resolved_market
             )
         )
+        runtime_profile["price_load_seconds"] = round(time.perf_counter() - price_started, 6)
         if prices_close.empty:
             raise ValueError("No price data available for the given tickers and date range")
 
         # ---- 5. Bulk-load required factors ----
+        factor_started = time.perf_counter()
         required_factors = strategy_def.get("required_factors", [])
         factor_data: dict[str, pd.DataFrame] = {}
 
@@ -275,6 +284,9 @@ class BacktestService:
                             factor_name=factor_name,
                             error=str(exc),
                         )
+        runtime_profile["factor_load_seconds"] = round(time.perf_counter() - factor_started, 6)
+        runtime_profile["factor_count"] = len(required_factors)
+        runtime_profile["computed_factor_count"] = len(factor_data)
 
         # ---- 6. Build signals for each trading day ----
         debug_state = self._init_debug_replay_state(config_dict, market=resolved_market)
@@ -283,6 +295,9 @@ class BacktestService:
             all_trading_days, bt_config.rebalance_freq
         )
         rebalance_dates_set = set(rebalance_dates)
+        runtime_profile["trading_days"] = len(all_trading_days)
+        runtime_profile["rebalance_dates"] = len(rebalance_dates)
+        runtime_profile["model_count"] = len(required_models)
 
         # Build a prices DataFrame with MultiIndex columns (field, ticker)
         # for the StrategyContext — computed once, strategies slice via current_date
@@ -305,12 +320,17 @@ class BacktestService:
         # ---- 6a. Pre-compute model predictions for ALL rebalance dates at once ----
         # This avoids per-date DB lookups, model loading, feature computation
         model_preds_by_date: dict[str, dict[str, pd.Series]] = {}
+        model_predict_started = time.perf_counter()
         if required_models:
             model_preds_by_date = self._batch_predict_all_dates(
                 required_models, tickers, start_str, end_str,
                 [d for d in all_trading_days if d in rebalance_dates_set],
                 market=resolved_market,
             )
+        runtime_profile["model_predict_seconds"] = round(
+            time.perf_counter() - model_predict_started,
+            6,
+        )
 
         # -- Runtime check: warn if required models produced no predictions --
         if required_models and not model_preds_by_date:
@@ -355,6 +375,7 @@ class BacktestService:
         port_exit_idx: dict[str, int] = {}
         pending_context_state: dict | None = None
 
+        signal_started = time.perf_counter()
         for day_idx, trade_date in enumerate(all_trading_days):
             trade_ts = pd.Timestamp(trade_date)
 
@@ -551,6 +572,7 @@ class BacktestService:
             if constraint_actions:
                 diag_entry["constraint_actions"] = constraint_actions
             rebalance_diagnostics.append(diag_entry)
+        runtime_profile["signal_loop_seconds"] = round(time.perf_counter() - signal_started, 6)
 
         # ---- 7. Check for pervasive signal errors ----
         num_rebalance = len(rebalance_dates)
@@ -564,6 +586,7 @@ class BacktestService:
                 )
 
         # ---- 8. Run BacktestEngine ----
+        engine_started = time.perf_counter()
         run_kwargs: dict[str, Any] = {}
         if has_planned_price_inputs:
             run_kwargs["planned_prices"] = planned_prices
@@ -598,6 +621,7 @@ class BacktestService:
             )
         else:
             result = overlay_result
+        runtime_profile["engine_seconds"] = round(time.perf_counter() - engine_started, 6)
         rebalance_diagnostics = self._merge_engine_rebalance_diagnostics(
             rebalance_diagnostics,
             (result.trade_diagnostics or {}).get("rebalance_execution_diagnostics"),
@@ -694,6 +718,7 @@ class BacktestService:
             "result": result,
             "result_level": result_level,
         }
+        persistence_started = time.perf_counter()
         if callable(stage_domain_write):
             stage_domain_write(
                 "backtest_results",
@@ -709,8 +734,13 @@ class BacktestService:
             )
         else:
             self._save_result(**save_payload)
+        runtime_profile["persistence_seconds"] = round(
+            time.perf_counter() - persistence_started,
+            6,
+        )
 
         # ---- 10. Return result ----
+        postprocess_started = time.perf_counter()
         result_dict = result.to_dict()
         result_dict["backtest_id"] = bt_id
         result_dict["market"] = resolved_market
@@ -839,11 +869,30 @@ class BacktestService:
                 warnings=len(leakage_warnings),
             )
 
+        runtime_profile["postprocess_seconds"] = round(
+            time.perf_counter() - postprocess_started,
+            6,
+        )
+        runtime_profile["total_seconds"] = round(time.perf_counter() - run_started, 6)
+        result_dict["runtime_profile"] = dict(runtime_profile)
+        if callable(stage_domain_write):
+            self._update_staged_result_summary(
+                save_payload,
+                {"runtime_profile": dict(runtime_profile)},
+            )
+        else:
+            self._update_result_summary(
+                bt_id=bt_id,
+                market=resolved_market,
+                updates={"runtime_profile": dict(runtime_profile)},
+            )
+
         log.info(
             "backtest_service.done",
             backtest_id=bt_id,
             total_return=result.total_return,
             sharpe=result.sharpe_ratio,
+            runtime_profile=runtime_profile,
         )
         return result_dict
 
@@ -1386,27 +1435,42 @@ class BacktestService:
         self,
         strategy_id: str | None = None,
         market: str | None = None,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[dict]:
         """List backtest results (summary only, no heavy series)."""
         resolved_market = normalize_market(market)
         conn = get_connection()
+        safe_limit = max(1, min(int(limit), 1000)) if limit is not None else None
+        safe_offset = max(0, int(offset or 0))
         if strategy_id:
+            params: list[Any] = [resolved_market, strategy_id]
+            query = """SELECT id, market, strategy_id, config, summary, trade_count,
+                              result_level, created_at
+                       FROM backtest_results
+                       WHERE market = ? AND strategy_id = ?
+                       ORDER BY created_at DESC"""
+            if safe_limit is not None:
+                query += " LIMIT ? OFFSET ?"
+                params.extend([safe_limit, safe_offset])
             rows = conn.execute(
-                """SELECT id, market, strategy_id, config, summary, trade_count,
-                          result_level, created_at
-                   FROM backtest_results
-                   WHERE market = ? AND strategy_id = ?
-                   ORDER BY created_at DESC""",
-                [resolved_market, strategy_id],
+                query,
+                params,
             ).fetchall()
         else:
+            params = [resolved_market]
+            query = """SELECT id, market, strategy_id, config, summary, trade_count,
+                              result_level, created_at
+                       FROM backtest_results
+                       WHERE market = ?
+                       ORDER BY created_at DESC"""
+            if safe_limit is not None:
+                query += " LIMIT ? OFFSET ?"
+                params.extend([safe_limit, safe_offset])
             rows = conn.execute(
-                """SELECT id, market, strategy_id, config, summary, trade_count,
-                          result_level, created_at
-                   FROM backtest_results
-                   WHERE market = ?
-                   ORDER BY created_at DESC""",
-                [resolved_market],
+                query,
+                params,
             ).fetchall()
 
         results = []
@@ -1813,22 +1877,80 @@ class BacktestService:
         """
         if not isinstance(summary, dict):
             return {}
-        heavy_keys = {
-            "rebalance_diagnostics",
-            "leakage_warnings",
-            "reproducibility_fingerprint",
+        scalar_keys = {
+            "total_return",
+            "annual_return",
+            "annual_volatility",
+            "max_drawdown",
+            "sharpe",
+            "sharpe_ratio",
+            "calmar_ratio",
+            "sortino_ratio",
+            "win_rate",
+            "profit_loss_ratio",
+            "total_trades",
+            "annual_turnover",
+            "total_cost",
+            "constraint_pass",
+            "start_date",
+            "end_date",
+            "requested_start_date",
+            "requested_end_date",
+            "effective_start_date",
+            "effective_end_date",
+            "evaluation_start_date",
+            "warmup_start_date",
+            "debug_artifact_id",
         }
-        lightweight = {
-            key: value
-            for key, value in summary.items()
-            if key not in heavy_keys
-        }
+        lightweight = {key: summary.get(key) for key in scalar_keys if key in summary}
+        compliance = summary.get("portfolio_compliance")
+        if isinstance(compliance, dict):
+            lightweight["portfolio_compliance"] = {
+                key: compliance.get(key)
+                for key in (
+                    "compliance_pass",
+                    "min_position_count",
+                    "max_target_weight",
+                    "max_trade_holding_days",
+                )
+                if key in compliance
+            }
+        runtime_profile = summary.get("runtime_profile")
+        if isinstance(runtime_profile, dict):
+            runtime_keys = {
+                "total_seconds",
+                "setup_seconds",
+                "price_load_seconds",
+                "factor_load_seconds",
+                "model_predict_seconds",
+                "signal_loop_seconds",
+                "engine_seconds",
+                "persistence_seconds",
+                "postprocess_seconds",
+                "ticker_count",
+                "trading_days",
+                "rebalance_dates",
+                "factor_count",
+                "computed_factor_count",
+                "model_count",
+            }
+            lightweight["runtime_profile"] = {
+                key: runtime_profile.get(key)
+                for key in runtime_keys
+                if key in runtime_profile
+            }
         lightweight["has_rebalance_diagnostics"] = bool(
             summary.get("rebalance_diagnostics")
         )
         lightweight["has_leakage_warnings"] = bool(
             summary.get("leakage_warnings")
         )
+        lightweight["has_trade_diagnostics"] = bool(summary.get("trade_diagnostics"))
+        lightweight["has_constraint_report"] = bool(summary.get("constraint_report"))
+        lightweight["has_startup_state_report"] = bool(summary.get("startup_state_report"))
+        lightweight["has_planned_price_execution"] = bool(summary.get("planned_price_execution"))
+        lightweight["has_planned_price_inputs"] = bool(summary.get("planned_price_inputs"))
+        lightweight["has_fill_diagnostics"] = bool(summary.get("fill_diagnostics"))
         fingerprint = summary.get("reproducibility_fingerprint")
         if isinstance(fingerprint, dict):
             lightweight["reproducibility_hash"] = fingerprint.get("hash")

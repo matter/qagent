@@ -479,6 +479,54 @@ class BacktestDiagnosticsContractTests(unittest.TestCase):
         self.assertIn("has_rebalance_diagnostics", lightweight)
         self.assertTrue(lightweight["has_rebalance_diagnostics"])
 
+    def test_list_summary_keeps_only_table_metrics_and_flags(self):
+        summary = {
+            "total_return": 0.12,
+            "annual_return": 0.08,
+            "sharpe_ratio": 1.9,
+            "max_drawdown": -0.07,
+            "constraint_pass": True,
+            "portfolio_compliance": {"compliance_pass": True, "large_payload": list(range(100))},
+            "trade_diagnostics": {"planned_price_inputs": {"samples": list(range(100))}},
+            "constraint_report": {"large_payload": list(range(100))},
+            "startup_state_report": {"large_payload": list(range(100))},
+            "planned_price_execution": {"filled": 12},
+            "planned_price_inputs": {"fallback_count": 3},
+            "fill_diagnostics": {"cancelled": 2},
+            "runtime_profile": {
+                "total_seconds": 12.34,
+                "price_load_seconds": 1.1,
+                "signal_loop_seconds": 4.2,
+                "large_payload": list(range(100)),
+            },
+            "rebalance_diagnostics": [{"date": "2026-04-10"}],
+            "leakage_warnings": [{"model_id": "m1"}],
+            "reproducibility_fingerprint": {"hash": "fp_hash", "large_payload": list(range(100))},
+        }
+
+        lightweight = BacktestService._list_summary(summary)
+
+        self.assertEqual(lightweight["annual_return"], 0.08)
+        self.assertEqual(lightweight["sharpe_ratio"], 1.9)
+        self.assertTrue(lightweight["constraint_pass"])
+        self.assertEqual(lightweight["portfolio_compliance"], {"compliance_pass": True})
+        self.assertEqual(
+            lightweight["runtime_profile"],
+            {
+                "total_seconds": 12.34,
+                "price_load_seconds": 1.1,
+                "signal_loop_seconds": 4.2,
+            },
+        )
+        self.assertEqual(lightweight["reproducibility_hash"], "fp_hash")
+        self.assertTrue(lightweight["has_trade_diagnostics"])
+        self.assertNotIn("trade_diagnostics", lightweight)
+        self.assertNotIn("constraint_report", lightweight)
+        self.assertNotIn("startup_state_report", lightweight)
+        self.assertNotIn("planned_price_execution", lightweight)
+        self.assertNotIn("planned_price_inputs", lightweight)
+        self.assertNotIn("fill_diagnostics", lightweight)
+
     def test_get_backtest_promotes_rebalance_diagnostics_to_top_level(self):
         svc = BacktestService()
         conn = _BacktestDetailConnection(

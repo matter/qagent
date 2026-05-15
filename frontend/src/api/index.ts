@@ -779,13 +779,12 @@ export async function deleteModel(modelId: string, market?: string) {
 
 // ---- Strategy Types ----
 
-export interface Strategy {
+export interface StrategySummary {
   id: string;
   market: Market;
   name: string;
   version: number;
   description: string | null;
-  source_code: string;
   required_factors: string[] | null;
   required_models: string[] | null;
   position_sizing: string;
@@ -794,6 +793,10 @@ export interface Strategy {
   default_paper_config?: Record<string, unknown> | null;
   status: string;
   created_at: string;
+}
+
+export interface Strategy extends StrategySummary {
+  source_code: string;
 }
 
 export interface StrategyTemplate {
@@ -919,9 +922,16 @@ export async function createStrategy(params: {
   return data;
 }
 
-export async function listStrategies(market?: string): Promise<Strategy[]> {
-  const { data } = await client.get<Strategy[]>("/strategies", {
-    params: { market: market || undefined },
+export async function listStrategies(
+  market?: string,
+  params?: { limit?: number; offset?: number },
+): Promise<StrategySummary[]> {
+  const { data } = await client.get<StrategySummary[]>("/strategies", {
+    params: {
+      market: market || undefined,
+      limit: params?.limit,
+      offset: params?.offset,
+    },
   });
   return data;
 }
@@ -973,9 +983,18 @@ export async function runBacktest(
   return data;
 }
 
-export async function listBacktests(strategyId?: string, market?: string): Promise<BacktestResultSummary[]> {
+export async function listBacktests(
+  strategyId?: string,
+  market?: string,
+  params?: { limit?: number; offset?: number },
+): Promise<BacktestResultSummary[]> {
   const { data } = await client.get<BacktestResultSummary[]>("/strategies/backtests", {
-    params: { strategy_id: strategyId || undefined, market: market || undefined },
+    params: {
+      strategy_id: strategyId || undefined,
+      market: market || undefined,
+      limit: params?.limit,
+      offset: params?.offset,
+    },
   });
   return data;
 }

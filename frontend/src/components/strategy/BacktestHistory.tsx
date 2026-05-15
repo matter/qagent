@@ -22,7 +22,7 @@ import type {
   BacktestResultDetail,
   ExecutionModel,
   Market,
-  Strategy,
+  StrategySummary,
 } from "../../api";
 import {
   BacktestSummaryCards,
@@ -95,10 +95,10 @@ export default function BacktestHistory({ refreshKey, onRestoreConfig }: Backtes
     setLoading(true);
     try {
       const [backtests, strategies] = await Promise.all([
-        listBacktests(),
-        listStrategies(),
+        listBacktests(undefined, undefined, { limit: 500 }),
+        listStrategies(undefined, { limit: 1000 }),
       ]);
-      const stratMap: Record<string, Strategy> = {};
+      const stratMap: Record<string, StrategySummary> = {};
       for (const s of strategies) {
         stratMap[s.id] = s;
       }

@@ -24,9 +24,11 @@ import {
   runBacktest,
   getTaskStatus,
   getBacktest,
+  getStrategy,
 } from "../../api";
 import type {
   Strategy,
+  StrategySummary,
   StockGroup,
   BacktestResultDetail,
   ExecutionModel,
@@ -52,7 +54,8 @@ interface BacktestRunnerPanelProps {
 }
 
 export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig }: BacktestRunnerPanelProps) {
-  const [strategies, setStrategies] = useState<Strategy[]>([]);
+  const [strategies, setStrategies] = useState<StrategySummary[]>([]);
+  const [selectedStrategyDetail, setSelectedStrategyDetail] = useState<Strategy | null>(null);
   const [groups, setGroups] = useState<StockGroup[]>([]);
 
   const [selectedStrategy, setSelectedStrategy] = useState<string>("");
@@ -92,6 +95,24 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
     listStrategies().then(setStrategies).catch(() => {});
     listGroups().then(setGroups).catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (!selectedStrategy) {
+      setSelectedStrategyDetail(null);
+      return;
+    }
+    let cancelled = false;
+    getStrategy(selectedStrategy)
+      .then((detail) => {
+        if (!cancelled) setSelectedStrategyDetail(detail);
+      })
+      .catch(() => {
+        if (!cancelled) setSelectedStrategyDetail(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedStrategy]);
 
   // Restore config from backtest history
   useEffect(() => {
@@ -214,7 +235,7 @@ export default function BacktestRunnerPanel({ onBacktestComplete, restoreConfig 
     }
   };
 
-  const selectedStrategyDef = strategies.find((s) => s.id === selectedStrategy);
+  const selectedStrategyDef = selectedStrategyDetail ?? strategies.find((s) => s.id === selectedStrategy);
   const strategyDefaults = selectedStrategyDef?.default_backtest_config;
 
   return (

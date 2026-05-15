@@ -127,11 +127,15 @@ async def create_strategy(body: CreateStrategyRequest) -> dict:
 
 
 @router.get("/strategies")
-async def list_strategies(market: Optional[str] = Query(None)) -> list[dict]:
+async def list_strategies(
+    market: Optional[str] = Query(None),
+    limit: Optional[int] = Query(None, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+) -> list[dict]:
     """List all strategies."""
     svc = _get_strategy_service()
     try:
-        return svc.list_strategies(market=market)
+        return svc.list_strategies(market=market, limit=limit, offset=offset)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -160,11 +164,18 @@ async def get_template(template_name: str) -> dict:
 async def list_all_backtests(
     strategy_id: Optional[str] = None,
     market: Optional[str] = Query(None),
+    limit: Optional[int] = Query(None, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
 ) -> list[dict]:
     """List all backtest results, optionally filtered by strategy_id."""
     svc = _get_backtest_service()
     try:
-        return svc.list_backtests(strategy_id=strategy_id, market=market)
+        return svc.list_backtests(
+            strategy_id=strategy_id,
+            market=market,
+            limit=limit,
+            offset=offset,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

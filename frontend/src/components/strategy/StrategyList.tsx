@@ -12,8 +12,8 @@ import {
   Typography,
 } from "antd";
 import { ReloadOutlined, DeleteOutlined, EyeOutlined, SearchOutlined } from "@ant-design/icons";
-import { listStrategies, deleteStrategy } from "../../api";
-import type { Market, Strategy } from "../../api";
+import { getStrategy, listStrategies, deleteStrategy } from "../../api";
+import type { Market, Strategy, StrategySummary } from "../../api";
 
 const { Text } = Typography;
 
@@ -40,8 +40,9 @@ interface StrategyListProps {
 }
 
 export default function StrategyList({ refreshKey, onViewStrategy }: StrategyListProps) {
-  const [strategies, setStrategies] = useState<Strategy[]>([]);
+  const [strategies, setStrategies] = useState<StrategySummary[]>([]);
   const [loading, setLoading] = useState(false);
+  const [openingId, setOpeningId] = useState<string | null>(null);
   const [idSearch, setIdSearch] = useState<string>("");
   const [messageApi, contextHolder] = message.useMessage();
 
@@ -68,6 +69,18 @@ export default function StrategyList({ refreshKey, onViewStrategy }: StrategyLis
       fetchData();
     } catch {
       messageApi.error("删除失败");
+    }
+  };
+
+  const handleView = async (record: StrategySummary) => {
+    setOpeningId(record.id);
+    try {
+      const detail = await getStrategy(record.id, record.market);
+      onViewStrategy?.(detail);
+    } catch {
+      messageApi.error("加载策略详情失败");
+    } finally {
+      setOpeningId(null);
     }
   };
 
@@ -132,7 +145,7 @@ export default function StrategyList({ refreshKey, onViewStrategy }: StrategyLis
       key: "created_at",
       width: 160,
       ellipsis: true,
-      sorter: (a: Strategy, b: Strategy) => (a.created_at ?? "").localeCompare(b.created_at ?? ""),
+      sorter: (a: StrategySummary, b: StrategySummary) => (a.created_at ?? "").localeCompare(b.created_at ?? ""),
       defaultSortOrder: "descend" as const,
       render: (d: string) => d?.slice(0, 19) ?? "-",
     },
@@ -140,12 +153,13 @@ export default function StrategyList({ refreshKey, onViewStrategy }: StrategyLis
       title: "操作",
       key: "actions",
       width: 120,
-      render: (_: unknown, record: Strategy) => (
+      render: (_: unknown, record: StrategySummary) => (
         <Space size="small">
           <Button
             size="small"
             icon={<EyeOutlined />}
-            onClick={() => onViewStrategy?.(record)}
+            loading={openingId === record.id}
+            onClick={() => handleView(record)}
           >
             查看
           </Button>

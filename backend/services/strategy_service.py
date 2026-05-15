@@ -312,21 +312,31 @@ class StrategyService:
             raise ValueError(f"Strategy {strategy_id} not found")
         return row
 
-    def list_strategies(self, market: str | None = None) -> list[dict]:
-        """List all strategies."""
+    def list_strategies(
+        self,
+        market: str | None = None,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[dict]:
+        """List strategy summaries without source code."""
         resolved_market = normalize_market(market)
         conn = get_connection()
         self._ensure_constraint_config_column(conn)
-        rows = conn.execute(
-            """SELECT id, market, name, version, description, source_code,
-                      required_factors, required_models, position_sizing,
-                      constraint_config, status, created_at, updated_at
-               FROM strategies
-               WHERE market = ?
-               ORDER BY name, version DESC""",
-            [resolved_market],
-        ).fetchall()
-        return [self._row_to_dict(r) for r in rows]
+        params: list = [resolved_market]
+        query = """SELECT id, market, name, version, description,
+                          required_factors, required_models, position_sizing,
+                          constraint_config, status, created_at, updated_at
+                   FROM strategies
+                   WHERE market = ?
+                   ORDER BY name, version DESC"""
+        if limit is not None:
+            safe_limit = max(1, min(int(limit), 1000))
+            safe_offset = max(0, int(offset or 0))
+            query += " LIMIT ? OFFSET ?"
+            params.extend([safe_limit, safe_offset])
+        rows = conn.execute(query, params).fetchall()
+        return [self._row_to_summary_dict(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -696,4 +706,31 @@ class StrategyService:
             "updated_at": str(row[12]) if row[12] else None,
             "default_backtest_config": defaults.get("default_backtest_config", {}),
             "default_paper_config": defaults.get("default_paper_config", {}),
+        }
+
+    @staticmethod
+    def _row_to_summary_dict(row) -> dict:
+        def _parse_json(raw, default):
+            if isinstance(raw, str):
+                try:
+                    return json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    return default
+            return raw if raw else default
+
+        return {
+            "id": row[0],
+            "market": row[1],
+            "name": row[2],
+            "version": row[3],
+            "description": row[4],
+            "required_factors": _parse_json(row[5], []),
+            "required_models": _parse_json(row[6], []),
+            "position_sizing": row[7],
+            "constraint_config": _parse_json(row[8], {}) if row[8] else {},
+            "status": row[9],
+            "created_at": str(row[10]) if row[10] else None,
+            "updated_at": str(row[11]) if row[11] else None,
+            "default_backtest_config": {},
+            "default_paper_config": {},
         }

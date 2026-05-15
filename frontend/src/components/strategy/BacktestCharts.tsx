@@ -66,6 +66,7 @@ export function BacktestSummaryCards({ summary }: BacktestSummaryCardsProps) {
   const tradeDiagnostics = summary.trade_diagnostics as Record<string, unknown> | undefined;
   const plannedExecution = tradeDiagnostics?.planned_price_execution as Record<string, unknown> | undefined;
   const plannedInputs = tradeDiagnostics?.planned_price_inputs as Record<string, unknown> | undefined;
+  const runtimeProfile = summary.runtime_profile as Record<string, unknown> | undefined;
   const startupState = (
     summary.startup_state_report
     || constraintReport?.startup_state_report
@@ -79,6 +80,10 @@ export function BacktestSummaryCards({ summary }: BacktestSummaryCardsProps) {
   const plannedFilled = asNumber(plannedExecution?.filled_order_count);
   const plannedBlocked = asNumber(plannedExecution?.blocked_order_count);
   const plannedFallbacks = asNumber(plannedInputs?.fallback_count);
+  const totalSeconds = asNumber(runtimeProfile?.total_seconds);
+  const modelSeconds = asNumber(runtimeProfile?.model_predict_seconds);
+  const signalSeconds = asNumber(runtimeProfile?.signal_loop_seconds);
+  const engineSeconds = asNumber(runtimeProfile?.engine_seconds);
   const items: Array<{
     key: string;
     title: string;
@@ -201,6 +206,22 @@ export function BacktestSummaryCards({ summary }: BacktestSummaryCardsProps) {
             />
             <Text type="secondary" style={{ fontSize: 11 }}>
               {`成交 ${plannedFilled ?? 0} / 失败 ${plannedBlocked ?? 0} / fallback ${plannedFallbacks ?? 0}`}
+            </Text>
+          </Card>
+        </Col>
+      )}
+      {runtimeProfile && (
+        <Col xs={12} sm={8} md={6} lg={3}>
+          <Card size="small">
+            <Statistic
+              title="运行耗时"
+              value={totalSeconds ?? "-"}
+              precision={totalSeconds != null ? 2 : undefined}
+              suffix={totalSeconds != null ? "s" : undefined}
+              valueStyle={{ fontSize: 18, color: "#1677ff" }}
+            />
+            <Text type="secondary" style={{ fontSize: 11 }}>
+              {`模型 ${modelSeconds?.toFixed(1) ?? "-"} / 信号 ${signalSeconds?.toFixed(1) ?? "-"} / 引擎 ${engineSeconds?.toFixed(1) ?? "-"}`}
             </Text>
           </Card>
         </Col>
