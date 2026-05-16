@@ -16,6 +16,8 @@ router = APIRouter(prefix="/api", tags=["paper-trading"])
 
 _svc: PaperTradingService | None = None
 
+_V32_LEGACY_PAPER_REPLACEMENT = "/api/research-assets/paper-sessions"
+
 
 def _get_svc() -> PaperTradingService:
     global _svc
@@ -26,6 +28,20 @@ def _get_svc() -> PaperTradingService:
 
 def _get_executor() -> TaskExecutor:
     return get_task_executor()
+
+
+def _raise_v32_legacy_paper_disabled() -> None:
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "status": "disabled",
+            "message": (
+                "Legacy 2.x paper trading is disabled in V3.2. "
+                "Create and advance paper sessions from a 3.0 StrategyGraph."
+            ),
+            "replacement": _V32_LEGACY_PAPER_REPLACEMENT,
+        },
+    )
 
 
 # ---- Request models ----
@@ -49,11 +65,13 @@ class AdvanceRequest(BaseModel):
 
 @router.get("/paper-trading/sessions")
 async def list_sessions(market: str | None = Query(None)) -> list[dict]:
+    _raise_v32_legacy_paper_disabled()
     return _get_svc().list_sessions(market=market)
 
 
 @router.post("/paper-trading/sessions")
 async def create_session(body: CreateSessionRequest) -> dict:
+    _raise_v32_legacy_paper_disabled()
     try:
         return _get_svc().create_session(
             strategy_id=body.strategy_id,
@@ -72,6 +90,7 @@ async def get_session(
     session_id: str,
     market: str | None = Query(None),
 ) -> dict:
+    _raise_v32_legacy_paper_disabled()
     try:
         return _get_svc().get_session(session_id, market=market)
     except ValueError as e:
@@ -83,6 +102,7 @@ async def delete_session(
     session_id: str,
     market: str | None = Query(None),
 ) -> dict:
+    _raise_v32_legacy_paper_disabled()
     try:
         resolved_market = normalize_market(market)
         _get_svc().delete_session(session_id, market=resolved_market)
@@ -96,6 +116,7 @@ async def pause_session(
     session_id: str,
     market: str | None = Query(None),
 ) -> dict:
+    _raise_v32_legacy_paper_disabled()
     try:
         return _get_svc().pause_session(session_id, market=market)
     except ValueError as e:
@@ -107,6 +128,7 @@ async def resume_session(
     session_id: str,
     market: str | None = Query(None),
 ) -> dict:
+    _raise_v32_legacy_paper_disabled()
     try:
         return _get_svc().resume_session(session_id, market=market)
     except ValueError as e:
@@ -115,6 +137,7 @@ async def resume_session(
 
 @router.post("/paper-trading/sessions/{session_id}/advance")
 async def advance_session(session_id: str, body: AdvanceRequest | None = None) -> dict:
+    _raise_v32_legacy_paper_disabled()
     try:
         target = body.target_date if body else None
         steps = body.steps if body else 0
@@ -151,6 +174,7 @@ async def get_daily_series(
     session_id: str,
     market: str | None = Query(None),
 ) -> list[dict]:
+    _raise_v32_legacy_paper_disabled()
     return _get_svc().get_daily_series(session_id, market=market)
 
 
@@ -160,6 +184,7 @@ async def get_positions(
     market: str | None = Query(None),
     as_of_date: str | None = Query(None, alias="date"),
 ) -> list[dict]:
+    _raise_v32_legacy_paper_disabled()
     return _get_svc().get_positions(session_id, as_of_date=as_of_date, market=market)
 
 
@@ -169,6 +194,7 @@ async def compare_with_backtest(
     backtest_id: str,
     market: str | None = Query(None),
 ) -> dict:
+    _raise_v32_legacy_paper_disabled()
     return _get_svc().compare_with_backtest(session_id, backtest_id, market=market)
 
 
@@ -178,6 +204,7 @@ async def get_trades(
     market: str | None = Query(None),
     limit: int = Query(200, ge=1, le=1000),
 ) -> list[dict]:
+    _raise_v32_legacy_paper_disabled()
     return _get_svc().get_trades(session_id, limit, market=market)
 
 
@@ -186,6 +213,7 @@ async def get_summary(
     session_id: str,
     market: str | None = Query(None),
 ) -> dict:
+    _raise_v32_legacy_paper_disabled()
     try:
         return _get_svc().get_summary(session_id, market=market)
     except ValueError as e:
@@ -197,6 +225,7 @@ async def get_latest_signals(
     session_id: str,
     market: str | None = Query(None),
 ) -> dict:
+    _raise_v32_legacy_paper_disabled()
     try:
         svc = _get_svc()
         resolved_market = normalize_market(market)
@@ -224,6 +253,7 @@ async def get_stock_chart(
     ticker: str,
     market: str | None = Query(None),
 ) -> dict:
+    _raise_v32_legacy_paper_disabled()
     try:
         return _get_svc().get_stock_chart(session_id, ticker, market=market)
     except ValueError as e:

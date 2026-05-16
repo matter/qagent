@@ -6,6 +6,7 @@ from unittest.mock import patch
 import duckdb
 
 from backend.services.db_preflight_service import DbPreflightService
+from backend.services.maintenance_guard_service import MaintenanceGuardService
 
 
 class DbPreflightServiceContractTests(unittest.TestCase):
@@ -68,6 +69,24 @@ class DbPreflightServiceContractTests(unittest.TestCase):
         self.assertEqual(result["status"], "locked")
         self.assertIn("/api/diagnostics/daily-bars", result["running_api_routes"])
         self.assertEqual(result["maintenance_required_for"], ["backup", "restore", "schema_migration", "direct_duckdb_reads"])
+
+    def test_maintenance_guard_blocks_direct_db_work_when_preflight_fails(self):
+        guard = MaintenanceGuardService()
+
+        with patch(
+            "backend.services.maintenance_guard_service.DbPreflightService.check_database",
+            return_value={
+                "ok": False,
+                "status": "in_use",
+                "message": "Database is already open by the running backend process.",
+                "action": "Use the running API or stop services with bash scripts/stop.sh.",
+            },
+        ):
+            with self.assertRaisesRegex(RuntimeError, "backup.*blocked"):
+                guard.assert_direct_db_maintenance_allowed(
+                    Path("/tmp/qagent.duckdb"),
+                    operation="backup",
+                )
 
 
 if __name__ == "__main__":

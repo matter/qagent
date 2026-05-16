@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from backend.services.maintenance_guard_service import MaintenanceGuardService
 from backend.services.migration_3_2_service import Migration32Service
 
 
@@ -54,6 +55,10 @@ def main() -> int:
 
     service = Migration32Service()
     if args.apply_basic_assets:
+        MaintenanceGuardService().assert_direct_db_maintenance_allowed(
+            db_path,
+            operation="v3.2 apply basic assets",
+        )
         result = service.apply_basic_assets(db_path=db_path)
         print("V3.2 basic asset migration:")
         print(f"  manifest_id: {result['manifest_id']}")
@@ -61,6 +66,10 @@ def main() -> int:
         print(f"  factor_specs inserted: {result['factor_specs']['inserted']}")
         print(f"  universes inserted: {result['universes']['inserted']}")
     elif args.apply_market_data_snapshots:
+        MaintenanceGuardService().assert_direct_db_maintenance_allowed(
+            db_path,
+            operation="v3.2 apply market data snapshots",
+        )
         result = service.apply_market_data_snapshots(db_path=db_path)
         print("V3.2 market data snapshot migration:")
         print(f"  manifest_id: {result['manifest_id']}")
@@ -72,6 +81,10 @@ def main() -> int:
                 f"unmapped_tickers={info['unmapped_ticker_count']}"
             )
     elif args.apply_dependency_assets:
+        MaintenanceGuardService().assert_direct_db_maintenance_allowed(
+            db_path,
+            operation="v3.2 apply dependency assets",
+        )
         result = service.apply_dependency_assets(db_path=db_path)
         print("V3.2 dependency asset migration:")
         print(f"  manifest_id: {result['manifest_id']}")

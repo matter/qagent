@@ -22,6 +22,11 @@ router = APIRouter(prefix="/api", tags=["strategies"])
 _strategy_service: StrategyService | None = None
 _backtest_service: BacktestService | None = None
 
+_V32_LEGACY_STRATEGY_REPLACEMENT = (
+    "/api/research-assets/strategy-graphs, "
+    "/api/research-assets/strategy-graphs/{strategy_graph_id}/backtest"
+)
+
 
 def _get_strategy_service() -> StrategyService:
     global _strategy_service
@@ -39,6 +44,21 @@ def _get_backtest_service() -> BacktestService:
 
 def _get_executor() -> TaskExecutor:
     return get_task_executor()
+
+
+def _raise_v32_legacy_strategy_disabled() -> None:
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "status": "disabled",
+            "message": (
+                "Legacy 2.x strategy and backtest runtime is disabled in V3.2. "
+                "Re-enter strategy logic as a 3.0 StrategyGraph and use the "
+                "shared portfolio/execution runtime."
+            ),
+            "replacement": _V32_LEGACY_STRATEGY_REPLACEMENT,
+        },
+    )
 
 
 # ------------------------------------------------------------------
@@ -95,6 +115,7 @@ class ResearchSummaryRequest(BaseModel):
 @router.post("/strategies")
 async def create_strategy(body: CreateStrategyRequest) -> dict:
     """Create a new strategy definition."""
+    _raise_v32_legacy_strategy_disabled()
     svc = _get_strategy_service()
     try:
         return svc.create_strategy(
@@ -133,6 +154,7 @@ async def list_strategies(
     offset: int = Query(0, ge=0),
 ) -> list[dict]:
     """List all strategies."""
+    _raise_v32_legacy_strategy_disabled()
     svc = _get_strategy_service()
     try:
         return svc.list_strategies(market=market, limit=limit, offset=offset)
@@ -143,6 +165,7 @@ async def list_strategies(
 @router.get("/strategies/templates")
 async def list_templates() -> list[dict]:
     """List available built-in strategy templates."""
+    _raise_v32_legacy_strategy_disabled()
     names = get_template_names()
     return [{"name": n} for n in names]
 
@@ -150,6 +173,7 @@ async def list_templates() -> list[dict]:
 @router.get("/strategies/templates/{template_name}")
 async def get_template(template_name: str) -> dict:
     """Get source code for a built-in strategy template."""
+    _raise_v32_legacy_strategy_disabled()
     source = get_template_source(template_name)
     if source is None:
         raise HTTPException(status_code=404, detail=f"Template '{template_name}' not found")
@@ -168,6 +192,7 @@ async def list_all_backtests(
     offset: int = Query(0, ge=0),
 ) -> list[dict]:
     """List all backtest results, optionally filtered by strategy_id."""
+    _raise_v32_legacy_strategy_disabled()
     svc = _get_backtest_service()
     try:
         return svc.list_backtests(
@@ -186,6 +211,7 @@ async def get_backtest(
     market: Optional[str] = Query(None),
 ) -> dict:
     """Get full backtest result."""
+    _raise_v32_legacy_strategy_disabled()
     svc = _get_backtest_service()
     try:
         return svc.get_backtest(backtest_id, market=market)
@@ -201,6 +227,7 @@ async def get_backtest_rebalance_diagnostics(
     limit: int = Query(200, ge=1, le=1000),
 ) -> dict:
     """Get paginated per-rebalance diagnostics for a backtest."""
+    _raise_v32_legacy_strategy_disabled()
     svc = _get_backtest_service()
     try:
         return svc.get_rebalance_diagnostics(
@@ -221,6 +248,7 @@ async def get_backtest_debug_replay(
     ticker: Optional[str] = Query(None),
 ) -> dict:
     """Get an optional temporary debug replay bundle for a backtest."""
+    _raise_v32_legacy_strategy_disabled()
     svc = _get_backtest_service()
     try:
         return svc.get_debug_replay(
@@ -238,6 +266,7 @@ async def cleanup_backtest_debug_replay(
     ttl_hours: int = Query(24, ge=0, le=168),
 ) -> dict:
     """Delete expired temporary debug replay bundles."""
+    _raise_v32_legacy_strategy_disabled()
     svc = _get_backtest_service()
     return svc.cleanup_debug_replay(ttl_hours=ttl_hours)
 
@@ -248,6 +277,7 @@ async def delete_backtest(
     market: Optional[str] = Query(None),
 ) -> dict:
     """Delete a backtest result."""
+    _raise_v32_legacy_strategy_disabled()
     svc = _get_backtest_service()
     try:
         resolved_market = normalize_market(market)
@@ -264,6 +294,7 @@ async def get_backtest_stock_chart(
     market: Optional[str] = Query(None),
 ) -> dict:
     """Get daily bars and trade markers for a single stock within a backtest."""
+    _raise_v32_legacy_strategy_disabled()
     svc = _get_backtest_service()
     try:
         return svc.get_stock_chart_data(backtest_id, ticker, market=market)
@@ -274,6 +305,7 @@ async def get_backtest_stock_chart(
 @router.post("/strategies/backtests/compare")
 async def compare_backtests(body: CompareBacktestsRequest) -> dict:
     """Compare multiple backtest results."""
+    _raise_v32_legacy_strategy_disabled()
     svc = _get_backtest_service()
     try:
         return svc.compare_strategies(body.backtest_ids, market=body.market)
@@ -284,6 +316,7 @@ async def compare_backtests(body: CompareBacktestsRequest) -> dict:
 @router.post("/strategies/backtests/research-summary")
 async def get_backtest_research_summary(body: ResearchSummaryRequest) -> dict:
     """Return a compact bounded comparison summary for agent research."""
+    _raise_v32_legacy_strategy_disabled()
     svc = _get_backtest_service()
     try:
         return svc.get_research_summary(
@@ -305,6 +338,7 @@ async def get_strategy(
     market: Optional[str] = Query(None),
 ) -> dict:
     """Get strategy definition detail including source code."""
+    _raise_v32_legacy_strategy_disabled()
     svc = _get_strategy_service()
     try:
         return svc.get_strategy(strategy_id, market=market)
@@ -315,6 +349,7 @@ async def get_strategy(
 @router.put("/strategies/{strategy_id}")
 async def update_strategy(strategy_id: str, body: UpdateStrategyRequest) -> dict:
     """Update a strategy -- creates new version if source_code changes."""
+    _raise_v32_legacy_strategy_disabled()
     svc = _get_strategy_service()
     try:
         return svc.update_strategy(
@@ -336,6 +371,7 @@ async def delete_strategy(
     market: Optional[str] = Query(None),
 ) -> dict:
     """Delete a strategy definition."""
+    _raise_v32_legacy_strategy_disabled()
     svc = _get_strategy_service()
     try:
         resolved_market = normalize_market(market)
@@ -356,6 +392,7 @@ async def run_backtest(strategy_id: str, body: RunBacktestRequest) -> dict:
 
     Returns a task_id to poll for progress.
     """
+    _raise_v32_legacy_strategy_disabled()
     try:
         resolved_market = normalize_market(body.market)
     except ValueError as e:

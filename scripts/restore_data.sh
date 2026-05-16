@@ -34,18 +34,27 @@ if [ ! -d "$BACKUP_DIR" ]; then
     exit 1
 fi
 
-# Check if backend is running
-if lsof "$DB_PATH" >/dev/null 2>&1; then
-    echo "Error: Database is in use. Stop the backend first:"
-    echo "  bash scripts/stop.sh"
-    exit 1
-fi
-
 echo "==> Restoring all QAgent data from $BACKUP_DIR"
 echo "    Target DB: $DB_PATH"
 echo ""
 
 cd "$PROJECT_ROOT"
+echo "==> Checking database maintenance preflight"
+uv run python - << PYEOF
+from pathlib import Path
+from backend.services.maintenance_guard_service import MaintenanceGuardService
+
+try:
+    result = MaintenanceGuardService().assert_direct_db_maintenance_allowed(
+        Path("$DB_PATH"),
+        operation="restore",
+    )
+except RuntimeError as exc:
+    print(f"Error: {exc}")
+    raise SystemExit(1)
+print(f"Database preflight: {result['status']}")
+PYEOF
+
 uv run python << PYEOF
 import os
 from pathlib import Path

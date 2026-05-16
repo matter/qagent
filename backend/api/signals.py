@@ -23,6 +23,8 @@ router = APIRouter(prefix="/api/signals", tags=["signals"])
 
 _service: SignalService | None = None
 
+_V32_LEGACY_SIGNAL_REPLACEMENT = "/api/research-assets/production-signals/generate"
+
 
 def _get_service() -> SignalService:
     global _service
@@ -33,6 +35,20 @@ def _get_service() -> SignalService:
 
 def _get_executor() -> TaskExecutor:
     return get_task_executor()
+
+
+def _raise_v32_legacy_signal_disabled() -> None:
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "status": "disabled",
+            "message": (
+                "Legacy 2.x signal generation is disabled in V3.2. "
+                "Generate production signals from a 3.0 StrategyGraph instead."
+            ),
+            "replacement": _V32_LEGACY_SIGNAL_REPLACEMENT,
+        },
+    )
 
 
 # ------------------------------------------------------------------
@@ -77,6 +93,7 @@ async def generate_signals(body: GenerateSignalsRequest) -> dict:
 
     Returns a task_id to poll for progress.
     """
+    _raise_v32_legacy_signal_disabled()
     svc = _get_service()
     executor = _get_executor()
     try:
@@ -135,6 +152,7 @@ async def generate_signals(body: GenerateSignalsRequest) -> dict:
 async def diagnose_signals(body: DiagnoseSignalsRequest) -> dict:
     """Async signal diagnosis: returns model scores, factor snapshots,
     candidate pool, final signals, and eliminated tickers without DB persistence."""
+    _raise_v32_legacy_signal_disabled()
     svc = _get_service()
     executor = _get_executor()
     try:
@@ -215,6 +233,7 @@ async def list_signal_runs(
     limit: int = Query(50, ge=1, le=500),
 ) -> list[dict]:
     """List signal runs, optionally filtered by strategy_id."""
+    _raise_v32_legacy_signal_disabled()
     svc = _get_service()
     return svc.list_signal_runs(strategy_id=strategy_id, limit=limit, market=market)
 
@@ -225,6 +244,7 @@ async def get_signal_run(
     market: Optional[str] = Query(None),
 ) -> dict:
     """Get signal run detail with all signal entries."""
+    _raise_v32_legacy_signal_disabled()
     svc = _get_service()
     try:
         return svc.get_signal_run(run_id, market=market)
@@ -239,6 +259,7 @@ async def export_signals(
     format: str = Query("csv", description="Export format: csv or json"),
 ) -> Response:
     """Export signal details as CSV or JSON file."""
+    _raise_v32_legacy_signal_disabled()
     svc = _get_service()
     try:
         run = svc.get_signal_run(run_id, market=market)

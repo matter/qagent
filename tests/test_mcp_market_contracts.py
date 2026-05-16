@@ -101,7 +101,7 @@ class MCPMarketContractsTests(unittest.TestCase):
         self.assertEqual(fake_executor.submissions[0]["params"]["start_date"], "2016-01-01")
         self.assertEqual(fake_executor.submissions[1]["params"]["markets"], ["US", "CN"])
 
-    def test_models_strategies_backtests_and_signals_forward_market_to_tasks(self):
+    def test_models_and_strategy_crud_forward_market_while_legacy_runtime_tools_are_disabled(self):
         fake_model = _FakeModelService()
         fake_strategy = _FakeStrategyService()
         fake_backtest = _FakeBacktestService()
@@ -148,18 +148,21 @@ class MCPMarketContractsTests(unittest.TestCase):
             )
 
         self.assertEqual(models[0]["market"], "CN")
-        self.assertEqual(strategies[0]["market"], "CN")
-        self.assertEqual(created_strategy["market"], "CN")
+        self.assertEqual(strategies["status"], "disabled")
+        self.assertIn("StrategyGraph", strategies["message"])
+        self.assertEqual(created_strategy["status"], "disabled")
+        self.assertIn("strategy-graphs", created_strategy["replacement"])
         self.assertEqual(train["market"], "CN")
         self.assertEqual(train["poll_url"], "/api/tasks/task_cn")
         self.assertEqual(fake_executor.submissions[0]["params"]["market"], "CN")
         self.assertEqual(fake_executor.submissions[0]["params"]["objective_type"], "ranking")
-        self.assertEqual(backtest["market"], "CN")
-        self.assertEqual(fake_executor.submissions[1]["params"]["market"], "CN")
-        self.assertEqual(signal["market"], "CN")
-        self.assertEqual(fake_executor.submissions[2]["params"]["market"], "CN")
+        self.assertEqual(backtest["status"], "disabled")
+        self.assertIn("backtest_strategy_graph_3_0", backtest["replacement"])
+        self.assertEqual(signal["status"], "disabled")
+        self.assertIn("generate_production_signal_3_0", signal["replacement"])
+        self.assertEqual(len(fake_executor.submissions), 1)
 
-    def test_group_label_feature_and_paper_tools_forward_market(self):
+    def test_group_label_feature_forward_market_and_legacy_paper_tools_are_disabled(self):
         fake_group = _FakeGroupService()
         fake_label = _FakeLabelService()
         fake_feature = _FakeFeatureService()
@@ -202,10 +205,10 @@ class MCPMarketContractsTests(unittest.TestCase):
         self.assertEqual(refreshed_groups[0]["market"], "CN")
         self.assertEqual(labels[0]["market"], "CN")
         self.assertEqual(feature_sets[0]["market"], "CN")
-        self.assertEqual(paper_sessions[0]["market"], "CN")
-        self.assertEqual(paper["market"], "CN")
-        self.assertEqual(advanced["market"], "CN")
-        self.assertEqual(fake_executor.params["market"], "CN")
+        self.assertEqual(paper_sessions["status"], "disabled")
+        self.assertEqual(paper["status"], "disabled")
+        self.assertEqual(advanced["status"], "disabled")
+        self.assertIsNone(fake_executor.params)
 
 
 class _FakeResult:

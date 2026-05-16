@@ -521,6 +521,67 @@ class ResearchKernelService:
             ],
         }
 
+    def apply_artifact_cleanup(
+        self,
+        *,
+        project_id: str | None = None,
+        run_id: str | None = None,
+        artifact_ids: list[str] | None = None,
+        lifecycle_stage: str | None = None,
+        retention_class: str | None = None,
+        artifact_type: str | None = None,
+        include_published: bool = False,
+        limit: int = 500,
+        confirm: bool = False,
+        archive_reason: str | None = None,
+    ) -> dict:
+        """Archive cleanup preview candidates after explicit confirmation."""
+        if not confirm:
+            raise ValueError("cleanup apply requires confirm=true")
+
+        preview = self.preview_artifact_cleanup(
+            project_id=project_id,
+            run_id=run_id,
+            artifact_ids=artifact_ids,
+            lifecycle_stage=lifecycle_stage,
+            retention_class=retention_class,
+            artifact_type=artifact_type,
+            include_published=include_published,
+            limit=limit,
+        )
+        archived: list[dict] = []
+        errors: list[dict[str, str]] = []
+        reason = archive_reason or "cleanup_apply"
+        for artifact in preview["candidates"]:
+            try:
+                archived.append(
+                    self.archive_artifact(
+                        artifact["id"],
+                        retention_class="archived",
+                        archive_reason=reason,
+                    )
+                )
+            except ValueError as exc:
+                errors.append({"artifact_id": artifact["id"], "error": str(exc)})
+
+        return {
+            "mode": "archive",
+            "preview": preview,
+            "summary": {
+                "matched_count": preview["summary"]["matched_count"],
+                "candidate_count": preview["summary"]["candidate_count"],
+                "protected_count": preview["summary"]["protected_count"],
+                "archived_count": len(archived),
+                "error_count": len(errors),
+            },
+            "archived": archived,
+            "protected": preview["protected"],
+            "errors": errors,
+            "warnings": [
+                "Cleanup apply archives artifact files and metadata; it does not permanently delete source records.",
+            ],
+        }
+
     def get_promotion_record(self, promotion_id: str) -> dict:
         row = get_connection().execute(
             """SELECT id, project_id, source_type, source_id, target_type,

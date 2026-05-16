@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Routes, Route, useNavigate, useLocation } from "react-router-dom";
-import { ConfigProvider, Layout, Menu, theme, Typography } from "antd";
+import { Alert, Button, ConfigProvider, Layout, Menu, theme, Typography } from "antd";
 import {
   DashboardOutlined,
   LineChartOutlined,
@@ -8,9 +8,6 @@ import {
   ExperimentOutlined,
   ToolOutlined,
   RocketOutlined,
-  FundOutlined,
-  ThunderboltOutlined,
-  PlayCircleOutlined,
   ScheduleOutlined,
   SettingOutlined,
 } from "@ant-design/icons";
@@ -21,9 +18,6 @@ import DataManagement from "./pages/DataManagePage";
 import FactorResearch from "./pages/FactorResearch";
 import FeatureEngineering from "./pages/FeatureEngineering";
 import ModelTraining from "./pages/ModelTraining";
-import StrategyBacktest from "./pages/StrategyBacktest";
-import SignalGeneration from "./pages/SignalGeneration";
-import PaperTrading from "./pages/PaperTrading";
 import SystemSettings from "./pages/SystemSettings";
 import TaskManagement from "./pages/TaskManagement";
 import ResearchWorkbench3 from "./pages/ResearchWorkbench3";
@@ -41,9 +35,6 @@ const menuItems: MenuProps["items"] = [
   { key: "/factors", icon: <ExperimentOutlined />, label: "因子研究" },
   { key: "/features", icon: <ToolOutlined />, label: "特征工程" },
   { key: "/models", icon: <RocketOutlined />, label: "模型训练" },
-  { key: "/backtest", icon: <FundOutlined />, label: "策略回测" },
-  { key: "/signals", icon: <ThunderboltOutlined />, label: "信号生成" },
-  { key: "/paper-trading", icon: <PlayCircleOutlined />, label: "模拟交易" },
   { key: "/tasks", icon: <ScheduleOutlined />, label: "任务管理" },
   { key: "/settings", icon: <SettingOutlined />, label: "系统设置" },
 ];
@@ -137,9 +128,9 @@ export default function App() {
               <Route path="/factors" element={<FactorResearch />} />
               <Route path="/features" element={<FeatureEngineering />} />
               <Route path="/models" element={<ModelTraining />} />
-              <Route path="/backtest" element={<StrategyBacktest />} />
-              <Route path="/signals" element={<SignalGeneration />} />
-              <Route path="/paper-trading" element={<PaperTrading />} />
+              <Route path="/backtest" element={<LegacyRuntimeDisabledPage />} />
+              <Route path="/signals" element={<LegacyRuntimeDisabledPage />} />
+              <Route path="/paper-trading" element={<LegacyRuntimeDisabledPage />} />
               <Route path="/tasks" element={<TaskManagement />} />
               <Route path="/settings" element={<SystemSettings />} />
             </Routes>
@@ -147,5 +138,22 @@ export default function App() {
         </Layout>
       </Layout>
     </ConfigProvider>
+  );
+}
+
+function LegacyRuntimeDisabledPage() {
+  const navigate = useNavigate();
+  return (
+    <Alert
+      type="warning"
+      showIcon
+      message="旧运行入口已在 V3.2 禁用"
+      description="策略回测、信号生成和模拟交易现在统一在 3.0 Research Workbench 中通过 StrategyGraph、production signal 和 paper session 完成。旧页面不再作为业务入口展示。"
+      action={
+        <Button type="primary" onClick={() => navigate("/research")}>
+          打开研究工作台
+        </Button>
+      }
+    />
   );
 }

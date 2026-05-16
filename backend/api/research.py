@@ -59,6 +59,11 @@ class CleanupPreviewRequest(BaseModel):
     limit: int = 500
 
 
+class CleanupApplyRequest(CleanupPreviewRequest):
+    confirm: bool = False
+    archive_reason: str | None = None
+
+
 class ArchiveArtifactRequest(BaseModel):
     retention_class: str = "archived"
     archive_reason: str | None = None
@@ -163,6 +168,25 @@ async def preview_artifact_cleanup(body: CleanupPreviewRequest) -> dict:
         include_published=body.include_published,
         limit=body.limit,
     )
+
+
+@router.post("/artifacts/cleanup-apply")
+async def apply_artifact_cleanup(body: CleanupApplyRequest) -> dict:
+    try:
+        return _svc().apply_artifact_cleanup(
+            project_id=body.project_id,
+            run_id=body.run_id,
+            artifact_ids=body.artifact_ids,
+            lifecycle_stage=body.lifecycle_stage,
+            retention_class=body.retention_class,
+            artifact_type=body.artifact_type,
+            include_published=body.include_published,
+            limit=body.limit,
+            confirm=body.confirm,
+            archive_reason=body.archive_reason,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/artifacts/{artifact_id}/archive")

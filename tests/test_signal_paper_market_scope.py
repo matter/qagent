@@ -77,25 +77,27 @@ class SignalPaperMarketScopeTests(unittest.TestCase):
             self.assertEqual(SignalService().list_signal_runs(market="CN")[0]["market"], "CN")
             self.assertEqual(SignalService().list_signal_runs(), [])
 
-    def test_signal_api_forwards_market_to_task(self):
+    def test_signal_api_is_disabled_in_v3_2_before_task_submission(self):
         executor = _FakeExecutor()
         with (
             patch.object(signal_api, "_get_executor", return_value=executor),
             patch.object(signal_api, "_get_service", return_value=_FakeSignalService()),
         ):
-            result = asyncio.run(
-                signal_api.generate_signals(
-                    signal_api.GenerateSignalsRequest(
-                        market="CN",
-                        strategy_id="strategy_cn",
-                        target_date="2024-01-02",
-                        universe_group_id="cn_group",
+            with self.assertRaises(signal_api.HTTPException) as ctx:
+                asyncio.run(
+                    signal_api.generate_signals(
+                        signal_api.GenerateSignalsRequest(
+                            market="CN",
+                            strategy_id="strategy_cn",
+                            target_date="2024-01-02",
+                            universe_group_id="cn_group",
+                        )
                     )
                 )
-            )
 
-        self.assertEqual(result["market"], "CN")
-        self.assertEqual(executor.params["market"], "CN")
+        self.assertEqual(ctx.exception.status_code, 410)
+        self.assertIn("production-signals", str(ctx.exception.detail))
+        self.assertIsNone(executor.params)
 
     def test_paper_session_persists_market_and_rejects_us_strategy_for_cn(self):
         with self._patch_connections():
@@ -155,7 +157,7 @@ class SignalPaperMarketScopeTests(unittest.TestCase):
             {"open": 10.0, "high": 11.0, "low": 9.5, "close": 10.5},
         )
 
-    def test_paper_api_forwards_market_to_create_and_advance(self):
+    def test_paper_api_is_disabled_in_v3_2_before_task_submission(self):
         executor = _FakeExecutor()
         service = _FakePaperService()
 
@@ -163,28 +165,30 @@ class SignalPaperMarketScopeTests(unittest.TestCase):
             patch.object(paper_api, "_get_executor", return_value=executor),
             patch.object(paper_api, "_get_svc", return_value=service),
         ):
-            created = asyncio.run(
-                paper_api.create_session(
-                    paper_api.CreateSessionRequest(
-                        market="CN",
-                        strategy_id="strategy_cn",
-                        universe_group_id="cn_group",
-                        start_date="2024-01-02",
+            with self.assertRaises(paper_api.HTTPException) as create_ctx:
+                asyncio.run(
+                    paper_api.create_session(
+                        paper_api.CreateSessionRequest(
+                            market="CN",
+                            strategy_id="strategy_cn",
+                            universe_group_id="cn_group",
+                            start_date="2024-01-02",
+                        )
                     )
                 )
-            )
-            advanced = asyncio.run(
-                paper_api.advance_session(
-                    "session_cn",
-                    paper_api.AdvanceRequest(market="CN", steps=1),
+            with self.assertRaises(paper_api.HTTPException) as advance_ctx:
+                asyncio.run(
+                    paper_api.advance_session(
+                        "session_cn",
+                        paper_api.AdvanceRequest(market="CN", steps=1),
+                    )
                 )
-            )
 
-        self.assertEqual(created["market"], "CN")
-        self.assertEqual(advanced["market"], "CN")
-        self.assertEqual(executor.params["market"], "CN")
+        self.assertEqual(create_ctx.exception.status_code, 410)
+        self.assertEqual(advance_ctx.exception.status_code, 410)
+        self.assertIsNone(executor.params)
 
-    def test_paper_advance_task_exposes_staged_domain_write_contract(self):
+    def test_legacy_paper_advance_api_no_longer_exposes_staged_domain_write_contract(self):
         executor = _InlineExecutor()
         service = _FakePaperAdvanceStagingService()
 
@@ -192,17 +196,17 @@ class SignalPaperMarketScopeTests(unittest.TestCase):
             patch.object(paper_api, "_get_executor", return_value=executor),
             patch.object(paper_api, "_get_svc", return_value=service),
         ):
-            response = asyncio.run(
-                paper_api.advance_session(
-                    "session_cn",
-                    paper_api.AdvanceRequest(market="CN", steps=1),
+            with self.assertRaises(paper_api.HTTPException) as ctx:
+                asyncio.run(
+                    paper_api.advance_session(
+                        "session_cn",
+                        paper_api.AdvanceRequest(market="CN", steps=1),
+                    )
                 )
-            )
 
-        self.assertEqual(response["task_id"], "task_inline")
-        self.assertTrue(callable(service.stage_domain_write_seen))
-        self.assertEqual(executor.staged[0]["table"], "paper_trading_advance")
-        self.assertEqual(executor.result["staging"]["workflow"], "paper_trading_advance")
+        self.assertEqual(ctx.exception.status_code, 410)
+        self.assertEqual(executor.staged, [])
+        self.assertIsNone(service.stage_domain_write_seen)
 
     def test_paper_advance_stages_daily_and_session_updates_until_commit(self):
         with self._patch_connections():

@@ -1257,7 +1257,7 @@ class StrategyBacktestMarketScopeTests(unittest.TestCase):
                     market="CN",
                 )
 
-    def test_strategy_api_forwards_market_to_backtest_task(self):
+    def test_strategy_api_backtest_is_disabled_in_v3_2_before_task_submission(self):
         executor = _FakeExecutor()
         strategy_service = _FakeStrategyService()
         backtest_service = _FakeBacktestService()
@@ -1267,21 +1267,23 @@ class StrategyBacktestMarketScopeTests(unittest.TestCase):
             patch.object(strategy_api, "_get_backtest_service", return_value=backtest_service),
             patch.object(strategy_api, "_get_executor", return_value=executor),
         ):
-            result = asyncio.run(
-                strategy_api.run_backtest(
-                    "strategy_cn",
-                    strategy_api.RunBacktestRequest(
-                        market="CN",
-                        config={"benchmark": "sh.000300"},
-                        universe_group_id="cn_group",
+            with self.assertRaises(strategy_api.HTTPException) as ctx:
+                asyncio.run(
+                    strategy_api.run_backtest(
+                        "strategy_cn",
+                        strategy_api.RunBacktestRequest(
+                            market="CN",
+                            config={"benchmark": "sh.000300"},
+                            universe_group_id="cn_group",
+                        ),
                     ),
                 )
-            )
 
-        self.assertEqual(result["market"], "CN")
-        self.assertEqual(executor.params["market"], "CN")
+        self.assertEqual(ctx.exception.status_code, 410)
+        self.assertIn("strategy-graphs", str(ctx.exception.detail))
+        self.assertIsNone(executor.params)
 
-    def test_strategy_api_backtest_task_summary_includes_date_adjustment(self):
+    def test_legacy_strategy_api_backtest_task_summary_is_not_exposed_in_v3_2(self):
         executor = _FakeExecutor()
         strategy_service = _FakeStrategyService()
         backtest_service = _FakeBacktestService(
@@ -1308,24 +1310,22 @@ class StrategyBacktestMarketScopeTests(unittest.TestCase):
             patch.object(strategy_api, "_get_backtest_service", return_value=backtest_service),
             patch.object(strategy_api, "_get_executor", return_value=executor),
         ):
-            asyncio.run(
-                strategy_api.run_backtest(
-                    "strategy_cn",
-                    strategy_api.RunBacktestRequest(
-                        market="CN",
-                        config={"benchmark": "sh.000300"},
-                        universe_group_id="cn_group",
+            with self.assertRaises(strategy_api.HTTPException) as ctx:
+                asyncio.run(
+                    strategy_api.run_backtest(
+                        "strategy_cn",
+                        strategy_api.RunBacktestRequest(
+                            market="CN",
+                            config={"benchmark": "sh.000300"},
+                            universe_group_id="cn_group",
+                        ),
                     ),
                 )
-            )
 
-        summary = executor.fn(**executor.params)
+        self.assertEqual(ctx.exception.status_code, 410)
+        self.assertIsNone(executor.fn)
 
-        self.assertEqual(summary["date_adjustment"]["effective_start_date"], "2026-04-07")
-        self.assertEqual(summary["requested_start_date"], "2026-04-06")
-        self.assertEqual(summary["effective_start_date"], "2026-04-07")
-
-    def test_strategy_api_backtest_task_summary_includes_debug_artifact_id(self):
+    def test_legacy_strategy_api_backtest_debug_artifact_summary_is_not_exposed_in_v3_2(self):
         executor = _FakeExecutor()
         strategy_service = _FakeStrategyService()
         backtest_service = _FakeBacktestService(
@@ -1342,38 +1342,39 @@ class StrategyBacktestMarketScopeTests(unittest.TestCase):
             patch.object(strategy_api, "_get_backtest_service", return_value=backtest_service),
             patch.object(strategy_api, "_get_executor", return_value=executor),
         ):
-            asyncio.run(
-                strategy_api.run_backtest(
-                    "strategy_us",
-                    strategy_api.RunBacktestRequest(
-                        market="US",
-                        config={"debug_mode": True},
-                        universe_group_id="sp500",
+            with self.assertRaises(strategy_api.HTTPException) as ctx:
+                asyncio.run(
+                    strategy_api.run_backtest(
+                        "strategy_us",
+                        strategy_api.RunBacktestRequest(
+                            market="US",
+                            config={"debug_mode": True},
+                            universe_group_id="sp500",
+                        ),
                     ),
                 )
-            )
 
-        summary = executor.fn(**executor.params)
-        self.assertEqual(summary["debug_artifact_id"], "bt_debug")
+        self.assertEqual(ctx.exception.status_code, 410)
+        self.assertIsNone(executor.fn)
 
-    def test_strategy_api_debug_replay_routes_to_backtest_service(self):
+    def test_strategy_api_debug_replay_is_disabled_in_v3_2(self):
         svc = _FakeBacktestService(
             result={"backtest_id": "bt_debug", "market": "US"},
         )
 
         with patch.object(strategy_api, "_get_backtest_service", return_value=svc):
-            result = asyncio.run(
-                strategy_api.get_backtest_debug_replay(
-                    "bt_debug",
-                    market="US",
-                    date="2026-04-06",
-                    ticker="AAA",
+            with self.assertRaises(strategy_api.HTTPException) as ctx:
+                asyncio.run(
+                    strategy_api.get_backtest_debug_replay(
+                        "bt_debug",
+                        market="US",
+                        date="2026-04-06",
+                        ticker="AAA",
+                    )
                 )
-            )
 
-        self.assertEqual(result["backtest_id"], "bt_debug")
-        self.assertEqual(svc.debug_replay_call["date"], "2026-04-06")
-        self.assertEqual(svc.debug_replay_call["ticker"], "AAA")
+        self.assertEqual(ctx.exception.status_code, 410)
+        self.assertIsNone(svc.debug_replay_call)
 
     def test_debug_backtest_writes_readable_replay_bundle_and_cleanup(self):
         tmp_data = Path(self._tmp.name) / "runtime"
@@ -1465,7 +1466,7 @@ class StrategyBacktestMarketScopeTests(unittest.TestCase):
                 }
             )
 
-    def test_strategy_api_rejects_cross_market_benchmark_before_queueing(self):
+    def test_strategy_api_returns_v3_2_disabled_before_legacy_benchmark_validation(self):
         executor = _FakeExecutor()
         strategy_service = _FakeStrategyService()
         backtest_service = _FakeBacktestService()
@@ -1487,11 +1488,11 @@ class StrategyBacktestMarketScopeTests(unittest.TestCase):
                     )
                 )
 
-        self.assertEqual(ctx.exception.status_code, 400)
-        self.assertIn("benchmark", str(ctx.exception.detail))
+        self.assertEqual(ctx.exception.status_code, 410)
+        self.assertIn("StrategyGraph", str(ctx.exception.detail))
         self.assertIsNone(executor.params)
 
-    def test_create_strategy_api_logs_unexpected_failures_with_readable_detail(self):
+    def test_create_strategy_api_returns_v3_2_disabled_before_legacy_service(self):
         strategy_service = _FailingCreateStrategyService()
 
         with (
@@ -1509,13 +1510,9 @@ class StrategyBacktestMarketScopeTests(unittest.TestCase):
                     )
                 )
 
-        self.assertEqual(ctx.exception.status_code, 500)
-        self.assertIn("Failed to create strategy", str(ctx.exception.detail))
-        self.assertIn("duckdb internal failure", str(ctx.exception.detail))
-        log_error.assert_called_once()
-        self.assertEqual(log_error.call_args.args[0], "api.strategy.create_failed")
-        self.assertEqual(log_error.call_args.kwargs["market"], "CN")
-        self.assertEqual(log_error.call_args.kwargs["name"], "CN broken strategy")
+        self.assertEqual(ctx.exception.status_code, 410)
+        self.assertIn("StrategyGraph", str(ctx.exception.detail))
+        log_error.assert_not_called()
 
     def _patch_connections(self):
         return _MultiPatch(

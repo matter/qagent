@@ -3,12 +3,12 @@ import unittest
 from datetime import date, timedelta
 from unittest.mock import Mock, patch
 
-from backend.api.paper_trading import AdvanceRequest, advance_session
+from backend.api.paper_trading import AdvanceRequest, HTTPException, advance_session
 from backend.services.paper_trading_service import PaperTradingService
 
 
 class PaperTradingApiContractTests(unittest.IsolatedAsyncioTestCase):
-    async def test_advance_session_returns_queued_async_contract(self):
+    async def test_legacy_advance_session_returns_gone_before_task_submission(self):
         class FakeExecutor:
             def submit(self, **kwargs):
                 self.kwargs = kwargs
@@ -24,16 +24,15 @@ class PaperTradingApiContractTests(unittest.IsolatedAsyncioTestCase):
             patch("backend.api.paper_trading._get_executor", return_value=fake_executor),
             patch("backend.api.paper_trading._get_svc", return_value=FakeService()),
         ):
-            result = await advance_session(
-                "session-1",
-                AdvanceRequest(target_date="2026-04-24", steps=0),
-            )
+            with self.assertRaises(HTTPException) as ctx:
+                await advance_session(
+                    "session-1",
+                    AdvanceRequest(target_date="2026-04-24", steps=0),
+                )
 
-        self.assertEqual(result["task_id"], "task-123")
-        self.assertEqual(result["status"], "queued")
-        self.assertEqual(result["task_type"], "paper_trading_advance")
-        self.assertTrue(result["async"])
-        self.assertEqual(result["poll_url"], "/api/tasks/task-123")
+        self.assertEqual(ctx.exception.status_code, 410)
+        self.assertIn("/api/research-assets/paper-sessions", str(ctx.exception.detail))
+        self.assertFalse(hasattr(fake_executor, "kwargs"))
 
 
 class PaperTradingServiceContractTests(unittest.TestCase):

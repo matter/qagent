@@ -1224,6 +1224,22 @@ export interface CleanupPreview3 {
   warnings: string[];
 }
 
+export interface CleanupApply3 {
+  mode: string;
+  preview: CleanupPreview3;
+  summary: {
+    matched_count: number;
+    candidate_count: number;
+    protected_count: number;
+    archived_count: number;
+    error_count: number;
+  };
+  archived: ResearchArtifact3[];
+  protected: Array<{ artifact: ResearchArtifact3; reasons: string[] }>;
+  errors: Array<Record<string, unknown>>;
+  warnings: string[];
+}
+
 export interface LineageEdge3 {
   id: string;
   from_type: string;
@@ -1633,6 +1649,22 @@ export async function previewArtifactCleanup3(body: {
   limit?: number;
 }): Promise<CleanupPreview3> {
   const { data } = await client.post<CleanupPreview3>("/research/artifacts/cleanup-preview", body);
+  return data;
+}
+
+export async function applyArtifactCleanup3(body: {
+  project_id?: string;
+  run_id?: string;
+  artifact_ids?: string[];
+  lifecycle_stage?: string;
+  retention_class?: string;
+  artifact_type?: string;
+  include_published?: boolean;
+  limit?: number;
+  confirm: boolean;
+  archive_reason?: string;
+}): Promise<CleanupApply3> {
+  const { data } = await client.post<CleanupApply3>("/research/artifacts/cleanup-apply", body);
   return data;
 }
 

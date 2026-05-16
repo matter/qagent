@@ -17,6 +17,15 @@ log = get_logger(__name__)
 mcp = FastMCP("qagent", stateless_http=True)
 
 
+def _v32_disabled_runtime_tool(*, tool: str, replacement: str, message: str) -> dict:
+    return {
+        "status": "disabled",
+        "tool": tool,
+        "message": message,
+        "replacement": replacement,
+    }
+
+
 # ======================================================================
 # Lazy service accessors (avoid import-time DB initialization)
 # ======================================================================
@@ -258,6 +267,34 @@ def preview_artifact_cleanup_3_0(
         artifact_type=artifact_type,
         include_published=include_published,
         limit=limit,
+    )
+
+
+@mcp.tool()
+def apply_artifact_cleanup_3_0(
+    project_id: str | None = None,
+    run_id: str | None = None,
+    artifact_ids: list[str] | None = None,
+    lifecycle_stage: str | None = None,
+    retention_class: str | None = None,
+    artifact_type: str | None = None,
+    include_published: bool = False,
+    limit: int = 500,
+    confirm: bool = False,
+    archive_reason: str | None = None,
+) -> dict:
+    """Archive artifact cleanup candidates after explicit confirmation."""
+    return _research_kernel_service().apply_artifact_cleanup(
+        project_id=project_id,
+        run_id=run_id,
+        artifact_ids=artifact_ids,
+        lifecycle_stage=lifecycle_stage,
+        retention_class=retention_class,
+        artifact_type=artifact_type,
+        include_published=include_published,
+        limit=limit,
+        confirm=confirm,
+        archive_reason=archive_reason,
     )
 
 
@@ -1363,6 +1400,15 @@ def advance_paper_session_3_0(
 
 
 @mcp.tool()
+def list_paper_sessions_3_0(status: str | None = None, limit: int = 50) -> list[dict]:
+    """List 3.0 paper sessions created from StrategyGraph runtime."""
+    return _production_signal_3_service().list_paper_sessions(
+        status=status,
+        limit=limit,
+    )
+
+
+@mcp.tool()
 def export_reproducibility_bundle_3_0(
     source_type: str,
     source_id: str,
@@ -1835,19 +1881,16 @@ def train_model_distillation(
 
 
 @mcp.tool()
-def list_strategies(market: str | None = None) -> list[dict]:
-    """List all registered trading strategies.
-
-    Args:
-        market: Market scope. Defaults to "US" for compatibility.
-
-    Returns:
-        List of strategy records with id, name, version, required_factors,
-        required_models, position_sizing, status.
-    """
-    resolved_market = _resolve_market(market)
-    svc = _strategy_service()
-    return svc.list_strategies(market=resolved_market)
+def list_strategies(market: str | None = None) -> dict:
+    """Legacy StrategyBase listing is disabled in V3.2."""
+    return _v32_disabled_runtime_tool(
+        tool="list_strategies",
+        replacement="list_strategy_graph_backtests_3_0 and /api/research-assets/strategy-graphs",
+        message=(
+            "Legacy StrategyBase strategy listing is disabled in V3.2. "
+            "Use StrategyGraph assets and the 3.0 research workbench instead."
+        ),
+    )
 
 
 @mcp.tool()
@@ -1859,27 +1902,14 @@ def create_strategy(
     constraint_config: dict | None = None,
     market: str | None = None,
 ) -> dict:
-    """Create a market-scoped strategy definition.
-
-    Args:
-        name: Strategy name.
-        source_code: Python source implementing StrategyBase.
-        description: Optional description.
-        position_sizing: Position sizing mode: equal_weight, signal_weight, max_position, or raw_weight.
-        market: Market scope. Defaults to "US" for compatibility.
-
-    Returns:
-        Created strategy record.
-    """
-    resolved_market = _resolve_market(market)
-    svc = _strategy_service()
-    return svc.create_strategy(
-        name=name,
-        source_code=source_code,
-        description=description,
-        position_sizing=position_sizing,
-        constraint_config=constraint_config,
-        market=resolved_market,
+    """Legacy StrategyBase creation is disabled in V3.2."""
+    return _v32_disabled_runtime_tool(
+        tool="create_strategy",
+        replacement="create_builtin_alpha_strategy_graph_3_0 (/api/research-assets/strategy-graphs)",
+        message=(
+            "Legacy StrategyBase strategy creation is disabled in V3.2. "
+            "Re-enter strategy logic as a 3.0 StrategyGraph with standard order intents."
+        ),
     )
 
 
@@ -1906,6 +1936,17 @@ def run_backtest(
     Returns:
         Dict with task_id for tracking the background backtest task.
     """
+    return _v32_disabled_runtime_tool(
+        tool="run_backtest",
+        replacement=(
+            "backtest_strategy_graph_3_0 "
+            "(/api/research-assets/strategy-graphs/{strategy_graph_id}/backtest)"
+        ),
+        message=(
+            "Legacy StrategyBase backtests are disabled in V3.2. "
+            "Re-enter strategy logic as a 3.0 StrategyGraph and run StrategyGraph backtests."
+        ),
+    )
     import json as _json
     from backend.tasks.models import TaskSource
     resolved_market = _resolve_market(market)
@@ -1962,6 +2003,11 @@ def get_backtest_debug_replay(
     ticker: str | None = None,
 ) -> dict:
     """Load a temporary debug replay bundle produced by debug_mode backtest."""
+    return _v32_disabled_runtime_tool(
+        tool="get_backtest_debug_replay",
+        replacement="get_strategy_graph_backtest_3_0",
+        message="Legacy backtest debug replay is disabled in V3.2.",
+    )
     resolved_market = _resolve_market(market)
     return _backtest_service().get_debug_replay(
         backtest_id,
@@ -1982,6 +2028,11 @@ def get_backtest_research_summary(
     max_rebalance_items: int = 20,
 ) -> dict:
     """Return compact bounded legacy backtest comparison for agent research."""
+    return _v32_disabled_runtime_tool(
+        tool="get_backtest_research_summary",
+        replacement="get_agent_research_trial_matrix_3_0",
+        message="Legacy backtest research summaries are disabled in V3.2.",
+    )
     resolved_market = _resolve_market(market)
     return _backtest_service().get_research_summary(
         baseline_backtest_id=baseline_backtest_id,
@@ -1997,6 +2048,11 @@ def get_backtest_research_summary(
 @mcp.tool()
 def cleanup_backtest_debug_replay(ttl_hours: int = 24) -> dict:
     """Delete expired temporary backtest debug replay bundles."""
+    return _v32_disabled_runtime_tool(
+        tool="cleanup_backtest_debug_replay",
+        replacement="preview_artifact_cleanup_3_0",
+        message="Legacy backtest debug replay cleanup is disabled in V3.2.",
+    )
     return _backtest_service().cleanup_debug_replay(ttl_hours=ttl_hours)
 
 
@@ -2022,6 +2078,17 @@ def generate_signals(
     Returns:
         Dict with task_id for tracking the background signal generation task.
     """
+    return _v32_disabled_runtime_tool(
+        tool="generate_signals",
+        replacement=(
+            "generate_production_signal_3_0 "
+            "(/api/research-assets/production-signals/generate)"
+        ),
+        message=(
+            "Legacy signal generation is disabled in V3.2. "
+            "Use production-signals from a 3.0 StrategyGraph."
+        ),
+    )
     from backend.tasks.models import TaskSource
     resolved_market = _resolve_market(market)
 
@@ -2332,6 +2399,11 @@ def create_feature_set(
 @mcp.tool()
 def list_paper_sessions(market: str | None = None) -> list[dict]:
     """List paper-trading sessions in one market."""
+    return _v32_disabled_runtime_tool(
+        tool="list_paper_sessions",
+        replacement="list_paper_sessions_3_0 (/api/research-assets/paper-sessions)",
+        message="Legacy paper trading is disabled in V3.2.",
+    )
     resolved_market = _resolve_market(market)
     svc = _paper_service()
     return svc.list_sessions(market=resolved_market)
@@ -2352,6 +2424,14 @@ def create_paper_session(
     planned_price_buffer_bps. Missing strategy planned_price values fall back
     to decision-date close; failed planned orders are canceled for that day.
     """
+    return _v32_disabled_runtime_tool(
+        tool="create_paper_session",
+        replacement="create_paper_session_3_0 (/api/research-assets/paper-sessions)",
+        message=(
+            "Legacy paper trading is disabled in V3.2. "
+            "Create paper-sessions from a 3.0 StrategyGraph."
+        ),
+    )
     resolved_market = _resolve_market(market)
     svc = _paper_service()
     return svc.create_session(
@@ -2372,6 +2452,14 @@ def advance_paper_session(
     market: str | None = None,
 ) -> dict:
     """Advance a paper-trading session as a background task."""
+    return _v32_disabled_runtime_tool(
+        tool="advance_paper_session",
+        replacement=(
+            "advance_paper_session_3_0 "
+            "(/api/research-assets/paper-sessions/{session_id}/advance)"
+        ),
+        message="Legacy paper trading advance is disabled in V3.2.",
+    )
     from backend.tasks.models import TaskSource
 
     resolved_market = _resolve_market(market)

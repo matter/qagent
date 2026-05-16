@@ -32,6 +32,7 @@ import {
 } from "@ant-design/icons";
 import type { ColumnsType } from "antd/es/table";
 import {
+  applyArtifactCleanup3,
   archiveResearchArtifact3,
   backtestStrategyGraph3,
   evaluatePromotion3,
@@ -286,6 +287,27 @@ export default function ResearchWorkbench3() {
       }));
     } catch {
       messageApi.error("清理预览失败");
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const applyCleanup = async () => {
+    if (!state.project || !cleanupPreview) return;
+    setActionLoading(true);
+    try {
+      const result = await applyArtifactCleanup3({
+        project_id: state.project.id,
+        lifecycle_stage: "scratch",
+        retention_class: "scratch",
+        confirm: true,
+        archive_reason: "research_workbench_cleanup",
+      });
+      messageApi.success(`已归档 ${result.summary.archived_count} 个 artifact`);
+      setCleanupPreview(null);
+      await load();
+    } catch {
+      messageApi.error("清理应用失败");
     } finally {
       setActionLoading(false);
     }
@@ -938,6 +960,16 @@ export default function ResearchWorkbench3() {
         open={!!cleanupPreview}
         onClose={() => setCleanupPreview(null)}
         size={720}
+        extra={
+          cleanupPreview && cleanupPreview.summary.candidate_count > 0 ? (
+            <Popconfirm
+              title="确认归档预览中的可清理 artifacts？"
+              onConfirm={applyCleanup}
+            >
+              <Button danger loading={actionLoading}>应用清理</Button>
+            </Popconfirm>
+          ) : null
+        }
       >
         {cleanupPreview ? (
           <Space orientation="vertical" size={16} style={{ width: "100%" }}>

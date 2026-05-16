@@ -120,6 +120,47 @@ class ResearchKernelServiceContractTests(unittest.TestCase):
         self.assertEqual(archived["metadata"]["archive_previous_uri"], artifact["uri"])
         self.assertEqual(archived["metadata"]["archive_reason"], "unit test archive")
 
+    def test_apply_artifact_cleanup_archives_only_preview_candidates_when_confirmed(self):
+        service = ResearchKernelService()
+        run = service.create_run(
+            run_type="cleanup_apply_smoke",
+            lifecycle_stage="scratch",
+            retention_class="scratch",
+            created_by="unit-test",
+        )
+        candidate = service.create_json_artifact(
+            run_id=run["id"],
+            artifact_type="cleanup_apply_candidate",
+            payload={"ok": True},
+            lifecycle_stage="scratch",
+            retention_class="scratch",
+            rebuildable=True,
+        )
+        protected = service.create_json_artifact(
+            run_id=run["id"],
+            artifact_type="cleanup_apply_protected",
+            payload={"ok": True},
+            lifecycle_stage="published",
+            retention_class="standard",
+            rebuildable=False,
+        )
+
+        with self.assertRaisesRegex(ValueError, "confirm"):
+            service.apply_artifact_cleanup(project_id="bootstrap_us", confirm=False)
+
+        result = service.apply_artifact_cleanup(
+            project_id="bootstrap_us",
+            run_id=run["id"],
+            confirm=True,
+            archive_reason="unit test cleanup",
+        )
+
+        self.assertEqual(result["mode"], "archive")
+        self.assertEqual(result["summary"]["archived_count"], 1)
+        self.assertEqual(result["archived"][0]["id"], candidate["id"])
+        self.assertEqual(service.get_artifact(candidate["id"])["lifecycle_stage"], "archived")
+        self.assertEqual(service.get_artifact(protected["id"])["lifecycle_stage"], "published")
+
     def test_list_promotion_records_supports_workbench_filters(self):
         service = ResearchKernelService()
 

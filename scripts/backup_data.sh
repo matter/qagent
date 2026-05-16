@@ -22,13 +22,15 @@ cd "$PROJECT_ROOT"
 echo "==> Checking database maintenance preflight"
 uv run python - << PYEOF
 from pathlib import Path
-from backend.services.db_preflight_service import DbPreflightService
+from backend.services.maintenance_guard_service import MaintenanceGuardService
 
-result = DbPreflightService().check_database(Path("$DB_PATH"))
-if not result["ok"]:
-    print(f"Error: {result['message']}")
-    print(f"Status: {result['status']}")
-    print(f"Action: {result['action']}")
+try:
+    result = MaintenanceGuardService().assert_direct_db_maintenance_allowed(
+        Path("$DB_PATH"),
+        operation="backup",
+    )
+except RuntimeError as exc:
+    print(f"Error: {exc}")
     raise SystemExit(1)
 print(f"Database preflight: {result['status']}")
 PYEOF
