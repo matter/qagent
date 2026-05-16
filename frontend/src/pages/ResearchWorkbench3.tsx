@@ -973,6 +973,8 @@ function BacktestSummaryPanel({ backtest }: { backtest: BacktestRun3 | null }) {
   const executionModel = String(diagnostics.execution_model ?? "-");
   const executionModelCounts = objectField(diagnostics, "execution_model_counts");
   const pathWarnings = arrayField(diagnostics, "path_assumption_warnings");
+  const positionDiagnostics = objectField(backtest.summary, "position_diagnostics");
+  const driftRows = arrayField(positionDiagnostics, "drift");
   const warnings = arrayField(backtest.summary, "valuation_warnings");
   return (
     <Space orientation="vertical" size={12} style={{ width: "100%" }}>
@@ -998,6 +1000,27 @@ function BacktestSummaryPanel({ backtest }: { backtest: BacktestRun3 | null }) {
       </Descriptions>
       <SimpleList title="Daily-Bar Path Warnings" empty={pathWarnings.length === 0}>
         {pathWarnings.slice(0, 8).map((item, index) => (
+          <SimpleListItem key={index}>
+            <Text>{shortJson(item)}</Text>
+          </SimpleListItem>
+        ))}
+      </SimpleList>
+      <Descriptions size="small" bordered column={2} title="Position Diagnostics">
+        <Descriptions.Item label="Skipped Rebalance">
+          {String(numberField(positionDiagnostics, "skipped_rebalance_count") ?? 0)}
+        </Descriptions.Item>
+        <Descriptions.Item label="Turnover Saved">
+          {percentText(numberField(positionDiagnostics, "turnover_saved"))}
+        </Descriptions.Item>
+        <Descriptions.Item label="Target Turnover">
+          {percentText(numberField(positionDiagnostics, "turnover_before"))}
+        </Descriptions.Item>
+        <Descriptions.Item label="Executed Turnover">
+          {percentText(numberField(positionDiagnostics, "turnover_after"))}
+        </Descriptions.Item>
+      </Descriptions>
+      <SimpleList title="Drift / Skipped Rebalance" empty={driftRows.length === 0}>
+        {driftRows.slice(0, 8).map((item, index) => (
           <SimpleListItem key={index}>
             <Text>{shortJson(item)}</Text>
           </SimpleListItem>

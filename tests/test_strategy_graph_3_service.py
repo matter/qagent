@@ -464,6 +464,62 @@ class StrategyGraph3ServiceContractTests(unittest.TestCase):
         self.assertIn("stop_limit_not_reached", metadata_text)
         self.assertIn("daily_bar_no_intraday_path", metadata_text)
 
+    def test_backtest_graph_summarizes_position_controller_drift(self):
+        conn = get_connection()
+        conn.executemany(
+            """INSERT INTO stocks
+               (market, ticker, name, exchange, sector, status, updated_at)
+               VALUES ('US', ?, ?, 'NYSE', 'Test', 'active', current_timestamp)""",
+            [("AAA", "Drifted"), ("BBB", "Entry")],
+        )
+        conn.executemany(
+            """INSERT INTO daily_bars
+               (market, ticker, date, open, high, low, close, volume, adj_factor)
+               VALUES ('US', ?, ?, ?, ?, ?, ?, 1000, 1.0)""",
+            [
+                ("AAA", "2024-01-02", 10.0, 10.2, 9.8, 10.0),
+                ("AAA", "2024-01-03", 10.2, 10.4, 10.0, 10.2),
+                ("BBB", "2024-01-02", 20.0, 20.2, 19.8, 20.0),
+                ("BBB", "2024-01-03", 20.0, 20.2, 19.8, 20.0),
+            ],
+        )
+        controller = self.portfolio_service.create_position_controller_spec(
+            name="M6 graph drift controller",
+            controller_type="threshold",
+            params={"rebalance_band": 0.02, "min_weight_delta": 0.02},
+        )
+        service = StrategyGraph3Service()
+        graph = service.create_builtin_alpha_graph(
+            name="M6 drift graph",
+            selection_policy={"top_n": 2, "score_column": "score"},
+            portfolio_construction_spec_id=self.portfolio["id"],
+            risk_control_spec_id=None,
+            position_controller_spec_id=controller["id"],
+            execution_policy_spec_id=self.execution["id"],
+        )
+
+        result = service.backtest_graph(
+            graph["id"],
+            start_date="2024-01-02",
+            end_date="2024-01-03",
+            alpha_frames_by_date={
+                "2024-01-02": [
+                    {"asset_id": "US_EQ:AAA", "score": 1.0},
+                    {"asset_id": "US_EQ:BBB", "score": 0.9},
+                ],
+                "2024-01-03": [
+                    {"asset_id": "US_EQ:AAA", "score": 1.0},
+                    {"asset_id": "US_EQ:BBB", "score": 0.9},
+                ],
+            },
+            initial_capital=1_000_000,
+        )
+
+        position_diag = result["summary"]["position_diagnostics"]
+        self.assertGreater(position_diag["skipped_rebalance_count"], 0)
+        self.assertGreater(position_diag["turnover_saved"], 0)
+        self.assertTrue(position_diag["drift"])
+
     def test_backtest_graph_blocks_cn_st_limit_and_missing_price_orders(self):
         conn = get_connection()
         conn.executemany(

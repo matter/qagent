@@ -46,12 +46,25 @@ class PolicySpecRequest(BaseModel):
     metadata: dict | None = None
 
 
+class PositionControllerSpecRequest(BaseModel):
+    name: str
+    controller_type: str = "threshold"
+    params: dict | None = None
+    project_id: str | None = None
+    market_profile_id: str | None = None
+    description: str | None = None
+    lifecycle_stage: str = "experiment"
+    status: str = "draft"
+    metadata: dict | None = None
+
+
 class ConstructPortfolioRequest(BaseModel):
     decision_date: str
     alpha_frame: list[dict]
     portfolio_spec_id: str
     risk_control_spec_id: str | None = None
     rebalance_policy_spec_id: str | None = None
+    position_controller_spec_id: str | None = None
     execution_policy_spec_id: str | None = None
     state_policy_spec_id: str | None = None
     current_weights: dict[str, float] | None = None
@@ -115,6 +128,22 @@ async def create_rebalance_policy_spec(body: PolicySpecRequest) -> dict:
 async def get_rebalance_policy_spec(spec_id: str) -> dict:
     try:
         return _svc().get_rebalance_policy_spec(spec_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/position-controller-specs")
+async def create_position_controller_spec(body: PositionControllerSpecRequest) -> dict:
+    try:
+        return _svc().create_position_controller_spec(**body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/position-controller-specs/{spec_id}")
+async def get_position_controller_spec(spec_id: str) -> dict:
+    try:
+        return _svc().get_position_controller_spec(spec_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

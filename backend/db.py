@@ -687,6 +687,23 @@ CREATE TABLE IF NOT EXISTS rebalance_policy_specs (
 );
 """
 
+_POSITION_CONTROLLER_SPECS_DDL = """\
+CREATE TABLE IF NOT EXISTS position_controller_specs (
+    id                 VARCHAR PRIMARY KEY,
+    project_id         VARCHAR NOT NULL,
+    market_profile_id  VARCHAR NOT NULL,
+    name               VARCHAR NOT NULL,
+    description        TEXT,
+    controller_type    VARCHAR NOT NULL,
+    params             JSON,
+    lifecycle_stage    VARCHAR NOT NULL DEFAULT 'experiment',
+    status             VARCHAR NOT NULL DEFAULT 'draft',
+    metadata           JSON,
+    created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 _EXECUTION_POLICY_SPECS_DDL = """\
 CREATE TABLE IF NOT EXISTS execution_policy_specs (
     id                 VARCHAR PRIMARY KEY,
@@ -731,6 +748,7 @@ CREATE TABLE IF NOT EXISTS portfolio_runs (
     portfolio_construction_spec_id   VARCHAR NOT NULL,
     risk_control_spec_id             VARCHAR,
     rebalance_policy_spec_id         VARCHAR,
+    position_controller_spec_id      VARCHAR,
     execution_policy_spec_id         VARCHAR,
     state_policy_spec_id             VARCHAR,
     input_artifact_id                VARCHAR,
@@ -1472,6 +1490,7 @@ def init_db() -> None:
         ("portfolio_construction_specs", _PORTFOLIO_CONSTRUCTION_SPECS_DDL),
         ("risk_control_specs", _RISK_CONTROL_SPECS_DDL),
         ("rebalance_policy_specs", _REBALANCE_POLICY_SPECS_DDL),
+        ("position_controller_specs", _POSITION_CONTROLLER_SPECS_DDL),
         ("execution_policy_specs", _EXECUTION_POLICY_SPECS_DDL),
         ("state_policy_specs", _STATE_POLICY_SPECS_DDL),
         ("portfolio_runs", _PORTFOLIO_RUNS_DDL),
@@ -1569,6 +1588,17 @@ def _run_migrations(conn) -> None:
         if not cols:
             conn.execute("ALTER TABLE strategies ADD COLUMN constraint_config JSON")
             log.info("db.migration", action="added strategies.constraint_config column")
+    except Exception:
+        pass
+
+    try:
+        cols = conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'portfolio_runs' AND column_name = 'position_controller_spec_id'"
+        ).fetchall()
+        if not cols:
+            conn.execute("ALTER TABLE portfolio_runs ADD COLUMN position_controller_spec_id VARCHAR")
+            log.info("db.migration", action="added portfolio_runs.position_controller_spec_id column")
     except Exception:
         pass
 

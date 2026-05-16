@@ -69,6 +69,7 @@ class StrategyGraph3Service:
         portfolio_construction_spec_id: str,
         risk_control_spec_id: str | None = None,
         rebalance_policy_spec_id: str | None = None,
+        position_controller_spec_id: str | None = None,
         execution_policy_spec_id: str | None = None,
         state_policy_spec_id: str | None = None,
         project_id: str | None = None,
@@ -88,6 +89,7 @@ class StrategyGraph3Service:
             "portfolio_construction_spec_id": portfolio_construction_spec_id,
             "risk_control_spec_id": risk_control_spec_id,
             "rebalance_policy_spec_id": rebalance_policy_spec_id,
+            "position_controller_spec_id": position_controller_spec_id,
             "execution_policy_spec_id": execution_policy_spec_id,
             "state_policy_spec_id": state_policy_spec_id,
         }
@@ -115,6 +117,7 @@ class StrategyGraph3Service:
         portfolio_construction_spec_id: str,
         risk_control_spec_id: str | None = None,
         rebalance_policy_spec_id: str | None = None,
+        position_controller_spec_id: str | None = None,
         execution_policy_spec_id: str | None = None,
         state_policy_spec_id: str | None = None,
         project_id: str | None = None,
@@ -184,6 +187,7 @@ class StrategyGraph3Service:
             portfolio_spec_id=config["portfolio_construction_spec_id"],
             risk_control_spec_id=config.get("risk_control_spec_id"),
             rebalance_policy_spec_id=config.get("rebalance_policy_spec_id"),
+            position_controller_spec_id=config.get("position_controller_spec_id"),
             execution_policy_spec_id=config.get("execution_policy_spec_id"),
             state_policy_spec_id=config.get("state_policy_spec_id"),
             current_weights=current_weights,
@@ -366,6 +370,14 @@ class StrategyGraph3Service:
         execution_model_counts: dict[str, int] = {}
         path_assumption_warnings: list[dict[str, Any]] = []
         path_assumption_warning_count = 0
+        position_diagnostics = {
+            "skipped_rebalance_count": 0,
+            "turnover_saved": 0.0,
+            "turnover_before": 0.0,
+            "turnover_after": 0.0,
+            "forced_exit_count": 0,
+            "drift": [],
+        }
 
         for decision_date in dates:
             valuation = self.valuation_service.revalue_weights(
@@ -389,6 +401,11 @@ class StrategyGraph3Service:
                 current_weights=drifted_weights,
                 portfolio_value=nav,
                 lifecycle_stage=lifecycle_stage,
+            )
+            self._merge_position_diagnostics(
+                position_diagnostics,
+                runtime["profile"].get("position_controller") or {},
+                decision_date=decision_date,
             )
             target_weights = {
                 row["asset_id"]: float(row["target_weight"])
@@ -495,6 +512,12 @@ class StrategyGraph3Service:
                     if len(execution_model_counts) > 1
                     else next(iter(execution_model_counts), next(iter(execution_models_seen), "next_open"))
                 ),
+            },
+            "position_diagnostics": {
+                **position_diagnostics,
+                "turnover_saved": round(float(position_diagnostics["turnover_saved"]), 12),
+                "turnover_before": round(float(position_diagnostics["turnover_before"]), 12),
+                "turnover_after": round(float(position_diagnostics["turnover_after"]), 12),
             },
             "valuation_warnings": warnings,
         }
@@ -715,6 +738,7 @@ class StrategyGraph3Service:
                 "Risk Control and Execution",
                 {
                     "risk_control_spec_id": graph_config.get("risk_control_spec_id"),
+                    "position_controller_spec_id": graph_config.get("position_controller_spec_id"),
                     "execution_policy_spec_id": graph_config.get("execution_policy_spec_id"),
                 },
                 {"orders": "decision_date, execution_date, asset_id, side, target_weight"},
@@ -924,12 +948,39 @@ class StrategyGraph3Service:
         }
 
     @staticmethod
+    def _merge_position_diagnostics(
+        aggregate: dict[str, Any],
+        daily: dict[str, Any],
+        *,
+        decision_date: str,
+    ) -> None:
+        aggregate["skipped_rebalance_count"] = int(aggregate.get("skipped_rebalance_count") or 0) + int(
+            daily.get("skipped_rebalance_count") or 0
+        )
+        aggregate["turnover_saved"] = float(aggregate.get("turnover_saved") or 0.0) + float(
+            daily.get("turnover_saved") or 0.0
+        )
+        aggregate["turnover_before"] = float(aggregate.get("turnover_before") or 0.0) + float(
+            daily.get("turnover_before") or 0.0
+        )
+        aggregate["turnover_after"] = float(aggregate.get("turnover_after") or 0.0) + float(
+            daily.get("turnover_after") or 0.0
+        )
+        aggregate["forced_exit_count"] = int(aggregate.get("forced_exit_count") or 0) + int(
+            daily.get("forced_exit_count") or 0
+        )
+        drift = aggregate.setdefault("drift", [])
+        for item in daily.get("drift") or []:
+            drift.append({"date": decision_date, **item})
+
+    @staticmethod
     def _dependency_refs(config: dict[str, Any]) -> list[dict[str, Any]]:
         refs = []
         mapping = {
             "portfolio_construction_spec_id": "portfolio_construction_spec",
             "risk_control_spec_id": "risk_control_spec",
             "rebalance_policy_spec_id": "rebalance_policy_spec",
+            "position_controller_spec_id": "position_controller_spec",
             "execution_policy_spec_id": "execution_policy_spec",
             "state_policy_spec_id": "state_policy_spec",
         }

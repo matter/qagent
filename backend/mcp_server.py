@@ -952,6 +952,28 @@ def create_rebalance_policy_spec_3_0(
 
 
 @mcp.tool()
+def create_position_controller_spec_3_0(
+    name: str,
+    controller_type: str = "threshold",
+    params: dict | None = None,
+    project_id: str | None = None,
+    market_profile_id: str | None = None,
+) -> dict:
+    """Create a reusable 3.0 position controller spec.
+
+    threshold params support rebalance_band, min_weight_delta,
+    min_trade_value, and turnover_budget.
+    """
+    return _portfolio_assets_3_service().create_position_controller_spec(
+        name=name,
+        controller_type=controller_type,
+        params=params,
+        project_id=project_id,
+        market_profile_id=market_profile_id,
+    )
+
+
+@mcp.tool()
 def create_execution_policy_spec_3_0(
     name: str,
     policy_type: str = "next_open",
@@ -981,6 +1003,7 @@ def construct_portfolio_3_0(
     portfolio_spec_id: str,
     risk_control_spec_id: str | None = None,
     rebalance_policy_spec_id: str | None = None,
+    position_controller_spec_id: str | None = None,
     execution_policy_spec_id: str | None = None,
     current_weights: dict[str, float] | None = None,
     portfolio_value: float = 1_000_000,
@@ -997,6 +1020,7 @@ def construct_portfolio_3_0(
         portfolio_spec_id=portfolio_spec_id,
         risk_control_spec_id=risk_control_spec_id,
         rebalance_policy_spec_id=rebalance_policy_spec_id,
+        position_controller_spec_id=position_controller_spec_id,
         execution_policy_spec_id=execution_policy_spec_id,
         current_weights=current_weights,
         portfolio_value=portfolio_value,
@@ -1026,6 +1050,7 @@ def create_builtin_alpha_strategy_graph_3_0(
     selection_policy: dict | None = None,
     risk_control_spec_id: str | None = None,
     rebalance_policy_spec_id: str | None = None,
+    position_controller_spec_id: str | None = None,
     execution_policy_spec_id: str | None = None,
 ) -> dict:
     """Create a StrategyGraph that accepts an alpha frame as input."""
@@ -1035,6 +1060,7 @@ def create_builtin_alpha_strategy_graph_3_0(
         portfolio_construction_spec_id=portfolio_construction_spec_id,
         risk_control_spec_id=risk_control_spec_id,
         rebalance_policy_spec_id=rebalance_policy_spec_id,
+        position_controller_spec_id=position_controller_spec_id,
         execution_policy_spec_id=execution_policy_spec_id,
     )
 

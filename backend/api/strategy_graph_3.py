@@ -18,6 +18,7 @@ class BuiltinAlphaGraphRequest(BaseModel):
     portfolio_construction_spec_id: str
     risk_control_spec_id: str | None = None
     rebalance_policy_spec_id: str | None = None
+    position_controller_spec_id: str | None = None
     execution_policy_spec_id: str | None = None
     state_policy_spec_id: str | None = None
     project_id: str | None = None

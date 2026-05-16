@@ -147,6 +147,54 @@ class PortfolioAssets3ServiceContractTests(unittest.TestCase):
         self.assertGreater(vol_weights["US_EQ:BBB"], vol_weights["US_EQ:CCC"])
         self.assertGreater(vol_weights["US_EQ:CCC"], vol_weights["US_EQ:AAA"])
 
+    def test_position_controller_skips_drift_and_allows_forced_exit(self):
+        service = PortfolioAssets3Service()
+        portfolio = service.create_portfolio_construction_spec(
+            name="M6 position controlled equal",
+            method="equal_weight",
+            params={"top_n": 3},
+        )
+        controller = service.create_position_controller_spec(
+            name="M6 no micro rebalance",
+            controller_type="threshold",
+            params={
+                "rebalance_band": 0.02,
+                "min_weight_delta": 0.02,
+                "min_trade_value": 20_000,
+            },
+        )
+
+        result = service.construct_portfolio(
+            decision_date="2024-01-02",
+            alpha_frame=[
+                {"asset_id": "US_EQ:AAA", "score": 1.0},
+                {"asset_id": "US_EQ:BBB", "score": 0.9},
+                {
+                    "asset_id": "US_EQ:CCC",
+                    "score": 0.8,
+                    "order_reason": "forced_exit:risk_violation",
+                    "force_trade": True,
+                },
+            ],
+            portfolio_spec_id=portfolio["id"],
+            position_controller_spec_id=controller["id"],
+            current_weights={"US_EQ:AAA": 0.32, "US_EQ:BBB": 0.0, "US_EQ:CCC": 0.08},
+            portfolio_value=1_000_000,
+        )
+
+        order_assets = {row["asset_id"] for row in result["order_intents"]}
+        diagnostics = result["profile"]["position_controller"]
+        self.assertNotIn("US_EQ:AAA", order_assets)
+        self.assertIn("US_EQ:BBB", order_assets)
+        self.assertIn("US_EQ:CCC", order_assets)
+        self.assertEqual(diagnostics["skipped_rebalance_count"], 1)
+        self.assertGreater(diagnostics["turnover_saved"], 0)
+        self.assertEqual(diagnostics["forced_exit_count"], 1)
+        self.assertEqual(result["portfolio_run"]["position_controller_spec_id"], controller["id"])
+        self.assertTrue(
+            any(item["rule_id"] == "position_controller_drift" for item in result["constraint_trace"])
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

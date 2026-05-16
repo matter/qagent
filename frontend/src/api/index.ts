@@ -1424,6 +1424,7 @@ export interface PortfolioRun3 {
   portfolio_construction_spec_id: string;
   risk_control_spec_id: string | null;
   rebalance_policy_spec_id: string | null;
+  position_controller_spec_id: string | null;
   execution_policy_spec_id: string;
   state_policy_spec_id: string;
   input_artifact_id: string;
@@ -1843,6 +1844,21 @@ export async function listPortfolioRuns3(params?: {
 
 export async function getPortfolioRun3(portfolioRunId: string): Promise<PortfolioRun3> {
   const { data } = await client.get<PortfolioRun3>(`/research-assets/portfolio-runs/${portfolioRunId}`);
+  return data;
+}
+
+export async function createPositionControllerSpec3(body: {
+  name: string;
+  controller_type?: string;
+  params?: Record<string, unknown>;
+  project_id?: string;
+  market_profile_id?: string;
+  description?: string;
+  lifecycle_stage?: string;
+  status?: string;
+  metadata?: Record<string, unknown>;
+}): Promise<Record<string, unknown>> {
+  const { data } = await client.post<Record<string, unknown>>("/research-assets/position-controller-specs", body);
   return data;
 }
 

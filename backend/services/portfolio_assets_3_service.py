@@ -21,6 +21,7 @@ from backend.services.execution_model_service import (
     normalize_planned_price_fallback,
 )
 from backend.services.market_context import normalize_market
+from backend.services.position_controller_service import PositionControllerService
 from backend.services.research_kernel_service import ResearchKernelService
 from backend.time_utils import utc_now_naive
 
@@ -29,6 +30,7 @@ _PROFILE_BY_MARKET = {"US": "US_EQ", "CN": "CN_A"}
 _MARKET_BY_PROFILE = {"US_EQ": "US", "CN_A": "CN"}
 _SUPPORTED_BUILDERS = {"equal_weight", "score_proportional", "inverse_vol"}
 _SUPPORTED_REBALANCE = {"none", "band"}
+_SUPPORTED_POSITION_CONTROLLER = {"threshold"}
 _SUPPORTED_EXECUTION = {"next_open", "next_close", "planned_price", "limit", "stop", "stop_limit"}
 _SUPPORTED_STATE = {"stateless"}
 
@@ -36,8 +38,14 @@ _SUPPORTED_STATE = {"stateless"}
 class PortfolioAssets3Service:
     """Create M7 specs and run alpha-to-portfolio construction."""
 
-    def __init__(self, *, kernel_service: ResearchKernelService | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        kernel_service: ResearchKernelService | None = None,
+        position_controller: PositionControllerService | None = None,
+    ) -> None:
         self.kernel = kernel_service or ResearchKernelService()
+        self.position_controller = position_controller or PositionControllerService()
         self.ensure_default_state_policy()
 
     # ------------------------------------------------------------------
@@ -121,6 +129,33 @@ class PortfolioAssets3Service:
             status=status,
             metadata=metadata,
             extra_columns={"policy_type": policy_type, "params": params or {}},
+        )
+
+    def create_position_controller_spec(
+        self,
+        *,
+        name: str,
+        controller_type: str = "threshold",
+        params: dict[str, Any] | None = None,
+        project_id: str | None = None,
+        market_profile_id: str | None = None,
+        description: str | None = None,
+        lifecycle_stage: str = "experiment",
+        status: str = "draft",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict:
+        if controller_type not in _SUPPORTED_POSITION_CONTROLLER:
+            raise ValueError(f"Unsupported position controller {controller_type!r}")
+        return self._insert_spec(
+            table="position_controller_specs",
+            name=name,
+            project_id=project_id,
+            market_profile_id=market_profile_id,
+            description=description,
+            lifecycle_stage=lifecycle_stage,
+            status=status,
+            metadata=metadata,
+            extra_columns={"controller_type": controller_type, "params": params or {}},
         )
 
     def create_execution_policy_spec(
@@ -247,6 +282,7 @@ class PortfolioAssets3Service:
         portfolio_spec_id: str,
         risk_control_spec_id: str | None = None,
         rebalance_policy_spec_id: str | None = None,
+        position_controller_spec_id: str | None = None,
         execution_policy_spec_id: str | None = None,
         state_policy_spec_id: str | None = None,
         current_weights: dict[str, float] | None = None,
@@ -259,6 +295,11 @@ class PortfolioAssets3Service:
             self.get_rebalance_policy_spec(rebalance_policy_spec_id)
             if rebalance_policy_spec_id
             else None
+        )
+        position_spec = (
+            self.get_position_controller_spec(position_controller_spec_id)
+            if position_controller_spec_id
+            else self._position_controller_from_rebalance_policy(rebalance_spec)
         )
         execution_spec = (
             self.get_execution_policy_spec(execution_policy_spec_id)
@@ -276,7 +317,7 @@ class PortfolioAssets3Service:
                 market_profile_id=portfolio_spec["market_profile_id"],
             )
         )
-        self._assert_same_scope([portfolio_spec, risk_spec, rebalance_spec, execution_spec, state_spec])
+        self._assert_same_scope([portfolio_spec, risk_spec, rebalance_spec, position_spec, execution_spec, state_spec])
 
         frame = self._alpha_frame(alpha_frame, decision_date=decision_date)
         constructed = self._construct_weights(frame, portfolio_spec)
@@ -298,13 +339,26 @@ class PortfolioAssets3Service:
             decision_date=decision_date,
             portfolio_spec=portfolio_spec,
         )
-        orders = self._order_intents(
+        raw_orders = self._order_intents(
             targets=targets,
             current_weights=current_weights or {},
             execution_spec=execution_spec,
             decision_date=decision_date,
             market_profile_id=portfolio_spec["market_profile_id"],
             portfolio_value=portfolio_value,
+        )
+        controlled = self.position_controller.apply(
+            orders=raw_orders,
+            params=(position_spec or {}).get("params") or {},
+            portfolio_value=portfolio_value,
+        )
+        orders = controlled["orders"]
+        position_diagnostics = controlled["diagnostics"]
+        trace.extend(
+            self._position_controller_trace(
+                position_diagnostics,
+                decision_date=decision_date,
+            )
         )
 
         run = self.kernel.create_run(
@@ -319,6 +373,7 @@ class PortfolioAssets3Service:
                 "portfolio_spec_id": portfolio_spec_id,
                 "risk_control_spec_id": risk_control_spec_id,
                 "rebalance_policy_spec_id": rebalance_policy_spec_id,
+                "position_controller_spec_id": position_controller_spec_id,
                 "execution_policy_spec_id": execution_policy_spec_id,
                 "state_policy_spec_id": state_spec["id"],
                 "portfolio_value": portfolio_value,
@@ -364,7 +419,13 @@ class PortfolioAssets3Service:
             retention_class="rebuildable",
             metadata={"decision_date": decision_date, "execution_policy_id": execution_spec["id"]},
         )
-        profile = self._profile_run(targets=targets, trace=trace, orders=orders)
+        profile = self._profile_run(
+            targets=targets,
+            trace=trace,
+            orders=orders,
+            raw_orders=raw_orders,
+            position_diagnostics=position_diagnostics,
+        )
         portfolio_run = self._insert_portfolio_run(
             run_id=run["id"],
             project_id=portfolio_spec["project_id"],
@@ -373,6 +434,7 @@ class PortfolioAssets3Service:
             portfolio_spec_id=portfolio_spec_id,
             risk_control_spec_id=risk_control_spec_id,
             rebalance_policy_spec_id=rebalance_policy_spec_id,
+            position_controller_spec_id=position_spec["id"] if position_spec else None,
             execution_policy_spec_id=execution_spec["id"],
             state_policy_spec_id=state_spec["id"],
             input_artifact_id=alpha_artifact["id"],
@@ -479,6 +541,16 @@ class PortfolioAssets3Service:
             parser=lambda row: self._policy_spec_row(row, kind="rebalance_policy"),
         )
 
+    def get_position_controller_spec(self, spec_id: str) -> dict:
+        return self._get_spec(
+            "position_controller_specs",
+            spec_id,
+            select="""id, project_id, market_profile_id, name, description,
+                      controller_type, params, lifecycle_stage, status, metadata,
+                      created_at, updated_at""",
+            parser=lambda row: self._position_controller_spec_row(row),
+        )
+
     def get_execution_policy_spec(self, spec_id: str) -> dict:
         return self._get_spec(
             "execution_policy_specs",
@@ -503,7 +575,8 @@ class PortfolioAssets3Service:
         row = get_connection().execute(
             """SELECT id, run_id, project_id, market_profile_id, decision_date,
                       portfolio_construction_spec_id, risk_control_spec_id,
-                      rebalance_policy_spec_id, execution_policy_spec_id,
+                      rebalance_policy_spec_id, position_controller_spec_id,
+                      execution_policy_spec_id,
                       state_policy_spec_id, input_artifact_id, target_artifact_id,
                       trace_artifact_id, order_intent_artifact_id, profile,
                       status, lifecycle_stage, created_at, completed_at
@@ -519,7 +592,8 @@ class PortfolioAssets3Service:
         rows = get_connection().execute(
             """SELECT id, run_id, project_id, market_profile_id, decision_date,
                       portfolio_construction_spec_id, risk_control_spec_id,
-                      rebalance_policy_spec_id, execution_policy_spec_id,
+                      rebalance_policy_spec_id, position_controller_spec_id,
+                      execution_policy_spec_id,
                       state_policy_spec_id, input_artifact_id, target_artifact_id,
                       trace_artifact_id, order_intent_artifact_id, profile,
                       status, lifecycle_stage, created_at, completed_at
@@ -584,6 +658,8 @@ class PortfolioAssets3Service:
             return self.get_risk_control_spec(spec_id)
         if table == "rebalance_policy_specs":
             return self.get_rebalance_policy_spec(spec_id)
+        if table == "position_controller_specs":
+            return self.get_position_controller_spec(spec_id)
         if table == "execution_policy_specs":
             return self.get_execution_policy_spec(spec_id)
         if table == "state_policy_specs":
@@ -761,6 +837,50 @@ class PortfolioAssets3Service:
         )
         return adjusted, trace
 
+    def _position_controller_from_rebalance_policy(self, rebalance_spec: dict | None) -> dict | None:
+        if not rebalance_spec or rebalance_spec.get("policy_type") == "none":
+            return None
+        if rebalance_spec.get("policy_type") != "band":
+            return None
+        params = dict(rebalance_spec.get("params") or {})
+        if params.get("band") is not None and params.get("rebalance_band") is None:
+            params["rebalance_band"] = params["band"]
+        return {
+            "id": rebalance_spec["id"],
+            "project_id": rebalance_spec["project_id"],
+            "market_profile_id": rebalance_spec["market_profile_id"],
+            "name": f"{rebalance_spec['name']} Position Controller",
+            "description": rebalance_spec.get("description"),
+            "controller_type": "threshold",
+            "params": params,
+            "lifecycle_stage": rebalance_spec.get("lifecycle_stage", "experiment"),
+            "status": rebalance_spec.get("status", "draft"),
+            "metadata": {"derived_from_rebalance_policy": True},
+            "asset_type": "position_controller",
+        }
+
+    @staticmethod
+    def _position_controller_trace(
+        diagnostics: dict[str, Any],
+        *,
+        decision_date: str,
+    ) -> list[dict]:
+        rows = []
+        for item in diagnostics.get("skipped_rebalance", []):
+            rows.append(
+                {
+                    "date": decision_date,
+                    "asset_id": item.get("asset_id"),
+                    "before_weight": item.get("current_weight"),
+                    "after_weight": item.get("current_weight"),
+                    "rule_id": "position_controller_drift",
+                    "rule_order": 20_000,
+                    "reason": ",".join(item.get("reasons") or ["position_controller_skip"]),
+                    "diagnostics": item,
+                }
+            )
+        return rows
+
     def _target_rows(
         self,
         weights: dict[str, float],
@@ -788,6 +908,7 @@ class PortfolioAssets3Service:
             "time_in_force",
             "priority",
             "order_reason",
+            "force_trade",
         ]
         passthrough_by_asset = {
             column: dict(zip(frame["asset_id"], frame[column], strict=False))
@@ -883,6 +1004,8 @@ class PortfolioAssets3Service:
                 order["reason"] = str(target_row["order_reason"])
             if target_row.get("time_in_force") is not None:
                 order["time_in_force"] = str(target_row["time_in_force"])
+            if target_row.get("force_trade") is not None:
+                order["force_trade"] = bool(target_row["force_trade"])
             if policy_type_for_order == "planned_price":
                 if target_row.get("planned_price") is not None:
                     order["planned_price"] = float(target_row["planned_price"])
@@ -931,6 +1054,7 @@ class PortfolioAssets3Service:
         portfolio_spec_id: str,
         risk_control_spec_id: str | None,
         rebalance_policy_spec_id: str | None,
+        position_controller_spec_id: str | None,
         execution_policy_spec_id: str,
         state_policy_spec_id: str,
         input_artifact_id: str,
@@ -945,11 +1069,12 @@ class PortfolioAssets3Service:
             """INSERT INTO portfolio_runs
                (id, run_id, project_id, market_profile_id, decision_date,
                 portfolio_construction_spec_id, risk_control_spec_id,
-                rebalance_policy_spec_id, execution_policy_spec_id,
+                rebalance_policy_spec_id, position_controller_spec_id,
+                execution_policy_spec_id,
                 state_policy_spec_id, input_artifact_id, target_artifact_id,
                 trace_artifact_id, order_intent_artifact_id, profile, status,
                 lifecycle_stage, created_at, completed_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                        'completed', ?, ?, ?)""",
             [
                 portfolio_run_id,
@@ -960,6 +1085,7 @@ class PortfolioAssets3Service:
                 portfolio_spec_id,
                 risk_control_spec_id,
                 rebalance_policy_spec_id,
+                position_controller_spec_id,
                 execution_policy_spec_id,
                 state_policy_spec_id,
                 input_artifact_id,
@@ -1042,9 +1168,12 @@ class PortfolioAssets3Service:
         targets: list[dict],
         trace: list[dict],
         orders: list[dict],
+        raw_orders: list[dict] | None = None,
+        position_diagnostics: dict[str, Any] | None = None,
     ) -> dict:
         live = [row for row in targets if float(row["target_weight"]) > 1e-8]
         weights = [float(row["target_weight"]) for row in live]
+        raw_orders = raw_orders if raw_orders is not None else orders
         return {
             "target_count": len(targets),
             "active_positions": len(live),
@@ -1053,7 +1182,10 @@ class PortfolioAssets3Service:
             "min_weight": round(min(weights), 12) if weights else 0.0,
             "constraint_trace_count": len(trace),
             "order_intent_count": len(orders),
+            "raw_order_intent_count": len(raw_orders),
             "turnover_estimate": round(sum(abs(float(o["delta_weight"])) for o in orders), 12),
+            "target_turnover_estimate": round(sum(abs(float(o["delta_weight"])) for o in raw_orders), 12),
+            "position_controller": position_diagnostics or {},
         }
 
     def _assert_same_scope(self, specs: list[dict | None]) -> None:
@@ -1121,6 +1253,23 @@ class PortfolioAssets3Service:
             "asset_type": kind,
         }
 
+    def _position_controller_spec_row(self, row) -> dict:
+        return {
+            "id": row[0],
+            "project_id": row[1],
+            "market_profile_id": row[2],
+            "name": row[3],
+            "description": row[4],
+            "controller_type": row[5],
+            "params": _json(row[6], {}),
+            "lifecycle_stage": row[7],
+            "status": row[8],
+            "metadata": _json(row[9], {}),
+            "created_at": str(row[10]) if row[10] is not None else None,
+            "updated_at": str(row[11]) if row[11] is not None else None,
+            "asset_type": "position_controller",
+        }
+
     def _portfolio_run_row(self, row) -> dict:
         return {
             "id": row[0],
@@ -1131,17 +1280,18 @@ class PortfolioAssets3Service:
             "portfolio_construction_spec_id": row[5],
             "risk_control_spec_id": row[6],
             "rebalance_policy_spec_id": row[7],
-            "execution_policy_spec_id": row[8],
-            "state_policy_spec_id": row[9],
-            "input_artifact_id": row[10],
-            "target_artifact_id": row[11],
-            "trace_artifact_id": row[12],
-            "order_intent_artifact_id": row[13],
-            "profile": _json(row[14], {}),
-            "status": row[15],
-            "lifecycle_stage": row[16],
-            "created_at": str(row[17]) if row[17] is not None else None,
-            "completed_at": str(row[18]) if row[18] is not None else None,
+            "position_controller_spec_id": row[8],
+            "execution_policy_spec_id": row[9],
+            "state_policy_spec_id": row[10],
+            "input_artifact_id": row[11],
+            "target_artifact_id": row[12],
+            "trace_artifact_id": row[13],
+            "order_intent_artifact_id": row[14],
+            "profile": _json(row[15], {}),
+            "status": row[16],
+            "lifecycle_stage": row[17],
+            "created_at": str(row[18]) if row[18] is not None else None,
+            "completed_at": str(row[19]) if row[19] is not None else None,
         }
 
 
