@@ -244,6 +244,55 @@ class AgentResearch3ServiceContractTests(unittest.TestCase):
         self.assertEqual(matrix["rows"][1]["stop_reason"], "cut off main-wave candidates")
         self.assertIn("entry_guard", matrix["hypotheses"])
 
+    def test_observability_summarizes_budget_evidence_isolation_and_decisions(self):
+        service = AgentResearch3Service()
+        kernel = ResearchKernelService()
+        plan = service.create_research_plan(
+            hypothesis="Coordinator needs one screen for agent research",
+            budget={"max_trials": 2},
+            metadata={"round": "r1", "agent_role": "researcher", "model": "codex"},
+        )
+        run = kernel.create_run(
+            run_type="strategy_graph_backtest",
+            lifecycle_stage="experiment",
+            retention_class="rebuildable",
+            created_by="agent-a",
+            params={"plan_id": plan["id"]},
+        )
+        artifact = kernel.create_json_artifact(
+            run_id=run["id"],
+            artifact_type="trial_result",
+            payload={"summary": "candidate result"},
+            lifecycle_stage="scratch",
+            retention_class="rebuildable",
+            metadata={"result_status": "isolated", "requires_decision": True},
+        )
+        service.record_trial(
+            plan["id"],
+            trial_type="strategy_graph_backtest",
+            params={"round": "r1", "agent_role": "researcher", "model": "codex"},
+            result_refs=[{"type": "artifact", "id": artifact["id"]}],
+            metrics={"sharpe": 0.9, "result_status": "needs_review"},
+            status="completed",
+        )
+        qa = service.evaluate_qa(
+            source_type="backtest_run",
+            source_id="bt-needs-review",
+            metrics={"coverage": 0.8, "reviewer_decision": {"decision": "pending"}},
+            artifact_refs=[{"type": "artifact", "id": artifact["id"]}],
+        )
+
+        summary = service.get_research_observability(project_id="bootstrap_us")
+
+        self.assertEqual(summary["summary"]["active_plan_count"], 1)
+        self.assertEqual(summary["summary"]["total_trial_count"], 1)
+        self.assertEqual(summary["plans"][0]["round"], "r1")
+        self.assertEqual(summary["plans"][0]["agent_role"], "researcher")
+        self.assertEqual(summary["plans"][0]["budget_state"]["remaining_trials"], 1)
+        self.assertEqual(summary["isolated_results"][0]["artifact_id"], artifact["id"])
+        self.assertEqual(summary["pending_decisions"][0]["qa_report_id"], qa["id"])
+        self.assertTrue(summary["evidence"][0]["artifact_refs"])
+
     def test_next_trial_index_avoids_empty_plan_aggregate_path(self):
         conn = _TrialIndexConnection(rows=[])
 

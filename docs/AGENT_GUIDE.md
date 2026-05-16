@@ -428,6 +428,7 @@ Agent 自治研究必须有计划、预算、trial 记录、QA 和 promotion gat
 | `GET` | `/api/research/agent/playbooks/{playbook_id}` | 查询 playbook |
 | `POST` | `/api/research/agent/plans` | 创建研究计划 |
 | `GET` | `/api/research/agent/plans` | 查询研究计划 |
+| `GET` | `/api/research/agent/observability` | 查询 agent/human 研究聚合视图 |
 | `GET` | `/api/research/agent/plans/{plan_id}` | 查询计划详情 |
 | `GET` | `/api/research/agent/plans/{plan_id}/performance` | 查询 trial 排名和指标分布 |
 | `GET` | `/api/research/agent/plans/{plan_id}/trial-matrix` | 查询结构化 trial 矩阵、hypothesis 分组和 stop/promote 决策 |
@@ -450,6 +451,22 @@ Agent 自治研究必须有计划、预算、trial 记录、QA 和 promotion gat
 - `EvaluatePromotionRequest`: `source_type`, `source_id`, `qa_report_id`, `metrics`, `policy_id`, `approved_by`, `rationale`
 
 legacy 策略研究也应使用 3.0 agent research plan 记录 trial。建议在 plan `metadata` 中写 `baseline_strategy_id` 和 `baseline_backtest_id`，每个 trial 的 `params` 至少包含 `changed_module`、`changed_variable`、`hypothesis`、`config_hash`、`baseline_strategy_id`、`baseline_backtest_id`；停止方向写 `conclusion="stop"` 和 `stop_reason`。`trial-matrix` 会按主指标排序，并按 changed module 聚合，便于下一个 agent 避免重复失败方向。
+
+V3.2 增加 agent research observability。agent 写入计划、trial、run、artifact 时，应使用以下元数据字段，便于 coordinator、下一个 agent 和 human UI 按轮次和角色过滤：
+
+- `round`: 研究轮次，例如 `v3.2-migration-m7`、`r1`。
+- `agent_role`: agent 分工，例如 `researcher`、`implementer`、`reviewer`。
+- `model`: 使用的模型或执行器名称，例如 `codex`。
+- `result_status`: 结果状态，例如 `isolated`、`needs_review`、`promoted`、`rejected`。
+- `requires_decision`: 写在 artifact metadata 中，表示需要 human 或 coordinator 决策。
+
+查询入口：
+
+```bash
+curl -fsS "http://127.0.0.1:8000/api/research/agent/observability?project_id=bootstrap_us&round=r1&limit=50"
+```
+
+返回结构包含 `summary`、`plans`、`running`、`evidence`、`isolated_results`、`pending_decisions`。验收一个 agent 研究批次时，优先看这一个接口或 UI 的 `Agent Plans` 页签：谁在跑、预算用了多少、证据 artifact 在哪里、哪些结果仍隔离、哪些事项需要 human 决策，都应能从这里读到。
 
 QA gate 对 promotion-like source 会校验 artifact refs。不存在的 artifact 会阻断；scratch artifact 不能支撑 StrategyGraph、backtest、model package、production signal 等进入推广链路。
 
@@ -952,6 +969,8 @@ MCP 工具调用同一 service layer。3.0 工具通常以 `_3_0` 结尾；legac
 - `record_agent_research_trials_batch_3_0`
 - `check_agent_research_budget_3_0`
 - `get_agent_research_plan_performance_3_0`
+- `get_agent_research_trial_matrix_3_0`
+- `get_agent_research_observability_3_0`
 - `evaluate_qa_gate_3_0`
 - `evaluate_research_promotion_3_0`
 - `generate_production_signal_3_0`

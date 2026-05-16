@@ -94,6 +94,28 @@ async def list_research_plans(
     return _svc().list_plans(project_id=project_id, status=status, limit=limit)
 
 
+@router.get("/observability")
+async def get_research_observability(
+    project_id: str | None = Query(None),
+    round: str | None = Query(None),
+    agent_role: str | None = Query(None),
+    model: str | None = Query(None),
+    result_status: str | None = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+) -> dict:
+    try:
+        return _svc().get_research_observability(
+            project_id=project_id,
+            research_round=round,
+            agent_role=agent_role,
+            model=model,
+            result_status=result_status,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/plans/{plan_id}")
 async def get_research_plan(plan_id: str) -> dict:
     try:

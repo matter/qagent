@@ -35,6 +35,7 @@ import {
   archiveResearchArtifact3,
   backtestStrategyGraph3,
   evaluatePromotion3,
+  getAgentResearchObservability3,
   getBootstrapProject3,
   getDataQualityContract3,
   getProjectDataStatus3,
@@ -58,6 +59,7 @@ import {
 } from "../api";
 import type {
   AgentPlaybook3,
+  AgentResearchObservability3,
   AgentResearchPlan3,
   BacktestRun3,
   CleanupPreview3,
@@ -99,6 +101,7 @@ interface WorkbenchState {
   artifacts: ResearchArtifact3[];
   playbooks: AgentPlaybook3[];
   plans: AgentResearchPlan3[];
+  agentObservability: AgentResearchObservability3 | null;
   qaReports: QaReport3[];
   promotions: PromotionRecord3[];
   universes: Universe3[];
@@ -118,6 +121,7 @@ const emptyState: WorkbenchState = {
   artifacts: [],
   playbooks: [],
   plans: [],
+  agentObservability: null,
   qaReports: [],
   promotions: [],
   universes: [],
@@ -181,6 +185,7 @@ export default function ResearchWorkbench3() {
         artifacts,
         playbooks,
         plans,
+        agentObservability,
         qaReports,
         promotions,
         universes,
@@ -197,6 +202,7 @@ export default function ResearchWorkbench3() {
         listResearchArtifacts3({ project_id: project.id, limit: 50 }),
         listAgentPlaybooks3(),
         listAgentResearchPlans3({ project_id: project.id, limit: 50 }),
+        getAgentResearchObservability3({ project_id: project.id, limit: 50 }),
         listQaReports3({ limit: 50 }),
         listPromotionRecords3({ project_id: project.id, limit: 50 }),
         listUniverses3({ project_id: project.id, limit: 50 }),
@@ -215,6 +221,7 @@ export default function ResearchWorkbench3() {
         artifacts,
         playbooks,
         plans,
+        agentObservability,
         qaReports,
         promotions,
         universes,
@@ -365,6 +372,8 @@ export default function ResearchWorkbench3() {
       artifactCount: state.artifacts.length,
       protectedArtifacts,
       qaBlocking: state.qaReports.filter((item) => item.blocking).length,
+      pendingDecisions: state.agentObservability?.summary.pending_decision_count ?? 0,
+      isolatedResults: state.agentObservability?.summary.isolated_result_count ?? 0,
       strategyCount: state.strategyGraphs.length,
       signalCount: state.productionSignals.length,
       nonPitSources: state.providerCapabilities.filter((item) => !item.pit_supported).length,
@@ -576,6 +585,8 @@ export default function ResearchWorkbench3() {
           <Statistic title="Artifacts" value={summary.artifactCount} prefix={<FileSearchOutlined />} />
           <Statistic title="Protected" value={summary.protectedArtifacts} prefix={<CheckCircleOutlined />} />
           <Statistic title="QA Blocking" value={summary.qaBlocking} prefix={<AuditOutlined />} />
+          <Statistic title="Pending Decisions" value={summary.pendingDecisions} prefix={<AuditOutlined />} />
+          <Statistic title="Isolated Results" value={summary.isolatedResults} prefix={<FileSearchOutlined />} />
           <Statistic title="Strategy Graphs" value={summary.strategyCount} prefix={<BranchesOutlined />} />
           <Statistic title="Signals" value={summary.signalCount} prefix={<DatabaseOutlined />} />
           <Statistic title="Non-PIT Sources" value={summary.nonPitSources} prefix={<DatabaseOutlined />} />
@@ -726,7 +737,14 @@ export default function ResearchWorkbench3() {
               key: "agent",
               label: "Agent Plans",
               children: (
-                <div style={{ display: "grid", gridTemplateColumns: "minmax(320px, 1fr) minmax(320px, 1fr)", gap: 12 }}>
+                <Space orientation="vertical" size={12} style={{ width: "100%" }}>
+                  <Alert
+                    type={(state.agentObservability?.summary.pending_decision_count ?? 0) > 0 ? "warning" : "info"}
+                    showIcon
+                    message={`Agent observability: ${state.agentObservability?.summary.running_run_count ?? 0} running, ${state.agentObservability?.summary.total_trial_count ?? 0} trials`}
+                    description={`Evidence ${state.agentObservability?.summary.evidence_count ?? 0}; isolated results ${state.agentObservability?.summary.isolated_result_count ?? 0}; pending human decisions ${state.agentObservability?.summary.pending_decision_count ?? 0}.`}
+                  />
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 12 }}>
                   <SimpleList title="Research Plans" empty={state.plans.length === 0}>
                     {state.plans.map((item) => (
                       <SimpleListItem key={item.id}>
@@ -741,6 +759,63 @@ export default function ResearchWorkbench3() {
                           <Paragraph ellipsis={{ rows: 2 }} style={{ margin: 0 }}>
                             {item.hypothesis}
                           </Paragraph>
+                          <Text type="secondary">{shortJson(item.metadata)}</Text>
+                        </Space>
+                      </SimpleListItem>
+                    ))}
+                  </SimpleList>
+                  <SimpleList title="Running Research" empty={(state.agentObservability?.running ?? []).length === 0}>
+                    {(state.agentObservability?.running ?? []).map((item) => (
+                      <SimpleListItem key={String(item.run_id)}>
+                        <Space orientation="vertical" size={2}>
+                          <Space wrap>
+                            <Tag color={statusColor(String(item.status ?? ""))}>{String(item.status ?? "unknown")}</Tag>
+                            <Text code>{String(item.run_id ?? "-")}</Text>
+                            <Text>{String(item.created_by ?? "-")}</Text>
+                          </Space>
+                          <Text type="secondary">{shortJson({ round: item.round, role: item.agent_role, model: item.model, plan_id: item.plan_id })}</Text>
+                        </Space>
+                      </SimpleListItem>
+                    ))}
+                  </SimpleList>
+                  <SimpleList title="Pending Decisions" empty={(state.agentObservability?.pending_decisions ?? []).length === 0}>
+                    {(state.agentObservability?.pending_decisions ?? []).map((item, index) => (
+                      <SimpleListItem key={`${String(item.source_type ?? "decision")}-${String(item.source_id ?? index)}`}>
+                        <Space orientation="vertical" size={2}>
+                          <Space wrap>
+                            <Tag color={statusColor(String(item.status ?? ""))}>{String(item.status ?? "pending")}</Tag>
+                            <Text>{String(item.decision_type ?? "decision")}</Text>
+                            <Text code>{String(item.source_id ?? "-")}</Text>
+                          </Space>
+                          <Text type="secondary">{String(item.reason ?? "")}</Text>
+                        </Space>
+                      </SimpleListItem>
+                    ))}
+                  </SimpleList>
+                  <SimpleList title="Isolated Results" empty={(state.agentObservability?.isolated_results ?? []).length === 0}>
+                    {(state.agentObservability?.isolated_results ?? []).map((item) => (
+                      <SimpleListItem key={String(item.artifact_id)}>
+                        <Space orientation="vertical" size={2}>
+                          <Space wrap>
+                            <Tag color={statusColor(String(item.lifecycle_stage ?? ""))}>{String(item.lifecycle_stage ?? "scratch")}</Tag>
+                            <Text code>{String(item.artifact_id ?? "-")}</Text>
+                            <Text>{String(item.artifact_type ?? "-")}</Text>
+                          </Space>
+                          <Text type="secondary">{shortJson({ status: item.result_status, requires_decision: item.requires_decision, round: item.round, role: item.agent_role })}</Text>
+                        </Space>
+                      </SimpleListItem>
+                    ))}
+                  </SimpleList>
+                  <SimpleList title="Evidence" empty={(state.agentObservability?.evidence ?? []).length === 0}>
+                    {(state.agentObservability?.evidence ?? []).map((item) => (
+                      <SimpleListItem key={String(item.trial_id)}>
+                        <Space orientation="vertical" size={2}>
+                          <Space wrap>
+                            <Tag color={statusColor(String(item.status ?? ""))}>{String(item.status ?? "trial")}</Tag>
+                            <Text code>{String(item.trial_id ?? "-")}</Text>
+                            <Text>{String(item.trial_type ?? "-")}</Text>
+                          </Space>
+                          <Text type="secondary">{shortJson({ refs: item.artifact_refs, metrics: item.metrics })}</Text>
                         </Space>
                       </SimpleListItem>
                     ))}
@@ -758,7 +833,8 @@ export default function ResearchWorkbench3() {
                       </SimpleListItem>
                     ))}
                   </SimpleList>
-                </div>
+                  </div>
+                </Space>
               ),
             },
           ]}

@@ -491,6 +491,115 @@ class AgentResearch3Service:
             "hypotheses": hypotheses,
         }
 
+    def get_research_observability(
+        self,
+        *,
+        project_id: str | None = None,
+        research_round: str | None = None,
+        agent_role: str | None = None,
+        model: str | None = None,
+        result_status: str | None = None,
+        limit: int = 50,
+    ) -> dict:
+        """Return one coordinator view for bounded agent research.
+
+        The method intentionally derives the view from existing 3.0 facts
+        instead of creating a separate coordinator runtime.  Agents write
+        metadata on plans, trials, and artifacts; human and agent clients read
+        the same aggregated result through REST/MCP/UI.
+        """
+        project = self.kernel.get_project(project_id)
+        capped_limit = max(1, min(int(limit), 500))
+
+        plans = self._observability_plans(
+            project["id"],
+            research_round=research_round,
+            agent_role=agent_role,
+            model=model,
+            limit=capped_limit,
+        )
+        plan_ids = [plan["plan_id"] for plan in plans]
+        plan_id_set = set(plan_ids)
+
+        trials = self._observability_trials(
+            project["id"],
+            plan_id_set=plan_id_set,
+            research_round=research_round,
+            agent_role=agent_role,
+            model=model,
+            result_status=result_status,
+            limit=capped_limit,
+        )
+        running = self._observability_running_runs(
+            project["id"],
+            plan_id_set=plan_id_set,
+            research_round=research_round,
+            agent_role=agent_role,
+            model=model,
+            limit=capped_limit,
+        )
+        artifacts = self._observability_artifacts(
+            project["id"],
+            research_round=research_round,
+            agent_role=agent_role,
+            model=model,
+            result_status=result_status,
+            limit=capped_limit,
+        )
+        qa_reports = self._observability_qa_reports(
+            project["id"],
+            result_status=result_status,
+            limit=capped_limit,
+        )
+
+        evidence = [
+            self._observability_evidence_row(trial)
+            for trial in trials
+            if trial.get("result_refs")
+        ]
+        isolated_results = [
+            self._observability_artifact_result(artifact)
+            for artifact in artifacts
+            if self._artifact_is_isolated_result(artifact)
+        ]
+        pending_decisions = [
+            self._observability_qa_decision(qa)
+            for qa in qa_reports
+            if self._qa_needs_decision(qa)
+        ]
+        pending_decisions.extend(
+            self._observability_artifact_decision(artifact)
+            for artifact in artifacts
+            if self._artifact_requires_decision(artifact)
+        )
+
+        return {
+            "project_id": project["id"],
+            "market_profile_id": project["market_profile_id"],
+            "filters": {
+                "round": research_round,
+                "agent_role": agent_role,
+                "model": model,
+                "result_status": result_status,
+                "limit": capped_limit,
+            },
+            "summary": {
+                "active_plan_count": sum(1 for plan in plans if plan["status"] == "active"),
+                "running_run_count": len(running),
+                "total_trial_count": len(trials),
+                "evidence_count": len(evidence),
+                "isolated_result_count": len(isolated_results),
+                "pending_decision_count": len(pending_decisions),
+                "qa_blocking_count": sum(1 for qa in qa_reports if qa["blocking"]),
+            },
+            "plans": plans,
+            "running": running,
+            "evidence": evidence,
+            "isolated_results": isolated_results,
+            "pending_decisions": pending_decisions,
+            "generated_at": str(utc_now_naive()),
+        }
+
     # ------------------------------------------------------------------
     # QA gate and promotion
     # ------------------------------------------------------------------
@@ -848,6 +957,341 @@ class AgentResearch3Service:
             "result_refs": trial.get("result_refs") or [],
             "created_at": trial.get("created_at"),
         }
+
+    def _observability_plans(
+        self,
+        project_id: str,
+        *,
+        research_round: str | None,
+        agent_role: str | None,
+        model: str | None,
+        limit: int,
+    ) -> list[dict]:
+        plans = self.list_plans(project_id=project_id, limit=limit)
+        result: list[dict] = []
+        for plan in plans:
+            metadata = plan.get("metadata") or {}
+            if not self._metadata_matches(
+                metadata,
+                research_round=research_round,
+                agent_role=agent_role,
+                model=model,
+            ):
+                continue
+            result.append(
+                {
+                    "plan_id": plan["id"],
+                    "id": plan["id"],
+                    "project_id": plan["project_id"],
+                    "market_profile_id": plan["market_profile_id"],
+                    "hypothesis": plan["hypothesis"],
+                    "status": plan["status"],
+                    "round": metadata.get("round"),
+                    "agent_role": metadata.get("agent_role"),
+                    "model": metadata.get("model"),
+                    "result_status": metadata.get("result_status"),
+                    "budget_state": plan.get("budget_state") or {},
+                    "created_by": plan["created_by"],
+                    "metadata": metadata,
+                    "created_at": plan["created_at"],
+                    "updated_at": plan["updated_at"],
+                }
+            )
+        return result
+
+    def _observability_trials(
+        self,
+        project_id: str,
+        *,
+        plan_id_set: set[str],
+        research_round: str | None,
+        agent_role: str | None,
+        model: str | None,
+        result_status: str | None,
+        limit: int,
+    ) -> list[dict]:
+        query = """SELECT t.id, t.plan_id, t.trial_index, t.trial_type, t.params,
+                          t.result_refs, t.metrics, t.qa_report_id, t.status,
+                          t.created_at
+                   FROM agent_research_trials t
+                   JOIN agent_research_plans p ON p.id = t.plan_id
+                   WHERE p.project_id = ?
+                   ORDER BY t.created_at DESC
+                   LIMIT ?"""
+        rows = get_connection().execute(query, [project_id, int(limit)]).fetchall()
+        trials = [self._trial_row(row) for row in rows]
+        result: list[dict] = []
+        for trial in trials:
+            if plan_id_set and trial["plan_id"] not in plan_id_set:
+                continue
+            metadata = self._trial_metadata(trial)
+            if not self._metadata_matches(
+                metadata,
+                research_round=research_round,
+                agent_role=agent_role,
+                model=model,
+                result_status=result_status,
+            ):
+                continue
+            result.append(trial)
+        return result
+
+    def _observability_running_runs(
+        self,
+        project_id: str,
+        *,
+        plan_id_set: set[str],
+        research_round: str | None,
+        agent_role: str | None,
+        model: str | None,
+        limit: int,
+    ) -> list[dict]:
+        runs = self.kernel.list_runs(project_id=project_id, limit=limit)
+        result: list[dict] = []
+        for run in runs:
+            if run["status"] not in {"queued", "running"}:
+                continue
+            metadata = self._run_metadata(run)
+            plan_id = metadata.get("plan_id")
+            if plan_id_set and plan_id and str(plan_id) not in plan_id_set:
+                continue
+            if not self._metadata_matches(
+                metadata,
+                research_round=research_round,
+                agent_role=agent_role,
+                model=model,
+            ):
+                continue
+            result.append(
+                {
+                    "run_id": run["id"],
+                    "run_type": run["run_type"],
+                    "status": run["status"],
+                    "created_by": run["created_by"],
+                    "plan_id": plan_id,
+                    "round": metadata.get("round"),
+                    "agent_role": metadata.get("agent_role"),
+                    "model": metadata.get("model"),
+                    "budget_hint": metadata.get("budget_hint"),
+                    "params": run.get("params") or {},
+                    "created_at": run["created_at"],
+                    "updated_at": run["updated_at"],
+                }
+            )
+        return result
+
+    def _observability_artifacts(
+        self,
+        project_id: str,
+        *,
+        research_round: str | None,
+        agent_role: str | None,
+        model: str | None,
+        result_status: str | None,
+        limit: int,
+    ) -> list[dict]:
+        artifacts = self.kernel.list_artifacts(project_id=project_id, limit=limit)
+        result: list[dict] = []
+        for artifact in artifacts:
+            metadata = artifact.get("metadata") or {}
+            if not self._metadata_matches(
+                metadata,
+                research_round=research_round,
+                agent_role=agent_role,
+                model=model,
+                result_status=result_status,
+            ):
+                continue
+            result.append(artifact)
+        return result
+
+    def _observability_qa_reports(
+        self,
+        project_id: str,
+        *,
+        result_status: str | None,
+        limit: int,
+    ) -> list[dict]:
+        rows = get_connection().execute(
+            """SELECT id, project_id, market_profile_id, source_type, source_id,
+                      status, blocking, findings, metrics, artifact_refs,
+                      created_at
+               FROM qa_gate_results
+               WHERE project_id = ?
+               ORDER BY created_at DESC
+               LIMIT ?""",
+            [project_id, int(limit)],
+        ).fetchall()
+        reports = [self._qa_row(row) for row in rows]
+        if not result_status:
+            return reports
+        expected = str(result_status)
+        return [
+            qa
+            for qa in reports
+            if str((qa.get("metrics") or {}).get("result_status") or qa["status"]) == expected
+        ]
+
+    @staticmethod
+    def _observability_evidence_row(trial: dict) -> dict:
+        result_refs = trial.get("result_refs") or []
+        return {
+            "trial_id": trial["id"],
+            "plan_id": trial["plan_id"],
+            "trial_index": trial["trial_index"],
+            "trial_type": trial["trial_type"],
+            "status": trial["status"],
+            "round": (trial.get("params") or {}).get("round"),
+            "agent_role": (trial.get("params") or {}).get("agent_role"),
+            "model": (trial.get("params") or {}).get("model"),
+            "result_status": AgentResearch3Service._result_status_from_trial(trial),
+            "result_refs": result_refs,
+            "artifact_refs": [
+                ref
+                for ref in result_refs
+                if str(ref.get("type") or ref.get("ref_type") or "") == "artifact"
+                or ref.get("artifact_id")
+            ],
+            "metrics": trial.get("metrics") or {},
+            "qa_report_id": trial.get("qa_report_id"),
+            "created_at": trial.get("created_at"),
+        }
+
+    @staticmethod
+    def _observability_artifact_result(artifact: dict) -> dict:
+        metadata = artifact.get("metadata") or {}
+        return {
+            "artifact_id": artifact["id"],
+            "run_id": artifact["run_id"],
+            "project_id": artifact["project_id"],
+            "artifact_type": artifact["artifact_type"],
+            "lifecycle_stage": artifact["lifecycle_stage"],
+            "retention_class": artifact["retention_class"],
+            "result_status": metadata.get("result_status"),
+            "requires_decision": bool(metadata.get("requires_decision")),
+            "round": metadata.get("round"),
+            "agent_role": metadata.get("agent_role"),
+            "model": metadata.get("model"),
+            "metadata": metadata,
+            "created_at": artifact["created_at"],
+        }
+
+    @staticmethod
+    def _observability_qa_decision(qa: dict) -> dict:
+        return {
+            "decision_type": "qa_review",
+            "qa_report_id": qa["id"],
+            "source_type": qa["source_type"],
+            "source_id": qa["source_id"],
+            "status": qa["status"],
+            "blocking": qa["blocking"],
+            "reason": AgentResearch3Service._qa_decision_reason(qa),
+            "artifact_refs": qa.get("artifact_refs") or [],
+            "created_at": qa["created_at"],
+        }
+
+    @staticmethod
+    def _observability_artifact_decision(artifact: dict) -> dict:
+        metadata = artifact.get("metadata") or {}
+        return {
+            "decision_type": "artifact_review",
+            "qa_report_id": None,
+            "artifact_id": artifact["id"],
+            "source_type": "artifact",
+            "source_id": artifact["id"],
+            "status": str(metadata.get("result_status") or "needs_review"),
+            "blocking": False,
+            "reason": metadata.get("decision_reason") or "artifact requires human decision",
+            "artifact_refs": [{"type": "artifact", "id": artifact["id"]}],
+            "created_at": artifact["created_at"],
+        }
+
+    @staticmethod
+    def _artifact_is_isolated_result(artifact: dict) -> bool:
+        metadata = artifact.get("metadata") or {}
+        result_status = str(metadata.get("result_status") or "").strip().lower()
+        return artifact["lifecycle_stage"] == "scratch" or result_status == "isolated"
+
+    @staticmethod
+    def _artifact_requires_decision(artifact: dict) -> bool:
+        metadata = artifact.get("metadata") or {}
+        result_status = str(metadata.get("result_status") or "").strip().lower()
+        return bool(metadata.get("requires_decision")) or result_status in {
+            "needs_review",
+            "pending_decision",
+        }
+
+    @staticmethod
+    def _qa_needs_decision(qa: dict) -> bool:
+        metrics = qa.get("metrics") or {}
+        reviewer_decision = metrics.get("reviewer_decision")
+        if isinstance(reviewer_decision, dict):
+            decision = str(reviewer_decision.get("decision") or "").strip().lower()
+            if decision in {"pending", "needs_review", "requested"}:
+                return True
+        return qa["blocking"] or qa["status"] in {"fail", "warning"}
+
+    @staticmethod
+    def _qa_decision_reason(qa: dict) -> str:
+        findings = qa.get("findings") or []
+        if findings:
+            first = findings[0]
+            return str(first.get("message") or first.get("check") or "QA requires review")
+        metrics = qa.get("metrics") or {}
+        reviewer_decision = metrics.get("reviewer_decision")
+        if isinstance(reviewer_decision, dict):
+            return f"reviewer_decision={reviewer_decision.get('decision', 'pending')}"
+        return "QA requires review"
+
+    @staticmethod
+    def _trial_metadata(trial: dict) -> dict[str, Any]:
+        params = trial.get("params") or {}
+        metrics = trial.get("metrics") or {}
+        metadata = {**params}
+        if "result_status" in metrics and "result_status" not in metadata:
+            metadata["result_status"] = metrics["result_status"]
+        return metadata
+
+    @staticmethod
+    def _run_metadata(run: dict) -> dict[str, Any]:
+        params = run.get("params") or {}
+        metrics = run.get("metrics_summary") or {}
+        return {
+            **params,
+            **{
+                key: value
+                for key, value in metrics.items()
+                if key in {"round", "agent_role", "model", "result_status", "budget_hint"}
+            },
+        }
+
+    @staticmethod
+    def _metadata_matches(
+        metadata: dict[str, Any],
+        *,
+        research_round: str | None = None,
+        agent_role: str | None = None,
+        model: str | None = None,
+        result_status: str | None = None,
+    ) -> bool:
+        expected = {
+            "round": research_round,
+            "agent_role": agent_role,
+            "model": model,
+            "result_status": result_status,
+        }
+        for key, value in expected.items():
+            if value is None:
+                continue
+            if str(metadata.get(key) or "") != str(value):
+                return False
+        return True
+
+    @staticmethod
+    def _result_status_from_trial(trial: dict) -> Any:
+        params = trial.get("params") or {}
+        metrics = trial.get("metrics") or {}
+        return metrics.get("result_status") or params.get("result_status") or trial.get("status")
 
     def _metric_ranges(self, trials: list[dict]) -> dict[str, dict[str, float | int]]:
         values_by_metric: dict[str, list[float]] = {}

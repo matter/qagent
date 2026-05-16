@@ -1304,6 +1304,27 @@ export interface AgentResearchPlan3 {
   updated_at: string | null;
 }
 
+export interface AgentResearchObservability3 {
+  project_id: string;
+  market_profile_id: string;
+  filters: Record<string, unknown>;
+  summary: {
+    active_plan_count: number;
+    running_run_count: number;
+    total_trial_count: number;
+    evidence_count: number;
+    isolated_result_count: number;
+    pending_decision_count: number;
+    qa_blocking_count: number;
+  };
+  plans: Array<Record<string, unknown>>;
+  running: Array<Record<string, unknown>>;
+  evidence: Array<Record<string, unknown>>;
+  isolated_results: Array<Record<string, unknown>>;
+  pending_decisions: Array<Record<string, unknown>>;
+  generated_at: string;
+}
+
 export interface QaReport3 {
   id: string;
   project_id: string;
@@ -1673,6 +1694,18 @@ export async function listAgentResearchPlans3(params?: {
   limit?: number;
 }): Promise<AgentResearchPlan3[]> {
   const { data } = await client.get<AgentResearchPlan3[]>("/research/agent/plans", { params });
+  return data;
+}
+
+export async function getAgentResearchObservability3(params?: {
+  project_id?: string;
+  round?: string;
+  agent_role?: string;
+  model?: string;
+  result_status?: string;
+  limit?: number;
+}): Promise<AgentResearchObservability3> {
+  const { data } = await client.get<AgentResearchObservability3>("/research/agent/observability", { params });
   return data;
 }
 

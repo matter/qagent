@@ -1162,6 +1162,7 @@ def create_agent_research_plan_3_0(
     project_id: str | None = None,
     market_profile_id: str | None = None,
     created_by: str = "agent",
+    metadata: dict | None = None,
 ) -> dict:
     """Create a controlled agent research plan with budget and stop rules."""
     return _agent_research_3_service().create_research_plan(
@@ -1173,6 +1174,7 @@ def create_agent_research_plan_3_0(
         project_id=project_id,
         market_profile_id=market_profile_id,
         created_by=created_by,
+        metadata=metadata,
     )
 
 
@@ -1241,6 +1243,26 @@ def get_agent_research_trial_matrix_3_0(
     return _agent_research_3_service().get_trial_matrix(
         plan_id,
         primary_metric=primary_metric,
+    )
+
+
+@mcp.tool()
+def get_agent_research_observability_3_0(
+    project_id: str | None = None,
+    round: str | None = None,
+    agent_role: str | None = None,
+    model: str | None = None,
+    result_status: str | None = None,
+    limit: int = 50,
+) -> dict:
+    """Return one coordinator view of agent plans, trials, evidence, and decisions."""
+    return _agent_research_3_service().get_research_observability(
+        project_id=project_id,
+        research_round=round,
+        agent_role=agent_role,
+        model=model,
+        result_status=result_status,
+        limit=limit,
     )
 
 
