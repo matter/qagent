@@ -24,14 +24,20 @@ def main() -> int:
         action="store_true",
         help="Idempotently import/re-enter stocks, factor specs, and universes into 3.0 tables",
     )
+    parser.add_argument(
+        "--apply-market-data-snapshots",
+        action="store_true",
+        help="Idempotently register daily_bars coverage as 3.0 market_data_snapshots",
+    )
     parser.add_argument("--apply", action="store_true", help="Reserved; V3.2 apply is intentionally not implemented yet")
     args = parser.parse_args()
 
     if args.apply:
         raise SystemExit("V3.2 apply is not implemented. Use --dry-run to generate a manifest.")
-    if args.dry_run and args.apply_basic_assets:
-        raise SystemExit("Choose either --dry-run or --apply-basic-assets, not both")
-    if not args.dry_run and not args.apply_basic_assets:
+    modes = [args.dry_run, args.apply_basic_assets, args.apply_market_data_snapshots]
+    if sum(1 for mode in modes if mode) > 1:
+        raise SystemExit("Choose only one of --dry-run, --apply-basic-assets, or --apply-market-data-snapshots")
+    if not any(modes):
         args.dry_run = True
 
     db_path = Path(args.db_path)
@@ -46,6 +52,17 @@ def main() -> int:
         print(f"  assets inserted: {result['assets']['inserted']}")
         print(f"  factor_specs inserted: {result['factor_specs']['inserted']}")
         print(f"  universes inserted: {result['universes']['inserted']}")
+    elif args.apply_market_data_snapshots:
+        result = service.apply_market_data_snapshots(db_path=db_path)
+        print("V3.2 market data snapshot migration:")
+        print(f"  manifest_id: {result['manifest_id']}")
+        print(f"  snapshots inserted: {result['snapshots']['inserted']}")
+        for market, info in result["markets"].items():
+            print(
+                f"  {market}: rows={info['row_count']} "
+                f"mapped={info['mapped_row_count']} "
+                f"unmapped_tickers={info['unmapped_ticker_count']}"
+            )
     else:
         manifest = service.build_dry_run_manifest(db_path=db_path)
         json_path, md_path = service.write_manifest_files(manifest, out_dir=Path(args.out_dir))

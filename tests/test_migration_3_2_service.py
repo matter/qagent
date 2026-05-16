@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -165,6 +166,54 @@ class Migration32ServiceTests(unittest.TestCase):
         self.assertIn('"source_table": "factors"', factor[4])
         self.assertEqual(universe[1:3], ("US_EQ", "Core"))
         self.assertIn('"tickers": ["AAPL"]', universe[3])
+
+    def test_apply_market_data_snapshots_registers_daily_bars_without_rewriting_source(self):
+        conn = get_connection()
+        conn.execute(
+            """
+            INSERT INTO stocks (market, ticker, name, exchange, sector, status, updated_at)
+            VALUES
+                ('US', 'AAPL', 'Apple', 'NASDAQ', 'Technology', 'active', current_timestamp),
+                ('CN', '600000', 'Pufa Bank', 'SSE', 'Financials', 'active', current_timestamp)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO daily_bars (market, ticker, date, open, high, low, close, volume, adj_factor)
+            VALUES
+                ('US', 'AAPL', DATE '2024-01-02', 10, 11, 9, 10.5, 1000, 1),
+                ('US', 'MSFT', DATE '2024-01-02', 20, 21, 19, 20.5, 2000, 1),
+                ('CN', '600000', DATE '2024-01-02', 8, 9, 7, 8.5, 3000, 1)
+            """
+        )
+        before_bars = conn.execute("SELECT COUNT(*) FROM daily_bars").fetchone()[0]
+
+        first = self.service.apply_market_data_snapshots(db_path=self.db_path)
+        second = self.service.apply_market_data_snapshots(db_path=self.db_path)
+        after_bars = conn.execute("SELECT COUNT(*) FROM daily_bars").fetchone()[0]
+
+        self.assertEqual(first["mode"], "apply_market_data_snapshots")
+        self.assertEqual(first["snapshots"]["inserted"], 2)
+        self.assertEqual(second["snapshots"]["inserted"], 0)
+        self.assertEqual(before_bars, after_bars)
+        self.assertEqual(first["markets"]["US"]["row_count"], 2)
+        self.assertEqual(first["markets"]["US"]["mapped_row_count"], 1)
+        self.assertEqual(first["markets"]["US"]["unmapped_ticker_count"], 1)
+        self.assertEqual(first["markets"]["US"]["missing_asset_tickers_sample"], ["MSFT"])
+        self.assertEqual(first["markets"]["CN"]["market_profile_id"], "CN_A")
+        self.assertEqual(first["markets"]["CN"]["mapped_row_count"], 1)
+
+        snapshots = conn.execute(
+            """SELECT market_profile_id, coverage_summary, quality_summary
+                 FROM market_data_snapshots
+                ORDER BY market_profile_id"""
+        ).fetchall()
+        self.assertEqual(len(snapshots), 2)
+        us_snapshot = next(row for row in snapshots if row[0] == "US_EQ")
+        us_coverage = json.loads(us_snapshot[1])
+        us_quality = json.loads(us_snapshot[2])
+        self.assertEqual(us_coverage["row_count"], 2)
+        self.assertEqual(us_quality["status"], "needs_asset_mapping")
 
 
 if __name__ == "__main__":

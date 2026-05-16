@@ -167,6 +167,38 @@ class Migration32Service:
                 "universes": universe_result,
             }
 
+    def apply_market_data_snapshots(self, db_path: Path | None = None) -> dict[str, Any]:
+        """Register legacy daily bars as auditable 3.0 data snapshots.
+
+        The current 3.0 runtime still reads the market-aware ``daily_bars``
+        table directly. V3.2 therefore treats k-line migration as a metadata
+        promotion step: keep the source rows untouched, ensure assets exist,
+        and persist per-market coverage/quality snapshots for validation and
+        future asset-id physical migration.
+        """
+        with self._connection(db_path) as conn:
+            manifest = self.build_dry_run_manifest(db_path)
+            if not self._table_exists(conn, "daily_bars"):
+                return {
+                    "mode": "apply_market_data_snapshots",
+                    "manifest_id": manifest["manifest_id"],
+                    "would_delete_old_tables": False,
+                    "snapshots": {"before": 0, "after": 0, "inserted": 0},
+                    "markets": {},
+                }
+
+            self._import_assets(conn)
+            before = int(conn.execute("SELECT COUNT(*) FROM market_data_snapshots").fetchone()[0])
+            markets = self._register_daily_bar_snapshots(conn)
+            after = int(conn.execute("SELECT COUNT(*) FROM market_data_snapshots").fetchone()[0])
+            return {
+                "mode": "apply_market_data_snapshots",
+                "manifest_id": manifest["manifest_id"],
+                "would_delete_old_tables": False,
+                "snapshots": {"before": before, "after": after, "inserted": after - before},
+                "markets": markets,
+            }
+
     @staticmethod
     def render_manifest_markdown(manifest: dict[str, Any]) -> str:
         lines = [
@@ -471,6 +503,157 @@ class Migration32Service:
             inserted += 1
         after = int(conn.execute("SELECT COUNT(*) FROM universes").fetchone()[0])
         return {"before": before, "after": after, "inserted": inserted}
+
+    def _register_daily_bar_snapshots(self, conn) -> dict[str, dict[str, Any]]:
+        rows = conn.execute(
+            """
+            SELECT CASE WHEN market = 'CN' THEN 'CN' ELSE 'US' END AS normalize_market,
+                   COUNT(*) AS row_count,
+                   COUNT(DISTINCT ticker) AS ticker_count,
+                   MIN(date) AS min_date,
+                   MAX(date) AS max_date
+              FROM daily_bars
+             GROUP BY normalize_market
+             ORDER BY normalize_market
+            """
+        ).fetchall()
+        results: dict[str, dict[str, Any]] = OrderedDict()
+        for market, row_count, ticker_count, min_date, max_date in rows:
+            profile_id = _profile_for_market(market)
+            mapped_row_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*)
+                      FROM daily_bars b
+                      JOIN assets a
+                        ON a.market_profile_id = ?
+                       AND a.symbol = b.ticker
+                     WHERE CASE WHEN b.market = 'CN' THEN 'CN' ELSE 'US' END = ?
+                    """,
+                    [profile_id, market],
+                ).fetchone()[0]
+            )
+            mapped_ticker_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(DISTINCT b.ticker)
+                      FROM daily_bars b
+                      JOIN assets a
+                        ON a.market_profile_id = ?
+                       AND a.symbol = b.ticker
+                     WHERE CASE WHEN b.market = 'CN' THEN 'CN' ELSE 'US' END = ?
+                    """,
+                    [profile_id, market],
+                ).fetchone()[0]
+            )
+            missing_tickers = [
+                str(row[0])
+                for row in conn.execute(
+                    """
+                    SELECT DISTINCT b.ticker
+                      FROM daily_bars b
+                     WHERE CASE WHEN b.market = 'CN' THEN 'CN' ELSE 'US' END = ?
+                       AND NOT EXISTS (
+                            SELECT 1
+                              FROM assets a
+                             WHERE a.market_profile_id = ?
+                               AND a.symbol = b.ticker
+                       )
+                     ORDER BY b.ticker
+                     LIMIT 50
+                    """,
+                    [market, profile_id],
+                ).fetchall()
+            ]
+            content_hash = self._daily_bars_market_hash(conn, market)
+            snapshot_id = f"v32_daily_bars_{profile_id}_{content_hash[:16]}"
+            coverage = {
+                "migration": "v3.2",
+                "source_table": "daily_bars",
+                "market": market,
+                "row_count": int(row_count or 0),
+                "ticker_count": int(ticker_count or 0),
+                "mapped_row_count": mapped_row_count,
+                "mapped_ticker_count": mapped_ticker_count,
+                "date_range": {
+                    "min": str(min_date) if min_date else None,
+                    "max": str(max_date) if max_date else None,
+                },
+                "content_hash": content_hash,
+            }
+            quality = {
+                "status": "valid" if not missing_tickers else "needs_asset_mapping",
+                "unmapped_ticker_count": len(missing_tickers),
+                "missing_asset_tickers_sample": missing_tickers,
+            }
+            provider, data_policy_id = self._profile_policy(conn, profile_id)
+            exists = conn.execute(
+                "SELECT 1 FROM market_data_snapshots WHERE id = ?",
+                [snapshot_id],
+            ).fetchone()
+            if not exists:
+                conn.execute(
+                    """
+                    INSERT INTO market_data_snapshots
+                        (id, market_profile_id, provider, data_policy_id,
+                         as_of_date, coverage_summary, quality_summary, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, current_timestamp)
+                    """,
+                    [
+                        snapshot_id,
+                        profile_id,
+                        provider,
+                        data_policy_id,
+                        max_date,
+                        json.dumps(coverage, default=str),
+                        json.dumps(quality, default=str),
+                    ],
+                )
+            results[str(market)] = {
+                "market_profile_id": profile_id,
+                "snapshot_id": snapshot_id,
+                "row_count": int(row_count or 0),
+                "ticker_count": int(ticker_count or 0),
+                "mapped_row_count": mapped_row_count,
+                "mapped_ticker_count": mapped_ticker_count,
+                "unmapped_ticker_count": len(missing_tickers),
+                "missing_asset_tickers_sample": missing_tickers,
+                "date_range": coverage["date_range"],
+            }
+        return results
+
+    @staticmethod
+    def _daily_bars_market_hash(conn, market: str) -> str:
+        rows = conn.execute(
+            """
+            SELECT ticker, date, open, high, low, close, volume, adj_factor
+              FROM daily_bars
+             WHERE CASE WHEN market = 'CN' THEN 'CN' ELSE 'US' END = ?
+             ORDER BY ticker, date
+            """,
+            [market],
+        ).fetchall()
+        digest = hashlib.sha256()
+        for row in rows:
+            digest.update(json.dumps([str(item) for item in row], sort_keys=True).encode("utf-8"))
+            digest.update(b"\n")
+        return digest.hexdigest()
+
+    @staticmethod
+    def _profile_policy(conn, profile_id: str) -> tuple[str, str | None]:
+        row = conn.execute(
+            "SELECT data_policy_id FROM market_profiles WHERE id = ?",
+            [profile_id],
+        ).fetchone()
+        data_policy_id = str(row[0]) if row and row[0] else None
+        if data_policy_id:
+            policy = conn.execute(
+                "SELECT provider FROM data_policies WHERE id = ?",
+                [data_policy_id],
+            ).fetchone()
+            if policy and policy[0]:
+                return str(policy[0]), data_policy_id
+        return "legacy_daily_bars", data_policy_id
 
     @staticmethod
     def _id_columns(spec: dict[str, Any]) -> list[str]:
