@@ -125,38 +125,10 @@ class StrategyGraph3Service:
         status: str = "draft",
         metadata: dict[str, Any] | None = None,
     ) -> dict:
-        portfolio_spec = self.portfolio_service.get_portfolio_construction_spec(
-            portfolio_construction_spec_id
+        raise ValueError(
+            "Legacy strategy adapters are disabled in V3.2 runtime. "
+            "Re-enter or reimplement the strategy as a 3.0 StrategyGraph."
         )
-        project = self.kernel.get_project(project_id or portfolio_spec["project_id"])
-        profile_id = market_profile_id or portfolio_spec["market_profile_id"]
-        graph_config = {
-            "legacy_strategy_id": legacy_strategy_id,
-            "selection_policy": {"top_n": 10, "score_column": "score"},
-            "portfolio_construction_spec_id": portfolio_construction_spec_id,
-            "risk_control_spec_id": risk_control_spec_id,
-            "rebalance_policy_spec_id": rebalance_policy_spec_id,
-            "execution_policy_spec_id": execution_policy_spec_id,
-            "state_policy_spec_id": state_policy_spec_id,
-        }
-        dependency_refs = [
-            {"type": "legacy_strategy", "id": legacy_strategy_id},
-            *self._dependency_refs(graph_config),
-        ]
-        graph = self._insert_graph(
-            name=name,
-            graph_type="legacy_strategy_adapter",
-            project_id=project["id"],
-            market_profile_id=profile_id,
-            description=description,
-            graph_config=graph_config,
-            dependency_refs=dependency_refs,
-            lifecycle_stage=lifecycle_stage,
-            status=status,
-            metadata={**(metadata or {}), "legacy_adapter": True},
-        )
-        self._insert_standard_nodes(graph["id"], graph_config, legacy=True)
-        return self.get_graph(graph["id"])
 
     # ------------------------------------------------------------------
     # Runtime
@@ -173,6 +145,11 @@ class StrategyGraph3Service:
         portfolio_value: float = 1_000_000,
         lifecycle_stage: str = "experiment",
     ) -> dict:
+        if legacy_signal_frame is not None:
+            raise ValueError(
+                "legacy_signal_frame is disabled in V3.2 runtime. "
+                "Provide a 3.0 alpha_frame instead."
+            )
         graph = self.get_graph(strategy_graph_id)
         config = graph.get("graph_config") or {}
         run = self.kernel.create_run(
@@ -324,6 +301,11 @@ class StrategyGraph3Service:
         lifecycle_stage: str = "experiment",
         price_field: str = "close",
     ) -> dict:
+        if legacy_signal_frames_by_date is not None:
+            raise ValueError(
+                "legacy_signal_frames_by_date is disabled in V3.2 runtime. "
+                "Provide alpha_frames_by_date instead."
+            )
         graph = self.get_graph(strategy_graph_id)
         market = "CN" if graph["market_profile_id"] == "CN_A" else "US"
         dates = [str(day) for day in get_trading_days(start_date, end_date, market=market)]
@@ -363,7 +345,6 @@ class StrategyGraph3Service:
                     {
                         "price_field": price_field,
                         "alpha_dates": sorted((alpha_frames_by_date or {}).keys()),
-                        "legacy_signal_dates": sorted((legacy_signal_frames_by_date or {}).keys()),
                     },
                     default=str,
                 ),
@@ -399,12 +380,10 @@ class StrategyGraph3Service:
                 for asset_id, weight in (valuation.get("weights") or {}).items()
             }
             alpha_frame = (alpha_frames_by_date or {}).get(decision_date)
-            legacy_signal_frame = (legacy_signal_frames_by_date or {}).get(decision_date)
             runtime = self.simulate_day(
                 strategy_graph_id,
                 decision_date=decision_date,
                 alpha_frame=alpha_frame,
-                legacy_signal_frame=legacy_signal_frame,
                 current_weights=drifted_weights,
                 portfolio_value=nav,
                 lifecycle_stage=lifecycle_stage,
@@ -759,9 +738,12 @@ class StrategyGraph3Service:
         decision_date: str,
     ) -> list[dict[str, Any]]:
         if graph["graph_type"] == "legacy_strategy_adapter":
-            if not legacy_signal_frame:
-                raise ValueError("legacy_signal_frame is required for legacy adapter graphs")
-            return self._legacy_signal_to_alpha(legacy_signal_frame, decision_date=decision_date)
+            raise ValueError("Legacy strategy adapters are disabled in V3.2 runtime")
+        if legacy_signal_frame is not None:
+            raise ValueError(
+                "legacy_signal_frame is disabled in V3.2 runtime. "
+                "Provide a 3.0 alpha_frame instead."
+            )
         if not alpha_frame:
             raise ValueError("alpha_frame is required for builtin alpha graphs")
         rows = []
@@ -781,37 +763,6 @@ class StrategyGraph3Service:
                 alpha_row["planned_price"] = planned_price
             rows.append(alpha_row)
         return sorted(rows, key=lambda item: item["score"], reverse=True)
-
-    def _legacy_signal_to_alpha(
-        self,
-        rows: list[dict[str, Any]],
-        *,
-        decision_date: str,
-    ) -> list[dict[str, Any]]:
-        alpha = []
-        for row in rows:
-            signal = int(row.get("signal", 0))
-            if signal <= 0:
-                continue
-            ticker = str(row.get("ticker") or row.get("asset_id")).upper()
-            asset_id = row.get("asset_id") or f"US_EQ:{ticker}"
-            score = float(row.get("strength", row.get("weight", 0.0)))
-            alpha.append(
-                {
-                    "date": decision_date,
-                    "asset_id": asset_id,
-                    "score": score,
-                    "rank": 0,
-                    "confidence": 1.0,
-                    "reason": "legacy signal adapter",
-                }
-            )
-        if not alpha:
-            raise ValueError("legacy_signal_frame produced no buy alpha rows")
-        alpha = sorted(alpha, key=lambda item: item["score"], reverse=True)
-        for index, row in enumerate(alpha, start=1):
-            row["rank"] = index
-        return alpha
 
     def _select_assets(
         self,

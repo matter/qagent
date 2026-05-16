@@ -1783,7 +1783,6 @@ export async function backtestStrategyGraph3(
     start_date: string;
     end_date: string;
     alpha_frames_by_date?: Record<string, Array<Record<string, unknown>>>;
-    legacy_signal_frames_by_date?: Record<string, Array<Record<string, unknown>>>;
     initial_capital?: number;
     lifecycle_stage?: string;
     price_field?: string;

@@ -14,7 +14,6 @@ class GenerateProductionSignalRequest(BaseModel):
     strategy_graph_id: str
     decision_date: str
     alpha_frame: list[dict] | None = None
-    legacy_signal_frame: list[dict] | None = None
     current_weights: dict[str, float] | None = None
     portfolio_value: float = 1_000_000
     qa_report_id: str | None = None
@@ -32,7 +31,6 @@ class CreatePaperSessionRequest(BaseModel):
 class AdvancePaperSessionRequest(BaseModel):
     decision_date: str
     alpha_frame: list[dict] | None = None
-    legacy_signal_frame: list[dict] | None = None
 
 
 class ExportBundleRequest(BaseModel):

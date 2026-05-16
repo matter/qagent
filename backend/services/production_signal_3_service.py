@@ -48,6 +48,11 @@ class ProductionSignal3Service:
         qa_report_id: str | None = None,
         approved_by: str = "system",
     ) -> dict:
+        if legacy_signal_frame is not None:
+            raise ValueError(
+                "legacy_signal_frame is disabled in V3.2 runtime. "
+                "Provide a 3.0 alpha_frame instead."
+            )
         graph = self._require_publishable_graph(strategy_graph_id)
         run = self.kernel.create_run(
             run_type="production_signal_generate",
@@ -68,7 +73,6 @@ class ProductionSignal3Service:
             strategy_graph_id,
             decision_date=decision_date,
             alpha_frame=alpha_frame,
-            legacy_signal_frame=legacy_signal_frame,
             current_weights=current_weights,
             portfolio_value=portfolio_value,
             lifecycle_stage="published",
@@ -242,6 +246,11 @@ class ProductionSignal3Service:
         alpha_frame: list[dict[str, Any]] | None = None,
         legacy_signal_frame: list[dict[str, Any]] | None = None,
     ) -> dict:
+        if legacy_signal_frame is not None:
+            raise ValueError(
+                "legacy_signal_frame is disabled in V3.2 runtime. "
+                "Provide a 3.0 alpha_frame instead."
+            )
         session = self.get_paper_session(session_id)
         if session["status"] != "active":
             raise ValueError(f"Paper session is {session['status']}, not active")
@@ -262,7 +271,6 @@ class ProductionSignal3Service:
             strategy_graph_id=session["strategy_graph_id"],
             decision_date=decision_date,
             alpha_frame=alpha_frame,
-            legacy_signal_frame=legacy_signal_frame,
             current_weights=drifted_weights,
             portfolio_value=nav,
             approved_by="paper_session",

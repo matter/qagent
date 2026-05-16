@@ -84,29 +84,51 @@ class StrategyGraph3ServiceContractTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(counts, (1, 6, 1, 1))
 
-    def test_legacy_signal_adapter_graph_can_run_from_legacy_signal_frame(self):
+    def test_legacy_strategy_adapter_graph_is_not_a_v3_2_runtime_path(self):
         service = StrategyGraph3Service()
-        graph = service.create_legacy_strategy_adapter_graph(
-            name="M8 legacy adapter graph",
-            legacy_strategy_id="legacy-strategy-id",
+        with self.assertRaisesRegex(ValueError, "Legacy strategy adapters are disabled"):
+            service.create_legacy_strategy_adapter_graph(
+                name="M8 legacy adapter graph",
+                legacy_strategy_id="legacy-strategy-id",
+                portfolio_construction_spec_id=self.portfolio["id"],
+                risk_control_spec_id=self.risk["id"],
+                execution_policy_spec_id=self.execution["id"],
+            )
+
+    def test_builtin_alpha_graph_rejects_legacy_signal_frames(self):
+        service = StrategyGraph3Service()
+        graph = service.create_builtin_alpha_graph(
+            name="M8 no legacy signal graph",
+            selection_policy={"top_n": 4, "score_column": "score"},
             portfolio_construction_spec_id=self.portfolio["id"],
             risk_control_spec_id=self.risk["id"],
             execution_policy_spec_id=self.execution["id"],
         )
-        result = service.simulate_day(
-            graph["id"],
-            decision_date="2024-01-02",
-            legacy_signal_frame=[
-                {"ticker": "AAA", "signal": 1, "weight": 0.5, "strength": 5.0},
-                {"ticker": "BBB", "signal": 1, "weight": 0.3, "strength": 3.0},
-                {"ticker": "CCC", "signal": 0, "weight": 0.0, "strength": 1.0},
-            ],
-        )
 
-        self.assertEqual(graph["graph_type"], "legacy_strategy_adapter")
-        self.assertEqual(result["alpha_frame"][0]["asset_id"], "US_EQ:AAA")
-        self.assertEqual(result["strategy_signal"]["status"], "completed")
-        self.assertTrue(result["order_intents"])
+        with self.assertRaisesRegex(ValueError, "legacy_signal_frame is disabled"):
+            service.simulate_day(
+                graph["id"],
+                decision_date="2024-01-02",
+                alpha_frame=[
+                    {"asset_id": "US_EQ:AAA", "score": 0.90, "confidence": 0.9},
+                ],
+                legacy_signal_frame=[
+                    {"ticker": "BBB", "signal": 1, "weight": 0.3, "strength": 3.0},
+                ],
+            )
+
+        with self.assertRaisesRegex(ValueError, "legacy_signal_frames_by_date is disabled"):
+            service.backtest_graph(
+                graph["id"],
+                start_date="2024-01-02",
+                end_date="2024-01-03",
+                alpha_frames_by_date={
+                    "2024-01-02": [{"asset_id": "US_EQ:AAA", "score": 1.0}],
+                },
+                legacy_signal_frames_by_date={
+                    "2024-01-02": [{"ticker": "BBB", "signal": 1}],
+                },
+            )
 
     def test_backtest_graph_revalues_nav_and_persists_daily_records(self):
         conn = get_connection()

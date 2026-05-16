@@ -28,26 +28,9 @@ class BuiltinAlphaGraphRequest(BaseModel):
     metadata: dict | None = None
 
 
-class LegacyAdapterGraphRequest(BaseModel):
-    name: str
-    legacy_strategy_id: str
-    portfolio_construction_spec_id: str
-    risk_control_spec_id: str | None = None
-    rebalance_policy_spec_id: str | None = None
-    execution_policy_spec_id: str | None = None
-    state_policy_spec_id: str | None = None
-    project_id: str | None = None
-    market_profile_id: str | None = None
-    description: str | None = None
-    lifecycle_stage: str = "experiment"
-    status: str = "draft"
-    metadata: dict | None = None
-
-
 class SimulateDayRequest(BaseModel):
     decision_date: str
     alpha_frame: list[dict] | None = None
-    legacy_signal_frame: list[dict] | None = None
     current_weights: dict[str, float] | None = None
     portfolio_value: float = 1_000_000
     lifecycle_stage: str = "experiment"
@@ -57,7 +40,6 @@ class BacktestGraphRequest(BaseModel):
     start_date: str
     end_date: str
     alpha_frames_by_date: dict[str, list[dict]] | None = None
-    legacy_signal_frames_by_date: dict[str, list[dict]] | None = None
     initial_capital: float = 1_000_000
     lifecycle_stage: str = "experiment"
     price_field: str = "close"
@@ -75,14 +57,6 @@ def _executor():
 async def create_builtin_alpha_graph(body: BuiltinAlphaGraphRequest) -> dict:
     try:
         return _svc().create_builtin_alpha_graph(**body.model_dump())
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@router.post("/strategy-graphs/legacy-adapter")
-async def create_legacy_adapter_graph(body: LegacyAdapterGraphRequest) -> dict:
-    try:
-        return _svc().create_legacy_strategy_adapter_graph(**body.model_dump())
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

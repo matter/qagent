@@ -1040,29 +1040,10 @@ def create_builtin_alpha_strategy_graph_3_0(
 
 
 @mcp.tool()
-def create_legacy_strategy_adapter_graph_3_0(
-    name: str,
-    legacy_strategy_id: str,
-    portfolio_construction_spec_id: str,
-    risk_control_spec_id: str | None = None,
-    execution_policy_spec_id: str | None = None,
-) -> dict:
-    """Create a StrategyGraph wrapper for legacy strategy signal frames."""
-    return _strategy_graph_3_service().create_legacy_strategy_adapter_graph(
-        name=name,
-        legacy_strategy_id=legacy_strategy_id,
-        portfolio_construction_spec_id=portfolio_construction_spec_id,
-        risk_control_spec_id=risk_control_spec_id,
-        execution_policy_spec_id=execution_policy_spec_id,
-    )
-
-
-@mcp.tool()
 def simulate_strategy_graph_day_3_0(
     strategy_graph_id: str,
     decision_date: str,
     alpha_frame: list[dict] | None = None,
-    legacy_signal_frame: list[dict] | None = None,
     current_weights: dict[str, float] | None = None,
 ) -> dict:
     """Run one StrategyGraph decision day and return stage outputs."""
@@ -1070,7 +1051,6 @@ def simulate_strategy_graph_day_3_0(
         strategy_graph_id,
         decision_date=decision_date,
         alpha_frame=alpha_frame,
-        legacy_signal_frame=legacy_signal_frame,
         current_weights=current_weights,
     )
 
@@ -1081,7 +1061,6 @@ def backtest_strategy_graph_3_0(
     start_date: str,
     end_date: str,
     alpha_frames_by_date: dict[str, list[dict]] | None = None,
-    legacy_signal_frames_by_date: dict[str, list[dict]] | None = None,
     initial_capital: float = 1_000_000,
     price_field: str = "close",
 ) -> dict:
@@ -1098,7 +1077,6 @@ def backtest_strategy_graph_3_0(
         "start_date": start_date,
         "end_date": end_date,
         "alpha_frames_by_date": alpha_frames_by_date,
-        "legacy_signal_frames_by_date": legacy_signal_frames_by_date,
         "initial_capital": initial_capital,
         "price_field": price_field,
     }
@@ -1287,7 +1265,6 @@ def generate_production_signal_3_0(
     strategy_graph_id: str,
     decision_date: str,
     alpha_frame: list[dict] | None = None,
-    legacy_signal_frame: list[dict] | None = None,
     current_weights: dict[str, float] | None = None,
     portfolio_value: float = 1_000_000,
     qa_report_id: str | None = None,
@@ -1298,7 +1275,6 @@ def generate_production_signal_3_0(
         strategy_graph_id=strategy_graph_id,
         decision_date=decision_date,
         alpha_frame=alpha_frame,
-        legacy_signal_frame=legacy_signal_frame,
         current_weights=current_weights,
         portfolio_value=portfolio_value,
         qa_report_id=qa_report_id,
@@ -1329,14 +1305,12 @@ def advance_paper_session_3_0(
     session_id: str,
     decision_date: str,
     alpha_frame: list[dict] | None = None,
-    legacy_signal_frame: list[dict] | None = None,
 ) -> dict:
     """Advance a 3.0 paper session by one day using the same runtime as production signal."""
     return _production_signal_3_service().advance_paper_session(
         session_id,
         decision_date=decision_date,
         alpha_frame=alpha_frame,
-        legacy_signal_frame=legacy_signal_frame,
     )
 
 

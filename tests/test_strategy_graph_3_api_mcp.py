@@ -32,6 +32,7 @@ class StrategyGraph3ApiMcpTests(unittest.TestCase):
         self.assertEqual(fake_executor.params["strategy_graph_id"], "graph1")
         self.assertEqual(fake_executor.params["start_date"], "2024-01-02")
         self.assertIs(fake_executor.fn.__self__, fake_service)
+        self.assertNotIn("legacy_signal_frames_by_date", fake_executor.params)
 
     def test_mcp_backtest_tool_submits_agent_task(self):
         fake_executor = _FakeExecutor()
@@ -51,6 +52,12 @@ class StrategyGraph3ApiMcpTests(unittest.TestCase):
         self.assertEqual(fake_executor.params["strategy_graph_id"], "graph1")
         self.assertEqual(fake_executor.params["price_field"], "close")
         self.assertIs(fake_executor.fn.__self__, fake_service)
+        self.assertNotIn("legacy_signal_frames_by_date", fake_executor.params)
+
+    def test_legacy_adapter_api_is_removed_from_runtime_surface(self):
+        self.assertFalse(hasattr(strategy_graph_api, "LegacyAdapterGraphRequest"))
+        self.assertFalse(hasattr(strategy_graph_api, "create_legacy_adapter_graph"))
+        self.assertFalse(hasattr(mcp_server, "create_legacy_strategy_adapter_graph_3_0"))
 
 
 class _FakeStrategyGraphService:

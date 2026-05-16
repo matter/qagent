@@ -100,6 +100,30 @@ class ProductionSignal3ServiceContractTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(counts, (1, 1, 1))
 
+    def test_production_and_paper_reject_legacy_signal_frames(self):
+        service = ProductionSignal3Service()
+        with self.assertRaisesRegex(ValueError, "legacy_signal_frame is disabled"):
+            service.generate_production_signal(
+                strategy_graph_id=self.graph["id"],
+                decision_date="2024-01-02",
+                alpha_frame=self.alpha,
+                legacy_signal_frame=[{"ticker": "AAA", "signal": 1}],
+            )
+
+        session = service.create_paper_session(
+            strategy_graph_id=self.graph["id"],
+            name="M10 no legacy paper",
+            start_date="2024-01-02",
+            initial_capital=500_000,
+        )
+        with self.assertRaisesRegex(ValueError, "legacy_signal_frame is disabled"):
+            service.advance_paper_session(
+                session["id"],
+                decision_date="2024-01-02",
+                alpha_frame=self.alpha,
+                legacy_signal_frame=[{"ticker": "AAA", "signal": 1}],
+            )
+
     def test_paper_session_advances_with_same_runtime_and_exports_bundle(self):
         service = ProductionSignal3Service()
         session = service.create_paper_session(
