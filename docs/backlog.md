@@ -6,28 +6,44 @@ This file only tracks unresolved or deferred work. Fixed and mitigated items are
 
 | Priority | Defect | Necessity | Workload |
 | --- | --- | --- | --- |
-| P1 | Remaining stateful/multi-table long-running workflows need domain-specific staging | Medium. Main final-asset tasks and legacy paper trading advance now stage/promote at task acceptance, but data refresh and 3.0 graph/model/universe/research workflows are state machines, source-data updates, or cache/materialization pipelines that still need explicit resume/idempotency/rollback semantics. | High |
+| P1 | Remaining stateful/multi-table long-running workflows need domain-specific staging | Medium. 3.0 graph/model/universe/research workflows, data refresh, and cache/materialization pipelines are state machines or source-data updates that need explicit resume/idempotency/rollback semantics before old runtime paths can be removed. | High |
 | P2 | Coordinator-friendly research metadata is lightweight/manual | Medium. The coordinator can dispatch top-model Codex agents outside QAgent today; optional metadata/artifact conveniences would reduce bookkeeping without turning QAgent into an agent control plane. | Low-Medium |
 | P1 | Research cache file and metadata writes need atomic writer leases | Medium-High. Current cache locks are process-local; concurrent agents through one backend are mostly protected, but second processes or cleanup during writes can corrupt cache state. | Medium |
 | P2 | Multi-agent research observability is sparse | Medium. The coordinator can maintain an external dispatch board, but a compact QAgent view of tasks, budgets, evidence, and quarantined results would reduce manual joins. | Medium |
 | P0 | Main DuckDB has single-writer operational fragility | Medium. Preflight/API diagnostics make locks actionable, but DuckDB remains a single-file local database. For this single-user system, full replacement is not urgent unless concurrent agent writers become common. | Medium-High |
-| P1 | Free equity data is not PIT or survivorship-safe | High for publication-grade research, medium for local exploration. Free yfinance/BaoStock data cannot prove delisted assets, historical membership, symbol changes, and full corporate-action history. Current code blocks publication gates instead of pretending the data is clean. | High |
-| P3 | Legacy and 3.0 engines coexist with overlapping concepts | Medium. Migration overlap increases maintenance/audit cost, but it protects existing US workflows. Fix only after 3.0 backtest/signal/paper semantics cover the legacy surface. | High |
+| P3 | Old and 3.0 engines coexist with overlapping concepts | High. V3.2 should not keep old runtime compatibility. Valuable old assets and capabilities must be re-entered, imported, or reimplemented in 3.0, then old services/routes/tables/UI paths should be removed. | High |
 
 ## Open
+
+### [2026-05-15] P1 Cancelled old backtest lease can block queued research tasks until restart
+
+- **Market**: US
+- **Entry**: old backtest `TaskExecutor` resource leases for `US:legacy-backtest`, `/api/strategies/{strategy_id}/backtest`, `/api/tasks`.
+- **Current mitigation**:
+  - Agent can inspect `/api/tasks` progress and see `serial_wait`, `blocked_by`, `serial_key`, and terminal `server_restarted` / `cancelled_running_thread` results.
+  - Agent should submit old backtests one at a time when a stale or cancelled lane owner is visible.
+- **Remaining issue**: On 2026-05-15, three current-system replay backtests for high-performing old strategies were submitted and all waited behind task `522b3734912f4b759f77ffaa9b67e94b` on `US:legacy-backtest`. The blocking task was already terminal with `reason=cancelled_running_thread`, but queued tasks continued to report `serial_wait` until the backend restarted. The queued tasks then failed with `reason=server_restarted` and no `backtest_id`.
+- **Expected behavior**: Short term, terminal/cancelled tasks should release or expire resource leases promptly. V3.2 end state should eliminate this lane by reimplementing retained backtest capability in the 3.0 StrategyGraph runtime and deleting the old backtest runtime path.
+- **Validation standard**:
+  - Start a long old backtest, request cancellation, and verify the `US:legacy-backtest` lease is released or deterministically expired before the old path is removed.
+  - Submit a second old backtest after cancellation and confirm it does not wait indefinitely behind a terminal task.
+  - `/api/tasks` should distinguish active running owners from stale terminal owners in `blocked_by`.
+  - V3.2 final validation should run the equivalent 3.0 StrategyGraph backtest path and confirm the old lane is disabled or removed.
+- **Fix necessity**: Medium-High for autonomous research because stale leases can waste trial budget and force manual restarts during backtest sweeps.
+- **Estimated workload**: Medium.
 
 ### [2026-05-14] P2 Coordinator-friendly research metadata is lightweight/manual
 
 - **Market**: US, CN
-- **Entry**: `docs/agent-collaboration-protocol.md`, `backend/services/agent_research_3_service.py`, `backend/api/agent_research_3.py`, MCP agent research tools, and research artifact APIs.
+- **Entry**: `docs/agent-collaboration-protocol.md`, `docs/agent-workspace/`, `backend/services/agent_research_3_service.py`, `backend/api/agent_research_3.py`, REST agent research endpoints, and research artifact APIs.
 - **Current mitigation**:
   - A manual coordinator protocol defines the main coordinator, top-model specialist agents, task packets, result packets, coordinator reports, and a compact work record.
   - Existing 3.0 agent research plans can record hypothesis, search space, budget, stop conditions, trials, trial matrix, QA, and promotion decisions.
   - The coordinator can dispatch independent Codex threads outside QAgent and use QAgent only for execution/evidence records.
-- **Remaining issue**: Useful coordinator metadata is still mostly free-form. Plan/trial/artifact records can hold role, round, model, and result status in JSON, but MCP/REST convenience is uneven, and there is no standard result artifact schema. This increases bookkeeping, but it does not block the coordinator from operating externally.
-- **Expected behavior**: QAgent offers lightweight support for coordinator-managed work: plan metadata, standard JSON result artifacts, optional fields or filters for `round`, `agent_role`, `model`, and `result_status`, and convenient MCP/REST calls to write those records. QAgent should not be required to own Codex thread lifecycle, agent leases, or model dispatch authority.
+- **Remaining issue**: Useful coordinator metadata is still mostly free-form. Plan/trial/artifact records can hold role, round, model, and result status in JSON, but local REST/CLI examples and result schemas are still manual. This increases bookkeeping, but it does not block the coordinator from operating externally.
+- **Expected behavior**: QAgent offers lightweight support for coordinator-managed work: plan metadata, standard JSON result artifacts, optional fields or filters for `round`, `agent_role`, `model`, and `result_status`, and convenient REST/local CLI examples to write those records. QAgent should not be required to own Codex thread lifecycle, agent leases, or model dispatch authority.
 - **Validation standard**:
-  - MCP and REST can write/read plan metadata and JSON result artifacts.
+  - REST and local CLI examples can write/read plan metadata and JSON result artifacts.
   - A documented result schema can capture baseline refs, role, model, changed module, frozen modules, trials, metrics, risks, and recommendation.
   - Trial matrix or artifact listing can be filtered or grouped by round and role without requiring a full control-plane migration.
 - **Fix necessity**: Medium. It reduces manual coordination cost, but the coordinator can already operate from the Codex layer.
@@ -46,6 +62,23 @@ This file only tracks unresolved or deferred work. Fixed and mitigated items are
 - **Validation standard**: Simulated concurrent writes and cleanup leave either one valid cache entry or a clean miss; no partial file is advertised as valid metadata; stale writer lease cleanup is deterministic.
 - **Fix necessity**: Medium-High for multi-agent repeated research. Low-Medium for strictly single-process manual use.
 - **Estimated workload**: Medium.
+
+#### Evidence: feature matrix duplicate metadata write can terminate backend
+
+- **Observed at**: 2026-05-15 during current-system replay of `M0427_S262_S204_RANK20_AUG_R1` (`strategy_id=e86479701d15`) over `2026-01-02` to `2026-04-03`.
+- **Task**: `c6ff3af0d64e416e9e2432dc03dc0206`, old backtest, `US:legacy-backtest`.
+- **Crash point**: `FeatureService.compute_features_from_cache()` writing research-cache metadata for feature set `c52c3ec5572a` after loading 15 factors and starting a 221-factor feature matrix.
+- **Fatal error**: DuckDB raised an uncaught fatal internal exception while appending `research_cache_entries`: duplicate primary key `feature_matrix:0c6ebff714c7fba0fadf85f1ea84c65bfb406bc6e0f77def500c3680557b1f58`.
+- **Impact**: The backend process terminated; the task was later marked `server_restarted`. Repeating similar current-system replay tasks can crash the backend instead of returning a retryable cache-write conflict.
+- **Expected behavior addition**: Cache metadata writes should be idempotent for an already-materialized cache key. A duplicate key should become a valid cache hit or a controlled retryable conflict, never a process-fatal DuckDB append path.
+
+#### Evidence: feature matrix cache path can block API health during backtest
+
+- **Observed at**: 2026-05-15 during `M0515_STRICT_S262_ADAPTIVE_WAVE_CAP20_R1` (`strategy_id=1c9a330600fc`) backtest task `aa561366548240009b448756eb5a2433`.
+- **Task config**: `US/sp500`, `2026-01-02` to `2026-04-03`, strategy defaults inherited, `debug_mode=true`, `debug_level=signals`.
+- **Last backend progress**: `factor_engine.bulk_cache.loaded` loaded 17 requested factors, then `feature_set.compute_from_cache.start` for `fs_id=c52c3ec5572a`, 221 factors, 503 tickers.
+- **Impact**: `/api/health`, `/api/tasks/{task_id}`, and `/api/tasks/resource-leases` timed out after three 30-second wait/retry cycles. Manual backend restart was required, and the task was marked `server_restarted`.
+- **Expected behavior addition**: Long feature-matrix materialization should not starve health/task APIs. The task should emit progress heartbeat, reuse an existing active feature-matrix entry when present, or fail with a retryable cache diagnostic instead of making the backend appear unavailable.
 
 ### [2026-05-14] P2 Multi-agent research observability is sparse
 
@@ -68,7 +101,7 @@ This file only tracks unresolved or deferred work. Fixed and mitigated items are
   - `TaskExecutor.submit()` now injects `stage_domain_write` for task functions that explicitly accept it.
   - Staged commit callbacks run only at accepted completion boundary and execute inside one DuckDB transaction.
   - Late timeout/cancel results remain quarantined and do not run staged commits.
-  - Migrated final-asset tasks: legacy backtest (`backtest_results`), model train (`models` DB row), factor evaluation (`factor_eval_results`), signal generation (`signal_runs` / `signal_details`), and legacy paper trading advance (`paper_trading_daily` / `paper_trading_sessions`).
+  - Migrated final-asset tasks: old backtest (`backtest_results`), model train (`models` DB row), factor evaluation (`factor_eval_results`), signal generation (`signal_runs` / `signal_details`), and old paper trading advance (`paper_trading_daily` / `paper_trading_sessions`).
 - **Remaining issue**: Remaining stateful workflows still write intermediate or state-transition rows during execution. They cannot be safely migrated by a single final-row commit callback because their correctness depends on resume points, idempotent day advancement, source-data semantics, cache invalidation, and rollback policy.
 - **Expected behavior**: Each stateful workflow defines its own staging/resume/idempotency contract. Accepted completion should promote final state atomically; timeout/cancel should either leave a clearly resumable staging state or roll back final domain state.
 - **Validation standard**: Synthetic timeout/cancel cases for each migrated workflow leave no partial final state, or leave only documented resumable staging rows with a recovery command.
@@ -86,24 +119,13 @@ This file only tracks unresolved or deferred work. Fixed and mitigated items are
 - **Fix necessity**: Medium under the current single-user local design. Do not replace DuckDB unless concurrent writers become a product requirement.
 - **Estimated workload**: Medium-High for a full server-DB migration; Low-Medium for continued guardrail improvements.
 
-### [2026-05-07] P1 Corporate actions and survivorship-safe equity universe
+### [2026-05-08] P3 Old and 3.0 engines coexist with overlapping concepts
 
 - **Market**: US, CN
-- **Entry**: `MarketDataFoundationService`, universe/materialization, backtest valuation
-- **Current mitigation**: Provider capability metadata and `DataQualityService` publication gates explicitly block `pit_data`, `survivorship_safe_universe`, and `corporate_actions` for free equity sources.
-- **Remaining issue**: Free providers expose current/free universe snapshots and daily bars; they do not provide complete dated delistings, historical index membership, symbol changes, split/dividend facts, or fully auditable adjusted-price semantics.
-- **Expected behavior**: Delistings, symbol changes, corporate actions, and historical membership are modeled as dated facts and enforced during universe materialization.
-- **Validation standard**: Backtests over historical periods include delisted assets when eligible, exclude assets before listing, and apply dated corporate actions consistently.
-- **Fix necessity**: High for publication-grade long-horizon alpha claims; medium for exploratory personal research.
-- **Estimated workload**: High. Requires a better data source or curated local dated facts plus materialization/backtest enforcement.
-
-### [2026-05-08] P3 Legacy and 3.0 engines coexist with overlapping concepts
-
-- **Market**: US, CN
-- **Entry**: legacy services under `backend/services/*_service.py`, 3.0 services under research assets / StrategyGraph / production signal / paper paths.
-- **Current mitigation**: 3.0 introduces market-aware assets, StrategyGraph runtime, execution diagnostics, QA evidence, and Workbench visibility while preserving legacy US compatibility.
-- **Remaining issue**: Backtest, signal, paper trading, model, and strategy concepts still exist in both legacy and 3.0 forms.
-- **Expected behavior**: One audited service path owns each semantic contract, with legacy entry points delegating or migrating without behavior regressions.
-- **Validation standard**: Existing US legacy flows pass, 3.0 flows pass, and docs/API clearly mark canonical entry points.
-- **Fix necessity**: Medium. It reduces maintenance cost, but premature removal risks breaking validated legacy workflows.
-- **Estimated workload**: High. Should be scheduled as a migration project after 3.0 is feature-complete enough to replace legacy flows.
+- **Entry**: old services under `backend/services/*_service.py`, 3.0 services under research assets / StrategyGraph / production signal / paper paths.
+- **Current mitigation**: 3.0 introduces market-aware assets, StrategyGraph runtime, execution diagnostics, QA evidence, and Workbench visibility, but old US runtime paths still exist.
+- **Remaining issue**: Backtest, signal, paper trading, model, and strategy concepts still exist in both old and 3.0 forms.
+- **Expected behavior**: One audited 3.0 service path owns each semantic contract. Any old asset worth keeping is re-entered, imported, or reimplemented in 3.0; old entry points are deleted or disabled instead of delegated.
+- **Validation standard**: 3.0 flows pass for all retained capabilities; migration reports prove retained old assets were re-entered/imported/reimplemented; docs/API no longer advertise old runtime entry points.
+- **Fix necessity**: High. Keeping compatibility increases maintenance cost and blocks the goal of fully separating from the old architecture.
+- **Estimated workload**: High. This is the main V3.2 migration project.
