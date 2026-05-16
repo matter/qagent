@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import timezone
@@ -144,6 +145,28 @@ class Migration32Service:
         md_path.write_text(self.render_manifest_markdown(manifest), encoding="utf-8")
         return json_path, md_path
 
+    def apply_basic_assets(self, db_path: Path | None = None) -> dict[str, Any]:
+        """Import/re-enter the first safe V3.2 asset slice into 3.0 tables.
+
+        This method intentionally does not delete or mutate old source tables.
+        It only creates idempotent 3.0 records for assets, factor specs, and
+        universes so later milestones can rebuild datasets/models/strategies
+        without calling old runtime paths.
+        """
+        with self._connection(db_path) as conn:
+            manifest = self.build_dry_run_manifest(db_path)
+            asset_result = self._import_assets(conn)
+            factor_result = self._reenter_factor_specs(conn)
+            universe_result = self._rebuild_universes(conn)
+            return {
+                "mode": "apply_basic_assets",
+                "manifest_id": manifest["manifest_id"],
+                "would_delete_old_tables": False,
+                "assets": asset_result,
+                "factor_specs": factor_result,
+                "universes": universe_result,
+            }
+
     @staticmethod
     def render_manifest_markdown(manifest: dict[str, Any]) -> str:
         lines = [
@@ -244,6 +267,211 @@ class Migration32Service:
             }
         return result
 
+    def _import_assets(self, conn) -> dict[str, int]:
+        if not self._table_exists(conn, "stocks"):
+            return {"before": 0, "after": 0, "inserted": 0}
+        before = int(conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0])
+        conn.execute(
+            """
+            INSERT INTO assets
+                (asset_id, market_profile_id, symbol, display_symbol, name,
+                 exchange, sector, industry, status, metadata, created_at, updated_at)
+            SELECT CASE normalize_market WHEN 'US' THEN 'US_EQ:' || ticker ELSE 'CN_A:' || ticker END,
+                   CASE normalize_market WHEN 'US' THEN 'US_EQ' ELSE 'CN_A' END,
+                   ticker,
+                   ticker,
+                   name,
+                   exchange,
+                   sector,
+                   NULL,
+                   COALESCE(status, 'active'),
+                   json_object('migration', 'v3.2', 'source_table', 'stocks', 'source_market', normalize_market),
+                   current_timestamp,
+                   current_timestamp
+              FROM (
+                    SELECT CASE WHEN market = 'CN' THEN 'CN' ELSE 'US' END AS normalize_market,
+                           ticker, name, exchange, sector, status
+                      FROM stocks
+                   ) s
+             WHERE NOT EXISTS (
+                    SELECT 1
+                      FROM assets a
+                     WHERE a.asset_id = CASE s.normalize_market
+                         WHEN 'US' THEN 'US_EQ:' || s.ticker ELSE 'CN_A:' || s.ticker END
+                   )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO asset_identifiers
+                (asset_id, identifier_type, identifier_value, valid_from, valid_to, metadata)
+            SELECT a.asset_id,
+                   'ticker',
+                   a.symbol,
+                   DATE '1900-01-01',
+                   NULL,
+                   json_object('migration', 'v3.2')
+              FROM assets a
+             WHERE NOT EXISTS (
+                    SELECT 1
+                      FROM asset_identifiers i
+                     WHERE i.asset_id = a.asset_id
+                       AND i.identifier_type = 'ticker'
+                       AND i.identifier_value = a.symbol
+                   )
+            """
+        )
+        after = int(conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0])
+        return {"before": before, "after": after, "inserted": after - before}
+
+    def _reenter_factor_specs(self, conn) -> dict[str, int]:
+        if not self._table_exists(conn, "factors"):
+            return {"before": 0, "after": 0, "inserted": 0}
+        before = int(conn.execute("SELECT COUNT(*) FROM factor_specs").fetchone()[0])
+        rows = conn.execute(
+            """
+            SELECT id, market, name, version, description, category, source_code,
+                   params, status
+              FROM factors
+             ORDER BY market, name, version, id
+            """
+        ).fetchall()
+        inserted = 0
+        for row in rows:
+            legacy_id, market, name, version, description, category, source_code, params, status = row
+            profile_id = _profile_for_market(market)
+            source_ref = {
+                "migration": "v3.2",
+                "source_table": "factors",
+                "source_id": legacy_id,
+                "source_market": market,
+                "source_version": version,
+            }
+            exists = conn.execute(
+                """
+                SELECT 1
+                  FROM factor_specs
+                 WHERE market_profile_id = ?
+                   AND source_type = 'v3_2_reentered_factor'
+                   AND json_extract_string(source_ref, '$.source_id') = ?
+                """,
+                [profile_id, legacy_id],
+            ).fetchone()
+            if exists:
+                continue
+            factor_spec_id = f"v32_factor_{uuid.uuid5(uuid.NAMESPACE_URL, str(legacy_id)).hex[:16]}"
+            conn.execute(
+                """
+                INSERT INTO factor_specs
+                    (id, project_id, market_profile_id, name, description, version,
+                     source_type, source_ref, source_code, code_hash, params_schema,
+                     default_params, required_inputs, compute_mode, expected_warmup,
+                     applicable_profiles, semantic_tags, lifecycle_stage, status,
+                     metadata, created_at, updated_at)
+                VALUES (?, 'bootstrap_us', ?, ?, ?, ?, 'v3_2_reentered_factor',
+                        ?, ?, ?, ?, ?, ?, 'time_series', 0, ?, ?, 'experiment',
+                        ?, ?, current_timestamp, current_timestamp)
+                """,
+                [
+                    factor_spec_id,
+                    profile_id,
+                    name,
+                    description,
+                    int(version or 1),
+                    json.dumps(source_ref, default=str),
+                    source_code,
+                    hashlib.sha256(str(source_code or "").encode("utf-8")).hexdigest(),
+                    json.dumps({}, default=str),
+                    _json_string(params, {}),
+                    json.dumps(["open", "high", "low", "close", "volume"], default=str),
+                    json.dumps([profile_id], default=str),
+                    json.dumps([category or "custom", "v3.2_reentered"], default=str),
+                    status or "draft",
+                    json.dumps({"migration": "v3.2", "source_table": "factors"}, default=str),
+                ],
+            )
+            inserted += 1
+        after = int(conn.execute("SELECT COUNT(*) FROM factor_specs").fetchone()[0])
+        return {"before": before, "after": after, "inserted": inserted}
+
+    def _rebuild_universes(self, conn) -> dict[str, int]:
+        if not self._table_exists(conn, "stock_groups"):
+            return {"before": 0, "after": 0, "inserted": 0}
+        before = int(conn.execute("SELECT COUNT(*) FROM universes").fetchone()[0])
+        groups = conn.execute(
+            """
+            SELECT id, market, name, description, group_type, filter_expr
+              FROM stock_groups
+             ORDER BY market, name, id
+            """
+        ).fetchall()
+        inserted = 0
+        for group_id, market, name, description, group_type, filter_expr in groups:
+            profile_id = _profile_for_market(market)
+            exists = conn.execute(
+                """
+                SELECT 1
+                  FROM universes
+                 WHERE market_profile_id = ?
+                   AND json_extract_string(source_ref, '$.source_id') = ?
+                   AND json_extract_string(source_ref, '$.source_table') = 'stock_groups'
+                """,
+                [profile_id, group_id],
+            ).fetchone()
+            if exists:
+                continue
+            tickers = [
+                str(item[0])
+                for item in conn.execute(
+                    """
+                    SELECT ticker
+                      FROM stock_group_members
+                     WHERE group_id = ?
+                       AND market = ?
+                     ORDER BY ticker
+                    """,
+                    [group_id, market],
+                ).fetchall()
+            ]
+            universe_id = f"v32_universe_{uuid.uuid5(uuid.NAMESPACE_URL, str(group_id)).hex[:16]}"
+            source_ref = {
+                "migration": "v3.2",
+                "source_table": "stock_groups",
+                "source_id": group_id,
+                "source_market": market,
+                "tickers": tickers,
+            }
+            conn.execute(
+                """
+                INSERT INTO universes
+                    (id, project_id, market_profile_id, name, description,
+                     universe_type, source_ref, filter_expr, lifecycle_stage,
+                     status, metadata, created_at, updated_at)
+                VALUES (?, 'bootstrap_us', ?, ?, ?, 'v3_2_rebuilt_group', ?,
+                        ?, 'experiment', 'draft', ?, current_timestamp,
+                        current_timestamp)
+                """,
+                [
+                    universe_id,
+                    profile_id,
+                    name,
+                    description,
+                    json.dumps(source_ref, default=str),
+                    filter_expr,
+                    json.dumps(
+                        {
+                            "migration": "v3.2",
+                            "source_group_type": group_type,
+                            "member_count": len(tickers),
+                        },
+                        default=str,
+                    ),
+                ],
+            )
+            inserted += 1
+        after = int(conn.execute("SELECT COUNT(*) FROM universes").fetchone()[0])
+        return {"before": before, "after": after, "inserted": inserted}
+
     @staticmethod
     def _id_columns(spec: dict[str, Any]) -> list[str]:
         if "id_columns" in spec:
@@ -329,3 +557,19 @@ class Migration32Service:
                 [table, column],
             ).fetchone()
         )
+
+
+def _profile_for_market(market: str | None) -> str:
+    return "CN_A" if str(market or "").upper() == "CN" else "US_EQ"
+
+
+def _json_string(value: Any, default: Any) -> str:
+    if value is None:
+        return json.dumps(default, default=str)
+    if isinstance(value, str):
+        try:
+            json.loads(value)
+            return value
+        except Exception:
+            return json.dumps(default, default=str)
+    return json.dumps(value, default=str)

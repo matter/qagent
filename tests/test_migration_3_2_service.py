@@ -112,6 +112,60 @@ class Migration32ServiceTests(unittest.TestCase):
         self.assertIn("3.2-migration-dry-run", json_path.name)
         self.assertIn("V3.2 Migration Dry-Run Manifest", md_path.read_text())
 
+    def test_apply_basic_assets_reenters_imports_and_rebuilds_idempotently(self):
+        conn = get_connection()
+        conn.execute(
+            """
+            INSERT INTO stocks (market, ticker, name, exchange, sector, status, updated_at)
+            VALUES ('US', 'AAPL', 'Apple', 'NASDAQ', 'Technology', 'active', current_timestamp)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO stock_groups (id, market, name, description)
+            VALUES ('core', 'US', 'Core', 'Core universe')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO stock_group_members (group_id, market, ticker)
+            VALUES ('core', 'US', 'AAPL')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO factors (id, market, name, source_code, status, description, category)
+            VALUES ('f1', 'US', 'DemoFactor', 'class Demo: pass', 'active', 'demo factor', 'custom')
+            """
+        )
+
+        first = self.service.apply_basic_assets(db_path=self.db_path)
+        second = self.service.apply_basic_assets(db_path=self.db_path)
+
+        self.assertEqual(first["mode"], "apply_basic_assets")
+        self.assertEqual(first["assets"]["inserted"], 1)
+        self.assertEqual(first["factor_specs"]["inserted"], 1)
+        self.assertEqual(first["universes"]["inserted"], 1)
+        self.assertEqual(second["assets"]["inserted"], 0)
+        self.assertEqual(second["factor_specs"]["inserted"], 0)
+        self.assertEqual(second["universes"]["inserted"], 0)
+
+        asset = conn.execute(
+            "SELECT asset_id, market_profile_id, symbol FROM assets WHERE symbol = 'AAPL'"
+        ).fetchone()
+        factor = conn.execute(
+            "SELECT id, market_profile_id, name, source_type, source_ref FROM factor_specs WHERE name = 'DemoFactor'"
+        ).fetchone()
+        universe = conn.execute(
+            "SELECT id, market_profile_id, name, source_ref FROM universes WHERE name = 'Core'"
+        ).fetchone()
+
+        self.assertEqual(asset, ("US_EQ:AAPL", "US_EQ", "AAPL"))
+        self.assertEqual(factor[1:4], ("US_EQ", "DemoFactor", "v3_2_reentered_factor"))
+        self.assertIn('"source_table": "factors"', factor[4])
+        self.assertEqual(universe[1:3], ("US_EQ", "Core"))
+        self.assertIn('"tickers": ["AAPL"]', universe[3])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -19,12 +19,19 @@ def main() -> int:
     parser.add_argument("--db-path", default=str(DEFAULT_DB_PATH))
     parser.add_argument("--out-dir", default=str(DEFAULT_REPORT_DIR))
     parser.add_argument("--dry-run", action="store_true", help="Build a read-only inventory manifest")
+    parser.add_argument(
+        "--apply-basic-assets",
+        action="store_true",
+        help="Idempotently import/re-enter stocks, factor specs, and universes into 3.0 tables",
+    )
     parser.add_argument("--apply", action="store_true", help="Reserved; V3.2 apply is intentionally not implemented yet")
     args = parser.parse_args()
 
     if args.apply:
         raise SystemExit("V3.2 apply is not implemented. Use --dry-run to generate a manifest.")
-    if not args.dry_run:
+    if args.dry_run and args.apply_basic_assets:
+        raise SystemExit("Choose either --dry-run or --apply-basic-assets, not both")
+    if not args.dry_run and not args.apply_basic_assets:
         args.dry_run = True
 
     db_path = Path(args.db_path)
@@ -32,10 +39,18 @@ def main() -> int:
         raise SystemExit(f"Database not found: {db_path}")
 
     service = Migration32Service()
-    manifest = service.build_dry_run_manifest(db_path=db_path)
-    json_path, md_path = service.write_manifest_files(manifest, out_dir=Path(args.out_dir))
-    print(f"V3.2 migration manifest JSON: {json_path}")
-    print(f"V3.2 migration manifest Markdown: {md_path}")
+    if args.apply_basic_assets:
+        result = service.apply_basic_assets(db_path=db_path)
+        print("V3.2 basic asset migration:")
+        print(f"  manifest_id: {result['manifest_id']}")
+        print(f"  assets inserted: {result['assets']['inserted']}")
+        print(f"  factor_specs inserted: {result['factor_specs']['inserted']}")
+        print(f"  universes inserted: {result['universes']['inserted']}")
+    else:
+        manifest = service.build_dry_run_manifest(db_path=db_path)
+        json_path, md_path = service.write_manifest_files(manifest, out_dir=Path(args.out_dir))
+        print(f"V3.2 migration manifest JSON: {json_path}")
+        print(f"V3.2 migration manifest Markdown: {md_path}")
     return 0
 
 
