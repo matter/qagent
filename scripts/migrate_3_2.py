@@ -29,14 +29,22 @@ def main() -> int:
         action="store_true",
         help="Idempotently register daily_bars coverage as 3.0 market_data_snapshots",
     )
+    parser.add_argument(
+        "--apply-dependency-assets",
+        action="store_true",
+        help="Idempotently rebuild feature/model/strategy/paper dependency assets into 3.0 descriptors",
+    )
     parser.add_argument("--apply", action="store_true", help="Reserved; V3.2 apply is intentionally not implemented yet")
     args = parser.parse_args()
 
     if args.apply:
         raise SystemExit("V3.2 apply is not implemented. Use --dry-run to generate a manifest.")
-    modes = [args.dry_run, args.apply_basic_assets, args.apply_market_data_snapshots]
+    modes = [args.dry_run, args.apply_basic_assets, args.apply_market_data_snapshots, args.apply_dependency_assets]
     if sum(1 for mode in modes if mode) > 1:
-        raise SystemExit("Choose only one of --dry-run, --apply-basic-assets, or --apply-market-data-snapshots")
+        raise SystemExit(
+            "Choose only one of --dry-run, --apply-basic-assets, "
+            "--apply-market-data-snapshots, or --apply-dependency-assets"
+        )
     if not any(modes):
         args.dry_run = True
 
@@ -63,6 +71,16 @@ def main() -> int:
                 f"mapped={info['mapped_row_count']} "
                 f"unmapped_tickers={info['unmapped_ticker_count']}"
             )
+    elif args.apply_dependency_assets:
+        result = service.apply_dependency_assets(db_path=db_path)
+        print("V3.2 dependency asset migration:")
+        print(f"  manifest_id: {result['manifest_id']}")
+        print(f"  label_specs inserted: {result['label_specs']['inserted']}")
+        print(f"  feature_pipelines inserted: {result['feature_pipelines']['inserted']}")
+        print(f"  model_specs inserted: {result['model_specs']['inserted']}")
+        print(f"  model_packages inserted: {result['model_packages']['inserted']}")
+        print(f"  strategy_graphs inserted: {result['strategy_graphs']['inserted']}")
+        print(f"  paper_sessions inserted: {result['paper_sessions']['inserted']}")
     else:
         manifest = service.build_dry_run_manifest(db_path=db_path)
         json_path, md_path = service.write_manifest_files(manifest, out_dir=Path(args.out_dir))

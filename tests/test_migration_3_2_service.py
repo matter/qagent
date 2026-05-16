@@ -215,6 +215,149 @@ class Migration32ServiceTests(unittest.TestCase):
         self.assertEqual(us_coverage["row_count"], 2)
         self.assertEqual(us_quality["status"], "needs_asset_mapping")
 
+    def test_apply_dependency_assets_rebuilds_model_strategy_and_paper_chain_idempotently(self):
+        conn = get_connection()
+        conn.execute(
+            """
+            INSERT INTO stocks (market, ticker, name, exchange, sector, status, updated_at)
+            VALUES ('US', 'AAPL', 'Apple', 'NASDAQ', 'Technology', 'active', current_timestamp)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO stock_groups (id, market, name, description)
+            VALUES ('core', 'US', 'Core', 'Core universe')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO stock_group_members (group_id, market, ticker)
+            VALUES ('core', 'US', 'AAPL')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO factors (id, market, name, source_code, status, description, category)
+            VALUES ('f1', 'US', 'DemoFactor', 'class DemoFactor: pass', 'active', 'demo factor', 'custom')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO label_definitions
+                (id, market, name, target_type, horizon, config, status)
+            VALUES
+                ('l1', 'US', 'Forward 1d', 'return', 1, '{"target":"close"}', 'active')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO feature_sets
+                (id, market, name, factor_refs, preprocessing, status)
+            VALUES
+                ('fs1', 'US', 'Demo Features',
+                 '[{"factor_id":"f1","factor_name":"DemoFactor"}]',
+                 '{"missing":"forward_fill"}', 'active')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO models
+                (id, market, name, feature_set_id, label_id, model_type,
+                 model_params, train_config, eval_metrics, status)
+            VALUES
+                ('m1', 'US', 'Demo Model', 'fs1', 'l1', 'lightgbm',
+                 '{"n_estimators":8}', '{"train_start":"2024-01-02"}',
+                 '{"test_rmse":0.1,"task_type":"regression"}', 'trained')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO strategies
+                (id, market, name, source_code, required_factors,
+                 required_models, status, description)
+            VALUES
+                ('s1', 'US', 'Demo Strategy',
+                 'class DemoStrategy: pass',
+                 '["DemoFactor"]', '["m1"]', 'active', 'strategy source')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO paper_trading_sessions
+                (id, market, name, strategy_id, universe_group_id, config,
+                 status, start_date, current_date, initial_capital, current_nav)
+            VALUES
+                ('p1', 'US', 'Demo Paper', 's1', 'core',
+                 '{"rebalance":"weekly"}', 'active',
+                 DATE '2024-01-02', DATE '2024-01-05', 1000000, 1010000)
+            """
+        )
+
+        first = self.service.apply_dependency_assets(db_path=self.db_path)
+        second = self.service.apply_dependency_assets(db_path=self.db_path)
+
+        self.assertEqual(first["mode"], "apply_dependency_assets")
+        self.assertEqual(first["feature_pipelines"]["inserted"], 1)
+        self.assertEqual(first["label_specs"]["inserted"], 1)
+        self.assertEqual(first["model_specs"]["inserted"], 1)
+        self.assertEqual(first["model_packages"]["inserted"], 1)
+        self.assertEqual(first["strategy_graphs"]["inserted"], 1)
+        self.assertEqual(first["paper_sessions"]["inserted"], 1)
+        self.assertEqual(second["feature_pipelines"]["inserted"], 0)
+        self.assertEqual(second["label_specs"]["inserted"], 0)
+        self.assertEqual(second["model_specs"]["inserted"], 0)
+        self.assertEqual(second["model_packages"]["inserted"], 0)
+        self.assertEqual(second["strategy_graphs"]["inserted"], 0)
+        self.assertEqual(second["paper_sessions"]["inserted"], 0)
+
+        pipeline = conn.execute(
+            """SELECT id, source_type, source_ref
+                 FROM feature_pipelines
+                WHERE name = 'Demo Features'"""
+        ).fetchone()
+        label = conn.execute(
+            """SELECT id, source_type, source_ref
+                 FROM label_specs
+                WHERE name = 'Forward 1d'"""
+        ).fetchone()
+        package = conn.execute(
+            """SELECT id, source_experiment_id, model_artifact_id, status, metadata
+                 FROM model_packages
+                WHERE name = 'Demo Model'"""
+        ).fetchone()
+        graph = conn.execute(
+            """SELECT id, graph_type, dependency_refs, status
+                 FROM strategy_graphs
+                WHERE name = 'Demo Strategy'"""
+        ).fetchone()
+        paper = conn.execute(
+            """SELECT strategy_graph_id, status, config, initial_capital, current_nav
+                 FROM paper_sessions
+                WHERE name = 'Demo Paper'"""
+        ).fetchone()
+        artifact = conn.execute(
+            "SELECT artifact_type FROM artifacts WHERE id = ?",
+            [package[2]],
+        ).fetchone()
+
+        self.assertEqual(pipeline[1], "v3_2_rebuilt_feature_set")
+        self.assertEqual(json.loads(pipeline[2])["source_id"], "fs1")
+        self.assertEqual(label[1], "v3_2_reentered_label")
+        self.assertEqual(json.loads(label[2])["source_id"], "l1")
+        self.assertTrue(package[1].startswith("v32_retrain_experiment_"))
+        self.assertEqual(package[3], "requires_retrain")
+        self.assertFalse(json.loads(package[4])["executable"])
+        self.assertEqual(artifact[0], "v3_2_legacy_model_manifest")
+        self.assertEqual(graph[1], "v3_2_reimplemented_strategy_source")
+        self.assertEqual(graph[3], "requires_reimplementation")
+        graph_deps = json.loads(graph[2])
+        self.assertTrue(any(item["type"] == "model_package" for item in graph_deps))
+        self.assertEqual(paper[0], graph[0])
+        self.assertEqual(paper[1], "migration_pending")
+        self.assertEqual(json.loads(paper[2])["legacy_session_id"], "p1")
+        self.assertEqual(paper[3], 1000000)
+        self.assertEqual(paper[4], 1010000)
+
 
 if __name__ == "__main__":
     unittest.main()
