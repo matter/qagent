@@ -91,6 +91,42 @@ class TaskExecutorContractTests(unittest.TestCase):
         self.assertEqual(leases[0]["task_id"], "task_new")
         self.assertEqual(leases[0]["status"], "active")
 
+    def test_task_store_releases_terminal_owner_resource_lease_before_acquiring(self):
+        self._init_temp_db()
+        store = TaskStore()
+        conn = get_connection()
+        conn.execute(
+            """
+            INSERT INTO task_runs
+                (id, task_type, status, params, completed_at, error_message)
+            VALUES
+                ('task_cancelled', 'strategy_backtest', 'failed', '{"market":"US"}',
+                 current_timestamp, 'Cancelled by user')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO task_resource_leases
+                (resource_key, task_id, task_type, market, status, expires_at)
+            VALUES
+                ('market:US:legacy-backtest', 'task_cancelled', 'strategy_backtest',
+                 'US', 'active', current_timestamp + INTERVAL 5 MINUTE)
+            """
+        )
+
+        acquired = store.acquire_resource_leases(
+            task_id="task_new",
+            task_type="strategy_backtest",
+            resource_keys=["market:US:legacy-backtest"],
+            market="US",
+            ttl_seconds=120,
+        )
+
+        self.assertTrue(acquired["acquired"])
+        leases = store.list_resource_leases(active_only=False, limit=10)
+        self.assertEqual(leases[0]["task_id"], "task_new")
+        self.assertEqual(leases[0]["status"], "active")
+
     def test_two_executors_serialize_same_resource_through_store_lease(self):
         self._init_temp_db()
         store_1 = TaskStore()
@@ -162,6 +198,44 @@ class TaskExecutorContractTests(unittest.TestCase):
         self.assertEqual(leases[0]["task_id"], task_id)
         self.assertEqual(leases[0]["status"], "released")
         self.assertEqual(leases[0]["release_reason"], "completed")
+
+    def test_cancelled_running_task_releases_resource_lease_promptly(self):
+        self._init_temp_db()
+        store = TaskStore()
+        executor = TaskExecutor(store=store, max_workers=1)
+        started = threading.Event()
+        release_worker = threading.Event()
+
+        def work(**_kwargs):
+            started.set()
+            release_worker.wait(timeout=2)
+            return {"late": True}
+
+        task_id = executor.submit(
+            "strategy_backtest",
+            fn=work,
+            params={"market": "US"},
+            timeout=5,
+        )
+        try:
+            self.assertTrue(started.wait(timeout=2))
+            self.assertTrue(executor.cancel(task_id))
+
+            deadline = time.time() + 2
+            released = None
+            while time.time() < deadline:
+                leases = store.list_resource_leases(active_only=False, limit=10)
+                released = next((lease for lease in leases if lease["task_id"] == task_id), None)
+                if released and released["status"] == "released":
+                    break
+                time.sleep(0.01)
+
+            self.assertIsNotNone(released)
+            self.assertEqual(released["status"], "released")
+            self.assertEqual(released["release_reason"], "cancelled_running_thread")
+        finally:
+            release_worker.set()
+            executor.shutdown(wait=True)
 
     def test_get_task_prefers_in_memory_record(self):
         store = MemoryOnlyStore()

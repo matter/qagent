@@ -6,6 +6,7 @@ import hashlib
 import json
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -19,6 +20,7 @@ from backend.config import settings
 from backend.db import get_connection
 from backend.logger import get_logger
 from backend.services.market_context import normalize_market, normalize_ticker
+from backend.tasks.store import TaskStore
 from backend.time_utils import utc_now_naive
 
 log = get_logger(__name__)
@@ -36,6 +38,8 @@ _PROCESS_FEATURE_MATRIX_CACHE: OrderedDict[
     str,
     tuple[float, dict[str, Any], dict[str, pd.DataFrame]],
 ] = OrderedDict()
+_CACHE_WRITER_LEASE_TTL_SECONDS = 15 * 60
+_CACHE_WRITER_LEASE_WAIT_SECONDS = 60
 _TRANSIENT_DUCKDB_MARKERS = (
     "TransactionContext Error",
     "Conflict on tuple deletion",
@@ -282,12 +286,18 @@ class ResearchCacheService:
             cache_key,
             cache_key,
         ]
-        with _cache_write_lock(cache_key):
+        tmp_path = _cache_temp_path(path)
+        with _cache_write_lock(cache_key), _cache_writer_lease(
+            cache_key=cache_key,
+            market=resolved_market,
+            object_type="feature_matrix",
+            object_id=feature_set_id,
+            uri=path,
+            tmp_uri=tmp_path,
+        ):
             path = self._feature_matrix_path(resolved_market, feature_set_id, cache_key)
             path.parent.mkdir(parents=True, exist_ok=True)
-            frame.to_parquet(path, index=True)
-            byte_size = path.stat().st_size
-            content_hash = _file_hash(path)
+            byte_size, content_hash = _write_parquet_atomically(frame, path, tmp_path, index=True)
             insert_params[4] = str(path)
             insert_params[6] = byte_size
             insert_params[7] = content_hash
@@ -432,12 +442,18 @@ class ResearchCacheService:
             cache_key,
             cache_key,
         ]
-        with _cache_write_lock(cache_key):
+        tmp_path = _cache_temp_path(path)
+        with _cache_write_lock(cache_key), _cache_writer_lease(
+            cache_key=cache_key,
+            market=resolved_market,
+            object_type="label_values",
+            object_id=label_id,
+            uri=path,
+            tmp_uri=tmp_path,
+        ):
             path = self._label_values_path(resolved_market, label_id, cache_key)
             path.parent.mkdir(parents=True, exist_ok=True)
-            frame.to_parquet(path, index=False)
-            byte_size = path.stat().st_size
-            content_hash = _file_hash(path)
+            byte_size, content_hash = _write_parquet_atomically(frame, path, tmp_path, index=False)
             insert_params[4] = str(path)
             insert_params[6] = byte_size
             insert_params[7] = content_hash
@@ -578,10 +594,13 @@ class ResearchCacheService:
                 LIMIT ?""",
             params,
         ).fetchall()
+        active_writer_paths = self._active_writer_paths()
         deleted_keys: list[str] = []
         deleted_bytes = 0
         for cache_key, uri, byte_size in rows:
             path = Path(uri) if uri else None
+            if path is not None and str(path) in active_writer_paths:
+                continue
             if path is not None and path.exists():
                 try:
                     path.unlink()
@@ -624,10 +643,13 @@ class ResearchCacheService:
             ).fetchall()
             if row and row[0]
         }
+        active_writer_paths = self._active_writer_paths()
         candidates: list[dict[str, Any]] = []
         for path in self._iter_cache_files():
             path_str = str(path)
             if path_str in tracked_uris:
+                continue
+            if path_str in active_writer_paths:
                 continue
             try:
                 stat = path.stat()
@@ -691,6 +713,38 @@ class ResearchCacheService:
             for path in sorted(self._cache_root.rglob("*"))
             if path.is_file()
         )
+
+    @staticmethod
+    def _active_writer_paths() -> set[str]:
+        try:
+            rows = get_connection().execute(
+                """
+                SELECT metadata
+                  FROM task_resource_leases
+                 WHERE status = 'active'
+                   AND resource_key LIKE 'research_cache:%'
+                   AND expires_at > current_timestamp
+                """
+            ).fetchall()
+        except Exception as exc:
+            log.warning("research_cache.writer_lease_paths_failed", error=str(exc))
+            return set()
+        paths: set[str] = set()
+        for row in rows:
+            raw = row[0] if row else None
+            if not raw:
+                continue
+            try:
+                metadata = json.loads(raw) if isinstance(raw, str) else raw
+            except Exception:
+                continue
+            if not isinstance(metadata, dict):
+                continue
+            for key in ("uri", "tmp_uri"):
+                value = metadata.get(key)
+                if value:
+                    paths.add(str(value))
+        return paths
 
     # ------------------------------------------------------------------
     # Factor cache cleanup
@@ -930,6 +984,31 @@ def _timestamp_to_iso(timestamp: float) -> str:
     return pd.Timestamp.fromtimestamp(timestamp).isoformat()
 
 
+def _cache_temp_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+
+
+def _write_parquet_atomically(
+    frame: pd.DataFrame,
+    path: Path,
+    tmp_path: Path,
+    *,
+    index: bool,
+) -> tuple[int, str]:
+    try:
+        frame.to_parquet(tmp_path, index=index)
+        byte_size = tmp_path.stat().st_size
+        content_hash = _file_hash(tmp_path)
+        tmp_path.replace(path)
+        return byte_size, content_hash
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError as exc:
+                log.warning("research_cache.tmp_delete_failed", path=str(tmp_path), error=str(exc))
+
+
 def _canonical_json(value: Any) -> str:
     return json.dumps(_canonical_jsonable(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -971,6 +1050,60 @@ def _cache_write_lock(cache_key: str) -> Iterator[None]:
             _CACHE_WRITE_LOCKS[cache_key] = lock
     with lock:
         yield
+
+
+@contextmanager
+def _cache_writer_lease(
+    *,
+    cache_key: str,
+    market: str,
+    object_type: str,
+    object_id: str,
+    uri: Path,
+    tmp_uri: Path,
+) -> Iterator[None]:
+    store = TaskStore()
+    lease_task_id = f"research_cache_writer:{uuid.uuid4().hex}"
+    resource_key = f"research_cache:{cache_key}"
+    deadline = time.monotonic() + _CACHE_WRITER_LEASE_WAIT_SECONDS
+    delay = 0.1
+    acquired = False
+    while True:
+        result = store.acquire_resource_leases(
+            task_id=lease_task_id,
+            task_type="research_cache_write",
+            resource_keys=[resource_key],
+            market=market,
+            ttl_seconds=_CACHE_WRITER_LEASE_TTL_SECONDS,
+            metadata={
+                "cache_key": cache_key,
+                "object_type": object_type,
+                "object_id": object_id,
+                "uri": str(uri),
+                "tmp_uri": str(tmp_uri),
+            },
+        )
+        if result.get("acquired"):
+            acquired = True
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            blocked = result.get("blocked") or []
+            raise TimeoutError(
+                f"Timed out waiting for research cache writer lease {resource_key}; "
+                f"blocked_by={blocked}"
+            )
+        time.sleep(min(delay, remaining))
+        delay = min(2.0, delay * 1.5)
+    try:
+        yield
+    finally:
+        if acquired:
+            store.release_resource_leases(
+                lease_task_id,
+                [resource_key],
+                reason="completed",
+            )
 
 
 def _is_transient_duckdb_conflict(exc: Exception) -> bool:

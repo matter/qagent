@@ -281,6 +281,11 @@ class TaskExecutor:
             result_summary=cancel_summary,
             error_message="Cancelled by user",
         )
+        self._release_resource_leases(
+            task_id,
+            self._resource_keys(record.task_type, record.params),
+            cancel_summary["reason"],
+        )
         log.info("task.cancelled", task_id=task_id)
         return True
 

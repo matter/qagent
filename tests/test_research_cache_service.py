@@ -1,3 +1,4 @@
+import json
 import tempfile
 import threading
 import unittest
@@ -243,6 +244,102 @@ class ResearchCacheServiceTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertEqual(errors, [])
         self.assertEqual(rows, 1)
+
+    def test_feature_matrix_store_uses_temp_file_before_atomic_replace(self):
+        service = ResearchCacheService()
+        feature_data = {
+            "close": pd.DataFrame(
+                {"AAPL": [10.0, 11.0]},
+                index=pd.to_datetime(["2024-01-02", "2024-01-03"]),
+            )
+        }
+        writes = []
+        original_to_parquet = pd.DataFrame.to_parquet
+
+        def record_write(frame, path, *args, **kwargs):
+            writes.append(Path(path))
+            self.assertTrue(str(path).endswith(".tmp"))
+            self.assertFalse(str(path).endswith(".parquet"))
+            return original_to_parquet(frame, path, *args, **kwargs)
+
+        with patch.object(pd.DataFrame, "to_parquet", record_write):
+            record = service.store_feature_matrix(
+                market="US",
+                feature_set_id="fs_atomic",
+                tickers=["AAPL"],
+                start_date="2024-01-02",
+                end_date="2024-01-03",
+                factor_refs=[{"factor_id": "f_close", "factor_name": "close"}],
+                preprocessing={},
+                feature_data=feature_data,
+            )
+
+        final_path = Path(record["uri"])
+        self.assertEqual(len(writes), 1)
+        self.assertTrue(final_path.exists())
+        self.assertFalse(writes[0].exists())
+        self.assertEqual(final_path.suffix, ".parquet")
+
+    def test_feature_matrix_store_releases_writer_lease(self):
+        service = ResearchCacheService()
+        feature_data = {
+            "close": pd.DataFrame(
+                {"AAPL": [10.0]},
+                index=pd.to_datetime(["2024-01-02"]),
+            )
+        }
+
+        record = service.store_feature_matrix(
+            market="US",
+            feature_set_id="fs_writer_lease",
+            tickers=["AAPL"],
+            start_date="2024-01-02",
+            end_date="2024-01-02",
+            factor_refs=[{"factor_id": "f_close", "factor_name": "close"}],
+            preprocessing={},
+            feature_data=feature_data,
+        )
+
+        lease = get_connection().execute(
+            """
+            SELECT status, release_reason
+              FROM task_resource_leases
+             WHERE resource_key = ?
+            """,
+            [f"research_cache:{record['cache_key']}"],
+        ).fetchone()
+        self.assertEqual(lease, ("released", "completed"))
+
+    def test_orphan_cleanup_skips_active_writer_temp_file(self):
+        service = ResearchCacheService()
+        tmp_path = (
+            Path(self._tmp.name)
+            / "data"
+            / "research_cache"
+            / "feature_matrix"
+            / "US"
+            / "fs_active"
+            / "active.parquet.writer.tmp"
+        )
+        tmp_path.parent.mkdir(parents=True)
+        tmp_path.write_bytes(b"partial")
+        get_connection().execute(
+            """
+            INSERT INTO task_resource_leases
+                (resource_key, task_id, task_type, market, status,
+                 expires_at, metadata)
+            VALUES
+                ('research_cache:feature_matrix:active', 'writer_active',
+                 'research_cache_write', 'US', 'active',
+                 current_timestamp + INTERVAL 5 MINUTE, ?)
+            """,
+            [json.dumps({"tmp_uri": str(tmp_path), "uri": str(tmp_path.with_suffix(".parquet"))})],
+        )
+
+        preview = service.preview_orphan_file_cleanup(limit=10, min_age_seconds=0)
+
+        self.assertEqual(preview["summary"]["candidate_count"], 0)
+        self.assertEqual(preview["candidates"], [])
 
     def test_feature_matrix_key_changes_with_universe_and_preprocessing(self):
         service = ResearchCacheService()

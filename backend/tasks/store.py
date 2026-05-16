@@ -144,6 +144,7 @@ class TaskStore:
             now = self._lease_now(conn)
             expires_at = self._lease_expires_at(conn, ttl)
             self._expire_stale_resource_leases(conn, now)
+            self._release_terminal_owner_resource_leases(conn, now, keys)
             placeholders = ", ".join(["?"] * len(keys))
             rows = conn.execute(
                 f"""
@@ -555,6 +556,47 @@ class TaskStore:
                AND expires_at <= ?
             """,
             [now, now],
+        )
+        return int(existing)
+
+    @staticmethod
+    def _release_terminal_owner_resource_leases(
+        conn,
+        now: datetime,
+        resource_keys: list[str],
+    ) -> int:
+        if not resource_keys:
+            return 0
+        placeholders = ", ".join(["?"] * len(resource_keys))
+        existing = conn.execute(
+            f"""
+            SELECT COUNT(*)
+              FROM task_resource_leases
+             WHERE status = 'active'
+               AND resource_key IN ({placeholders})
+               AND task_id IN (
+                    SELECT id
+                      FROM task_runs
+                     WHERE status IN ('completed', 'failed', 'timeout')
+               )
+            """,
+            resource_keys,
+        ).fetchone()[0]
+        conn.execute(
+            f"""
+            UPDATE task_resource_leases
+               SET status = 'released',
+                   released_at = ?,
+                   release_reason = 'terminal_owner'
+             WHERE status = 'active'
+               AND resource_key IN ({placeholders})
+               AND task_id IN (
+                    SELECT id
+                      FROM task_runs
+                     WHERE status IN ('completed', 'failed', 'timeout')
+               )
+            """,
+            [now, *resource_keys],
         )
         return int(existing)
 
