@@ -253,6 +253,13 @@ class StrategyGraph3ServiceContractTests(unittest.TestCase):
         self.assertEqual(len(blocked), 1)
         self.assertIn("suspended", blocked[0][6])
         self.assertEqual(result["summary"]["fill_diagnostics"]["blocked_order_count"], 1)
+        self.assertTrue(
+            any(
+                (item["diagnostics"].get("skipped_execution") or {}).get("outside_backtest_window_count") == 1
+                for item in result["daily"]
+                if item["date"] == "2024-01-03"
+            )
+        )
 
     def test_backtest_graph_planned_price_fills_and_blocks_by_buffered_range(self):
         conn = get_connection()
@@ -376,6 +383,86 @@ class StrategyGraph3ServiceContractTests(unittest.TestCase):
         self.assertIsNotNone(row[0])
         self.assertEqual(row[1], 12.0)
         self.assertIn('"fill_type": "fallback_close"', row[2])
+
+    def test_backtest_graph_supports_mixed_order_intents_from_alpha_rows(self):
+        conn = get_connection()
+        conn.executemany(
+            """INSERT INTO stocks
+               (market, ticker, name, exchange, sector, status, updated_at)
+               VALUES ('US', ?, ?, 'NYSE', 'Test', 'active', current_timestamp)""",
+            [
+                ("AAA", "Next close"),
+                ("BBB", "Limit"),
+                ("CCC", "Stop limit"),
+            ],
+        )
+        conn.executemany(
+            """INSERT INTO daily_bars
+               (market, ticker, date, open, high, low, close, volume, adj_factor)
+               VALUES ('US', ?, ?, ?, ?, ?, ?, 1000, 1.0)""",
+            [
+                ("AAA", "2024-01-02", 10.0, 10.3, 9.8, 10.0),
+                ("AAA", "2024-01-03", 11.0, 11.5, 10.8, 11.2),
+                ("BBB", "2024-01-02", 20.0, 20.5, 19.8, 20.0),
+                ("BBB", "2024-01-03", 21.0, 21.5, 20.2, 20.8),
+                ("CCC", "2024-01-02", 30.0, 30.5, 29.8, 30.0),
+                ("CCC", "2024-01-03", 31.0, 33.0, 30.0, 32.0),
+            ],
+        )
+        service = StrategyGraph3Service()
+        graph = service.create_builtin_alpha_graph(
+            name="M5 mixed execution graph",
+            selection_policy={"top_n": 3, "score_column": "score"},
+            portfolio_construction_spec_id=self.portfolio["id"],
+            risk_control_spec_id=None,
+            execution_policy_spec_id=self.execution["id"],
+        )
+
+        result = service.backtest_graph(
+            graph["id"],
+            start_date="2024-01-02",
+            end_date="2024-01-03",
+            alpha_frames_by_date={
+                "2024-01-02": [
+                    {"asset_id": "US_EQ:AAA", "score": 1.0, "execution_model": "next_close"},
+                    {"asset_id": "US_EQ:BBB", "score": 0.9, "execution_model": "limit", "limit_price": 20.5},
+                    {
+                        "asset_id": "US_EQ:CCC",
+                        "score": 0.8,
+                        "execution_model": "stop_limit",
+                        "stop_price": 32.0,
+                        "limit_price": 29.0,
+                    },
+                ],
+                "2024-01-03": [
+                    {"asset_id": "US_EQ:AAA", "score": 1.0, "execution_model": "next_close"},
+                    {"asset_id": "US_EQ:BBB", "score": 0.9, "execution_model": "limit", "limit_price": 20.5},
+                    {
+                        "asset_id": "US_EQ:CCC",
+                        "score": 0.8,
+                        "execution_model": "stop_limit",
+                        "stop_price": 32.0,
+                        "limit_price": 29.0,
+                    },
+                ],
+            },
+            initial_capital=1_000_000,
+        )
+
+        self.assertEqual(result["summary"]["fill_diagnostics"]["execution_model"], "mixed")
+        self.assertGreater(result["summary"]["fill_diagnostics"]["path_assumption_warning_count"], 0)
+        rows = conn.execute(
+            """SELECT asset_id, price, metadata
+               FROM backtest_trades
+               WHERE backtest_run_id = ?
+               ORDER BY asset_id""",
+            [result["backtest_run"]["id"]],
+        ).fetchall()
+        metadata_text = "\n".join(row[2] for row in rows)
+        self.assertIn('"execution_model": "next_close"', metadata_text)
+        self.assertIn('"fill_type": "limit"', metadata_text)
+        self.assertIn("stop_limit_not_reached", metadata_text)
+        self.assertIn("daily_bar_no_intraday_path", metadata_text)
 
     def test_backtest_graph_blocks_cn_st_limit_and_missing_price_orders(self):
         conn = get_connection()

@@ -29,7 +29,7 @@ _PROFILE_BY_MARKET = {"US": "US_EQ", "CN": "CN_A"}
 _MARKET_BY_PROFILE = {"US_EQ": "US", "CN_A": "CN"}
 _SUPPORTED_BUILDERS = {"equal_weight", "score_proportional", "inverse_vol"}
 _SUPPORTED_REBALANCE = {"none", "band"}
-_SUPPORTED_EXECUTION = {"next_open", "planned_price"}
+_SUPPORTED_EXECUTION = {"next_open", "next_close", "planned_price", "limit", "stop", "stop_limit"}
 _SUPPORTED_STATE = {"stateless"}
 
 
@@ -212,6 +212,12 @@ class PortfolioAssets3Service:
     @staticmethod
     def _normalize_execution_params(policy_type: str, params: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(params or {})
+        if policy_type == "next_open":
+            normalized["price_field"] = normalized.get("price_field", "open")
+        elif policy_type == "next_close":
+            normalized["price_field"] = "close"
+        elif policy_type in {"limit", "stop", "stop_limit"}:
+            normalized["price_field"] = normalized.get("price_field", "close")
         if policy_type == "planned_price":
             normalized["planned_price_buffer_bps"] = normalize_planned_price_buffer_bps(
                 normalized.get("planned_price_buffer_bps")
@@ -770,6 +776,24 @@ class PortfolioAssets3Service:
             if "planned_price" in frame.columns
             else {}
         )
+        passthrough_columns = [
+            "execution_model",
+            "order_type",
+            "price_field",
+            "limit_price",
+            "stop_price",
+            "planned_price_buffer_bps",
+            "fill_fallback",
+            "planned_price_fallback",
+            "time_in_force",
+            "priority",
+            "order_reason",
+        ]
+        passthrough_by_asset = {
+            column: dict(zip(frame["asset_id"], frame[column], strict=False))
+            for column in passthrough_columns
+            if column in frame.columns
+        }
         rows = []
         for rank, (asset_id, weight) in enumerate(
             sorted(weights.items(), key=lambda item: item[1], reverse=True),
@@ -796,6 +820,11 @@ class PortfolioAssets3Service:
                 if math.isfinite(planned_price_float) and planned_price_float > 0:
                     row["planned_price"] = planned_price_float
                     row["planned_price_source"] = "strategy_output"
+            for column, values in passthrough_by_asset.items():
+                value = values.get(asset_id)
+                if value is None or (isinstance(value, float) and math.isnan(value)):
+                    continue
+                row[column] = value
             rows.append(
                 row
             )
@@ -828,6 +857,13 @@ class PortfolioAssets3Service:
                 continue
             target_row = target_rows_by_asset.get(asset_id, {})
             params = execution_spec.get("params") or {}
+            policy_type_for_order = str(
+                target_row.get("execution_model")
+                or target_row.get("order_type")
+                or policy_type
+            )
+            if policy_type_for_order not in _SUPPORTED_EXECUTION:
+                raise ValueError(f"Unsupported execution_model {policy_type_for_order!r}")
             order = {
                 "decision_date": decision_date,
                 "execution_date": str(execution_date),
@@ -838,9 +874,16 @@ class PortfolioAssets3Service:
                 "delta_weight": round(delta, 12),
                 "estimated_value": round(float(portfolio_value) * abs(delta), 2),
                 "execution_policy_id": execution_spec["id"],
-                "execution_model": policy_type,
+                "execution_model": policy_type_for_order,
+                "order_type": str(target_row.get("order_type") or policy_type_for_order),
             }
-            if policy_type == "planned_price":
+            if target_row.get("priority") is not None:
+                order["priority"] = int(float(target_row["priority"]))
+            if target_row.get("order_reason") is not None:
+                order["reason"] = str(target_row["order_reason"])
+            if target_row.get("time_in_force") is not None:
+                order["time_in_force"] = str(target_row["time_in_force"])
+            if policy_type_for_order == "planned_price":
                 if target_row.get("planned_price") is not None:
                     order["planned_price"] = float(target_row["planned_price"])
                     order["planned_price_source"] = target_row.get(
@@ -850,15 +893,29 @@ class PortfolioAssets3Service:
                 else:
                     order["planned_price_source"] = "decision_close"
                 order["planned_price_buffer_bps"] = float(
-                    params.get("planned_price_buffer_bps", 50)
+                    target_row.get("planned_price_buffer_bps")
+                    or params.get("planned_price_buffer_bps", 50)
                 )
                 order["fallback"] = params.get("fallback", "decision_close")
-                order["fill_fallback"] = params.get("fill_fallback", "cancel")
+                order["fill_fallback"] = (
+                    target_row.get("fill_fallback")
+                    or target_row.get("planned_price_fallback")
+                    or params.get("fill_fallback", "cancel")
+                )
                 order["order_ttl"] = params.get("order_ttl", "same_day")
-                order["reason"] = "move current portfolio toward target at planned price"
+                order.setdefault("reason", "move current portfolio toward target at planned price")
+            elif policy_type_for_order in {"limit", "stop", "stop_limit"}:
+                for field in ("limit_price", "stop_price"):
+                    if target_row.get(field) is not None:
+                        order[field] = float(target_row[field])
+                order["price_field"] = str(target_row.get("price_field") or params.get("price_field", "close"))
+                order.setdefault("reason", f"move current portfolio toward target with {policy_type_for_order} order")
+            elif policy_type_for_order == "next_close":
+                order["price_field"] = "close"
+                order.setdefault("reason", "move current portfolio toward target at next session close")
             else:
-                order["price_field"] = params.get("price_field", "open")
-                order["reason"] = "move current portfolio toward target at next session open"
+                order["price_field"] = str(target_row.get("price_field") or params.get("price_field", "open"))
+                order.setdefault("reason", "move current portfolio toward target at next session open")
             orders.append(
                 order
             )

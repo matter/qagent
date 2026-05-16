@@ -970,6 +970,9 @@ function BacktestSummaryPanel({ backtest }: { backtest: BacktestRun3 | null }) {
     return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} />;
   }
   const diagnostics = objectField(backtest.summary, "fill_diagnostics");
+  const executionModel = String(diagnostics.execution_model ?? "-");
+  const executionModelCounts = objectField(diagnostics, "execution_model_counts");
+  const pathWarnings = arrayField(diagnostics, "path_assumption_warnings");
   const warnings = arrayField(backtest.summary, "valuation_warnings");
   return (
     <Space orientation="vertical" size={12} style={{ width: "100%" }}>
@@ -981,13 +984,22 @@ function BacktestSummaryPanel({ backtest }: { backtest: BacktestRun3 | null }) {
         <Descriptions.Item label="Total Cost">{currencyText(numberField(backtest.summary, "total_cost"))}</Descriptions.Item>
         <Descriptions.Item label="Days">{String(numberField(backtest.summary, "days_processed") ?? "-")}</Descriptions.Item>
       </Descriptions>
-      <SimpleList title="Fill Diagnostics" empty={Object.keys(diagnostics).length === 0}>
-        {Object.entries(diagnostics).map(([key, value]) => (
-          <SimpleListItem key={key}>
-            <Space>
-              <Text strong>{key}</Text>
-              <Text type="secondary">{String(value)}</Text>
-            </Space>
+      <Descriptions size="small" bordered column={2} title="Fill Diagnostics">
+        <Descriptions.Item label="Execution Model">
+          <Tag color={executionModel === "mixed" ? "gold" : "blue"}>{executionModel}</Tag>
+        </Descriptions.Item>
+        <Descriptions.Item label="Fill Rate">{percentText(numberField(diagnostics, "fill_rate"))}</Descriptions.Item>
+        <Descriptions.Item label="Filled">{String(numberField(diagnostics, "filled_order_count") ?? "-")}</Descriptions.Item>
+        <Descriptions.Item label="Blocked">{String(numberField(diagnostics, "blocked_order_count") ?? "-")}</Descriptions.Item>
+        <Descriptions.Item label="Path Warnings">
+          {String(numberField(diagnostics, "path_assumption_warning_count") ?? 0)}
+        </Descriptions.Item>
+        <Descriptions.Item label="Model Counts">{shortJson(executionModelCounts)}</Descriptions.Item>
+      </Descriptions>
+      <SimpleList title="Daily-Bar Path Warnings" empty={pathWarnings.length === 0}>
+        {pathWarnings.slice(0, 8).map((item, index) => (
+          <SimpleListItem key={index}>
+            <Text>{shortJson(item)}</Text>
           </SimpleListItem>
         ))}
       </SimpleList>
